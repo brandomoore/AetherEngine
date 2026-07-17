@@ -3451,8 +3451,14 @@ public final class AetherEngine: ObservableObject {
         // AE#158: keepCurrentItem defers the item detach to the next host.load(inPlaceSwap:) so a
         // system PiP window never sees a nil-item gap across a native->native load. Only meaningful
         // together with keepNativeHost; load() computes it via shouldHandOverItemInPlace.
+        //
+        // deactivateAudioSession only on a TRUE final teardown (!keepNativeHost): a keepNativeHost reload keeps
+        // the session/host alive for the next item, and the native->audio/software handoff callers (which pass
+        // the default false) keep audio playing on another host. This releases the EAC3/Atmos passthrough ring
+        // that otherwise loops on the HDMI sink after leaving playback. A retained item implies keepNativeHost,
+        // so the skipped branch never owed a deactivation.
         if !keepCurrentItem {
-            nativeHost?.tearDown()
+            nativeHost?.tearDown(deactivateAudioSession: !keepNativeHost)
         }
         if !keepNativeHost {
             nativeHost = nil
