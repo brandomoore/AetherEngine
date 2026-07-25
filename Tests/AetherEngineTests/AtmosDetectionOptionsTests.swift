@@ -1,4 +1,5 @@
 import Testing
+import Foundation
 @testable import AetherEngine
 
 /// Pure unit tests for the bounded EAC3/JOC decode pass's control-flow logic (cap selection, track-target
@@ -138,5 +139,94 @@ struct AtmosDetectionOptionsTests {
     @Test("eac3JOCProfile mirrors FFmpeg's AV_PROFILE_EAC3_DDP_ATMOS (30)")
     func jocProfileConstant() {
         #expect(AtmosDetectionOutcome.eac3JOCProfile == 30)
+    }
+
+    // MARK: - enrichAtmos: the feature's actual output path
+    //
+    // enrichAtmos hand-copies all 13 TrackInfo fields and all 14 SourceProbe fields, so a dropped field
+    // compiles fine and silently ships. These pin the positive path the integration tests can't reach
+    // without a redistributable Atmos fixture.
+
+    private func makeTrack(
+        id: Int, isAtmos: Bool = false, assHeader: String? = nil, name: String = "Surround"
+    ) -> TrackInfo {
+        TrackInfo(
+            id: id, name: name, codec: "eac3", language: "eng", channels: 6, bitrate: 768_000,
+            isDefault: true, isForced: false, isHearingImpaired: false, isCommentary: false,
+            isAtmos: isAtmos, assHeader: assHeader, isExternal: false
+        )
+    }
+
+    private func makeProbe(audioTracks: [TrackInfo]) -> SourceProbe {
+        SourceProbe(
+            url: URL(string: "file:///tmp/movie.mkv")!, durationSeconds: 7261.5,
+            videoFormat: .dolbyVision, videoCodecID: 173, videoCodecName: "hevc",
+            videoWidth: 3840, videoHeight: 2160, videoFrameRate: 23.976,
+            isDolbyVision: true, dvProfile: 7,
+            audioTracks: audioTracks,
+            subtitleTracks: [makeTrack(id: 9, name: "English SDH")],
+            metadata: MediaMetadata(title: "T", artist: "A", album: "Al", artworkData: Data([0x1])),
+            isLive: false
+        )
+    }
+
+    @Test("enrichAtmos flips only the confirmed track and leaves its siblings alone")
+    func enrichFlipsOnlyConfirmedTrack() {
+        let probe = makeProbe(audioTracks: [makeTrack(id: 1), makeTrack(id: 2), makeTrack(id: 3)])
+        let out = AetherEngine.enrichAtmos(base: probe, confirmedTrackID: 2)
+        #expect(out.audioTracks.map(\.isAtmos) == [false, true, false])
+    }
+
+    @Test("enrichAtmos never overwrites a track the base probe already marked Atmos")
+    func enrichIsAdditiveOnly() {
+        let probe = makeProbe(audioTracks: [makeTrack(id: 1, isAtmos: true)])
+        let out = AetherEngine.enrichAtmos(base: probe, confirmedTrackID: 1)
+        #expect(out.audioTracks[0].isAtmos)
+    }
+
+    @Test("enrichAtmos with an id matching no track is a no-op")
+    func enrichNoMatchingTrack() {
+        let probe = makeProbe(audioTracks: [makeTrack(id: 1), makeTrack(id: 2)])
+        let out = AetherEngine.enrichAtmos(base: probe, confirmedTrackID: 99)
+        #expect(out.audioTracks.allSatisfy { !$0.isAtmos })
+    }
+
+    @Test("enrichAtmos round-trips every other SourceProbe and TrackInfo field unchanged")
+    func enrichPreservesAllOtherFields() {
+        let probe = makeProbe(audioTracks: [makeTrack(id: 1, assHeader: "[Script Info]")])
+        let out = AetherEngine.enrichAtmos(base: probe, confirmedTrackID: 1)
+
+        // SourceProbe fields.
+        #expect(out.url == probe.url)
+        #expect(out.durationSeconds == probe.durationSeconds)
+        #expect(out.videoFormat == probe.videoFormat)
+        #expect(out.videoCodecID == probe.videoCodecID)
+        #expect(out.videoCodecName == probe.videoCodecName)
+        #expect(out.videoWidth == probe.videoWidth)
+        #expect(out.videoHeight == probe.videoHeight)
+        #expect(out.videoFrameRate == probe.videoFrameRate)
+        #expect(out.isDolbyVision == probe.isDolbyVision)
+        #expect(out.dvProfile == probe.dvProfile)
+        #expect(out.isLive == probe.isLive)
+        #expect(out.subtitleTracks.map(\.id) == probe.subtitleTracks.map(\.id))
+        #expect(out.metadata.title == probe.metadata.title)
+        #expect(out.metadata.artworkData == probe.metadata.artworkData)
+
+        // TrackInfo fields on the flipped track: everything except isAtmos survives.
+        let before = probe.audioTracks[0]
+        let after = out.audioTracks[0]
+        #expect(after.isAtmos)
+        #expect(after.id == before.id)
+        #expect(after.name == before.name)
+        #expect(after.codec == before.codec)
+        #expect(after.language == before.language)
+        #expect(after.channels == before.channels)
+        #expect(after.bitrate == before.bitrate)
+        #expect(after.isDefault == before.isDefault)
+        #expect(after.isForced == before.isForced)
+        #expect(after.isHearingImpaired == before.isHearingImpaired)
+        #expect(after.isCommentary == before.isCommentary)
+        #expect(after.assHeader == before.assHeader)
+        #expect(after.isExternal == before.isExternal)
     }
 }

@@ -163,6 +163,21 @@ public final class AetherEngine: ObservableObject {
     /// Forwarder; for push updates subscribe to `clock.$currentTime` (objectWillChange does NOT fire on ticks).
     public var currentTime: Double { clock.currentTime }
 
+    /// Deactivate the shared `AVAudioSession` when playback is torn down for good. Default `false`.
+    ///
+    /// Opt in only if your app owns the audio session. On an E-AC-3/Atmos BITSTREAM PASSTHROUGH route the
+    /// HDMI sink keeps its own decode ring, and with the session still active it can loop the last MAT
+    /// frame after the player is released (audio keeps stuttering after leaving the video, even off-screen).
+    /// Deactivating on final teardown closes that ring.
+    ///
+    /// It is off by default because the native path deliberately never *activates* the session -- AVKit
+    /// does that per playback (#24) -- so switching this on makes the engine mutate process-global state it
+    /// did not create, using `.notifyOthersOnDeactivation`. An app that plays its own audio (UI sounds, TTS,
+    /// an `AVAudioEngine`, a background music player) would have its session torn out from under it. Only
+    /// a genuine final teardown honours this: `stop()` (with `resetDisplayCriteria: true`), never a
+    /// handoff, reload, or retune.
+    public var deactivatesAudioSessionOnStop: Bool = false
+
     @Published public internal(set) var duration: Double = 0
 
     /// Forwarder; see `clock.progress`.
@@ -2878,10 +2893,17 @@ public final class AetherEngine: ObservableObject {
                 // actually deliver the pending target. A far-forward target beyond coverage
                 // (640 s target, march at ~316 s) rides 3x30 s serve timeouts into item death
                 // if left to "land late"; the old-position buffer health cannot see that.
+                //
+                // Both reads use the immutable local `clockTarget`, not the published
+                // `pendingRecoverySeekClockTarget`: the $renderedTime sink can retire that field
+                // mid-flight (organic progress far from the target reads as "seek abandoned"). If it
+                // did, `recoveryAnchorPosition` would fall back to the frozen OLD position and we would
+                // re-anchor the producer at the very spot the user is leaving -- while this branch holds
+                // the clock at the target and re-seeks there. Producer and player would then be aimed at
+                // different regions, burning the whole post-reanchor budget by construction.
                 let targetBeyondCoverage: Bool = {
-                    guard let target = pendingRecoverySeekClockTarget,
-                          let session = nativeVideoSession else { return false }
-                    return !session.producerCoversPlaylistTime(target)
+                    guard let session = nativeVideoSession else { return false }
+                    return !session.producerCoversPlaylistTime(clockTarget)
                 }()
                 let reason = wasStarved
                     ? "starved"
@@ -2896,7 +2918,7 @@ public final class AetherEngine: ObservableObject {
                     reanchored = true
                     postReanchorWaits = 0
                     let recoveryAnchor = Self.recoveryAnchorPosition(
-                        frozenPosition: avpReal, pendingSeekTarget: pendingRecoverySeekClockTarget,
+                        frozenPosition: avpReal, pendingSeekTarget: clockTarget,
                         currentRendered: avpReal)
                     let didReanchor = Self.shouldReanchorProducerAfterSeekDeadline(
                         isStarved: wasStarved, targetBeyondProducerCoverage: targetBeyondCoverage)
@@ -3096,8 +3118,12 @@ public final class AetherEngine: ObservableObject {
     ///   through SDR (#128). The caller owns the follow-up; if no load() happens after all, the app UI
     ///   stays in the playback mode until a plain stop() clears it. Note that back-to-back load() calls
     ///   preserve the criteria on their own; the flag only matters when stop() is called between items.
+    ///
+    /// A `stop()` with `resetDisplayCriteria: true` is treated as a genuine final teardown (the host is
+    /// leaving playback, not handing off to another `load()`), which is what gates the optional
+    /// `AVAudioSession` deactivation -- see `deactivatesAudioSessionOnStop`.
     public func stop(resetDisplayCriteria: Bool = true) {
-        stopInternal(resetDisplayCriteria: resetDisplayCriteria)
+        stopInternal(resetDisplayCriteria: resetDisplayCriteria, finalTeardown: resetDisplayCriteria)
         state = .idle
         clock.currentTime = 0
         clock.bufferedPosition = 0
@@ -3426,7 +3452,7 @@ public final class AetherEngine: ObservableObject {
     ///   never settles and burns the full settle timeout (~12 s of
     ///   black-screen latency per audio switch on the old fixed 5 s
     ///   poll; capped at ~2 s since #117, but still worth skipping).
-    func stopInternal(resetDisplayCriteria: Bool = true, keepNativeHost: Bool = false, keepCustomReader: Bool = false, keepCurrentItem: Bool = false) {
+    func stopInternal(resetDisplayCriteria: Bool = true, keepNativeHost: Bool = false, keepCustomReader: Bool = false, keepCurrentItem: Bool = false, finalTeardown: Bool = false) {
         // Bump generation to invalidate in-flight load() checkpoints.
         loadGeneration &+= 1
         resumeAfterInterruption = false
@@ -3452,13 +3478,16 @@ public final class AetherEngine: ObservableObject {
         // system PiP window never sees a nil-item gap across a native->native load. Only meaningful
         // together with keepNativeHost; load() computes it via shouldHandOverItemInPlace.
         //
-        // deactivateAudioSession only on a TRUE final teardown (!keepNativeHost): a keepNativeHost reload keeps
-        // the session/host alive for the next item, and the native->audio/software handoff callers (which pass
-        // the default false) keep audio playing on another host. This releases the EAC3/Atmos passthrough ring
-        // that otherwise loops on the HDMI sink after leaving playback. A retained item implies keepNativeHost,
-        // so the skipped branch never owed a deactivation.
+        // The AVAudioSession deactivation is opt-in twice over: the caller must declare an actual
+        // final teardown (`finalTeardown`), AND the host app must have opted into the policy
+        // (`deactivatesAudioSessionOnStop`, default false). `!keepNativeHost` is NOT a usable proxy for
+        // "leaving playback" -- it defaults to false, so every bare `stopInternal()` (e.g. the live-reload
+        // watchdog, which expects the host to retune immediately) would deactivate a process-wide session
+        // mid-retune. And since the native path deliberately never ACTIVATES the session (#24, AVKit does
+        // it per playback), deactivating one the host app owns is only safe when the host says so.
         if !keepCurrentItem {
-            nativeHost?.tearDown(deactivateAudioSession: !keepNativeHost)
+            nativeHost?.tearDown(
+                deactivateAudioSession: finalTeardown && !keepNativeHost && deactivatesAudioSessionOnStop)
         }
         if !keepNativeHost {
             nativeHost = nil

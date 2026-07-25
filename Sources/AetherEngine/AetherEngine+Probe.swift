@@ -109,11 +109,19 @@ extension AetherEngine {
             options: atmosDetection, defaultAudioStreamIndex: demuxer.audioStreamIndex)
         let outcome = Self.detectAtmos(demuxer: demuxer, targetIndex: targetIndex, options: atmosDetection)
         guard outcome.confirmedAtmos else { return base }
+        return Self.enrichAtmos(base: base, confirmedTrackID: Int(targetIndex))
+    }
 
+    /// Flip `isAtmos` to `true` on exactly the one confirmed audio track, leaving everything else identical.
+    ///
+    /// Pure and `internal` so the field-by-field rebuild below is directly testable: it hand-copies every
+    /// `TrackInfo` and `SourceProbe` field, and the compiler cannot tell us if one is dropped (silently
+    /// losing e.g. `assHeader`, `dvProfile`, or `subtitleTracks`).
+    nonisolated static func enrichAtmos(base: SourceProbe, confirmedTrackID: Int) -> SourceProbe {
         // Additive only: a track already marked isAtmos by the base probe (a container that pre-declares
         // profile 30) is left untouched; this only ever flips false -> true for the one confirmed track.
         let enrichedTracks = base.audioTracks.map { track -> TrackInfo in
-            guard track.id == Int(targetIndex), !track.isAtmos else { return track }
+            guard track.id == confirmedTrackID, !track.isAtmos else { return track }
             return TrackInfo(
                 id: track.id, name: track.name, codec: track.codec, language: track.language,
                 channels: track.channels, bitrate: track.bitrate, isDefault: track.isDefault,

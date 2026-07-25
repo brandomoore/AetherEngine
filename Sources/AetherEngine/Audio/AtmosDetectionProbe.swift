@@ -92,6 +92,9 @@ struct AtmosDetectionOutcome: Sendable, Equatable {
 }
 
 extension AetherEngine {
+    /// How many total demuxed packets to tolerate per unit of decode budget before giving up, when a
+    /// demuxer ignores `AVDISCARD_ALL` and keeps yielding foreign streams.
+    nonisolated static let foreignPacketFuseMultiplier = 8
 
     /// Pure stop-condition check for the bounded decode loop: given how much work has been done, which cap
     /// (if any) has been hit. Extracted so the cap-selection PRIORITY (packets, then bytes, then time) is
@@ -167,6 +170,16 @@ extension AetherEngine {
         let start = Date()
         var packetsRead = 0
         var bytesRead: Int64 = 0
+        // Demuxed-but-discarded packets still cost wall clock and I/O, so they need their own fuse --
+        // but they must NOT consume the decode budget (see below).
+        var packetsSeen = 0
+
+        // Tell the demuxer to drop every other stream. Without this the caps are a budget over the whole
+        // INTERLEAVED container rather than over the audio we care about: on the exact content this
+        // feature targets (a UHD remux carrying an E-AC-3 JOC track) a few hundred-KB-to-MB video packets
+        // exhaust the 8 MiB byte cap in well under a second of container data, and the probe returns
+        // .byteCap having fed the decoder nothing -- reporting "not Atmos" for genuinely Atmos media.
+        demuxer.discardAllStreamsExcept([targetIndex])
 
         while true {
             if let cap = Self.atmosDecodeCapReached(
@@ -186,11 +199,13 @@ extension AetherEngine {
                 return AtmosDetectionOutcome(stopReason: .demuxEOF, packetsRead: packetsRead, bytesRead: bytesRead, decodedProfile: nil)
             }
 
-            packetsRead += 1
-            bytesRead += Int64(pkt.pointee.size)
-
             var decodedThisPacket = false
+            packetsSeen += 1
             if pkt.pointee.stream_index == targetIndex {
+                // Charge the decode budget only for packets actually offered to the decoder, so a coarse
+                // interleave or a large leading video run can never starve the probe of audio.
+                packetsRead += 1
+                bytesRead += Int64(pkt.pointee.size)
                 let sendRet = avcodec_send_packet(ctx, pkt)
                 if sendRet >= 0, avcodec_receive_frame(ctx, f) >= 0 {
                     decodedThisPacket = true
@@ -198,6 +213,14 @@ extension AetherEngine {
             }
             av_packet_unref(pkt)
             av_packet_free_safe(pkt)
+
+            // Independent fuse: AVDISCARD_ALL is honoured by most demuxers but is advisory, so a container
+            // that keeps handing back foreign packets still terminates.
+            if packetsSeen >= options.maxPackets * Self.foreignPacketFuseMultiplier {
+                return AtmosDetectionOutcome(
+                    stopReason: .packetCap, packetsRead: packetsRead, bytesRead: bytesRead,
+                    decodedProfile: nil)
+            }
 
             if decodedThisPacket {
                 return AtmosDetectionOutcome(

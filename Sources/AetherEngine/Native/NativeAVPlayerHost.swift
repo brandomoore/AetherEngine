@@ -795,7 +795,10 @@ final class NativeAVPlayerHost {
         // publish AVPlayer's still-pre-seek position and un-latch the optimistic clock. The original
         // seek's completion clears this again when it lands.
         let gen = seekGeneration
-        let wasInFlight = seekInFlight
+        // We latch the gate ourselves below, so "the original seek's completion cleared it" is simply
+        // `!seekInFlight` on a later pass. Capturing the pre-latch value instead would be dead: every
+        // caller reaches here only after a deadline expiry, and that path already cleared the flag
+        // (see the deadline Task above), so the captured value is always false.
         if !seekInFlight { seekInFlight = true }
         // Poll for landing rather than sleeping the whole window: on a slow extend-path seek AVPlayer can
         // resume playing partway through the wait, and finalize (which clears the consumer's loading
@@ -805,7 +808,15 @@ final class NativeAVPlayerHost {
         let pollInterval = 0.1
         let deadline = Date().addingTimeInterval(deadlineSeconds)
         while Date() < deadline {
-            try? await Task.sleep(nanoseconds: UInt64(pollInterval * 1_000_000_000))
+            do {
+                try await Task.sleep(nanoseconds: UInt64(pollInterval * 1_000_000_000))
+            } catch {
+                // Cancelled. Swallowing this (try?) would turn the loop into an unthrottled MainActor
+                // spin -- Task.sleep then throws instantly every pass -- with a synchronous XPC
+                // currentTime() read each iteration, for the rest of the wall-clock window.
+                releaseSeekGate()
+                return false
+            }
             // A newer seek arrived while we waited: let it own the final state.
             guard gen == seekGeneration else { return false }
             let now = avPlayer.currentTime().seconds
@@ -816,7 +827,7 @@ final class NativeAVPlayerHost {
             // downward). Accept an overshoot in the seek direction; the pinned pre-seek playhead sits far on
             // the opposite side, so it is never mistaken for a landing. This stops a forward overshoot from
             // reading as "still pending" and triggering a backward-yank re-seek on an already-playing item.
-            let completionLanded = wasInFlight && !seekInFlight
+            let completionLanded = !seekInFlight
             let positionLanded = now.isFinite
                 && (forward ? now >= seconds - 0.75 : now <= seconds + 0.75)
             if completionLanded || positionLanded {
@@ -827,7 +838,17 @@ final class NativeAVPlayerHost {
                 return true
             }
         }
+        // Timed out. Restore the gate to the state the deadline left it in: leaving it latched would keep
+        // the periodic observer from publishing `currentTime`, freezing `host.$currentTime` -- the sole
+        // driver of the engine's clock tick -- for the rest of this generation. On the give-up path this
+        // caller returns immediately afterwards, so nothing else would ever clear it.
+        releaseSeekGate()
         return false
+    }
+
+    /// Un-gate the periodic observer without asserting a landing (cancellation / give-up paths).
+    private func releaseSeekGate() {
+        seekInFlight = false
     }
 
     func setRate(_ value: Float) {
@@ -914,20 +935,46 @@ final class NativeAVPlayerHost {
         // keep audio alive -- never hit it. Best-effort + .notifyOthersOnDeactivation so other audio resumes.
         #if os(iOS) || os(tvOS)
         if deactivateAudioSession {
-            do {
-                try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
-                EngineLog.emit(
-                    "[NativeAVPlayerHost] #\(sessionID) deactivated AVAudioSession on final teardown "
-                    + "(release passthrough render ring)",
-                    category: .engine)
-            } catch {
-                EngineLog.emit(
-                    "[NativeAVPlayerHost] #\(sessionID) AVAudioSession deactivate on teardown failed: \(error)",
-                    category: .engine)
-            }
+            deactivateSharedAudioSession(attempt: 0)
         }
         #endif
     }
+
+    #if os(iOS) || os(tvOS)
+    /// Best-effort `setActive(false)`, retried on `.isBusy`.
+    ///
+    /// AVPlayer tears its audio I/O down asynchronously in mediaserverd after `pause()` +
+    /// `replaceCurrentItem(nil)`, and the engine only releases its player references after this returns.
+    /// So the first attempt commonly lands while I/O is still running and fails with
+    /// `AVAudioSessionErrorCodeIsBusy` -- and it is *most* likely to do so precisely when a passthrough
+    /// buffer is mid-IOProc, which is the exact case this deactivation exists to clean up. Retrying off
+    /// the current turn lets the player finish releasing first.
+    private func deactivateSharedAudioSession(attempt: Int) {
+        let maxAttempts = 4
+        let retryDelay = 0.15
+        do {
+            try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+            EngineLog.emit(
+                "[NativeAVPlayerHost] #\(sessionID) deactivated AVAudioSession on final teardown "
+                + "(release passthrough render ring)\(attempt > 0 ? " after \(attempt) retry/ies" : "")",
+                category: .engine)
+        } catch {
+            let isBusy = (error as NSError).code == AVAudioSession.ErrorCode.isBusy.rawValue
+            guard isBusy, attempt + 1 < maxAttempts else {
+                EngineLog.emit(
+                    "[NativeAVPlayerHost] #\(sessionID) AVAudioSession deactivate on teardown failed "
+                    + "after \(attempt + 1) attempt(s): \(error)"
+                    + (isBusy ? " (still busy; passthrough ring may keep looping)" : ""),
+                    category: .engine)
+                return
+            }
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: UInt64(retryDelay * 1_000_000_000))
+                self?.deactivateSharedAudioSession(attempt: attempt + 1)
+            }
+        }
+    }
+    #endif
 
     /// Dump asset URL + track FourCCs on .failed and asset.load failure; d9b8aa5 added the asset.load path because item.status never went .failed in DrHurt's P5 MKV session.
     // async: AVAsset.tracks and AVAssetTrack.formatDescriptions/isEnabled/isPlayable are load-based in

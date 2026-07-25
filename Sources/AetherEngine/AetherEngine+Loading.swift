@@ -800,6 +800,14 @@ extension AetherEngine {
                                     category: .engine
                                 )
                                 self.setPendingRecoverySeekTarget(nil)
+                                // Clearing the target retires the ONLY path that reaches
+                                // finalizeLateRecoverySeekLanding (this `if let`). The deadline loop's
+                                // spinner-at-target fallthrough returns while still `.seeking`, trusting
+                                // that finalizer to run later, so dropping the target without finalizing
+                                // strands `programmaticSeekInFlight`/`isSeeking` true forever -- the exact
+                                // permanent-spinner bug the hold-at-target path exists to remove. Playback
+                                // has demonstrably resumed elsewhere here, so leaving `.seeking` is correct.
+                                self.finalizeLateRecoverySeekLanding()
                             }
                         }
                         self.lastRenderedForPendingSeek = value
