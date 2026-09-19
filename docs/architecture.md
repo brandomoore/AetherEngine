@@ -22,6 +22,32 @@ Source URL ──► Demuxer ──► HLSSegmentProducer ──► SegmentCache
 
 Why HLS-fMP4 for the native path instead of feeding `AVPlayer` the source URL directly: AVPlayer's progressive-download path won't accept arbitrary MKV containers, and even for MP4 sources it's brittle around Dolby Vision sample-description quirks and EAC3 `dec3` box variants. The HLS-fMP4 wrapper is the most permissive surface AVPlayer exposes; libavformat's `hls` muxer produces bytes byte-identical to `ffmpeg -f hls -hls_segment_type fmp4`, which is what Apple's HLS spec is defined against.
 
+**Item diagnostics must not become playback work.** `accessLog()` and `errorLog()` can synchronously
+wait on AVFoundation's media-service queues, even when called from an item notification. The video
+host's log notifications and failure dump, the audio-only error observer, and outgoing-item counter
+reconciliation therefore use `AVPlayerItemDiagnostics`: each reader owns its original item, coalesces
+pending reasons, and delivers log values rather than native log objects to the main actor. Failure
+track arrays are fetched off-main as well; the SDK's UI-actor-isolated track handles then use async
+asset-property loaders. A stop/load invalidates publication, including queued callbacks, without
+waiting for a read. Coalesced error batches examine unseen entries so an intervening fetch error
+cannot hide the startup `-15628` loader-poison signal. Access-log notification output is capped at
+five entries per item; a failure still dumps the complete available logs.
+
+Admission is process-wide: at most **two concurrent diagnostic reads**, with **one pending retirement
+read** retained beyond those lanes. Current-item/error work precedes optional retirement work.
+Cancellation never releases a lane still inside a native getter; one stranded lane leaves the other
+available, and two stranded lanes defer diagnostics rather than spawn more threads. This contains
+diagnostic stalls, not an underlying media-server failure, and does not claim to make every other
+AVPlayer operation nonblocking. Telemetry retains its existing separate, serial read path.
+
+Same-session item swaps fold the outgoing item's last observed transferred-byte/dropped-frame totals
+without a getter at the handover, then reconcile only the delta from its final background read.
+Telemetry readings also refresh that cache, so an older diagnostic snapshot cannot move it backwards
+or double-count the outgoing item. If swaps outpace blocked readers, an older unstarted retirement
+read is discarded: its observed totals remain, but final totals are incomplete, reported once per
+session rather than fabricated. A new playback session (including an episode handover on the same
+player) clears those totals and rejects any old reconciliation.
+
 The playlist's segment boundaries come from a keyframe-aligned plan that mirrors the `hls` muxer's cut algorithm (segment N ends at the first IRAP at-or-after `(N+1) * targetSegmentDuration`), built in `HLSVideoEngine+SegmentPlanning.swift`. It needs the source's keyframe positions, which for MKV / MP4 come from a brief cue prewarm (a bounded seek that loads the Cues / `stss` index) and for MPEG-TS / M2TS come only from whatever `avformat_find_stream_info` plus that seek happened to scan. `keyframeIndexIsTrustworthy` gates the plan on two witnesses before trusting that index, falling back to a uniform-stride plan otherwise: the largest **gap** between consecutive keyframes must stay under a cap (a clustered TS index gaps by thousands of seconds; trusting it builds a multi-thousand-second first segment the `frag_custom` muxer buffers whole in RAM, #64), and the **coverage** from first to last indexed keyframe must span at least one `targetSegmentDuration`. The coverage check catches a remote MKV whose Cues tail read fails: the prewarm loads nothing, only the open-time keyframes survive bunched in the first few seconds, their gaps are tiny so the gap check passes, yet no keyframe reaches the first segment boundary, so the keyframe planner would degenerate to a single whole-file segment AVPlayer loads zero tracks from (`kFigAssetError_TrackNotFound`, #91). The uniform fallback anchors segment 0 at the content start so a late-starting title doesn't advertise empty leading segments.
 
 At runtime the producer honors those boundaries with a keyframe-gated, decode-order cut (`VODSegmentCutter`): a segment opens only at the IRAP whose PTS reaches the next boundary, so the IRAP is the segment's first sample and its open-GOP leading pictures stay with it, matching the live path and the `hls` muxer. The earlier routing keyed each packet to a segment by its DTS against the PTS-valued boundaries, so under B-frame reorder a keyframe whose DTS trailed its PTS fell into the previous segment and the next one started mid-GOP, decode-dependent on its predecessor; a fresh decode at that boundary (rebuffer recovery) surfaced it as transient blocky corruption (#92).
@@ -328,6 +354,7 @@ Sources/AetherEngine/
 │   ├── PacketTimingProbe.swift              Offline differential probe (#93 judder): raw demuxer packet timing per open profile, before NOPTS repair / muxing; backs aetherctl pktdump
 │   ├── AudioTapProbe.swift                  Headless native-session tap verification (#95): LoopbackAudioReader decode to mono 48 kHz WAV; backs aetherctl audiotap
 │   ├── AVFoundationOffMain.swift            Off-main hop for batched synchronous AVFoundation property reads (#134): figplayer-backed getters are sync XPC round trips, and a momentarily busy media server otherwise blocks the main thread into a watchdog kill
+│   ├── AVPlayerItemDiagnostics.swift        Item-bound log snapshots, coalesced notification/failure reads, bounded shared admission and asynchronous counter retirement
 │   ├── MallocBlockCensus.swift              In-process census of live malloc blocks by size class (#220), so a step in resident memory can name the allocation instead of being guessed at from a block count and a total
 │   ├── MallocBlockCensusTrigger.swift       Jump-triggered capture of that census: every kill on record is flat and then steps inside a single 30 s memprobe sample, so a periodic sampler can never catch the allocation (#220)
 │   ├── VMRegionCensus.swift                 Per-`user_tag` census of the dirty + swapped pages `phys_footprint` counts, delta against the session's first tick: names the region a rising footprint rose in when every itemized bucket (heap census included) is flat, which is the state AE#445 kept ending in

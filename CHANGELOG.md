@@ -10,7 +10,17 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **Native item diagnostics no longer block the main actor or read logs inside AVFoundation
+  callbacks.** Access/error notifications, failure dumps and outgoing-item counter reads use
+  item-bound, coalesced background batches. A blocked getter keeps its admission slot until it
+  actually returns; stopping or replacing an item only invalidates its results, never waits on it
+  or starts an unbounded replacement thread. Coalesced error batches preserve startup loader-poison
+  signals, and access-log output keeps its per-item cap. Same-session swaps fold observed counters
+  immediately and reconcile final deltas asynchronously; saturated retirement work retains the
+  last observed totals with an explicit incomplete-final-totals diagnostic. The audio-only host's
+  error-log observer follows the same off-main path.
 
 ## [7.7.1] - 2026-09-19
 

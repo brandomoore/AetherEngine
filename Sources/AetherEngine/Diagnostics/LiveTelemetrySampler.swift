@@ -307,6 +307,9 @@ final class LiveTelemetrySampler {
                 guard !Task.isCancelled,
                       engine.currentAVPlayer === player,
                       player.currentItem === item else { return }
+                engine.nativeHost?.recordItemCounters(
+                    ItemLogCounters(transferredBytes: readings.networkTransferredBytes,
+                                    droppedFrames: readings.droppedFrameCount), item: item)
                 // AE#443: the read above covers this item; the host carries what the items before it
                 // transferred. Read after the guard, so the two halves describe the same swap state.
                 readings.networkTransferredBytes = Self.foldRetired(

@@ -19,6 +19,16 @@ import AetherLibavcodec
 @MainActor
 final class DocumentedConstantsTests: XCTestCase {
 
+    func testItemDiagnosticBoundsMatchDocumentation() throws {
+        let docs = try documentation()
+        XCTAssertEqual(ItemDiagnosticReadPool.maximumConcurrentReads, 2)
+        XCTAssertEqual(AVPlayerItemDiagnostics.maximumPendingRetirements, 1)
+        XCTAssertEqual(AVPlayerItemDiagnostics.accessLogLimit, 5)
+        assertDocumented("**two concurrent diagnostic reads**", docs)
+        assertDocumented("**one pending retirement\nread**", docs)
+        assertDocumented("five entries per item", docs)
+    }
+
     func testPartialCompositionHoldBoundsMatchDocumentation() throws {
         let docs = try documentation()
         XCTAssertEqual(H264PartialCompositionRepair.maximumReorderDepth, 16)
