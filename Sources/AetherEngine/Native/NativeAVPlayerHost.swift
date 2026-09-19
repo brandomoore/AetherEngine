@@ -1909,30 +1909,41 @@ final class NativeAVPlayerHost {
 
     private func consumeDiagnostics(_ snapshot: ItemDiagnosticSnapshot, request: ItemDiagnosticRequest,
                                     reader: AVPlayerItemDiagnostics, sid: Int) {
+        func isCurrent() -> Bool {
+            sessionID == sid && itemDiagnostics === reader
+        }
+        // Both EngineLog's host handler and Combine subscribers can synchronously replace the item.
+        // Cancellation fences future completions, but cannot interrupt this delivery already on-stack.
+        func emit(_ line: String) -> Bool {
+            guard isCurrent() else { return false }
+            EngineLog.emit(line, category: .engine)
+            return isCurrent()
+        }
         for event in reader.newErrors(in: snapshot) {
-            EngineLog.emit("[NativeAVPlayerHost] #\(sid) errorLog code=\(event.code) domain=\(event.domain) uri=\(event.uri ?? "-") '\(event.comment ?? "no comment")'", category: .engine)
+            guard emit("[NativeAVPlayerHost] #\(sid) errorLog code=\(event.code) domain=\(event.domain) uri=\(event.uri ?? "-") '\(event.comment ?? "no comment")'") else { return }
             // #93: meaningful even when a later entry in the coalesced batch is not loader poison.
             if event.code == -15628 {
-                EngineLog.emit("[NativeAVPlayerHost] #\(sid) -15628 loader poison: surfacing as stall signal", category: .engine)
+                guard emit("[NativeAVPlayerHost] #\(sid) -15628 loader poison: surfacing as stall signal") else { return }
                 stallCount += 1
+                guard isCurrent() else { return }
             }
         }
         if request.contains(.access) {
             for event in reader.newAccessEntries(in: snapshot) {
-                EngineLog.emit("[NativeAVPlayerHost] #\(sid) accessLog uri=\(event.uri ?? "-") server=\(event.server ?? "-") bytes=\(event.bytes) reqs=\(event.requests)", category: .engine)
+                guard emit("[NativeAVPlayerHost] #\(sid) accessLog uri=\(event.uri ?? "-") server=\(event.server ?? "-") bytes=\(event.bytes) reqs=\(event.requests)") else { return }
             }
         }
         if request.contains(.failure) {
-            EngineLog.emit("[NativeAVPlayerHost] #\(sid) errorLog dump: \(snapshot.errors.map { "\($0.count) events" } ?? "<nil>")", category: .engine)
+            guard emit("[NativeAVPlayerHost] #\(sid) errorLog dump: \(snapshot.errors.map { "\($0.count) events" } ?? "<nil>")") else { return }
             for (idx, event) in (snapshot.errors ?? []).enumerated() {
-                EngineLog.emit("[NativeAVPlayerHost] #\(sid)   errorLog[\(idx)] code=\(event.code) domain=\(event.domain) uri=\(event.uri ?? "-") server=\(event.server ?? "-") '\(event.comment ?? "no comment")'", category: .engine)
+                guard emit("[NativeAVPlayerHost] #\(sid)   errorLog[\(idx)] code=\(event.code) domain=\(event.domain) uri=\(event.uri ?? "-") server=\(event.server ?? "-") '\(event.comment ?? "no comment")'") else { return }
             }
-            EngineLog.emit("[NativeAVPlayerHost] #\(sid) accessLog dump: \(snapshot.access.map { "\($0.count) events" } ?? "<nil>")", category: .engine)
+            guard emit("[NativeAVPlayerHost] #\(sid) accessLog dump: \(snapshot.access.map { "\($0.count) events" } ?? "<nil>")") else { return }
             for (idx, event) in (snapshot.access ?? []).enumerated() {
-                EngineLog.emit("[NativeAVPlayerHost] #\(sid)   accessLog[\(idx)] uri=\(event.uri ?? "-") bytes=\(event.bytes) reqs=\(event.requests) downloadOverdue=\(event.stalls) dlSegments=\(event.droppedFrames)", category: .engine)
+                guard emit("[NativeAVPlayerHost] #\(sid)   accessLog[\(idx)] uri=\(event.uri ?? "-") bytes=\(event.bytes) reqs=\(event.requests) downloadOverdue=\(event.stalls) dlSegments=\(event.droppedFrames)") else { return }
             }
             for detail in snapshot.failureDetails {
-                EngineLog.emit("[NativeAVPlayerHost] #\(sid) \(detail)", category: .engine)
+                guard emit("[NativeAVPlayerHost] #\(sid) \(detail)") else { return }
             }
             if let tracks = snapshot.failedTracks, let item = playerItem {
                 Task { @MainActor [weak self] in

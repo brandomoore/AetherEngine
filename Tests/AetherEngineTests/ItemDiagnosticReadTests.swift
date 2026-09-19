@@ -1,4 +1,5 @@
 import AVFoundation
+import Combine
 import Foundation
 import Testing
 @testable import AetherEngine
@@ -292,6 +293,42 @@ struct ItemDiagnosticReadTests {
         }
         probe.unblock()
         try await waitFor { host.stallCount == stalls + 1 && pool.runningCount == 0 }
+        #expect(host.stallCount == stalls + 1)
+    }
+
+    @Test("a synchronous stall subscriber replacing the item rejects the rest of the old batch",
+          arguments: [false, true])
+    func replacementDuringDelivery(inPlace: Bool) async throws {
+        let pool = ItemDiagnosticReadPool()
+        let probe = DiagnosticReadProbe(snapshot: .init(
+            errors: [.init(code: -15628, domain: "CoreMediaErrorDomain"),
+                     .init(code: -15628, domain: "CoreMediaErrorDomain")]), onlyFirstItem: true)
+        defer { probe.unblock() }
+        let host = NativeAVPlayerHost(diagnosticPool: pool, diagnosticRead: probe.read)
+        defer { host.tearDown() }
+        let url = URL(fileURLWithPath: "/nonexistent-reentrant-diagnostic.m3u8")
+        host.load(url: url, startPosition: nil, contract: .init())
+        let outgoing = try #require(host.avPlayer.currentItem)
+        NotificationCenter.default.post(name: AVPlayerItem.newErrorLogEntryNotification, object: outgoing)
+        try await waitFor { probe.count == 1 }
+        let stalls = host.stallCount
+        var publications: [Int] = []
+        var replacement: AVPlayerItem?
+        let subscription = host.$stallCount.dropFirst().sink { value in
+            publications.append(value)
+            guard replacement == nil else { return }
+            if inPlace {
+                host.swapItem(url: url, startPosition: nil)
+            } else {
+                host.load(url: url, startPosition: nil, contract: .init())
+            }
+            replacement = host.avPlayer.currentItem
+        }
+        defer { subscription.cancel() }
+        probe.unblock()
+        try await waitFor { replacement != nil && pool.runningCount == 0 }
+        #expect(replacement !== outgoing)
+        #expect(publications == [stalls + 1])
         #expect(host.stallCount == stalls + 1)
     }
 

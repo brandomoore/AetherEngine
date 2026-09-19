@@ -138,6 +138,7 @@ final class AudioAVPlayerHost {
         diagnostics.onSnapshot = { [weak self, weak diagnostics] snapshot, _ in
             guard let self, let diagnostics, self.itemDiagnostics === diagnostics else { return }
             for event in diagnostics.newErrors(in: snapshot) {
+                guard self.itemDiagnostics === diagnostics else { return }
                 EngineLog.emit(
                     "[AudioAVPlayerHost] item error log: domain=\(event.domain) status=\(event.code) "
                     + "comment=\(event.comment ?? "-") uri=\(event.uri ?? "-")",

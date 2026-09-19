@@ -29,7 +29,9 @@ reconciliation therefore use `AVPlayerItemDiagnostics`: each reader owns its ori
 pending reasons, and delivers log values rather than native log objects to the main actor. Failure
 track arrays are fetched off-main as well; the SDK's UI-actor-isolated track handles then use async
 asset-property loaders. A stop/load invalidates publication, including queued callbacks, without
-waiting for a read. Coalesced error batches examine unseen entries so an intervening fetch error
+waiting for a read. Delivery rechecks ownership after synchronous log handlers and state subscribers,
+which can replace the item while its diagnostic batch is being consumed. Coalesced error batches
+examine unseen entries so an intervening fetch error
 cannot hide the startup `-15628` loader-poison signal. Access-log notification output is capped at
 five entries per item; a failure still dumps the complete available logs.
 
