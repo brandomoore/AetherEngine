@@ -10,7 +10,18 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **The media fallback comes back where the rejected item was placed, not where the session
+  started (#98).** The fallback replayed the start position of the session's first mount. The
+  #93/#65 stage-2 recovery swaps a fresh item in at the position playback held, so when THAT item
+  was refused at startup (-11868), the session rewound to wherever it had first been loaded. Field
+  log, Apple TV 4K 3rd gen, tvOS 27.0, HDR10+ HEVC Matroska opened with a resume at 1844 s:
+  paused at 2099.69 s, the item died behind the screensaver, the recovery item was refused, and
+  playback resumed at 1834.79 s, the keyframe before the session's first mount and four minutes
+  behind the pause. A title started from its beginning resumes at its first frame. `NativeAVPlayerHost`
+  now records where every mount places its item, in-place swaps included, and the fallback reads
+  that.
 
 ## [7.15.2] - 2026-09-24
 

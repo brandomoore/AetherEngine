@@ -67,6 +67,13 @@ final class NativeAVPlayerHost {
     /// `SessionLoadContract` and `swapItem`.
     private(set) var sessionContract = SessionLoadContract()
 
+    /// Where the current item was placed when it was mounted: the explicit start seek `load` makes,
+    /// or nil when it joined without one (a live rejoin). Recorded on every mount, the in-place swaps
+    /// included, so a recovery that has to replace this item puts the next one where THIS one was,
+    /// not where the session first started (#98). A startup-failed item has no reliable
+    /// `renderedTime`, which is why the fallback reads the placement rather than the clock.
+    private(set) var mountedStartPosition: Double?
+
     /// Set per load; gates the AE#287 premature-end recovery, which only makes sense for a fixed-length
     /// presentation. A live session has no advertised end to fall short of.
     private var isLiveSession: Bool = false
@@ -433,6 +440,7 @@ final class NativeAVPlayerHost {
         unloadCurrentItem(inPlaceSwap: inPlaceSwap)
 
         self.sessionContract = contract
+        mountedStartPosition = skipInitialSeek ? nil : (startPosition ?? 0)
         let forwardBufferDuration = contract.forwardBufferDuration
         let httpHeaders = contract.httpHeaders
         let armIngestFallback = contract.armIngestFallback

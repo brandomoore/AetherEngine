@@ -2298,10 +2298,6 @@ public final class AetherEngine: ObservableObject {
     /// session so a media reload that also fails cannot loop. Reset on each load.
     var masterFallbackUsed = false
 
-    /// Start position of the current loopback video load, replayed if the master is rejected and we
-    /// reload the media playlist (a startup-failed item has no reliable renderedTime).
-    var lastNativeVideoStartPosition: Double = 0
-
     /// #93 PiP skips: AVKit-side seeks (PiP +-15s buttons) bypass the engine seek API, so a far
     /// playhead jump is detected on $renderedTime and, once settled, the native subtitle readers
     /// re-anchor and the remembered rendition selection replays (its deselect/reselect busts
@@ -2491,8 +2487,10 @@ public final class AetherEngine: ObservableObject {
         // #130: a live fallback is a REJOIN of the running ingest (the window may have slid since
         // the failed master attempt); a stale explicit position can wedge AVPlayer against the
         // backlog, so skip the initial seek and let it pick edge-minus-holdback (LiveReloadPolicy).
-        // VOD keeps the explicit pre-failure position.
-        let position = lastNativeVideoStartPosition
+        // VOD reloads where the rejected item was placed. That is not always where the session
+        // started: the #93/#65 stage-2 recovery swaps a fresh item in at the position it held, and a
+        // rejection of THAT item has to come back there, not rewind to the first mount.
+        let position = host.mountedStartPosition ?? 0
         EngineLog.emit(
             "[AetherEngine] AVPlayer rejected the master (code=\(rejection.code)); falling back to "
             + "media playlist (no CC/subtitle renditions) at "
