@@ -2501,7 +2501,9 @@ public final class AetherEngine: ObservableObject {
         host.swapItem(url: fallbackURL,
                       startPosition: isLive ? nil : position,
                       skipInitialSeek: LiveReloadPolicy.skipInitialSeek(isLive: isLive, isRejoin: true))
-        host.play()
+        // Resume only a viewer who was playing; the host's intent (#122) survives the in-place swap.
+        // A paused title refused behind the tvOS screensaver used to start itself and wake it.
+        if host.transportIntentIsPlaying { host.play() }
     }
 
     /// #35 readiness-gate settle windows. Generous enough that a slow-but-healthy cold start reads as
@@ -2934,7 +2936,11 @@ public final class AetherEngine: ObservableObject {
         // AE#454 round 2: the item that is about to load is the one the placement was armed for, and
         // the only one whose axis the playlist will state.
         if didArmPlacement { liveRejoinPlacementGeneration = host.itemGeneration }
-        host.play()
+        // Item death parks AVPlayer at .paused whatever the viewer wanted, which is why this reload may
+        // run for a paused consumer at all; resuming is still the viewer's call, read from the host's
+        // intent (#122), which the in-place swap keeps. Playing a paused title here woke the tvOS
+        // screensaver its item had died behind.
+        if host.transportIntentIsPlaying { host.play() }
         if let rejoinPosition {
             // Stashed rather than seeked: the pre-readiness seek IS the wedge LiveReloadPolicy exists
             // to avoid, and a live seek does not defer itself (`shouldDeferHostSeek` excludes live), so
