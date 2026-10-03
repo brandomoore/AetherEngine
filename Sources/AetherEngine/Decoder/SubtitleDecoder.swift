@@ -222,13 +222,14 @@ enum SubtitleDecoder {
                 : Double(pkt.pointee.pts) * tbSec
             lastPktPTS = pktPTS
             let startOffset = Double(sub.start_display_time) / 1000.0
-            let endOffset: Double
-            if sub.end_display_time > 0 {
-                endOffset = Double(sub.end_display_time) / 1000.0
-            } else if pkt.pointee.duration > 0 {
-                endOffset = Double(pkt.pointee.duration) * tbSec
-            } else {
-                endOffset = 5.0
+            guard let endOffset = SubtitleCueEndOffset.resolve(
+                decodedMilliseconds: sub.end_display_time, packetDuration: pkt.pointee.duration,
+                timeBaseSeconds: tbSec,
+                isASS: codecCtx.pointee.codec_id == AV_CODEC_ID_ASS || codecCtx.pointee.codec_id == AV_CODEC_ID_SSA,
+                fallback: 5.0
+            ) else {
+                avsubtitle_free(&sub)
+                return
             }
             let startTime = pktPTS + startOffset
             let endTime = pktPTS + endOffset
@@ -316,9 +317,15 @@ enum SubtitleDecoder {
                 guard flushRet >= 0, gotFlush != 0 else { break }
 
                 let startOffset = Double(flushSub.start_display_time) / 1000.0
-                let endOffset = flushSub.end_display_time > 0
-                    ? Double(flushSub.end_display_time) / 1000.0
-                    : startOffset + 5.0
+                guard let endOffset = SubtitleCueEndOffset.resolve(
+                    decodedMilliseconds: flushSub.end_display_time, packetDuration: nil,
+                    timeBaseSeconds: tbSec,
+                    isASS: codecCtx.pointee.codec_id == AV_CODEC_ID_ASS || codecCtx.pointee.codec_id == AV_CODEC_ID_SSA,
+                    fallback: startOffset + 5.0
+                ) else {
+                    avsubtitle_free(&flushSub)
+                    continue
+                }
                 var lines: [String] = []
                 if flushSub.num_rects > 0, let rects = flushSub.rects {
                     for i in 0..<Int(flushSub.num_rects) {

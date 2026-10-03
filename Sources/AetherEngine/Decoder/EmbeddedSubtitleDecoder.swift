@@ -184,13 +184,14 @@ final class EmbeddedSubtitleDecoder {
         let rawPTS = packet.pointee.pts
         let pktPTS = (rawPTS == Int64.min) ? 0 : Double(rawPTS) * tbSec
         let startOffset = Double(sub.start_display_time) / 1000.0
-        var endOffset: Double
-        if sub.end_display_time > 0 {
-            endOffset = Double(sub.end_display_time) / 1000.0
-        } else if packet.pointee.duration > 0 {
-            endOffset = Double(packet.pointee.duration) * tbSec
-        } else {
-            endOffset = 5.0
+        guard var endOffset = SubtitleCueEndOffset.resolve(
+            decodedMilliseconds: sub.end_display_time, packetDuration: packet.pointee.duration,
+            timeBaseSeconds: tbSec,
+            isASS: ctx.pointee.codec_id == AV_CODEC_ID_ASS || ctx.pointee.codec_id == AV_CODEC_ID_SSA,
+            fallback: 5.0
+        ) else {
+            avsubtitle_free(&sub)
+            return nil
         }
         // #107: libzvbi emits page content open-ended (end_display_time = u32 max, "until
         // replaced"); textTrimAt closes the window at the next page event or erase. The cap
