@@ -9,7 +9,7 @@ import Foundation
 /// through the source URL for a fresh redirect.
 ///
 /// `.serialized`: the rate-limit case mutates the process-wide backoff-scale test hook.
-@Suite("Resolved-URL invalidation on hard server errors", .serialized)
+@Suite("Resolved-URL invalidation on hard server errors", .serialized, .offCooperativePool)
 struct ResolvedURLInvalidationTests {
 
     /// These tests drive real 429 and 509 answers, and each one arms the request-rate pacer's
@@ -472,15 +472,7 @@ struct ResolvedURLInvalidationTests {
         // The bounded range plus the speculative 64 KB suffix is everything the open fetches, and
         // the range cannot overrun its bound, so this total is reached only once both are done.
         let openBytes = firstRange + 64 * 1024
-        var written: Int64 = 0
-        var polls = 0
-        while written < openBytes, polls < 400 {
-            try await Task.sleep(for: .milliseconds(25))
-            written = cdn.bytesWritten
-            polls += 1
-        }
-        #expect(written >= openBytes,
-                "the opening fetches never completed; the origin wrote \(written) of \(openBytes)")
+        try await waitFor { cdn.bytesWritten >= openBytes }
 
         // Idle past the threshold, then let the lease die. Every wait here is a LOWER bound, so a
         // slow machine only makes the pin more idle, never less.

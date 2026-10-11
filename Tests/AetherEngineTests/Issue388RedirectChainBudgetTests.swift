@@ -247,7 +247,7 @@ struct Issue388RedirectChainBudgetTests {
             #expect(n > 0, "forward read failed at \(read)")
             if n <= 0 { break }
             read += Int64(n)
-            try? await Task.sleep(nanoseconds: 2_000_000)
+            try await Task.sleep(nanoseconds: 2_000_000)
         }
 
         // The books, not the moment. `inflight` was a wall-clock reading: it is 1 only while the

@@ -88,14 +88,17 @@ struct SegmentPlanSparseIndexTests {
     @Test("The minimum-coverage threshold is one targetSegmentDuration (boundary)")
     func minimumCoverageBoundary() {
         // Span exactly one segment is trustworthy (seg 0 can be cut); span just under is not (seg 0
-        // degenerates to the whole file). Both have a single sub-cap inter-keyframe gap, so only the
-        // coverage check decides. Pins the threshold to targetSegmentDuration (4.0 s).
+        // degenerates to the whole file). Both have a single sub-cap inter-keyframe gap and the tail
+        // witness is lifted, so only the coverage check decides. Pins the threshold to
+        // targetSegmentDuration (4.0 s).
         let exactlyOneSegment: [Int64] = [0, 4_000]   // ms: 4.000 s span
         let justUnderOneSegment: [Int64] = [0, 3_999] // ms: 3.999 s span
         #expect(HLSVideoEngine.keyframeIndexIsTrustworthy(
-            keyframes: exactlyOneSegment, videoTimeBase: mkvMs, sourceDurationSeconds: 6843.872) == true)
+            keyframes: exactlyOneSegment, videoTimeBase: mkvMs, sourceDurationSeconds: 6843.872,
+            maxTrailingGapSeconds: .infinity) == true)
         #expect(HLSVideoEngine.keyframeIndexIsTrustworthy(
-            keyframes: justUnderOneSegment, videoTimeBase: mkvMs, sourceDurationSeconds: 6843.872) == false)
+            keyframes: justUnderOneSegment, videoTimeBase: mkvMs, sourceDurationSeconds: 6843.872,
+            maxTrailingGapSeconds: .infinity) == false)
     }
 
     @Test("A dense 4 s-GOP index across the whole title is trustworthy")
@@ -114,26 +117,54 @@ struct SegmentPlanSparseIndexTests {
     @Test("The trusted-gap cap is pinned at 30 s (boundary)")
     func gapCapBoundary() {
         // 30.000 s gap is trusted, 30.001 s is not. Pins the cap so a future targetSegmentDuration
-        // change becomes a visible test break.
+        // change becomes a visible test break. The tail witness is lifted so only the gap decides.
         let exactly30: [Int64] = [0, Int64(30.0 * 90_000)]
         let justOver30: [Int64] = [0, Int64(30.001 * 90_000)]
         #expect(HLSVideoEngine.keyframeIndexIsTrustworthy(
-            keyframes: exactly30, videoTimeBase: ts90k, sourceDurationSeconds: 6599) == true)
+            keyframes: exactly30, videoTimeBase: ts90k, sourceDurationSeconds: 6599,
+            maxTrailingGapSeconds: .infinity) == true)
         #expect(HLSVideoEngine.keyframeIndexIsTrustworthy(
-            keyframes: justOver30, videoTimeBase: ts90k, sourceDurationSeconds: 6599) == false)
+            keyframes: justOver30, videoTimeBase: ts90k, sourceDurationSeconds: 6599,
+            maxTrailingGapSeconds: .infinity) == false)
     }
 
-    @Test("A trailing gap from the last keyframe to EOF is not counted")
-    func tailGapNotCounted() {
-        // Keyframes spaced 4 s up to 60% of the duration, then nothing. The last-keyframe-to-EOF span
-        // is not an inter-keyframe gap and must not demote an otherwise-dense index.
+    /// A dense 4 s index from 0 up to `lastIndexedSeconds`, then nothing.
+    private func denseIndex(upTo lastIndexedSeconds: Double) -> [Int64] {
         let stride: Int64 = 4 * 90_000
         var kfs: [Int64] = []
         var t: Int64 = 0
-        let lastIndexed = Int64(0.6 * 6599 * 90_000)
-        while t <= lastIndexed { kfs.append(t); t += stride }
+        while t <= Int64(lastIndexedSeconds * 90_000) { kfs.append(t); t += stride }
+        return kfs
+    }
+
+    @Test("A dense index that stops minutes before EOF is a partial scan, not trustworthy (PR #703)")
+    func partialScanRejected() {
+        // Keyframes spaced 4 s up to 60% of the duration, then nothing: what a capped prewarm leaves
+        // on an MKV whose Cues are missing or point past EOF. Every inter-keyframe gap is fine; the
+        // index still cannot plan the last 40% of the title.
         #expect(HLSVideoEngine.keyframeIndexIsTrustworthy(
-            keyframes: kfs, videoTimeBase: ts90k, sourceDurationSeconds: 6599) == true)
+            keyframes: denseIndex(upTo: 0.6 * 6599), videoTimeBase: ts90k,
+            sourceDurationSeconds: 6599) == false)
+    }
+
+    @Test("Trusting the partial scan would have produced a final segment reaching to EOF (PR #703)")
+    func partialScanProducesGiantFinalSegment() {
+        // The device report: the last planned segment ran from the final scanned keyframe at 205 s to
+        // the end of the title at 5933 s, a segment the producer can never finish.
+        let plan = HLSVideoEngine.buildKeyframeSegmentPlan(
+            keyframes: denseIndex(upTo: 205), videoTimeBase: ts90k, sourceDurationSeconds: 5933)
+        #expect((plan.last?.durationSeconds ?? 0) > 5700)
+    }
+
+    @Test("The trailing-gap tolerance is pinned at 60 s (boundary)")
+    func trailingGapBoundary() {
+        // Coverage 0 to 1200 s: a duration 60 s past it is trusted (a long final GOP, a padded audio
+        // or subtitle tail), 60.5 s past it is not.
+        let kfs = denseIndex(upTo: 1200)
+        #expect(HLSVideoEngine.keyframeIndexIsTrustworthy(
+            keyframes: kfs, videoTimeBase: ts90k, sourceDurationSeconds: 1260) == true)
+        #expect(HLSVideoEngine.keyframeIndexIsTrustworthy(
+            keyframes: kfs, videoTimeBase: ts90k, sourceDurationSeconds: 1260.5) == false)
     }
 
     @Test("Degenerate inputs are never trustworthy")

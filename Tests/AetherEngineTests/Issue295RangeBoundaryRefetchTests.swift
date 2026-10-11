@@ -47,9 +47,9 @@ struct Issue295RangeBoundaryRefetchTests {
             #expect(n > 0, "read failed at offset \(read)")
             if n <= 0 { break }
             read += Int64(n)
-            try? await Task.sleep(nanoseconds: 6_000_000)
+            try await Task.sleep(nanoseconds: 6_000_000)
         }
-        try? await Task.sleep(nanoseconds: 200_000_000)
+        try await Task.sleep(nanoseconds: 200_000_000)
 
         // #310 changed what "no re-fetch" looks like on the wire. A connection can now be
         // ENDED at winHighWater with the tail of its range undelivered, and the refill then

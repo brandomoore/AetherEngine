@@ -7,7 +7,7 @@ import Foundation
 /// session has no public liveness and the origin is the one party that sees the socket.
 final class KeepAliveRangeOrigin: @unchecked Sendable {
     let port: UInt16
-    private let listenFD: Int32
+    private let listener: LoopbackListener
     private let data: Data
     private let lock = NSLock()
     private var connections: Set<Int32> = []
@@ -16,34 +16,10 @@ final class KeepAliveRangeOrigin: @unchecked Sendable {
 
     init?(data: Data) {
         self.data = data
-        let fd = socket(AF_INET, SOCK_STREAM, 0)
-        guard fd >= 0 else { return nil }
-        var one: Int32 = 1
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, socklen_t(MemoryLayout<Int32>.size))
-        var address = sockaddr_in()
-        address.sin_family = sa_family_t(AF_INET)
-        address.sin_port = 0
-        address.sin_addr.s_addr = inet_addr("127.0.0.1")
-        let bound = withUnsafePointer(to: &address) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
-        }
-        guard bound == 0, listen(fd, 16) == 0 else {
-            close(fd)
-            return nil
-        }
-        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
-        let named = withUnsafeMutablePointer(to: &address) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &length) }
-        }
-        guard named == 0 else {
-            close(fd)
-            return nil
-        }
-        listenFD = fd
-        port = UInt16(bigEndian: address.sin_port)
-        Thread.detachNewThread { [self] in acceptLoop() }
+        guard let listener = LoopbackListener(backlog: 16) else { return nil }
+        self.listener = listener
+        port = listener.port
+        listener.start { [self] fd in admit(fd) }
     }
 
     var openConnectionCount: Int { lock.withLock { connections.count } }
@@ -56,28 +32,22 @@ final class KeepAliveRangeOrigin: @unchecked Sendable {
         for fd in connections { shutdown(fd, SHUT_RDWR) }
         lock.unlock()
         guard !already else { return }
-        shutdown(listenFD, SHUT_RDWR)
-        close(listenFD)
+        listener.stop()
     }
 
-    private func acceptLoop() {
-        while true {
-            let fd = accept(listenFD, nil, nil)
-            if fd < 0 { return }
-            var one: Int32 = 1
-            setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
-            lock.lock()
-            if stopped {
-                lock.unlock()
-                shutdown(fd, SHUT_RDWR)
-                close(fd)
-                return
-            }
-            connections.insert(fd)
-            accepted += 1
+    private func admit(_ fd: Int32) -> Bool {
+        lock.lock()
+        if stopped {
             lock.unlock()
-            Thread.detachNewThread { [self] in serve(fd) }
+            shutdown(fd, SHUT_RDWR)
+            close(fd)
+            return false
         }
+        connections.insert(fd)
+        accepted += 1
+        lock.unlock()
+        Thread.detachNewThread { [self] in serve(fd) }
+        return true
     }
 
     private func serve(_ fd: Int32) {

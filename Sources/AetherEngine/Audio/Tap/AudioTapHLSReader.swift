@@ -37,7 +37,7 @@ final class AudioTapHLSReader: @unchecked Sendable {
     init(deps: Dependencies) { self.deps = deps }
 
     func start() {
-        task = Task.detached(priority: .utility) { [self] in await run() }
+        task = BlockingWork.detached(priority: .utility) { [self] in await run() }
     }
 
     func stop() {

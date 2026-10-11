@@ -24,7 +24,7 @@ import Foundation
 /// other's timing is worth more than running them concurrently. The stall threshold and the consumer
 /// pace are deliberately NOT process-wide hooks: swift-testing runs suites in parallel, and a hook
 /// that every reader reads at init would reach into whatever suite happens to run alongside this one.
-@Suite("Silent transport death (#309)", .serialized)
+@Suite("Silent transport death (#309)", .serialized, .offCooperativePool)
 struct Issue309SilentTransportDeathTests {
 
     private static let totalSize: Int64 = 256 * 1024 * 1024
@@ -77,7 +77,7 @@ struct Issue309SilentTransportDeathTests {
     /// setting it would throttle the readers of every suite swift-testing happens to run in parallel
     /// with this one. Pacing here is local by construction.
     private static func read(_ reader: AVIOReader, bytes target: Int, sliceCap: Int = 256 * 1024,
-                            deadline: TimeInterval = 30, bytesPerSecond: Int = 0) -> Int {
+                            deadline: TimeInterval = 120, bytesPerSecond: Int = 0) -> Int {
         let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: sliceCap)
         defer { buf.deallocate() }
         var got = 0
@@ -91,6 +91,29 @@ struct Issue309SilentTransportDeathTests {
             }
         }
         return got
+    }
+
+    // MARK: - The open keeps its own budget
+
+    /// The watchdog's threshold is a verdict on a transfer that stopped, and the first byte of the
+    /// open is not that: `SourceOpenPolicy.firstByteTimeout` is the budget for it, and a host sets it
+    /// for an origin that is known to be slow to answer (a NAS spinning up). Ended at the stall
+    /// threshold instead, both open attempts were cut at it and the open failed with `noResponse`:
+    /// measured with this origin, 0.4 s opened and 0.8 s failed in 1.3 s, every time. That is also
+    /// the shape #309's own detection test failed in on a loaded CI runner, where a first byte took
+    /// longer than its 0.6 s threshold.
+    @Test("an open whose first byte is slower than the stall threshold still opens",
+          .timeLimit(.minutes(1)))
+    func slowFirstByteOpens() throws {
+        let serverMaybe = ThrottledOriginServer(totalSize: Self.totalSize, firstByteDelayUs: { _ in 1_500_000 })
+        let server = try #require(serverMaybe)
+        defer { server.stop() }
+        let reader = AVIOReader(url: URL(string: "http://127.0.0.1:\(server.port)/movie.bin")!,
+                                boundedInitialFetch: Self.firstRange,
+                                connStallTimeout: 0.3)
+        defer { reader.markClosed(); reader.close() }
+        try reader.open()
+        #expect(Self.read(reader, bytes: 64 * 1024) == 64 * 1024)
     }
 
     // MARK: - Detection
@@ -119,14 +142,14 @@ struct Issue309SilentTransportDeathTests {
         // wait for that range to complete before consuming. Then consume enough to put the refill on
         // the wire and far less than the 4 MB it delivers: from here on every read is satisfied from
         // the window, which is precisely the state that used to defer detection indefinitely.
-        try await waitFor(upTo: .seconds(10)) { !reader.hasLiveConnectionForTesting }
+        try await waitFor { !reader.hasLiveConnectionForTesting }
         #expect(Self.read(reader, bytes: 1024 * 1024) == 1024 * 1024)
-        try await waitFor(upTo: .seconds(5)) { server.requestedRanges.contains { $0.start == silenceOffset } }
+        try await waitFor { server.requestedRanges.contains { $0.start == silenceOffset } }
         #expect(server.requestedRanges.contains { $0.start == silenceOffset },
                 "the frontier refill never went out: \(server.requestedRanges)")
 
         // No reads at all from here: the consumer is parked, exactly as a paused player is.
-        try await waitFor(upTo: .seconds(stallTimeout * 6)) { !reader.hasLiveConnectionForTesting }
+        try await waitFor { !reader.hasLiveConnectionForTesting }
 
         #expect(!reader.hasLiveConnectionForTesting,
                 "a connection that delivered nothing for \(stallTimeout)s is still installed")
@@ -161,10 +184,10 @@ struct Issue309SilentTransportDeathTests {
         defer { reader.markClosed(); reader.close() }
         try reader.open()
 
-        try await waitFor(upTo: .seconds(10)) { !reader.hasLiveConnectionForTesting }
+        try await waitFor { !reader.hasLiveConnectionForTesting }
         #expect(Self.read(reader, bytes: 512 * 1024) == 512 * 1024)
-        try await waitFor(upTo: .seconds(5)) { server.requestedRanges.contains { $0.start == silenceOffset } }
-        try await waitFor(upTo: .seconds(stallTimeout * 6)) { !reader.hasLiveConnectionForTesting }
+        try await waitFor { server.requestedRanges.contains { $0.start == silenceOffset } }
+        try await waitFor { !reader.hasLiveConnectionForTesting }
 
         #expect(!reader.hasLiveConnectionForTesting,
                 "a request answered with headers and no body stayed installed")
@@ -209,8 +232,7 @@ struct Issue309SilentTransportDeathTests {
         // Read straight through the death. 7 MB is past everything the silenced generation and the
         // first range delivered (6 MB), so completing it can only happen through a replacement.
         let target = 7 * 1024 * 1024
-        let got = Self.read(reader, bytes: target, deadline: 60,
-                            bytesPerSecond: consumerBytesPerSecond)
+        let got = Self.read(reader, bytes: target, bytesPerSecond: consumerBytesPerSecond)
         #expect(got == target, "read stopped at \(got / 1024) KB of \(target / 1024) KB")
 
         let runway = try #require(probe.runwayAtRequest,
@@ -235,7 +257,7 @@ struct Issue309SilentTransportDeathTests {
         // Nobody consumes: the window fills to high water, the connection is ended on purpose, and
         // from then on there is no delivery at all. That is the state the watchdog must NOT read as
         // a fault, or every paused player would reconnect on a timer.
-        try await waitFor(upTo: .seconds(5)) { reader.windowDiagnostics.parked }
+        try await waitFor { reader.windowDiagnostics.parked }
         try await Task.sleep(for: .seconds(stallTimeout * 4))
 
         #expect(reader.windowDiagnostics.parked, "the high-water end must still own this state")

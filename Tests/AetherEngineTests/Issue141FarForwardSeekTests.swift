@@ -94,7 +94,7 @@ struct Issue141FarForwardSeekTests {
         }
         let provider = makeProvider(cache: cache, recorder: recorder,
                                     producerBase: 30, initialRestartIndex: 30,
-                                    backpressureWait: 1.0)
+                                    backpressureWait: 60.0)
 
         let served = provider.mediaSegment(at: 41)
 

@@ -42,7 +42,7 @@ final class ScriptedOriginServer: @unchecked Sendable {
         var body: Data? = nil
     }
 
-    private let listenFD: Int32
+    private let listener: LoopbackListener
     private let reply: @Sendable (Recorded) -> Reply
     private let lock = NSLock()
     private var _requests: [Recorded] = []
@@ -69,92 +69,49 @@ final class ScriptedOriginServer: @unchecked Sendable {
 
     init?(reply: @escaping @Sendable (Recorded) -> Reply) {
         self.reply = reply
-        let fd = socket(AF_INET, SOCK_STREAM, 0)
-        guard fd >= 0 else { return nil }
-        var one: Int32 = 1
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, socklen_t(MemoryLayout<Int32>.size))
-
-        var addr = sockaddr_in()
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = 0
-        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
-        let bound = withUnsafePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
-        }
-        guard bound == 0, listen(fd, 8) == 0 else {
-            close(fd)
-            return nil
-        }
-        var named = sockaddr_in()
-        var len = socklen_t(MemoryLayout<sockaddr_in>.size)
-        let gotName = withUnsafeMutablePointer(to: &named) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &len) }
-        }
-        guard gotName == 0 else {
-            close(fd)
-            return nil
-        }
-        self.listenFD = fd
-        self.port = UInt16(bigEndian: named.sin_port)
-        Thread.detachNewThread { [self] in acceptLoop() }
+        guard let listener = LoopbackListener(backlog: 8) else { return nil }
+        self.listener = listener
+        self.port = listener.port
+        listener.start { [self] fd in admit(fd) }
     }
 
     func stop() {
         lock.lock()
-        let fds = _connFDs
-        _connFDs = []
         let already = _stopped
         _stopped = true
+        // shutdown unblocks a write parked on a full socket buffer. Never close here: the serving
+        // thread still issues reads and writes on the number, and a closed number is the next
+        // opener's in this process, so its bytes would land on another suite's socket.
+        if !already { for fd in _connFDs { shutdown(fd, SHUT_RDWR) } }
         lock.unlock()
         guard !already else { return }
-        // shutdown unblocks a write parked on a full socket buffer; close alone may not.
-        for fd in fds {
+        listener.stop()
+    }
+
+    private func admit(_ fd: Int32) -> Bool {
+        lock.lock()
+        if _stopped {
+            lock.unlock()
             shutdown(fd, SHUT_RDWR)
             close(fd)
+            return false
         }
-        shutdown(listenFD, SHUT_RDWR)
-        close(listenFD)
+        _connFDs.append(fd)
+        lock.unlock()
+        Thread.detachNewThread { [self] in
+            while serveOneRequest(fd) {}
+            closeConnection(fd)
+        }
+        return true
     }
 
-    private func acceptLoop() {
-        while true {
-            let fd = accept(listenFD, nil, nil)
-            if fd < 0 { return }
-            var one: Int32 = 1
-            setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
-            lock.lock()
-            if _stopped {
-                lock.unlock()
-                shutdown(fd, SHUT_RDWR)
-                close(fd)
-                return
-            }
-            _connFDs.append(fd)
-            lock.unlock()
-            Thread.detachNewThread { [self] in
-                while serveOneRequest(fd) {}
-                closeConnection(fd)
-            }
-        }
-    }
-
-    /// Closes a connection exactly once. `stop()` closes every descriptor still registered, so a socket
-    /// whose serving thread is done has to leave the registry before it closes: otherwise the kernel
-    /// hands that number to the next opener (in practice a guarded descriptor), `stop()` closes it a
-    /// second time, and the EXC_GUARD kills the whole test process instead of failing one test. The run
-    /// then ends with no failing test and a bare exit 1.
+    /// The serving thread is the only closer. Deregistering and closing under the lock keeps `stop()`
+    /// from shutting down a number this thread has already given back.
     private func closeConnection(_ fd: Int32) {
         lock.lock()
-        guard let index = _connFDs.firstIndex(of: fd) else {
-            lock.unlock()
-            return  // stop() owns this descriptor now
-        }
-        _connFDs.remove(at: index)
-        lock.unlock()
-        shutdown(fd, SHUT_RDWR)
+        _connFDs.removeAll { $0 == fd }
         close(fd)
+        lock.unlock()
     }
 
     /// Returns false when the connection is done (client gone, malformed request, or a scripted close).
@@ -238,7 +195,7 @@ final class ScriptedOriginServer: @unchecked Sendable {
     }
 }
 
-@Suite("#255 a declared Content-Length never sizes an allocation", .serialized)
+@Suite("#255 a declared Content-Length never sizes an allocation", .serialized, .offCooperativePool)
 struct Issue255BodyReserveTests {
 
     /// The reported source: 12.4 GB, the number the HEAD declared and malloc refused.
@@ -341,10 +298,10 @@ struct Issue255BodyReserveTests {
         // "the HEAD fallback never ran" from a request log that only held the primary probe (one
         // observed failure, green on the next run of the same commit). The wait exits as soon as a
         // size resolves, so a wider ceiling costs nothing in the healthy case and only buys the
-        // fallback the room to actually be measured.
+        // fallback the room to actually be measured. 25 is the most the ladder takes (`min(25, _)`).
         let reader = AVIOReader(url: URL(string: "http://127.0.0.1:\(server.port)/big.mkv")!,
                                 chunkSize: 1024 * 1024, prefetchEnabled: false,
-                                chunkRequestTimeout: 15)
+                                chunkRequestTimeout: 25)
         defer { reader.markClosed(); reader.close() }
         try reader.open()
 
@@ -372,7 +329,7 @@ struct Issue255BodyReserveTests {
         let chunk = 1024 * 1024
         let reader = AVIOReader(url: URL(string: "http://127.0.0.1:\(server.port)/big.mkv")!,
                                 chunkSize: chunk, prefetchEnabled: false,
-                                chunkRequestTimeout: 5, chunkMaxRetries: 1)
+                                chunkRequestTimeout: 30, chunkMaxRetries: 1)
         defer { reader.markClosed(); reader.close() }
         try reader.open()
 

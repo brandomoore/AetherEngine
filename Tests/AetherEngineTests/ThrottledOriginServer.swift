@@ -39,7 +39,7 @@ final class ThrottledOriginServer: @unchecked Sendable {
     }
 
     let port: UInt16
-    private let listenFD: Int32
+    private let listener: LoopbackListener
     /// #551: a var only so a test can make the origin's stated total CHANGE between two requests,
     /// which is the one shape that proves the reader rechecks a warm's size against the connection
     /// that is actually serving it. Every other test leaves it at its init value.
@@ -161,42 +161,13 @@ final class ThrottledOriginServer: @unchecked Sendable {
         self.firstByteDelayUs = firstByteDelayUs
         self.respond = respond
 
-        let fd = socket(AF_INET, SOCK_STREAM, 0)
-        guard fd >= 0 else { return nil }
-        var one: Int32 = 1
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, socklen_t(MemoryLayout<Int32>.size))
-
-        var addr = sockaddr_in()
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = 0
-        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
-        let bindResult = withUnsafePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
-        }
         // #450: a backlog of 4 is a ceiling of this harness's own, and the suite that reads
         // this origin's request log is measuring how many concurrent readers get on the link.
         // A harness that brings its own version of the cause cannot measure it.
-        guard bindResult == 0, listen(fd, 32) == 0 else {
-            close(fd)
-            return nil
-        }
-        var bound = sockaddr_in()
-        var len = socklen_t(MemoryLayout<sockaddr_in>.size)
-        let nameResult = withUnsafeMutablePointer(to: &bound) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                getsockname(fd, $0, &len)
-            }
-        }
-        guard nameResult == 0 else {
-            close(fd)
-            return nil
-        }
-        self.listenFD = fd
-        self.port = UInt16(bigEndian: bound.sin_port)
-
-        Thread.detachNewThread { [self] in acceptLoop() }
+        guard let listener = LoopbackListener(backlog: 32) else { return nil }
+        self.listener = listener
+        self.port = listener.port
+        listener.start { [self] fd in admit(fd) }
     }
 
     func stop() {
@@ -213,8 +184,7 @@ final class ThrottledOriginServer: @unchecked Sendable {
         for fd in fds { shutdown(fd, SHUT_RDWR) }
         lock.unlock()
         guard !alreadyStopped else { return }
-        shutdown(listenFD, SHUT_RDWR)
-        close(listenFD)
+        listener.stop()
     }
 
     /// The one place a connection fd is closed. Deregistering and closing under the lock is
@@ -226,23 +196,18 @@ final class ThrottledOriginServer: @unchecked Sendable {
         lock.unlock()
     }
 
-    private func acceptLoop() {
-        while true {
-            let fd = accept(listenFD, nil, nil)
-            if fd < 0 { return }
-            var one: Int32 = 1
-            setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
-            lock.lock()
-            if _stopped {
-                lock.unlock()
-                shutdown(fd, SHUT_RDWR)
-                close(fd)
-                return
-            }
-            _connFDs.append(fd)
+    private func admit(_ fd: Int32) -> Bool {
+        lock.lock()
+        if _stopped {
             lock.unlock()
-            Thread.detachNewThread { [self] in serve(fd) }
+            shutdown(fd, SHUT_RDWR)
+            close(fd)
+            return false
         }
+        _connFDs.append(fd)
+        lock.unlock()
+        Thread.detachNewThread { [self] in serve(fd) }
+        return true
     }
 
     /// One connection, many requests: a bounded-range reader issues the next range on the

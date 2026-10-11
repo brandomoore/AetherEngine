@@ -143,7 +143,7 @@ struct Issue619ChunkedByteWindowTests {
 /// The same window behind the real reader: bytes read forward and bytes read back inside the
 /// lookback after several trims are the origin's bytes at those offsets, and the backward read is
 /// served from the window rather than from a new request.
-@Suite("AE#619: the reader's window over a live connection")
+@Suite("AE#619: the reader's window over a live connection", .offCooperativePool)
 struct Issue619ReaderWindowTests {
 
     private func readExactly(_ reader: AVIOReader, _ count: Int, at offset: Int64) -> [UInt8]? {

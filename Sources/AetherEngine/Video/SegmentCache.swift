@@ -43,11 +43,28 @@ final class SegmentCache: @unchecked Sendable {
     /// and detaches AVKit's PiP legible renderer (Sodalite#32). 0 = window-only legacy pruning
     /// (live sessions, where the sliding playlist already dropped everything behind the window).
     private let retentionBudgetBytes: Int
+    private let nativeLiveDVRPolicy: LiveDVRRetentionPolicy?
+    private var nativeLiveRetentionFloor = 0
+    private lazy var nativeLiveExpiryQueue = DispatchQueue(label: "com.aetherengine.live-expiry", qos: .utility)
+    private var nativeLiveExpiryTimer: DispatchSourceTimer? // condition; opt-in, cancelled by close
 
     private var entries: [Int: URL] = [:]
     /// Per-index byte ledger for _totalBytes. Stat-on-eviction was wrong when same index was
     /// overwritten (stat returned new size, old bytes stayed counted forever).
     private var entryBytes: [Int: Int] = [:]
+
+    /// Progressive delivery: the segments a producer is writing right now, index to staging file.
+    /// Registered when the producer opens the segment (`beginInProgress`), removed when it is
+    /// adopted or abandoned. A serve that finds its index here reads the staging file as it grows
+    /// (`ProgressiveSegmentReader`) instead of waiting for the cut.
+    private var inProgress: [Int: URL] = [:]
+    /// The staging file each recently adopted segment was renamed from, and its final size, so a
+    /// progressive reader can tell that the file IT holds was sealed, rather than the same index
+    /// produced again by a later epoch. Keyed by staging file (unique per segment and epoch) and
+    /// bounded to the most recent adoptions in adoption order: evicting by index dropped every
+    /// adoption below the 64 highest at once, so after a backward seek each reader read as abandoned.
+    private var sealedFromStaging: [URL: Int] = [:]
+    private var sealedStagingOrder: [URL] = []
 
     /// Pinned in RAM (~3.5 KB); AVPlayer fetches exactly once per session; never evicted.
     private var initSegment: Data?
@@ -103,12 +120,45 @@ final class SegmentCache: @unchecked Sendable {
     /// every fold counter at 0, which is exactly what disarms the #358 recovery arms.)
     static let maxFoldRunLength = 64
 
+    /// The volume holding `sessionDir` ran out of space while this session wrote to it: the
+    /// directory, a segment, or a muxer's staging file. Read when the pump gives up, so the failure
+    /// names the full disk instead of the audio or the source, neither of which is at fault.
+    /// Guarded by `condition`.
+    private var storageExhaustedLatch = false
+
+    var storageExhausted: Bool {
+        condition.lock(); defer { condition.unlock() }
+        return storageExhaustedLatch
+    }
+
+    func noteStorageExhausted() {
+        condition.lock()
+        let first = !storageExhaustedLatch
+        storageExhaustedLatch = true
+        condition.unlock()
+        if first {
+            EngineLog.emit("[SegmentCache] the segment volume is out of space at \(sessionDir.path)",
+                           category: .session)
+        }
+    }
+
+    /// A write that failed because the volume is full: `NSFileWriteOutOfSpaceError` from Foundation,
+    /// `ENOSPC` from POSIX, or either one underneath a wrapping error.
+    static func isOutOfSpace(_ error: Error) -> Bool {
+        let ns = error as NSError
+        if ns.domain == NSCocoaErrorDomain, ns.code == NSFileWriteOutOfSpaceError { return true }
+        if ns.domain == NSPOSIXErrorDomain, ns.code == Int(ENOSPC) { return true }
+        if let underlying = ns.userInfo[NSUnderlyingErrorKey] as? Error { return isOutOfSpace(underlying) }
+        return false
+    }
+
     /// (10, 20)=30 entries, ~300 MB at 4K HDR HEVC ~10 MB/seg.
     init(forwardWindow: Int = 10, backwardWindow: Int = 20, retentionBudgetBytes: Int = 0,
-         baseDirectory: URL? = nil, onResidentSetChanged: (@Sendable () -> Void)? = nil) {
+         baseDirectory: URL? = nil, nativeLiveDVRPolicy: LiveDVRRetentionPolicy? = nil, onResidentSetChanged: (@Sendable () -> Void)? = nil) {
         self.forwardWindow = forwardWindow
         self.backwardWindow = backwardWindow
         self.retentionBudgetBytes = retentionBudgetBytes
+        self.nativeLiveDVRPolicy = nativeLiveDVRPolicy
         self.onResidentSetChanged = onResidentSetChanged
 
         // aether-segments/ prefix lets sweepStaleSessionDirs() find sibling dirs from crashed sessions.
@@ -123,6 +173,7 @@ final class SegmentCache: @unchecked Sendable {
         } catch {
             EngineLog.emit("[SegmentCache] session dir create failed at \(sessionDir.path): \(error)",
                            category: .session)
+            if Self.isOutOfSpace(error) { storageExhaustedLatch = true }
         }
 
         // Before the sweep, so a sibling constructed in the same breath cannot read this session
@@ -134,6 +185,7 @@ final class SegmentCache: @unchecked Sendable {
     }
 
     deinit {
+        nativeLiveExpiryTimer?.cancel()
         releaseLiveMarker()
     }
 
@@ -226,6 +278,7 @@ final class SegmentCache: @unchecked Sendable {
         } catch {
             EngineLog.emit("[SegmentCache] session dir restore failed at \(sessionDir.path): \(error)",
                            category: .session)
+            if Self.isOutOfSpace(error) { noteStorageExhausted() }
             return false
         }
         releaseLiveMarker()
@@ -245,12 +298,24 @@ final class SegmentCache: @unchecked Sendable {
             try data.write(to: fileURL, options: [.atomic])
             writeOK = true
         } catch {
-            if restoreSessionDirIfMissing(), (try? data.write(to: fileURL, options: [.atomic])) != nil {
-                writeOK = true
-            } else {
-                EngineLog.emit("[SegmentCache] write failed seg-\(index): \(error)",
+            // The retry's own error decides: a missing directory restored onto a full volume fails
+            // the second write with ENOSPC, behind a first error that only said the file was missing.
+            var finalError: Error? = error
+            if restoreSessionDirIfMissing() {
+                do {
+                    try data.write(to: fileURL, options: [.atomic])
+                    finalError = nil
+                } catch {
+                    finalError = error
+                }
+            }
+            if let finalError {
+                EngineLog.emit("[SegmentCache] write failed seg-\(index): \(finalError)",
                                category: .session)
+                if Self.isOutOfSpace(finalError) { noteStorageExhausted() }
                 writeOK = false
+            } else {
+                writeOK = true
             }
         }
 
@@ -308,7 +373,18 @@ final class SegmentCache: @unchecked Sendable {
         }
 
         condition.lock()
+        // Sealed or not, this staging file is no longer being written.
+        if inProgress[index] == stagingPath { inProgress.removeValue(forKey: index) }
+        if renameOK {
+            if sealedFromStaging.updateValue(byteCount, forKey: stagingPath) == nil {
+                sealedStagingOrder.append(stagingPath)
+            }
+            while sealedStagingOrder.count > Self.sealedStagingMemory {
+                sealedFromStaging.removeValue(forKey: sealedStagingOrder.removeFirst())
+            }
+        }
         guard !closed else {
+            condition.broadcast()
             condition.unlock()
             try? FileManager.default.removeItem(at: fileURL)
             return
@@ -344,6 +420,8 @@ final class SegmentCache: @unchecked Sendable {
     func close() {
         condition.lock()
         closed = true
+        let expiryTimer = nativeLiveExpiryTimer
+        nativeLiveExpiryTimer = nil
         let dir = sessionDir
         let hadEntries = !entries.isEmpty
         entries.removeAll(keepingCapacity: false)
@@ -351,11 +429,15 @@ final class SegmentCache: @unchecked Sendable {
         videoReaches.removeAll(keepingCapacity: false)
         initSegment = nil
         initVersions.removeAll(keepingCapacity: false)
+        inProgress.removeAll(keepingCapacity: false)
+        sealedFromStaging.removeAll(keepingCapacity: false)
+        sealedStagingOrder.removeAll(keepingCapacity: false)
         _totalBytes = 0
         _highestStoredIndex = -1
         condition.broadcast()
         condition.unlock()
 
+        expiryTimer?.cancel()
         releaseLiveMarker()
         try? FileManager.default.removeItem(at: dir)
         // A closed cache holds nothing, and that is a resident-set change like any other. The engine
@@ -461,6 +543,77 @@ final class SegmentCache: @unchecked Sendable {
         condition.unlock()
         guard let url = fileURL else { return nil }
         return readOrDrop(index: index, url: url)
+    }
+
+    // MARK: - Progressive delivery
+
+    /// How many adoptions `sealedFromStaging` remembers: enough for every reader still draining.
+    static let sealedStagingMemory = 64
+
+    /// The producer opened segment `index` in `stagingPath`, which from here on is only appended to
+    /// until it is adopted under its final name.
+    func beginInProgress(index: Int, stagingPath: URL) {
+        condition.lock()
+        if !closed {
+            inProgress[index] = stagingPath
+            condition.broadcast()
+        }
+        condition.unlock()
+    }
+
+    /// The producer gave up the segment it was writing (restart, failed cut, teardown), so its
+    /// partial bytes are never adopted. A reader draining it learns that on its next poll.
+    func abandonInProgress(index: Int) {
+        condition.lock()
+        if inProgress.removeValue(forKey: index) != nil { condition.broadcast() }
+        condition.unlock()
+    }
+
+    enum InProgressState: Equatable {
+        case writing
+        case sealed(bytes: Int)
+        case abandoned
+    }
+
+    /// What became of the staging file a progressive reader holds.
+    func inProgressState(index: Int, stagingPath: URL) -> InProgressState {
+        condition.lock()
+        defer { condition.unlock() }
+        if inProgress[index] == stagingPath { return .writing }
+        if let bytes = sealedFromStaging[stagingPath] { return .sealed(bytes: bytes) }
+        return .abandoned
+    }
+
+    /// `fetch` for the loopback server. With `progressive`, a segment that is being written is
+    /// answered at once with a reader over its staging file, so AVPlayer receives each fragment as
+    /// the muxer flushes it instead of the whole segment after its cut.
+    func fetchSource(index: Int, timeout: TimeInterval, progressive: Bool) -> SegmentSource? {
+        let deadline = Date().addingTimeInterval(timeout)
+        condition.lock()
+        while true {
+            if let url = entries[index] {
+                condition.unlock()
+                return readOrDrop(index: index, url: url).map { .data($0) }
+            }
+            if closed {
+                condition.unlock()
+                return nil
+            }
+            if progressive, let staging = inProgress[index] {
+                condition.unlock()
+                if let reader = ProgressiveSegmentReader(cache: self, index: index, stagingPath: staging) {
+                    return .progressive(reader)
+                }
+                // The staging file was renamed or removed between the lookup and the open: look again.
+                condition.lock()
+                if inProgress[index] == staging { inProgress.removeValue(forKey: index) }
+                continue
+            }
+            if !condition.wait(until: deadline) {
+                condition.unlock()
+                return nil
+            }
+        }
     }
 
     /// AE#451: a read that comes back empty for a file the bookkeeping still lists is the same lie
@@ -762,6 +915,63 @@ final class SegmentCache: @unchecked Sendable {
         return bytes
     }
 
+    /// Metadata-only admission from the host setter. Exactly one weakly-owned timer per opted-in
+    /// cache; it progresses even when the pump is parked and AVPlayer makes no playlist requests.
+    func startNativeLiveDVRExpiryChecks() {
+        condition.lock()
+        guard !closed, nativeLiveDVRPolicy != nil, nativeLiveExpiryTimer == nil else {
+            condition.unlock()
+            return
+        }
+        let timer = DispatchSource.makeTimerSource(queue: nativeLiveExpiryQueue)
+        timer.schedule(deadline: .now() + .seconds(1), repeating: .seconds(1), leeway: .milliseconds(100))
+        timer.setEventHandler { [weak self] in _ = self?.reconcileExpiredNativeLiveDVRRetention() }
+        nativeLiveExpiryTimer = timer
+        timer.resume()
+        condition.unlock()
+    }
+
+    /// Both the independent timer and the producer use this implementation. The cap is evaluated
+    /// by the caller FIRST; then expiry pruning and the current entry count share this lock hold.
+    /// An expired smaller cap cannot park a pump behind unpruned expanded history.
+    @discardableResult
+    func reconcileExpiredNativeLiveDVRRetention(headroomCap: Int? = nil) -> Bool {
+        condition.lock()
+        guard !closed else { condition.unlock(); return false }
+        let expiredOrDenied = nativeLiveDVRPolicy?.snapshot?.retentionBytes == 0
+        let doomed = expiredOrDenied ? pruneOutsideWindow() : []
+        let hasHeadroom = headroomCap.map { entries.count < $0 } ?? true
+        if !doomed.isEmpty { condition.broadcast() }
+        condition.unlock()
+        for url in doomed { try? FileManager.default.removeItem(at: url) }
+        if !doomed.isEmpty { onResidentSetChanged?() }
+        return hasHeadroom
+    }
+
+    /// Called off the main actor after a native limit update and each finalized live segment.
+    func applyNativeLiveRetentionFloor(_ floor: Int) {
+        condition.lock()
+        nativeLiveRetentionFloor = max(nativeLiveRetentionFloor, floor)
+        let doomed = pruneOutsideWindow()
+        condition.broadcast()
+        condition.unlock()
+        for url in doomed { try? FileManager.default.removeItem(at: url) }
+        if !doomed.isEmpty { onResidentSetChanged?() }
+    }
+
+    /// The finite exception consists of the consumer's existing handover/prefetch band and
+    /// eight newest segments. No unbounded `[target ... highestStoredIndex]` exception for live.
+    private func isNativeLiveMandatory(_ index: Int) -> Bool {
+        let consumer = currentTargetIndex >= 0 &&
+            index >= currentTargetIndex - backwardWindow && index <= currentTargetIndex + forwardWindow
+        return consumer || index > _highestStoredIndex - LiveWindowSizing.minSafeSegments
+    }
+
+    var nativeLiveMandatoryBytes: Int {
+        condition.lock(); defer { condition.unlock() }
+        return entryBytes.reduce(0) { $0 + (isNativeLiveMandatory($1.key) ? $1.value : 0) }
+    }
+
     // MARK: - Internal
 
     /// Prune to [currentTarget - backwardWindow, max(currentTarget + forwardWindow, highestStoredIndex)].
@@ -775,6 +985,24 @@ final class SegmentCache: @unchecked Sendable {
     /// ends keeps each side of the resident span contiguous, so the provider's residency gate
     /// (a resident backward target = no producer restart) holds across the whole retained span.
     private func pruneOutsideWindow() -> [URL] {
+        if let limits = nativeLiveDVRPolicy?.snapshot {
+            var keptBytes = entryBytes.reduce(0) { $0 + (isNativeLiveMandatory($1.key) ? $1.value : 0) }
+            var doomed: [URL] = []
+            // Newest-first produces a contiguous playable suffix, even when an older consumer
+            // band must remain pinned. The published DVR range already walks this suffix.
+            for index in entries.keys.sorted(by: >) where !isNativeLiveMandatory(index) {
+                let bytes = entryBytes[index] ?? 0
+                if index >= nativeLiveRetentionFloor && bytes <= max(0, limits.retentionBytes - keptBytes) {
+                    keptBytes += bytes
+                } else if let url = entries.removeValue(forKey: index) {
+                    _totalBytes -= bytes
+                    entryBytes.removeValue(forKey: index)
+                    videoReaches.removeValue(forKey: index)
+                    doomed.append(url)
+                }
+            }
+            return doomed
+        }
         let lo = currentTargetIndex - backwardWindow
         let hi = max(currentTargetIndex + forwardWindow, _highestStoredIndex)
         var doomed: [URL] = []
@@ -843,5 +1071,92 @@ final class SegmentCache: @unchecked Sendable {
     private func byteSize(of url: URL) -> Int {
         let values = try? url.resourceValues(forKeys: [.fileSizeKey])
         return values?.fileSize ?? 0
+    }
+}
+
+/// A segment as the loopback server gets it: complete bytes, or a reader over one being written.
+enum SegmentSource {
+    case data(Data)
+    case progressive(ProgressiveSegmentReader)
+}
+
+/// Reads a segment while its producer is still writing it.
+///
+/// The muxer appends each flushed fragment (moof+mdat) to the staging file and never rewrites what
+/// it wrote, and adoption renames the file as it stands. So a descriptor opened on the staging file
+/// reads a growing prefix of the final segment, the rename does not disturb it, and the read is
+/// complete at the byte count the cache records for the adoption. A segment the producer abandons
+/// reads as `.abandoned`, and the server closes the connection so AVPlayer asks for it again.
+final class ProgressiveSegmentReader: @unchecked Sendable {
+    let index: Int
+    let stagingPath: URL
+    private let fd: Int32
+    private weak var cache: SegmentCache?
+    private(set) var offset: Int64 = 0
+
+    enum Next: Equatable {
+        case bytes(Data)
+        case finished
+        case abandoned
+    }
+
+    init?(cache: SegmentCache, index: Int, stagingPath: URL) {
+        let fd = open(stagingPath.path, O_RDONLY)
+        guard fd >= 0 else { return nil }
+        self.fd = fd
+        self.cache = cache
+        self.index = index
+        self.stagingPath = stagingPath
+    }
+
+    deinit { close(fd) }
+
+    /// The next bytes past `offset`, waiting for the producer to write them. `.finished` once the
+    /// sealed segment is read to its end; `.abandoned` when the producer gave it up, or wrote nothing
+    /// for `idleTimeout` (a wedged producer must not hold a connection forever).
+    func next(maxBytes: Int = 256 * 1024, pollInterval: TimeInterval = 0.02,
+              idleTimeout: TimeInterval = 60) -> Next {
+        let deadline = Date().addingTimeInterval(idleTimeout)
+        while true {
+            var st = stat()
+            let statOK = fstat(fd, &st) == 0
+            if statOK, st.st_size > offset {
+                let count = Int(min(Int64(maxBytes), st.st_size - offset))
+                var data = Data(count: count)
+                let read = data.withUnsafeMutableBytes { pread(fd, $0.baseAddress, count, off_t(offset)) }
+                if read > 0 {
+                    if read < count { data.removeSubrange(read ..< count) }
+                    offset += Int64(read)
+                    return .bytes(data)
+                }
+            }
+            switch cache?.inProgressState(index: index, stagingPath: stagingPath) ?? .abandoned {
+            case .writing:
+                break
+            case .sealed(let bytes):
+                if offset >= Int64(bytes) { return .finished }
+                // The last fragment can land with the seal, after the stat above, so stat again and
+                // read on. A file shorter than its recorded size is not a state to spin in.
+                var sealedStat = stat()
+                if fstat(fd, &sealedStat) == 0, sealedStat.st_size > offset { continue }
+                return .abandoned
+            case .abandoned:
+                return .abandoned
+            }
+            if Date() >= deadline { return .abandoned }
+            Thread.sleep(forTimeInterval: pollInterval)
+        }
+    }
+
+    /// Reads to the seal, for a caller that needs the whole segment. nil when it was abandoned.
+    func readToEnd() -> Data? {
+        var all = Data()
+        while true {
+            switch next() {
+            case .bytes(let d): all.append(d)
+            case .finished: return all
+            case .abandoned: return nil
+            }
+        }
     }
 }

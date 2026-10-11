@@ -164,7 +164,7 @@ private final class LoopbackBodyOrigin: @unchecked Sendable {
     }
 
     let port: UInt16
-    private let listenFD: Int32
+    private let listener: LoopbackListener
     private let body: Body
     private let status: Int
     private let declaredLength: Int64?
@@ -180,53 +180,21 @@ private final class LoopbackBodyOrigin: @unchecked Sendable {
         self.body = body
         self.status = status
         self.declaredLength = declaredLength
-        let fd = socket(AF_INET, SOCK_STREAM, 0)
-        guard fd >= 0 else { return nil }
-        var one: Int32 = 1
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, socklen_t(MemoryLayout<Int32>.size))
-        var address = sockaddr_in()
-        address.sin_family = sa_family_t(AF_INET)
-        address.sin_port = 0
-        address.sin_addr.s_addr = inet_addr("127.0.0.1")
-        let bound = withUnsafePointer(to: &address) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
+        guard let listener = LoopbackListener(backlog: 8) else { return nil }
+        self.listener = listener
+        port = listener.port
+        listener.start { [self] fd in
+            lock.withLock { _ = _connections.insert(fd) }
+            Thread.detachNewThread { [self] in serve(fd) }
+            return true
         }
-        guard bound == 0, listen(fd, 8) == 0 else {
-            close(fd)
-            return nil
-        }
-        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
-        let named = withUnsafeMutablePointer(to: &address) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &length) }
-        }
-        guard named == 0 else {
-            close(fd)
-            return nil
-        }
-        listenFD = fd
-        port = UInt16(bigEndian: address.sin_port)
-        Thread.detachNewThread { [self] in acceptLoop() }
     }
 
     func stop() {
         lock.lock()
         for fd in _connections { shutdown(fd, SHUT_RDWR) }
         lock.unlock()
-        shutdown(listenFD, SHUT_RDWR)
-        close(listenFD)
-    }
-
-    private func acceptLoop() {
-        while true {
-            let fd = accept(listenFD, nil, nil)
-            if fd < 0 { return }
-            var one: Int32 = 1
-            setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
-            lock.withLock { _ = _connections.insert(fd) }
-            Thread.detachNewThread { [self] in serve(fd) }
-        }
+        listener.stop()
     }
 
     private func serve(_ fd: Int32) {

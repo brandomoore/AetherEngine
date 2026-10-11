@@ -121,7 +121,7 @@ struct RestartTimelineContinuityTests {
     @Test("A restart reproduces a segment with the continuous run's timeline",
           .enabled(if: fixtureExists("restart-witness-av.mp4"),
                    "run Scripts/fetch-fixtures.sh to generate the witness clip"),
-          .timeLimit(.minutes(2)))
+          .timeLimit(.minutes(4)))
     func restartReproducesContinuousTimeline() throws {
         let engine = HLSVideoEngine(url: fixtureURL("restart-witness-av.mp4"), dvModeAvailable: false)
         _ = try engine.start()
@@ -141,8 +141,9 @@ struct RestartTimelineContinuityTests {
 
         engine.requestRestart(at: 1)
 
-        // The restarted producer rewrites seg-1 via rename(2), which changes the inode.
-        let deadline = Date().addingTimeInterval(30)
+        // The restarted producer rewrites seg-1 via rename(2), which changes the inode. A sync test
+        // cannot await, so this bound stays, sized as a hang catcher rather than an expectation.
+        let deadline = Date().addingTimeInterval(120)
         var rewritten = false
         while Date() < deadline {
             if let url = prov.mediaSegmentURL(at: 1), inode(of: url) != inodeBefore {
@@ -151,7 +152,7 @@ struct RestartTimelineContinuityTests {
             }
             usleep(50_000)
         }
-        try #require(rewritten, "restarted producer did not rewrite seg-1 within 30s")
+        try #require(rewritten, "restarted producer did not rewrite seg-1 within 120s")
 
         let restarted = try #require(prov.mediaSegment(at: 1))
         let restartedTrafs = FMP4.trafSummaries(of: restarted)
@@ -222,7 +223,7 @@ struct SubtitlePumpTapTests {
     @Test("Producing segments fills the native cue stores via the pump tap alone",
           .enabled(if: fixtureExists("restart-witness-subs.mkv"),
                    "run Scripts/fetch-fixtures.sh to generate the witness clip"),
-          .timeLimit(.minutes(2)))
+          .timeLimit(.minutes(5)))
     func pumpTapFillsStores() throws {
         let engine = HLSVideoEngine(url: fixtureURL("restart-witness-subs.mkv"), dvModeAvailable: false)
         engine.requestNativeSubtitleTrack()
@@ -239,7 +240,8 @@ struct SubtitlePumpTapTests {
         // tap set was armed after the producer's init had already discarded the subtitle streams,
         // so only two open-time cues ever arrived).
         let store = try #require(engine.nativeSubtitleCueStoresForSession.first)
-        let deadline = Date().addingTimeInterval(10)
+        // Sync test, so bounded; both bounds are hang catchers, not expectations.
+        let deadline = Date().addingTimeInterval(120)
         while store.readMaxCueEnd() < 11.0, Date() < deadline { usleep(50_000) }
         #expect(store.readMaxCueEnd() >= 11.0,
                 "pump tap coverage stalled at \(store.readMaxCueEnd())s of ~12s produced")
@@ -252,7 +254,7 @@ struct SubtitlePumpTapTests {
 
         // And a producer restart must keep harvesting: re-produce seg-1 and confirm coverage stays.
         engine.requestRestart(at: 1)
-        let redeadline = Date().addingTimeInterval(15)
+        let redeadline = Date().addingTimeInterval(120)
         while store.readMaxCueEnd() < 11.0, Date() < redeadline { usleep(50_000) }
         #expect(store.readMaxCueEnd() >= 11.0, "coverage lost after a producer restart")
     }
@@ -260,7 +262,7 @@ struct SubtitlePumpTapTests {
 
 // MARK: - Tap overlay markup handling (Sodalite#32 Phase 2)
 
-@Suite("ASS markup strip for the WebVTT rendition")
+@Suite("ASS markup strip for the WebVTT rendition", .offCooperativePool)
 struct ASSMarkupStripTests {
 
     @Test("A raw ASS event line strips to plain text")

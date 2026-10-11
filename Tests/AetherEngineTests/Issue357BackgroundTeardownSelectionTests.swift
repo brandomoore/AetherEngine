@@ -27,6 +27,16 @@ struct Issue357BackgroundTeardownSelectionTests {
         engine.stopInternal(resetDisplayCriteria: false, keepNativeHost: true, keepCustomReader: true)
     }
 
+    @Test("foreground restore is owed only after video teardown")
+    func restoreRequiresTeardown() throws {
+        let engine = try AetherEngine()
+        #expect(!engine.needsForegroundVideoRestore)
+        backgroundTeardown(engine)
+        #expect(engine.needsForegroundVideoRestore)
+        _ = engine.consumeReloadSelection()
+        #expect(!engine.needsForegroundVideoRestore)
+    }
+
     @Test("the selection stopInternal wipes is still there for the reload that follows minutes later")
     func teardownHandsSelectionToReload() throws {
         let engine = try AetherEngine()
@@ -168,12 +178,20 @@ struct Issue357BackgroundTeardownSelectionTests {
         let engine = try AetherEngine()
         engine.nativeHost = NativeAVPlayerHost()
         engine.playbackBackend = .native
+        let surface = AetherPlayerView(frame: .zero)
+        engine.bind(view: surface)
+        let layer = engine.nativePlayerLayer
+        #expect(layer?.superlayer != nil)
 
         backgroundTeardown(engine)
 
         // The teardown preserves the host on purpose: AVKit registers its Now-Playing client once
         // per AVPlayer instance (issue #15), so the instance has to outlive the suspension.
         #expect(engine.nativeHost != nil)
+        #expect(engine.nativePlayerLayer === layer)
+        #expect(layer?.superlayer != nil)
+        #expect(!engine.isSessionReady)
+        #expect(!engine.hasFirstFrameReadyForDisplay)
         // And it resets the backend, which is the state the foreground reload's load() reads.
         #expect(engine.playbackBackend == .none)
         // Reading the backend alone answered "nothing native here" and threw the kept host away.

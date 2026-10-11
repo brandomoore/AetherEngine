@@ -33,7 +33,8 @@ struct ClosedCaptionTapA53Tests {
     /// Regression for the tap-identity guard: `notifyA53CaptionsDetected` must surface the synthetic
     /// track exactly once, and a stray tap that is never assigned to `engine.closedCaptionTap` (a
     /// torn-down or superseded session's tap) must not resurrect or duplicate it.
-    @Test("Detection surfaces the synthetic track exactly once, even across a repeat and a stray tap")
+    @Test("Detection surfaces the synthetic track exactly once, even across a repeat and a stray tap",
+          .timeLimit(.minutes(2)))
     func onceOnlyNotify() async throws {
         let engine = try AetherEngine()
         let tap = ClosedCaptionTap(engine: engine, ccStreamIndex: Int32(AetherEngine.a53ClosedCaptionTrackID))
@@ -43,12 +44,7 @@ struct ClosedCaptionTapA53Tests {
         tap.ingestA53Ordered([triplet], ptsSeconds: 1.0)
         tap.ingestA53Ordered([triplet], ptsSeconds: 2.0)
 
-        let deadline = Date().addingTimeInterval(2)
-        while !engine.subtitleTracks.contains(where: { $0.id == AetherEngine.a53ClosedCaptionTrackID }),
-              Date() < deadline {
-            await Task.yield()
-            try await Task.sleep(nanoseconds: 20_000_000)
-        }
+        try await waitFor { engine.subtitleTracks.contains { $0.id == AetherEngine.a53ClosedCaptionTrackID } }
         #expect(engine.subtitleTracks.filter { $0.id == AetherEngine.a53ClosedCaptionTrackID }.count == 1)
 
         // A tap never assigned as the engine's active tap (stale/torn-down session): its detection

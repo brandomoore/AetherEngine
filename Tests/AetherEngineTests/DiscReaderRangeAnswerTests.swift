@@ -6,7 +6,7 @@ import Foundation
 /// the whole body, so an origin that ignored Range (or answered `bytes N-EOF`) put a 40 GB image
 /// into memory before the check could refuse it. The check now runs at the response head, and what
 /// is kept is capped at the range that was asked for.
-@Suite("Disc reader range answers")
+@Suite("Disc reader range answers", .offCooperativePool)
 struct DiscReaderRangeAnswerTests {
 
     private let total = Int64(512 * 1024 * 1024)

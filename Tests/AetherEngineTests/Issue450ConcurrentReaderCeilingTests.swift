@@ -45,12 +45,11 @@ struct Issue450ConcurrentReaderCeilingTests {
         }
     }
 
-    private static func read(_ reader: AVIOReader, bytes target: Int, deadline: TimeInterval) -> Int {
+    private static func read(_ reader: AVIOReader, bytes target: Int) -> Int {
         let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: target)
         defer { buf.deallocate() }
         var got = 0
-        let stopAt = Date().addingTimeInterval(deadline)
-        while got < target && Date() < stopAt {
+        while got < target {
             let n = reader.read(into: buf, size: Int32(target - got))
             if n <= 0 { break }
             got += Int(n)
@@ -85,6 +84,8 @@ struct Issue450ConcurrentReaderCeilingTests {
         defer { session.invalidateAndCancel() }
 
         Self.fireOpenEnded(session, port: server.port, count: 3)
+        try await waitFor { Self.pathsSeen(server).count >= 2 }
+        // The window the third request is given to show up and must not use.
         try await Task.sleep(for: .seconds(5))
 
         #expect(Self.pathsSeen(server).count == 2,
@@ -102,7 +103,7 @@ struct Issue450ConcurrentReaderCeilingTests {
         defer { session.invalidateAndCancel() }
 
         Self.fireOpenEnded(session, port: server.port, count: 3)
-        try await Task.sleep(for: .seconds(5))
+        try await waitFor { Self.pathsSeen(server).count >= 3 }
 
         #expect(Self.pathsSeen(server).count == 3,
                 "an open-ended request was parked by the long-lived pool: \(Self.pathsSeen(server))")
@@ -180,8 +181,8 @@ struct Issue450ConcurrentReaderCeilingTests {
 
         // Let the first range complete, then consume enough to put the refill on the wire. That
         // refill is the generation that receives headers and no body.
-        try await waitFor(upTo: .seconds(10)) { !reader.hasLiveConnectionForTesting }
-        #expect(Self.read(reader, bytes: 512 * 1024, deadline: 10) == 512 * 1024)
+        try await waitFor { !reader.hasLiveConnectionForTesting }
+        #expect(Self.read(reader, bytes: 512 * 1024) == 512 * 1024)
         // The capture sees every reader in the process, so the reader's own label picks its line.
         func reported() -> [String] { sink.matching(label).filter { $0.contains("no first byte after") } }
         try await waitFor { !reported().isEmpty }

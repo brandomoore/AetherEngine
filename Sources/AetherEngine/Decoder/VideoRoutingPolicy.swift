@@ -14,6 +14,7 @@ enum VideoRoutingPolicy {
 
     /// True when a video codec must use the software decode path (SoftwarePlaybackHost) instead of
     /// native AVPlayer. `av1Available` is `VTCapabilityProbe.av1Available` (HW AV1 decode support).
+    /// Evaluated only for AV1; registering its decoder must not delay unrelated formats.
     /// #150: `spsIndicatesInterlaced` (SPS frame_mbs_only_flag == 0) breaks the tie when the demuxer's
     /// field_order probe stays UNKNOWN; a concrete PROGRESSIVE probe analyzed actual frames and wins.
     /// A false positive costs an unnecessary SW decode (deint=interlaced passes progressive frames
@@ -30,7 +31,7 @@ enum VideoRoutingPolicy {
     static func requiresSoftwarePath(
         codecID: AVCodecID,
         fieldOrder: AVFieldOrder,
-        av1Available: Bool,
+        av1Available: @autoclosure () -> Bool,
         spsIndicatesInterlaced: Bool = false,
         stereo3DType: AVStereo3DType? = nil
     ) -> Bool {
@@ -38,7 +39,7 @@ enum VideoRoutingPolicy {
         case AV_CODEC_ID_NONE, AV_CODEC_ID_HEVC:
             return false
         case AV_CODEC_ID_AV1:
-            return !av1Available
+            return !av1Available()
         case AV_CODEC_ID_H264:
             if routesSoftwareForMultiviewCarriage(codecID: codecID, stereo3DType: stereo3DType) {
                 return true

@@ -4,7 +4,7 @@ import Foundation
 
 /// A ranged answer is only trusted as far as it matches what was asked: it has to start at the
 /// requested offset (audit DMX-5), and nothing past the requested end is kept (audit DMX-1).
-@Suite("Ranged response integrity")
+@Suite("Ranged response integrity", .offCooperativePool)
 struct RangedResponseIntegrityTests {
 
     private final class FirstRequestAt: @unchecked Sendable {
@@ -49,8 +49,18 @@ struct RangedResponseIntegrityTests {
         #expect(readExact(reader, 64 * 1024) != nil)
 
         try await waitFor { !reader.hasLiveConnectionForTesting }
-        #expect(reader.windowBytesForTesting <= Int(firstRange),
-                "the window held \(reader.windowBytesForTesting)B of a \(firstRange)B range")
+        // The read above may itself have drawn the window below low water after the range ended,
+        // which is the ordinary way a bounded read moves on, and the refill can have landed before
+        // this looks. What over-delivery would break is where that refill starts: excess kept in the
+        // window moves the frontier past the range end. So any refill starts exactly at it, and
+        // without one the window still holds no more than the range.
+        let tail = Int64(512 * 1024 * 1024) - Int64(AVIOReader.tailPrefetchBytes)
+        let refills = server.requestLog.map(\.start).filter { $0 > 1 && $0 != tail }
+        #expect(refills.allSatisfy { $0 == firstRange }, "refills at \(refills), the range ended at \(firstRange)")
+        if refills.isEmpty {
+            #expect(reader.windowBytesForTesting <= Int(firstRange),
+                    "the window held \(reader.windowBytesForTesting)B of a \(firstRange)B range")
+        }
     }
 
     @Test("a persistent 206 that starts elsewhere is refused, not placed at the requested offset",

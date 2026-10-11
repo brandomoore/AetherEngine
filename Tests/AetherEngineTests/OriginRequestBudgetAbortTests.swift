@@ -9,6 +9,19 @@ import Foundation
 @Suite("Origin request budget abort", .serialized)
 struct OriginRequestBudgetAbortTests {
 
+    @Test("a strict metadata caller never overcommits a full origin on timeout")
+    func strictSlotTimeout() {
+        let budget = OriginRequestBudget()
+        budget.setHostLimit(1, for: url)
+        let held = budget.acquire(for: url, label: "holder", timeout: 1)
+        defer { budget.release(held) }
+        let refused = budget.acquire(for: url, label: "metadata", timeout: 0.01, allowOvercommit: false)
+        #expect(refused == nil)
+        #expect(budget.snapshot(for: url)?.inflight == 1)
+        #expect(budget.snapshot(for: url)?.peakInflight == 1)
+        #expect(budget.snapshot(for: url)?.waiting == 0)
+    }
+
     private let url = URL(string: "https://abort.example.com:443/movie.mkv")!
 
     private final class Flag: @unchecked Sendable {

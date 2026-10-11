@@ -46,6 +46,15 @@ jobs:
       - name: swift test
         run: swift test
 
+      # The same Swift Testing suite on a ONE-thread cooperative pool. Anything that blocks a pool
+      # thread (a sync read, a semaphore, a `Task.detached` around engine I/O) starves every other
+      # test here deterministically, instead of a different victim timing out on some later run of
+      # the 3-core runner. See docs/architecture.md, "Blocking work and the cooperative pool".
+      - name: swift test (one-thread cooperative pool)
+        env:
+          LIBDISPATCH_COOPERATIVE_POOL_STRICT: "1"
+        run: swift test --skip-build --disable-xctest
+
       - name: Software VOD packet-cache regressions
         run: |
           bash Scripts/test-software-packet-coverage.sh

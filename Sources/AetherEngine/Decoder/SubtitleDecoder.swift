@@ -87,7 +87,7 @@ enum SubtitleDecoder {
         // Bridge cancellation explicitly via CancelFlag so the decode loop + AVIO reader abort promptly.
         let token = CancelFlag()
         return try await withTaskCancellationHandler {
-            try await Task.detached(priority: .userInitiated) {
+            try await BlockingWork.detached(priority: .userInitiated) {
                 try decodeFileSync(
                     url: url, httpHeaders: httpHeaders,
                     preserveASSMarkup: preserveASSMarkup, requested: requested, cancel: token

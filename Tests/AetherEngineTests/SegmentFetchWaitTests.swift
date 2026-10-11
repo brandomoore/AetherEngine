@@ -8,6 +8,7 @@ import Foundation
 /// stale index against the coalescer's newer target, and a re-request for the index a restart
 /// JUST targeted must wait for the fresh producer instead of tearing it down (device: three
 /// back-to-back restarts at the same index, one dropped frame each).
+@Suite(.offCooperativePool)
 struct SegmentFetchWaitTests {
 
     private final class Recorder: @unchecked Sendable {
@@ -375,7 +376,7 @@ extension SegmentFetchWaitTests {
         cache.store(index: 50, data: Data(repeating: 0x50, count: 8))
         let provider = makeCoverageProvider(
             cache: cache, recorder: recorder, producerBase: 55,
-            sparseHoleWaitSlice: 2.0, storeOnRestart: true)
+            sparseHoleWaitSlice: 30.0, storeOnRestart: true)
 
         let start = DispatchTime.now()
         let served = provider.mediaSegment(at: 40)
@@ -384,7 +385,8 @@ extension SegmentFetchWaitTests {
 
         #expect(served != nil)
         #expect(recorder.all == [40])
-        #expect(elapsed < 0.5)
+        // A waiting fetch would sit out the whole 30 s slice; 10 s leaves a loaded runner room.
+        #expect(elapsed < 10)
     }
 
     @Test("an interior sparse-cache hole waits when the active producer covers it")
@@ -395,15 +397,15 @@ extension SegmentFetchWaitTests {
         cache.store(index: 0, data: Data(repeating: 0x10, count: 8))
         cache.store(index: 50, data: Data(repeating: 0x50, count: 8))
         // Use a kernel-scheduled thread rather than a GCD timer: the macOS CI runner
-        // can starve global-queue timers past this test's 500 ms wait slice when the
-        // Swift Testing suites run concurrently.
+        // can starve global-queue timers past a short wait slice when the Swift Testing
+        // suites run concurrently. The slice returns as soon as the segment lands.
         Thread.detachNewThread {
             Thread.sleep(forTimeInterval: 0.05)
             cache.store(index: 40, data: Data(repeating: 0x40, count: 8))
         }
         let provider = makeCoverageProvider(
             cache: cache, recorder: recorder, producerBase: 38,
-            sparseHoleWaitSlice: 0.5)
+            sparseHoleWaitSlice: 30.0)
 
         let served = provider.mediaSegment(at: 40)
 

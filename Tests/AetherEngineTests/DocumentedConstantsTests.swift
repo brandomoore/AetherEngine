@@ -216,9 +216,41 @@ final class DocumentedConstantsTests: XCTestCase {
         assertDocumented("Two channels or fewer have no surround to carry", docs)
     }
 
+    // MARK: - The Atmos rendition's CHANNELS value
+
+    /// docs/formats.md and docs/architecture.md both print the CHANNELS value a stream-copied
+    /// E-AC-3 JOC rendition is advertised with, and the object count in it is the part a reader
+    /// checks against Dolby's delivery kit. If the engine ever sources it from the `dec3` box's
+    /// `complexity_index_type_a` instead of stating it, both sentences stop being true at once.
+    func testAtmosRenditionChannelsValueIsWhatTheDocsSay() throws {
+        let docs = try documentation()
+        XCTAssertEqual(VideoSegmentProvider.atmosChannelsAttribute, "16/JOC",
+                       "documented as the object count, a slash, then JOC")
+        assertDocumented(#"`CHANNELS="16/JOC"`"#, docs)
+    }
+
     // MARK: - External subtitle ids
 
     /// A host tells its own tracks from the engine's by this base, and docs/api.md prints the number.
+    /// docs/api.md and formats.md quote the APAC rate, the limiter and the bed log cadence (#731).
+    func testTrueHDAtmosNumbersAreWhatTheDocsSay() throws {
+        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
+        let docs = try documentation()
+        XCTAssertEqual(SpatialAudioBridge.bitRatePerChannel, 320_000)
+        assertDocumented("320 kbps per bed channel", docs)
+        XCTAssertEqual(PeakLimiter.threshold, 0.98)
+        assertDocumented("nothing leaves above −0.18 dBFS", docs)
+        XCTAssertEqual(PeakLimiter.releaseSeconds, 0.25)
+        assertDocumented("a 250 ms release", docs)
+        XCTAssertEqual(BedLevelMeter.firstWindowSeconds, 5)
+        XCTAssertEqual(BedLevelMeter.windowSeconds, 30)
+        assertDocumented("after the first 5 s of audio (and again after every seek), then every 30 s", docs)
+        XCTAssertEqual(SpatialAudioBridge.silentFeedPacketThreshold, 1200)
+        assertDocumented("returns nothing for 1200 packets in a row, a second of TrueHD", docs)
+        XCTAssertEqual(APACSampleEntry.codecsString(channelCount: 12), "apac.31.03")
+        XCTAssertEqual(APACSampleEntry.codecsString(channelCount: 16), "apac.31.04")
+    }
+
     func testExternalSubtitleTrackIDBaseIsDocumented() throws {
         let docs = try documentation()
         XCTAssertEqual(AetherEngine.externalSubtitleTrackIDBase, 100_000)

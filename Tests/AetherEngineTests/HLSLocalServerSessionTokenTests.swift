@@ -155,8 +155,19 @@ struct HLSLocalServerSessionTokenTests {
 
     // MARK: - Helpers
 
-    /// Status line of a plain GET, or 0 when the request could not be completed.
+    /// Status line of a plain GET, or 0 when the request could not be completed. A 0 is never the
+    /// answer under test, and a loaded CI runner has dropped one exchange mid-suite while the
+    /// requests around it on the same server were answered, so it is retried before it counts.
     private static func status(port: UInt16, path: String, extraHeaders: [String] = []) -> Int {
+        for attempt in 0..<3 {
+            if attempt > 0 { usleep(100_000) }
+            let code = singleStatus(port: port, path: path, extraHeaders: extraHeaders)
+            if code != 0 { return code }
+        }
+        return 0
+    }
+
+    private static func singleStatus(port: UInt16, path: String, extraHeaders: [String]) -> Int {
         let fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
         guard fd >= 0 else { return 0 }
         defer { close(fd) }

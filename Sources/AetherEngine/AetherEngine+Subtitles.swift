@@ -280,7 +280,7 @@ extension AetherEngine {
         subtitleDrainTickSerial &+= 1
         let serial = subtitleDrainTickSerial
         subtitleDrainTickInFlight = Task { [weak self] in
-            let events = await Task.detached(priority: .userInitiated) { handoff.decode() }.value
+            let events = await BlockingWork.detached(priority: .userInitiated) { handoff.decode() }.value
             guard let self, self.subtitleDrainTickSerial == serial else { return }
             self.subtitleDrainTickInFlight = nil
             self.finishSubtitleDrainTick(work, events: events)
@@ -740,7 +740,7 @@ extension AetherEngine {
         let titleID = activeDiscTitleID
         subtitleForwardPrefetchActiveLead = lead
         let link = SideReaderLinkArbiter(gate: sideReaderLinkGate)
-        subtitleForwardPrefetchTask = Task.detached(priority: .utility) { [weak self] in
+        subtitleForwardPrefetchTask = BlockingWork.detached(priority: .utility) { [weak self] in
             // #231: the loop used to end on the first failed read and only a seek or producer
             // re-anchor could bring it back, so a viewer who does not seek lost every cue beyond
             // the pump's own park for the rest of the session, silently. Restart on a read error,
@@ -1458,7 +1458,7 @@ extension AetherEngine {
             stores: session.nativeSubtitleCueStoresForSession,
             defaultHeaders: loadedOptions.httpHeaders)
         guard !jobs.isEmpty else { return }
-        externalNativeStoreFillTask = Task.detached(priority: .utility) { [jobs] in
+        externalNativeStoreFillTask = BlockingWork.detached(priority: .utility) { [jobs] in
             for job in jobs {
                 if Task.isCancelled { return }
                 await AetherEngine.runExternalSubtitleFill(job: job)
@@ -1746,13 +1746,25 @@ extension AetherEngine {
         let w = sourceVideoWidth > 0 ? sourceVideoWidth : 1920
         let h = sourceVideoHeight > 0 ? sourceVideoHeight : 1080
         let startAt = startAtSeconds ?? sourceTime
+        // Sodalite#156: the anchor next to the playhead it is supposed to mean. `sourceTime` is
+        // written on the native path only by the render sink and by seek landings, never by the clock
+        // tick (#49), and while an external screen holds the picture nothing renders locally. A
+        // reader anchored on a stale or zero source time refills from the head of the file and then
+        // serves empty .vtt for the window the receiver is actually asking for, which is a caption
+        // box with nothing in it. These two numbers disagreeing is that defect; them agreeing means
+        // the reader simply has not caught up yet, which is a different problem with a different fix.
+        EngineLog.emit("[AetherEngine] #156 reader anchor: startAt=\(String(format: "%.2f", startAt))s "
+                       + "sourceTime=\(String(format: "%.2f", sourceTime))s "
+                       + "clock=\(String(format: "%.2f", currentTime))s "
+                       + "explicit=\(startAtSeconds.map { String(format: "%.2f", $0) } ?? "nil")",
+                       category: .engine)
         let reader = customClone
         // #76: same bounded-probe + active-title open as the inline reader.
         let probesize = loadedOptions.probesize
         let maxAnalyzeDuration = loadedOptions.maxAnalyzeDuration
         let titleID = activeDiscTitleID
         let link = SideReaderLinkArbiter(gate: sideReaderLinkGate)
-        nativeSubtitleReadersTask = Task.detached(priority: .utility) { [weak self] in
+        nativeSubtitleReadersTask = BlockingWork.detached(priority: .utility) { [weak self] in
             await self?.runNativeSubtitleReaders(
                 url: url, reader: reader, formatHint: formatHint, headers: headers,
                 pairs: pairs, startAt: startAt, videoWidth: w, videoHeight: h,

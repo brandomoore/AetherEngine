@@ -7,7 +7,7 @@ import Foundation
 /// took the last slot and the inner acquire waited its whole four second budget for it: +4 s per
 /// block, and a third request on the books against a limit of two. A reader that already holds a
 /// ticket must never block on another, so the detour holds one.
-@Suite("Detour origin ticket", .serialized)
+@Suite("Detour origin ticket", .serialized, .offCooperativePool)
 struct DetourOriginTicketTests {
 
     @Test("a detour block behind a pump holding one of two slots takes one slot and no wait",

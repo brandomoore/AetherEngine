@@ -7,6 +7,7 @@ import Foundation
 /// stalled chunk read froze the FrameExtractor's serial decode queue and pinned the
 /// scrub-preview image. The abortable wait must bail promptly when a read is
 /// superseded (deadline/closed), bounded by a small budget instead of 35s.
+@Suite(.offCooperativePool)
 struct AVIOReaderAbortableWaitTests {
 
     @Test("awaitSignal returns .signaled when the semaphore fires")

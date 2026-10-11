@@ -16,7 +16,7 @@ final class DeinterlaceHardwareWarmup: @unchecked Sendable {
     private let task: Task<Outcome, Never>
 
     init(operation: @escaping Operation) {
-        task = Task.detached(priority: .userInitiated) {
+        task = BlockingWork.detached(priority: .userInitiated) {
             let started = DispatchTime.now()
             EngineLog.emit(
                 "[Deinterlace] hardware warm-up started",

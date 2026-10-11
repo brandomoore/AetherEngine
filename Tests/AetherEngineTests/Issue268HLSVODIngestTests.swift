@@ -287,6 +287,49 @@ final class Issue268HLSVODIngestTests: XCTestCase {
         )
     }
 
+    func testCarriageProbeAcceptsPrivatePESRegisteredAsHEVC() {
+        let hevc: [UInt8] = [0x05, 0x04, 0x48, 0x45, 0x56, 0x43]
+        XCTAssertEqual(
+            MPEGTransportStreamCodecProbe.classify(transportStream(streamType: 0x06, descriptors: hevc)),
+            .hevcInMPEGTS
+        )
+        XCTAssertEqual(
+            MPEGTransportStreamCodecProbe.classify(
+                transportStream(streamType: 0x06, descriptors: [0x0A, 0x04, 0x65, 0x6E, 0x67, 0x00] + hevc)),
+            .hevcInMPEGTS,
+            "the registration is found behind an unrelated descriptor"
+        )
+        XCTAssertEqual(
+            MPEGTransportStreamCodecProbe.classify(transportStream(streamType: 0x24, descriptors: hevc)),
+            .hevcInMPEGTS
+        )
+    }
+
+    func testCarriageProbeIgnoresPrivatePESWithoutHEVCRegistration() {
+        let cases: [(String, [UInt8], Int?)] = [
+            ("no descriptor", [], nil),
+            ("another format identifier", [0x05, 0x04, 0x4B, 0x4C, 0x56, 0x41], nil),
+            ("HEVC bytes under another tag", [0x0A, 0x04, 0x48, 0x45, 0x56, 0x43], nil),
+            ("registration shorter than a format identifier", [0x05, 0x03, 0x48, 0x45, 0x56], nil),
+            ("descriptor longer than its ES_info loop", [0x05, 0x04, 0x48, 0x45, 0x56, 0x43], 4),
+            ("ES_info loop longer than the section", [0x05, 0x04, 0x48, 0x45, 0x56, 0x43], 40),
+        ]
+        for (label, descriptors, declaredLength) in cases {
+            XCTAssertEqual(
+                MPEGTransportStreamCodecProbe.classify(
+                    transportStream(streamType: 0x06, descriptors: descriptors, declaredInfoLength: declaredLength)),
+                .otherCarriage,
+                label
+            )
+        }
+        XCTAssertEqual(
+            MPEGTransportStreamCodecProbe.classify(
+                transportStream(streamType: 0x1B, descriptors: [0x05, 0x04, 0x48, 0x45, 0x56, 0x43])),
+            .otherCarriage,
+            "the registration only reinterprets private PES"
+        )
+    }
+
     func testCarriageProbeWithoutEvidenceStaysInconclusive() {
         XCTAssertEqual(MPEGTransportStreamCodecProbe.classify(Data()), .inconclusive)
         XCTAssertEqual(
@@ -330,6 +373,22 @@ final class Issue268HLSVODIngestTests: XCTestCase {
         var bytes = transportStream(streamType: streamType)
         bytes[Self.markerOffset] = marker
         return bytes
+    }
+
+    /// `declaredInfoLength` overrides the ES_info_length the PMT announces, to build loops whose
+    /// bounds disagree with their descriptors.
+    private func transportStream(
+        streamType: UInt8,
+        descriptors: [UInt8],
+        declaredInfoLength: Int? = nil
+    ) -> Data {
+        var bytes = [UInt8](transportStream(streamType: streamType))
+        bytes[7] = UInt8(18 + descriptors.count)
+        let infoLength = declaredInfoLength ?? descriptors.count
+        bytes[20] = 0xF0 | UInt8(infoLength >> 8)
+        bytes[21] = UInt8(infoLength & 0xFF)
+        bytes.replaceSubrange(22..<(22 + descriptors.count), with: descriptors)
+        return Data(bytes)
     }
 
     private func transportStream(streamType: UInt8) -> Data {

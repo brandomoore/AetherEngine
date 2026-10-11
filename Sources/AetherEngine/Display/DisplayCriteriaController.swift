@@ -72,8 +72,14 @@ final class DisplayCriteriaController {
 
     /// #133 pure decision: skip only when we previously applied (`didApply`) exactly these criteria and have
     /// not reset since. Otherwise write, returning whether a dynamic-range switch is expected (HDR) or not (SDR).
-    nonisolated static func applyOutcome(didApply: Bool, last: AppliedCriteria?, target: AppliedCriteria) -> ApplyResult {
-        if didApply, last == target { return .unchanged }
+    ///
+    /// AE#678: `managerHoldsCriteria` is the display manager's own answer. A host that wrote
+    /// `preferredDisplayCriteria = nil` itself (leaving full screen for a preview) leaves `lastApplied`
+    /// describing criteria the panel no longer has, and the skip then kept the UI mode on a channel that
+    /// needed its frame rate.
+    nonisolated static func applyOutcome(didApply: Bool, last: AppliedCriteria?, target: AppliedCriteria,
+                                         managerHoldsCriteria: Bool = true) -> ApplyResult {
+        if didApply, managerHoldsCriteria, last == target { return .unchanged }
         return target.isHDR ? .willSwitch : .applied
     }
 
@@ -794,7 +800,15 @@ final class DisplayCriteriaController {
                 category: .engine
             )
         }
-        if case .unchanged = Self.applyOutcome(didApply: didApply, last: lastApplied, target: target) {
+        let managerHoldsCriteria = displayManager.preferredDisplayCriteria != nil
+        if didApply, !managerHoldsCriteria {
+            EngineLog.emit(
+                "[DisplayCriteria] criteria were cleared outside the engine since its last SET; writing again",
+                category: .engine
+            )
+        }
+        if case .unchanged = Self.applyOutcome(didApply: didApply, last: lastApplied, target: target,
+                                               managerHoldsCriteria: managerHoldsCriteria) {
             // Keep lastCriteriaWasHDR consistent with the still-active criteria for any waitForSwitch classification.
             lastCriteriaWasHDR = isHDR
             EngineLog.emit(

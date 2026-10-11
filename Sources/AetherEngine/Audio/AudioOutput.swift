@@ -9,6 +9,11 @@ final class AudioOutput: @unchecked Sendable {
     let renderer: AVSampleBufferAudioRenderer
     let synchronizer: AVSampleBufferRenderSynchronizer
 
+    /// AE#395: the renderers' axis. Every time this object takes or returns is on the source axis;
+    /// the conversion happens here, at the renderer and synchronizer calls, and in the video renderer
+    /// that shares this timeline.
+    let timeline = RendererTimeline()
+
     private let lock = NSLock()
 
     /// AE#464: the host's audio presentation offset, applied to every buffer on its way into the
@@ -56,6 +61,23 @@ final class AudioOutput: @unchecked Sendable {
         synchronizer.rate
     }
 
+    /// AE#395: the renderer's own view of its queue, for the diagnostic line: `status/sufficient/error`.
+    /// A session that is silent on one route while its clock runs at 1.00 has nothing else that could
+    /// say whether the renderer is playing what it was given, and the renderer error was only ever
+    /// logged in DEBUG builds.
+    var diagRendererState: String {
+        let status: String
+        switch renderer.status {
+        case .rendering: status = "rendering"
+        case .failed: status = "failed"
+        case .unknown: status = "unknown"
+        @unknown default: status = "?"
+        }
+        let sufficient = renderer.hasSufficientMediaDataForReliablePlaybackStart ? "y" : "n"
+        let error = (renderer.error as NSError?).map { "\($0.domain)/\($0.code)" } ?? "-"
+        return "\(status)/\(sufficient)/\(error)"
+    }
+
     /// AE#549: how often this renderer has flushed itself, for the diagnostic line.
     var automaticFlushCount: Int {
         lock.lock()
@@ -93,8 +115,8 @@ final class AudioOutput: @unchecked Sendable {
             queue: nil
         ) { [weak self] note in
             guard let self else { return }
-            let flushedFrom = (note.userInfo?[AVSampleBufferAudioRendererFlushTimeKey] as? NSValue)?
-                .timeValue.seconds
+            let flushedFrom = (note.userInfo?[AVSampleBufferAudioRendererFlushTimeKey] as? NSValue)
+                .map { self.timeline.sourceTime(forRenderer: $0.timeValue).seconds }
             automaticFlushQueue.async { [weak self] in
                 guard let self else { return }
                 lock.lock()
@@ -147,15 +169,26 @@ final class AudioOutput: @unchecked Sendable {
     /// Set playback speed (0.5-2.0). Hosts own rate state (lastRate/pausedByHost); this object is stateless about it.
     func setRate(_ rate: Float) {
         let at = synchronizer.currentTime()
-        EngineLog.emit("[AudioOutput] setRate \(rate) at t=\(String(format: "%.3f", at.seconds))", category: .swPlayback)
+        EngineLog.emit("[AudioOutput] setRate \(rate) at t=\(String(format: "%.3f", timeline.sourceSeconds(forRenderer: at.seconds)))", category: .swPlayback)
         synchronizer.setRate(rate, time: at)
     }
 
     /// Pause audio (and the master clock). Hosts resume via setRate (pausedByHost pattern); deliberately no resume() here.
     func pause() {
         let at = synchronizer.currentTime()
-        EngineLog.emit("[AudioOutput] pause at t=\(String(format: "%.3f", at.seconds))", category: .swPlayback)
+        EngineLog.emit("[AudioOutput] pause at t=\(String(format: "%.3f", timeline.sourceSeconds(forRenderer: at.seconds)))", category: .swPlayback)
         synchronizer.setRate(0.0, time: at)
+    }
+
+    /// Pause the master clock, at `latest` if it has already run past it. A park deferred to the last
+    /// sample runs whenever its task is scheduled, and on a starved main actor that is after the clock
+    /// has walked on (#694: 1.149 s on a 1.0 s source on a CI runner).
+    func pause(notAfter latest: Double) {
+        let now = timeline.sourceTime(forRenderer: synchronizer.currentTime())
+        let seconds = SoftwareEndOfMediaClock.parkSeconds(clockSeconds: CMTimeGetSeconds(now), notAfter: latest)
+        let at = seconds.map { CMTime(seconds: $0, preferredTimescale: 90000) } ?? now
+        EngineLog.emit("[AudioOutput] pause at t=\(String(format: "%.3f", at.seconds))", category: .swPlayback)
+        synchronizer.setRate(0.0, time: timeline.rendererTime(forSource: at))
     }
 
     /// AE#464: set the audio presentation offset. Positive presents audio later than video, which on
@@ -190,7 +223,9 @@ final class AudioOutput: @unchecked Sendable {
             return false
         }
         let offset = presentationOffset
-        let delivered = offset == .zero ? sampleBuffer : Self.retimed(sampleBuffer, by: offset)
+        // AE#395: the lip-sync offset and the move onto the renderer axis are one retime, not two copies.
+        let shift = CMTimeSubtract(offset, timeline.offset(latchingFrom: sampleBuffer))
+        let delivered = shift == .zero ? sampleBuffer : Self.retimed(sampleBuffer, by: shift)
         var offsetLine: String?
         if offset != .zero, !loggedOffsetInEffect, delivered !== sampleBuffer {
             loggedOffsetInEffect = true
@@ -273,8 +308,31 @@ final class AudioOutput: @unchecked Sendable {
     }
 
     var currentTime: CMTime {
-        synchronizer.currentTime()
+        timeline.sourceTime(forRenderer: synchronizer.currentTime())
     }
+
+    /// AE#395: the master clock on the source axis, for an overlay paced against it (#311). The
+    /// synchronizer's own timebase until the origin latches at a non-zero value, then a child of it
+    /// shifted by that origin, which follows every rate change of its parent by construction. Read it
+    /// per use rather than holding it across a session start.
+    var sourceTimebase: CMTimebase {
+        guard let origin = timeline.origin, origin != 0 else { return synchronizer.timebase }
+        lock.lock()
+        defer { lock.unlock() }
+        if let shiftedTimebase { return shiftedTimebase }
+        var child: CMTimebase?
+        guard CMTimebaseCreateWithSourceTimebase(allocator: kCFAllocatorDefault,
+                                                 sourceTimebase: synchronizer.timebase,
+                                                 timebaseOut: &child) == noErr,
+              let child,
+              CMTimebaseSetRateAndAnchorTime(child, rate: 1, anchorTime: RendererTimeline.cmTime(origin),
+                                             immediateSourceTime: .zero) == noErr else {
+            return synchronizer.timebase
+        }
+        shiftedTimebase = child
+        return child
+    }
+    private var shiftedTimebase: CMTimebase?
 
     var currentTimeSeconds: Double {
         let t = CMTimeGetSeconds(currentTime)
@@ -311,6 +369,6 @@ final class AudioOutput: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         EngineLog.emit("[AudioOutput] seekClock to=\(String(format: "%.3f", time.seconds)) rate=\(rate)", category: .swPlayback)
-        synchronizer.setRate(rate, time: time)
+        synchronizer.setRate(rate, time: timeline.rendererTime(forSource: time))
     }
 }

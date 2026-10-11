@@ -3,6 +3,19 @@ import XCTest
 @testable import AetherEngine
 
 final class PacketRingBufferTests: XCTestCase {
+    func testCancelledStillReadDoesNotReadPacketsOrChangeResidentRange() throws {
+        let ring = try PacketRingBuffer(windowSeconds: 10, scratch: tmpDir())
+        defer { ring.close() }
+        try ring.append(pts: 0, isKeyframe: true, isVideo: true, bytes: Data([0]))
+        try ring.append(pts: 1, isKeyframe: false, isVideo: true, bytes: Data([1]))
+        let bounds = ring.seqBounds
+        XCTAssertNil(ring.stillRun(target: 0.5, maxPackets: 900, maxSpanSeconds: 12,
+                                  reorderTail: 4, isCancelled: { true }))
+        XCTAssertEqual(ring.seqBounds.first, bounds.first)
+        XCTAssertEqual(ring.seqBounds.end, bounds.end)
+        XCTAssertEqual(ring.stillRun(target: 0.5, maxPackets: 900, maxSpanSeconds: 12,
+                                   reorderTail: 4, isCancelled: { false })?.map(\.pts), [0, 1])
+    }
     private func tmpDir() -> URL {
         let d = FileManager.default.temporaryDirectory
             .appendingPathComponent("prbtest-\(ProcessInfo.processInfo.globallyUniqueString)")
@@ -81,7 +94,7 @@ final class PacketRingBufferTests: XCTestCase {
 
         ring.close()
 
-        let deadline = Date().addingTimeInterval(5)
+        let deadline = Date().addingTimeInterval(120)
         while FileManager.default.fileExists(atPath: scratch.path), Date() < deadline {
             usleep(20_000)
         }

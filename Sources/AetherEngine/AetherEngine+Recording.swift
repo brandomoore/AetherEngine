@@ -126,7 +126,7 @@ extension AetherEngine {
         let previous = recordingFinish
         recordingFinish = Task { [weak self] in
             await previous?.value
-            let failure = await Task.detached(priority: .utility) { writer.finish(reason: reason) }.value
+            let failure = await BlockingWork.detached(priority: .utility) { writer.finish(reason: reason) }.value
             guard let self, self.recordingGeneration == generation else { return }
             if let failure {
                 self.recordingState = .failed(failure)

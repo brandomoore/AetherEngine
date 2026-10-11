@@ -6,6 +6,16 @@ import Foundation
 /// concatenating two heap copies. The reader must present exactly the bytes the concatenation did.
 @Suite("Scrub thumbnail segment mapping")
 struct ScrubThumbnailSegmentMappingTests {
+    @Test("absolute and restarted segment PTS use byte epoch normalization and display origin")
+    func previewActualTimeMapping() {
+        let absolute = ScrubSegmentTime.displayTime(rawPTS: 902.04, carriedOffset: 0, displayOrigin: 780)
+        #expect(absolute.map { abs($0 - 122.04) < 0.000001 } == true)
+        let restarted = ScrubSegmentTime.displayTime(rawPTS: 2.04, carriedOffset: 900, displayOrigin: 780)
+        #expect(restarted.map { abs($0 - 122.04) < 0.000001 } == true)
+        let composition = ScrubSegmentTime.displayTime(rawPTS: 10.12, carriedOffset: 889.92, displayOrigin: 780)
+        #expect(composition.map { abs($0 - 120.04) < 0.000001 } == true)
+        #expect(ScrubSegmentTime.displayTime(rawPTS: .nan, carriedOffset: 0, displayOrigin: 780) == nil)
+    }
 
     private func readAll(_ reader: DataIOReader, chunk: Int32) -> [UInt8] {
         var out: [UInt8] = []
@@ -50,12 +60,12 @@ struct ScrubThumbnailSegmentMappingTests {
         let initBytes: [UInt8] = [1, 2, 3, 4]
 
         let source = HLSVideoEngine.ScrubThumbnailSource(
-            segmentIndex: 3, initData: Data(initBytes), segmentURL: segURL)
+            segmentIndex: 3, startSeconds: 12, durationSeconds: 4, carriedOffset: 0, identity: "fixture-3", initData: Data(initBytes), segmentURL: segURL)
         let reader = try #require(source.makeReader())
         #expect(readAll(reader, chunk: 1000) == initBytes + segBytes)
 
         let missing = HLSVideoEngine.ScrubThumbnailSource(
-            segmentIndex: 4, initData: Data(initBytes), segmentURL: dir.appendingPathComponent("gone.m4s"))
+            segmentIndex: 4, startSeconds: 16, durationSeconds: 4, carriedOffset: 0, identity: "fixture-4", initData: Data(initBytes), segmentURL: dir.appendingPathComponent("gone.m4s"))
         #expect(missing.makeReader() == nil, "an evicted segment is a nil still, not a crash")
     }
 }

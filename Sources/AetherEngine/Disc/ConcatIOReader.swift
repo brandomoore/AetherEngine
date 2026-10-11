@@ -90,3 +90,9 @@ final class ConcatIOReader: IOReader, @unchecked Sendable {
                               extents: extents.map { (offset: $0.offset, length: $0.length) })
     }
 }
+
+extension ConcatIOReader: SourceTransferCounting {
+    /// The base reader's count: the extent map adds no transfer of its own, and over a remote disc
+    /// image every byte it serves was pulled by the base.
+    var sourceBytesFetched: Int64 { (base as? SourceTransferCounting)?.sourceBytesFetched ?? 0 }
+}

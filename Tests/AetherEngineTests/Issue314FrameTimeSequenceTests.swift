@@ -135,7 +135,7 @@ struct Issue314FrameTimeSequenceTests {
           .enabled(if: fixtureExists("restart-witness-av.mp4"),
                    "run Scripts/fetch-fixtures.sh to generate the witness clip"),
           .timeLimit(.minutes(2)))
-    func newNativeSessionOutranksTheOutgoingOne() throws {
+    func newNativeSessionOutranksTheOutgoingOne() async throws {
         let outgoingFrames = EpochCollector()
         let outgoing = HLSVideoEngine(url: fixtureURL("restart-witness-av.mp4"), dvModeAvailable: false)
         outgoing.setNativeVideoFrameTimeObserver { outgoingFrames.record($0) }
@@ -162,14 +162,7 @@ struct Issue314FrameTimeSequenceTests {
         // A restart in the new session still outranks its own first epoch, so the within-session rule
         // (#260) is untouched by the process-wide draw.
         incoming.requestRestart(at: 1)
-        let deadline = Date().addingTimeInterval(30)
-        var restarted: [NativeVideoFrameTime] = []
-        while Date() < deadline {
-            restarted = incomingFrames.snapshot().filter { $0.epoch > incomingEpoch }
-            if !restarted.isEmpty { break }
-            usleep(50_000)
-        }
-        #expect(!restarted.isEmpty, "restarted producer emitted no frame times within 30s")
+        try await waitFor { incomingFrames.snapshot().contains { $0.epoch > incomingEpoch } }
     }
 
     // MARK: - Helpers

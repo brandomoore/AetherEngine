@@ -11,6 +11,7 @@ import Foundation
 /// backpressure wait that elapsed with zero front progress for the same index escalates on the next
 /// request. Both must also bypass the restart loop's producerCovers veto, which reads the dead
 /// producer's still-installed base.
+@Suite(.offCooperativePool)
 struct Issue169DeadProducerEscalationTests {
 
     private final class Recorder: @unchecked Sendable {

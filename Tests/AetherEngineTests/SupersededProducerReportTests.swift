@@ -9,7 +9,7 @@ import AetherLibavutil
 /// superseded restart rewrote the epoch table, the delayed #377 revive re-anchored the producer that
 /// had replaced the dead one, and a re-cut lost its mark to the seek's 2 s wait while the restart it
 /// marked was still running.
-@Suite("A superseded producer leaves the current session alone", .serialized)
+@Suite("A superseded producer leaves the current session alone", .serialized, .offCooperativePool)
 struct SupersededProducerReportTests {
 
     private final class Session {

@@ -117,7 +117,7 @@ struct Issue260FrameTimeAxisTests {
           .enabled(if: fixtureExists("restart-witness-av.mp4"),
                    "run Scripts/fetch-fixtures.sh to generate the witness clip"),
           .timeLimit(.minutes(2)))
-    func restartOpensNewEpoch() throws {
+    func restartOpensNewEpoch() async throws {
         let collector = FrameTimeCollector()
         let seams = SeamCollector()
         let engine = HLSVideoEngine(url: fixtureURL("restart-witness-av.mp4"), dvModeAvailable: false)
@@ -135,14 +135,8 @@ struct Issue260FrameTimeAxisTests {
 
         engine.requestRestart(at: 1)
 
-        let deadline = Date().addingTimeInterval(30)
-        var restarted: [NativeVideoFrameTime] = []
-        while Date() < deadline {
-            restarted = collector.snapshot().filter { $0.epoch > firstEpoch }
-            if !restarted.isEmpty { break }
-            usleep(50_000)
-        }
-        try #require(!restarted.isEmpty, "restarted producer emitted no frame times within 30s")
+        try await waitFor { collector.snapshot().contains { $0.epoch > firstEpoch } }
+        let restarted = collector.snapshot().filter { $0.epoch > firstEpoch }
 
         // The restart producer starts at segment 1, so its seam sits at that segment's item-axis start,
         // not at 0: a seam of 0 would collapse the history exactly like the pre-#260 behaviour.

@@ -96,6 +96,10 @@ final class AudioPlaybackHost {
     /// True between pause() and next play() so play() resumes the synchronizer rate (mirrors SoftwarePlaybackHost.pausedByHost).
     private var pausedByHost: Bool = false
 
+    /// #694: latched when end of media parks the clock (AE#374 on this host). Keeps `play()` from
+    /// restarting a clock the source stopped; a seek clears it.
+    private var didParkClockAtEnd = false
+
     /// Shared clock-armed latch (mirrors SoftwarePlaybackHost._clockArmed): demux loop arms once on first decoded
     /// packet; seek() anchors directly and sets this so the loop doesn't snap back to the stale initial anchor.
     nonisolated(unsafe) private var _clockArmed = false
@@ -205,9 +209,9 @@ final class AudioPlaybackHost {
             hostPaused: pausedByHost,
             clockArmed: clockArmed && demuxLoopStarted,
             synchronizerRate: audioOutput?.rate ?? 0,
-            // This host has neither a rebuffer that stops the clock nor an end-of-media park.
+            // This host has no rebuffer that stops the clock.
             rebuffering: false,
-            parkedAtEndOfMedia: false
+            parkedAtEndOfMedia: didParkClockAtEnd
         ) {
         case .resumeHostPause:
             pausedByHost = false
@@ -291,6 +295,7 @@ final class AudioPlaybackHost {
         // and it invalidates in-flight packets from the moment the seek starts rather than after it.
         bumpSeekGeneration()
         let generation = seekGeneration
+        didParkClockAtEnd = false
         // #292: inside another seek's window `isPlaying` is that seek's parked flag, not the transport's
         // intent. Inherit what it captured, and hand the same value on to whoever supersedes this one.
         let wasPlaying = SeekResumeIntent.resolve(isPlaying: isPlaying,
@@ -387,10 +392,12 @@ final class AudioPlaybackHost {
                 self?.failure = PlaybackErrorInfo(kind: .audioSessionFailed, message: msg)
             }
         }
-        let onEnd: @Sendable () -> Void = { [weak self] in
+        let onEnd: @Sendable (UInt64, Double) -> Void = { [weak self] generation, lastEnqueuedEnd in
             Task { @MainActor [weak self] in
-                self?.didReachEnd = true
-                self?.isPlaying = false
+                guard let self, self.seekGeneration == generation else { return }
+                self.parkClockAtEndOfMedia(lastEnqueuedEnd: lastEnqueuedEnd)
+                self.didReachEnd = true
+                self.isPlaying = false
             }
         }
 
@@ -432,7 +439,7 @@ final class AudioPlaybackHost {
         onClockAnchored: @Sendable (Double) -> Void,
         seekGeneration: @Sendable () -> UInt64,
         onError: @Sendable (String) -> Void,
-        onEnd: @Sendable () -> Void
+        onEnd: @Sendable (UInt64, Double) -> Void
     ) {
         // Clock-armed latch is SHARED with the host: anchor the clock exactly once on the first decoded packet.
         // seekClock is NOT idempotent (re-sets rate+time), so per-packet calls would snap the clock back ~47x/sec
@@ -537,7 +544,7 @@ final class AudioPlaybackHost {
                 }
                 if seekedAway { return true }
                 if seekGeneration() != seenSeekGeneration { return true }
-                onEnd()
+                onEnd(seenSeekGeneration, lastEnqueuedEnd)
                 return false
             }
 
@@ -602,6 +609,39 @@ final class AudioPlaybackHost {
             }
             if !keepGoing { break }
         }
+    }
+
+    /// #694: stop the master clock on the last sample instead of letting it free-run past the end
+    /// (AE#374 on the software host). The playthrough wait in the demux loop releases up to 0.25 s
+    /// before the last enqueued sample, so the park is deferred by what is still queued: parking stops
+    /// the renderer too and an immediate park would cut that tail. Either way the clock stops on the
+    /// last sample, not where it stands when the park runs.
+    private func parkClockAtEndOfMedia(lastEnqueuedEnd: Double) {
+        guard !didParkClockAtEnd else { return }
+        didParkClockAtEnd = true
+        guard clockArmed, let aOut = audioOutput else { return }
+        let tail = SoftwareEndOfMediaClock.tailPlayoutSeconds(
+            clockSeconds: aOut.currentTimeSeconds,
+            lastAudioPts: lastEnqueuedEnd
+        )
+        guard tail > 0 else { return parkClockNow(notAfter: lastEnqueuedEnd) }
+        let generation = seekGeneration
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(tail * 1_000_000_000))
+            guard let self, self.seekGeneration == generation, self.didParkClockAtEnd else { return }
+            self.parkClockNow(notAfter: lastEnqueuedEnd)
+        }
+    }
+
+    private func parkClockNow(notAfter latest: Double) {
+        guard !stopRequested, let aOut = audioOutput else { return }
+        aOut.pause(notAfter: latest)
+        rate = 0
+        EngineLog.emit(
+            "[AudioHost] end of media: clock parked at "
+            + "\(String(format: "%.3f", aOut.currentTimeSeconds))s",
+            category: .swPlayback
+        )
     }
 
     // MARK: - Time updates

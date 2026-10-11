@@ -67,6 +67,21 @@ struct VideoRoutingPolicyTests {
             codecID: AV_CODEC_ID_AV1, fieldOrder: AV_FIELD_PROGRESSIVE, av1Available: true))
     }
 
+    @Test("Only AV1 routing evaluates the hardware capability probe")
+    func hardwareProbeIsLazy() {
+        var calls = 0
+        func probe() -> Bool { calls += 1; return true }
+        for codec in [AV_CODEC_ID_H264, AV_CODEC_ID_HEVC, AV_CODEC_ID_NONE,
+                      AV_CODEC_ID_VP9, AV_CODEC_ID_MPEG2VIDEO] {
+            _ = VideoRoutingPolicy.requiresSoftwarePath(
+                codecID: codec, fieldOrder: AV_FIELD_PROGRESSIVE, av1Available: probe())
+        }
+        #expect(calls == 0)
+        #expect(!VideoRoutingPolicy.requiresSoftwarePath(
+            codecID: AV_CODEC_ID_AV1, fieldOrder: AV_FIELD_PROGRESSIVE, av1Available: probe()))
+        #expect(calls == 1)
+    }
+
     // MARK: - #150 SPS frame_mbs_only fallback for UNKNOWN field order
 
     @Test("UNKNOWN field order + SPS frame_mbs_only=0 routes to software")

@@ -83,6 +83,13 @@ final class PacketRingBuffer: @unchecked Sendable {
     private let writeLock = NSLock()
     private let windowSeconds: Double
     private let byteBudget: Int
+    /// An opt-in capacity lease applies a strict startup and playback cap to this chunk spool.
+    /// Callers without retention leases retain their original byteBudget behavior.
+    private let strictRetention: Bool
+    private let startupMaximumBytes: Int
+    private let playbackCushionBytes: Int
+    private let playbackCushionSeconds: Double
+    private let retentionPolicy = LiveDVRRetentionPolicy()
     private let chunkTargetBytes: Int
     private let scratch: URL
     private let writeAll: WriteAll
@@ -101,6 +108,9 @@ final class PacketRingBuffer: @unchecked Sendable {
     /// Oldest first; the last record is the chunk the writer appends to.
     private var chunks: [ChunkRecord] = []
     private var retainedDiskBytes = 0
+    private var residentBytes = 0
+    private var awaitingKeyframe = false
+    private var writesSuspended = false
     /// Most recently used first, at most `readHandleCap`. Opening a descriptor per retained chunk
     /// would hold hundreds at a 2 GiB budget.
     private var readHandles: [ChunkHandle] = []
@@ -118,12 +128,20 @@ final class PacketRingBuffer: @unchecked Sendable {
     // MARK: - Init / close
 
     init(windowSeconds: Double, scratch: URL, byteBudget: Int = .max,
-         chunkTargetBytes: Int = 4 << 20, writeAll: WriteAll? = nil) throws {
+         retention: SoftwareDVRRetentionOptions? = nil, chunkTargetBytes: Int = 4 << 20,
+         writeAll: WriteAll? = nil) throws {
         self.windowSeconds = windowSeconds
         self.scratch = scratch
         self.byteBudget = max(0, byteBudget)
-        // Several chunks per budget, so evicting the oldest one frees a fraction of it, not all.
-        let target = min(chunkTargetBytes, max(64 << 10, self.byteBudget / 16))
+        self.strictRetention = retention != nil
+        self.startupMaximumBytes = max(1, min(retention?.startupMaximumBytes ?? .max, self.byteBudget))
+        self.playbackCushionBytes = retention?.playbackCushionBytes ?? 0
+        self.playbackCushionSeconds = retention?.playbackCushionSeconds ?? 0
+        // A strict lease needs chunks smaller than its smallest startup cap, including tiny test
+        // budgets. Callers without retention leases retain the normal 64 KiB minimum chunk size.
+        let target = retention == nil
+            ? min(chunkTargetBytes, max(64 << 10, self.byteBudget / 16))
+            : min(chunkTargetBytes, max(1, self.startupMaximumBytes / 16))
         self.chunkTargetBytes = max(1, min(target, Int(UInt32.max / 2)))
         self.writeAll = writeAll ?? Self.pwriteAll
         self.markerFD = SessionDirectoryLiveness.acquire(sessionDir: scratch, logPrefix: "[PacketRingBuffer]")
@@ -148,6 +166,8 @@ final class PacketRingBuffer: @unchecked Sendable {
         edge = -.infinity
         chunks = []
         retainedDiskBytes = 0
+        residentBytes = 0
+        awaitingKeyframe = false
         readHandles = []
         let marker = markerFD
         markerFD = -1
@@ -176,7 +196,32 @@ final class PacketRingBuffer: @unchecked Sendable {
         defer { writeLock.unlock() }
         guard !isClosed else {
             tail = nil
+            if strictRetention { return }
             throw Failure.closed
+        }
+        let limits = strictRetention ? retentionPolicy.snapshot : nil
+        let cap = strictRetention
+            ? min(byteBudget, limits.map { max(playbackCushionBytes, $0.retentionBytes) }
+                            ?? startupMaximumBytes)
+            : byteBudget
+        if strictRetention {
+            lock.lock()
+            let suspended = writesSuspended
+            let waiting = awaitingKeyframe
+            lock.unlock()
+            if suspended || (waiting && !(isVideo && isKeyframe)) { return }
+            if bytes.count > cap {
+                lock.lock()
+                dropEntriesLocked(upTo: entries.count)
+                let doomed = releaseUnreferencedChunksLocked(includingTail: true)
+                awaitingKeyframe = true
+                compactIfDueLocked()
+                lock.unlock()
+                tail = nil
+                tailOffset = 0
+                try deleteEvictedFiles(doomed)
+                return
+            }
         }
 
         let placement: (chunk: UInt32, offset: Int)
@@ -192,7 +237,7 @@ final class PacketRingBuffer: @unchecked Sendable {
                 noteWriteFailureOnce(error)
                 throw error
             }
-            guard makeRoomAfterFailedWrite(incomingKeyframe: isVideo && isKeyframe) else { throw error }
+            guard try makeRoomAfterFailedWrite(incomingKeyframe: isVideo && isKeyframe) else { throw error }
             placement = try writeLocked(bytes)
         }
         tailOffset = placement.offset + bytes.count
@@ -211,15 +256,44 @@ final class PacketRingBuffer: @unchecked Sendable {
         }
         if isKeyframe { keyframeSeqs.append(firstSeq + (entries.count - head)) }
         entries.append(entry)
+        residentBytes += bytes.count
+        awaitingKeyframe = false
         if pts > edge { edge = pts }
         if let last = chunks.indices.last, chunks[last].id == placement.chunk {
             retainedDiskBytes += tailOffset - chunks[last].bytes
             chunks[last].bytes = tailOffset
         }
-        let doomed = evictLocked()
+        let doomed = evictLocked(window: limits?.windowSeconds ?? (strictRetention && limits != nil ? playbackCushionSeconds : windowSeconds),
+                                  maximumBytes: cap)
+        let tailWasReleased = strictRetention && chunks.isEmpty
         lock.unlock()
+        if tailWasReleased {
+            tail = nil
+            tailOffset = 0
+        }
+        try deleteEvictedFiles(doomed)
+    }
 
-        Self.unlinkAll(doomed)
+    @discardableResult
+    func setLimits(_ limits: LiveDVRLimits, availableBytes: Int64?) -> Bool {
+        guard strictRetention else { return false }
+        lock.lock()
+        let resident = residentBytes
+        lock.unlock()
+        retentionPolicy.update(limits, availableBytes: availableBytes, residentBytes: resident)
+        return true
+    }
+
+    var retainedBytes: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return residentBytes
+    }
+
+    var retainedWindowSeconds: Double? {
+        guard oldestKeyframePts != nil else { return nil }
+        if let limits = retentionPolicy.snapshot { return limits.windowSeconds }
+        return windowSeconds
     }
 
     // MARK: - Reader
@@ -358,7 +432,9 @@ final class PacketRingBuffer: @unchecked Sendable {
     func stillRun(target: Double,
                   maxPackets: Int,
                   maxSpanSeconds: Double,
-                  reorderTail: Int) -> [Packet]? {
+                  reorderTail: Int, isCancelled: (() -> Bool)? = nil) -> [Packet]? {
+        guard target.isFinite, isCancelled?() != true else { return nil }
+        let deadline = ContinuousClock.now.advanced(by: .milliseconds(750))
         lock.lock()
         guard let startIdx = lastKeyframeIndexLocked(atOrBefore: target) else {
             lock.unlock()
@@ -377,8 +453,10 @@ final class PacketRingBuffer: @unchecked Sendable {
                                            reorderTail: reorderTail,
                                            indexReachesEnd: reachesEnd) else { return nil }
 
-        let run = span.compactMap { seq -> Packet? in
-            window[seq - base].isVideo ? packet(atSeq: seq) : nil
+        var run: [Packet] = []
+        for seq in span {
+            if isCancelled?() == true || (isCancelled != nil && ContinuousClock.now >= deadline) { return nil }
+            if window[seq - base].isVideo, let packet = packet(atSeq: seq) { run.append(packet) }
         }
         // Eviction between the snapshot and the off-lock reads would cost the run its keyframe, and
         // a run that does not open on one decodes as garbage.
@@ -491,7 +569,7 @@ final class PacketRingBuffer: @unchecked Sendable {
         insertReadHandleLocked(handle)
         let doomed = releaseUnreferencedChunksLocked(includingTail: false)
         lock.unlock()
-        Self.unlinkAll(doomed)
+        try deleteEvictedFiles(doomed)
     }
 
     /// A write that failed because the volume or the quota has no room, which freeing a chunk can cure.
@@ -514,7 +592,7 @@ final class PacketRingBuffer: @unchecked Sendable {
     /// up to the first keyframe in a later chunk, or, when the incoming packet is itself a video
     /// keyframe that can open a fresh span, everything including the tail chunk. False when nothing
     /// could be freed, and the packet is dropped as before.
-    private func makeRoomAfterFailedWrite(incomingKeyframe: Bool) -> Bool {
+    private func makeRoomAfterFailedWrite(incomingKeyframe: Bool) throws -> Bool {
         lock.lock()
         var doomed: [URL] = []
         var releasedTail = false
@@ -532,7 +610,7 @@ final class PacketRingBuffer: @unchecked Sendable {
             tail = nil
             tailOffset = 0
         }
-        Self.unlinkAll(doomed)
+        try deleteEvictedFiles(doomed)
         if !doomed.isEmpty {
             EngineLog.emit("[PacketRingBuffer] write failed; freed \(doomed.count) chunk(s) and retrying "
                            + "(the rewind window shrinks instead of the live feed stopping)",
@@ -541,11 +619,10 @@ final class PacketRingBuffer: @unchecked Sendable {
         return !doomed.isEmpty
     }
 
-    /// Drop leading entries outside `edge - windowSeconds` or past the byte budget, keyframe-aligned,
-    /// and return the chunk files no retained entry references any more (the caller unlinks them
-    /// after releasing the lock). Walks the keyframe list, one step per GOP.
-    private func evictLocked() -> [URL] {
-        let cutoff = edge - windowSeconds
+    /// Evict by time, then by the effective host lease. A strict lease also bounds actual
+    /// retained payload and chunk bytes; a GOP that cannot fit is dropped until its next keyframe.
+    private func evictLocked(window: Double, maximumBytes: Int) -> [URL] {
+        let cutoff = edge - window
         var pivot: Int? = nil
         var k = keyframeHead
         while k < keyframeSeqs.count, let idx = indexLocked(keyframeSeqs[k]), entries[idx].pts <= cutoff {
@@ -555,32 +632,54 @@ final class PacketRingBuffer: @unchecked Sendable {
         if let p = pivot, p > head { dropEntriesLocked(upTo: p) }
         var doomed = releaseUnreferencedChunksLocked(includingTail: false)
 
-        // Audit VPERF-101: time alone put 5.4 GB on disk at 8 Mbit/s over the 90 min default, and an
-        // infinite window never evicted at all.
-        while retainedDiskBytes > byteBudget, chunks.count > 1 {
-            if let p = keyframeInLaterChunkLocked() {
-                dropEntriesLocked(upTo: p)
-            } else if retainedDiskBytes - byteBudget > byteBudget, let p = firstIndexInLaterChunkLocked() {
-                // A GOP longer than the whole budget (or a stream that never flags a keyframe) must
-                // not grow the directory without bound; the rewind floor then decodes from the next
-                // keyframe, which `firstKeyframeSeq` points at.
-                dropEntriesLocked(upTo: p)
-            } else {
-                break
+        if strictRetention {
+            while residentBytes > maximumBytes || retainedDiskBytes > maximumBytes {
+                if let p = nextRetainedKeyframeIndexLocked() {
+                    dropEntriesLocked(upTo: p)
+                    doomed += releaseUnreferencedChunksLocked(includingTail: false)
+                } else {
+                    dropEntriesLocked(upTo: entries.count)
+                    doomed += releaseUnreferencedChunksLocked(includingTail: true)
+                    awaitingKeyframe = true
+                    break
+                }
             }
-            let freed = releaseUnreferencedChunksLocked(includingTail: false)
-            if freed.isEmpty { break }
-            doomed += freed
+        } else {
+            // The standalone ring's soft byte budget remains unchanged.
+            while retainedDiskBytes > byteBudget, chunks.count > 1 {
+                if let p = keyframeInLaterChunkLocked() {
+                    dropEntriesLocked(upTo: p)
+                } else if retainedDiskBytes - byteBudget > byteBudget,
+                          let p = firstIndexInLaterChunkLocked() {
+                    dropEntriesLocked(upTo: p)
+                } else {
+                    break
+                }
+                let freed = releaseUnreferencedChunksLocked(includingTail: false)
+                if freed.isEmpty { break }
+                doomed += freed
+            }
         }
         compactIfDueLocked()
         return doomed
     }
 
+    private func nextRetainedKeyframeIndexLocked() -> Int? {
+        var k = keyframeHead
+        while k < keyframeSeqs.count {
+            if let idx = indexLocked(keyframeSeqs[k]), idx > head { return idx }
+            k += 1
+        }
+        return nil
+    }
+
     private func dropEntriesLocked(upTo idx: Int) {
         guard idx > head else { return }
+        for entry in entries[head..<idx] { residentBytes -= Int(entry.length) }
         firstSeq += idx - head
         head = idx
         while keyframeHead < keyframeSeqs.count, keyframeSeqs[keyframeHead] < firstSeq { keyframeHead += 1 }
+        if head >= entries.count { awaitingKeyframe = true }
     }
 
     /// The first retained keyframe stored in a later chunk than the oldest retained entry.
@@ -699,7 +798,19 @@ final class PacketRingBuffer: @unchecked Sendable {
         }
     }
 
-    private static func unlinkAll(_ urls: [URL]) {
-        for url in urls { unlink(url.path) }
+    /// The strict host cannot keep writing if a failed unlink would leave orphaned disk bytes.
+    private func deleteEvictedFiles(_ urls: [URL]) throws {
+        if !strictRetention {
+            for url in urls { unlink(url.path) }
+            return
+        }
+        for url in urls {
+            if unlink(url.path) == 0 || errno == ENOENT { continue }
+            let failure = NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+            lock.lock()
+            writesSuspended = true
+            lock.unlock()
+            throw failure
+        }
     }
 }

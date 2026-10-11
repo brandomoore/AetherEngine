@@ -275,6 +275,7 @@ enum SessionOptionCorrection {
         "nativeRemoteHLS",
         "sequentialOrigin",
         "heldSourceConnection",
+        "sharedOutputRole",
     ]
 
     /// The fields a running SESSION owns, which a correction may name and the rebuild then decides
@@ -391,15 +392,16 @@ enum SessionOptionCorrection {
         "omitCriteriaColorExtensions", "suppressDisplayCriteria", "httpHeaders",
         "keepDvh1TagWithoutDV", "forceDolbyVisionOnNonDVDisplay", "dolbyVisionHandling", "matchContentEnabled",
         "panelIsInHDRMode", "attemptsHDRMasterOnUnprovenPanel", "panelPresentsDolbyVision",
-        "audioBridgeMode", "isLive", "audioOnly",
+        "audioBridgeMode", "objectAudioRendering", "isLive", "audioOnly",
         "dvrWindowSeconds",
-        "liveBlockingReload", "liveJoinProfile", "liveJoinStartsImmediately",
+        "softwareDVRRetention",
+        "liveBlockingReload", "liveJoinProfile", "sourceOpenPolicy", "liveStartupGraceSeconds", "liveStartupSingleSegmentMinimumSeconds", "liveJoinStartsImmediately",
         "clampsLiveResumeToWindow", "nativeRemoteHLS", "nativeRemoteHLSIngestFallback",
-        "preserveASSMarkup", "prepareNativeSubtitles", "eagerNativeSubtitleReaders", "confirmAtmos",
+        "preserveASSMarkup", "prepareNativeSubtitles", "eagerNativeSubtitleReaders", "serveIFramePlaylist", "confirmAtmos",
         "nativeSubtitlePreferredLanguages", "sequentialOrigin", "maxConcurrentSourceRequests", "heldSourceConnection",
         "declaredDurationSeconds", "probesize", "maxAnalyzeDuration", "preferredAudioLanguages",
-        "preferredSubtitleLanguages", "externalSubtitles", "forwardBufferSegments", "autoplay",
+        "preferredSubtitleLanguages", "externalSubtitles", "forwardBufferSegments", "progressiveSegmentDelivery", "autoplay",
         "audioDelaySeconds", "teletextPage", "deinterlaceMode", "deinterlaceFieldRate", "preferredDecodePath",
-        "escalatesToSoftwarePath", "isLiveRejoin", "subtitleSessionCarryover",
+        "escalatesToSoftwarePath", "sharedOutputRole", "isLiveRejoin", "subtitleSessionCarryover",
     ]
 }

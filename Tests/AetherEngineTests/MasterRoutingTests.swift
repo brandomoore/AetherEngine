@@ -17,14 +17,16 @@ struct MasterRoutingTests {
                        panelEngagesOnDemand: Bool = false,
                        frameRateKnown: Bool = true,
                        hevcNeedsMasterSignaling: Bool = false,
-                       audioRendition: Bool = false) -> Bool {
+                       audioRendition: Bool = false,
+                       iFrameRendition: Bool = false) -> Bool {
         HLSVideoEngine.resolveUseMasterPlaylist(
             videoRange: videoRange, effectiveDvMode: effectiveDvMode,
             panelIsInHDRMode: panelHDR, displaySupportsHDR: displayHDR,
             hasNativeSubs: nativeSubs, builtInPanelEngagesOnDemand: panelEngagesOnDemand,
             frameRateKnown: frameRateKnown,
             videoCodecNeedsMasterSignaling: hevcNeedsMasterSignaling,
-            hasAudioRendition: audioRendition)
+            hasAudioRendition: audioRendition,
+            hasIFrameRendition: iFrameRendition)
     }
 
     @Test("tvOS: HDR source on an SDR-parked panel stays media-direct (-11848 guard)")
@@ -161,5 +163,21 @@ struct MasterRoutingTests {
         #elseif os(tvOS)
         #expect(!HLSVideoEngine.builtInPanelEngagesOnDemand)
         #endif
+    }
+
+    @Test("AE#682: an I-frame rendition forces the master for an SDR source, like a subtitle rendition")
+    func iFrameRenditionForcesMasterOnSDR() {
+        #expect(!route(videoRange: .sdr))
+        #expect(route(videoRange: .sdr, iFrameRendition: true))
+    }
+
+    @Test("AE#682: an I-frame rendition never forces an HDR master onto an unready panel")
+    func iFrameRenditionRespectsRoutingSafety() {
+        #expect(!route(videoRange: .pq, displayHDR: true, iFrameRendition: true))
+    }
+
+    @Test("AE#682: an I-frame rendition cannot rescue a PQ master without a frame rate (#130)")
+    func iFrameRenditionRespectsFrameRateGate() {
+        #expect(!route(videoRange: .pq, panelHDR: true, frameRateKnown: false, iFrameRendition: true))
     }
 }

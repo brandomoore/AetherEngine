@@ -9,7 +9,7 @@ import Testing
 /// moving the consumer, or every preview would rewind playback. And the run is offered exactly where
 /// a commit would be a cache hit: a target past the retained frontier has a real frame the store
 /// does not hold yet, so the frame before it is the wrong answer rather than a close one.
-@Suite("Software VOD scrub stills from the packet cache (AE#605)")
+@Suite("Software VOD scrub stills from the packet cache (AE#605)", .offCooperativePool, .timeLimit(.minutes(2)))
 struct Issue605SoftwareVODStillTests {
 
     // MARK: - FIFO history walk
@@ -134,13 +134,10 @@ struct Issue605SoftwareVODStillTests {
             fifo: fifo
         ) { _ in Self.sourcePacket(index: counter.next(), keyframeEvery: keyframeEvery) }
         cache.start()
-        let deadline = Date().addingTimeInterval(10)
-        var previous = -1
-        while Date() < deadline {
-            Thread.sleep(forTimeInterval: 0.15)
-            let now = counter.value
-            if now == previous, now > 0 { break }
-            previous = now
+        // The park itself, not a counter that held still for 150 ms: a producer that is merely slow
+        // on a loaded machine looked parked to that, and the still past its frontier came back nil.
+        while !cache.producerParkedForTesting {
+            Thread.sleep(forTimeInterval: 0.02)
         }
         return cache
     }

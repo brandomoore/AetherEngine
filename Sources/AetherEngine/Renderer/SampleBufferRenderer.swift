@@ -74,6 +74,17 @@ final class SampleBufferRenderer: @unchecked Sendable {
         reorderLock.unlock()
     }
 
+    /// AE#395: the session's renderer axis, shared with the `AudioOutput` whose synchronizer this
+    /// renderer runs on. Only the stamp on the sample buffer moves onto it; the reorder buffer, the
+    /// frontier and the frame-time reports stay on the source axis. Guarded by `reorderLock`.
+    private var _timeline: RendererTimeline?
+
+    func setTimeline(_ timeline: RendererTimeline?) {
+        reorderLock.lock()
+        _timeline = timeline
+        reorderLock.unlock()
+    }
+
     /// #311: moved on by every flush, so a consumer can drop the frame times it recorded for frames the
     /// compositor has since discarded. Guarded by `reorderLock`.
     ///
@@ -400,12 +411,22 @@ final class SampleBufferRenderer: @unchecked Sendable {
         reorderLock.unlock()
     }
 
+    /// AE#711 follow-up: the newest frame handed to the layer, before the subtitle compositor, for a
+    /// rebuild to hold when the layer cannot say what it is showing (off screen, or before tvOS 17.4's
+    /// readback has anything). At most one buffer, released by `flush`.
+    private var _lastEnqueuedFrame: CVPixelBuffer?
+    var lastEnqueuedFrame: CVPixelBuffer? {
+        reorderLock.lock(); defer { reorderLock.unlock() }
+        return _lastEnqueuedFrame
+    }
+
     /// Discard all buffered frames. `removingDisplayedImage: true` (stop/teardown) also clears the visible
     /// frame; `false` (seek) holds the last frame on screen until the post-seek frame is enqueued, so a seek
     /// doesn't flash black between the old and new positions (matches the hardware path's hold-last-frame).
     func flush(removingDisplayedImage: Bool = true) {
         reorderLock.lock()
         reorderBuffer.removeAll()
+        _lastEnqueuedFrame = nil
         // #407: the next frame handed over will not follow the last one, so the gap between them is
         // not a cadence measurement. Left standing, every seek would report one enormous interval.
         _lastHandedPtsSeconds = nil
@@ -446,8 +467,11 @@ final class SampleBufferRenderer: @unchecked Sendable {
     private func flushFrame(pixelBuffer: CVPixelBuffer, pts: CMTime, hdr10PlusData: Data?,
                             nextPTS: CMTime? = nil) {
         let outputBuffer = subtitleCompositor.composite(pixelBuffer, ptsSeconds: pts.seconds)
+        reorderLock.lock()
+        let timeline = _timeline
+        reorderLock.unlock()
         guard let sampleBuffer = createSampleBuffer(
-            from: outputBuffer, pts: pts,
+            from: outputBuffer, pts: timeline?.rendererTime(forSource: pts) ?? pts,
             duration: Self.frameDuration(from: pts, to: nextPTS)) else {
             // #407: a frame the decoder produced and the layer never saw. Counted, because the
             // per-second frame count is taken on the decoder's side of this line.
@@ -483,6 +507,9 @@ final class SampleBufferRenderer: @unchecked Sendable {
             EngineLog.emit("[Renderer] isReadyForMoreMediaData=false at enqueue #\(enqueueCount + 1) status=\(statusName)", category: .swPlayback)
         }
         target.enqueue(sampleBuffer)
+        reorderLock.lock()
+        _lastEnqueuedFrame = pixelBuffer
+        reorderLock.unlock()
 
         // #311: reported here rather than at admission, so it describes frames the compositor has
         // been given. A frame refused for an unschedulable timestamp, skipped after a seek, or lost

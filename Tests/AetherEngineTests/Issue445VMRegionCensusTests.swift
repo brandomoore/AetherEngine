@@ -9,7 +9,7 @@ import Darwin.Mach
 /// an IOSurface, a mapped file kept dirty) leaves no name behind, only a slope.
 ///
 /// Serialized: the census keeps a process-wide baseline, and Swift Testing runs cases in parallel.
-@Suite(.serialized)
+@Suite(.serialized, .offCooperativePool)
 struct Issue445VMRegionCensusTests {
 
     @Test("census is opt-in and answers nothing while disabled")
@@ -33,28 +33,34 @@ struct Issue445VMRegionCensusTests {
         defer { VMRegionCensus.isEnabled = false }
 
         VMRegionCensus.markBaseline()
+        // An application-specific tag of its own, not the heap: the census is process-wide, and a
+        // test running in parallel that frees a large MALLOC block between baseline and census
+        // took this growth back out of the MALLOC tallies, so a 96 MB write read as less than 64.
+        let tag = 242
         let size = 96 << 20
-        let buffer = UnsafeMutableRawPointer.allocate(byteCount: size, alignment: 4096)
-        defer { buffer.deallocate() }
+        let mapped = mmap(nil, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, Int32(bitPattern: UInt32(tag) << 24), 0)
+        guard let buffer = mapped, buffer != MAP_FAILED else {
+            Issue.record("mmap failed: \(errno)")
+            return
+        }
+        defer { munmap(buffer, size) }
         // Footprint counts DIRTY pages, so the allocation has to be written to before it exists as
-        // far as this census is concerned. A calloc'd region that is never touched is a promise.
+        // far as this census is concerned. A mapping that is never touched is a promise.
         memset(buffer, 0xAB, size)
 
         guard let result = VMRegionCensus.census() else {
             Issue.record("census returned nil while enabled")
             return
         }
+        let own = result.tallies.first { $0.tag == tag }
+        #expect((own?.deltaBytes ?? 0) >= 64 << 20,
+                "expected the 96 MB write to show as growth of tag \(tag), saw \((own?.deltaBytes ?? 0) >> 20) MB")
         let grownBytes = result.tallies.reduce(0) { $0 + max(0, $1.deltaBytes) }
-        #expect(grownBytes >= 64 << 20, "expected the 96 MB write to show as growth, saw \(grownBytes >> 20) MB")
-
-        let top = result.tallies.max { $0.deltaBytes < $1.deltaBytes }
-        #expect(top != nil)
-        #expect((top?.deltaBytes ?? 0) >= 64 << 20)
+        #expect(grownBytes >= 64 << 20, "the total counts the tagged growth too, saw \(grownBytes >> 20) MB")
 
         let fragment = VMRegionCensus.probeFragment()
         #expect(fragment.contains("vmGrewMB="))
         #expect(fragment.contains("vmTagTop="))
-        #expect(fragment.contains("MALLOC"), "a large heap allocation should land in a MALLOC tag, saw \(fragment)")
     }
 
     @Test("the fragment states growth since the baseline, which is the figure that can be checked")

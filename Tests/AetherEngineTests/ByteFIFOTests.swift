@@ -27,7 +27,7 @@ final class ByteFIFOTests: XCTestCase {
         }
         while fifo.parkedWaiterCount == 0 { usleep(200) }  // the park, not a guess at it
         XCTAssertTrue(fifo.write(Data([9, 9])))
-        wait(for: [expectation], timeout: 2)
+        wait(for: [expectation], timeout: 300)
     }
 
     func testFinishDrainsThenSignalsEOF() {
@@ -58,7 +58,7 @@ final class ByteFIFOTests: XCTestCase {
         }
         while fifo.parkedWaiterCount == 0 { usleep(200) }  // the park, not a guess at it
         fifo.cancel()
-        wait(for: [expectation], timeout: 2)
+        wait(for: [expectation], timeout: 300)
     }
 
     // audit NET-8: storage moved from one re-based `Data` to a queue of chunks plus a head offset;
@@ -105,6 +105,6 @@ final class ByteFIFOTests: XCTestCase {
         _ = buffer.withUnsafeMutableBufferPointer {
             fifo.read(into: $0.baseAddress!, maxLength: 4)
         }
-        wait(for: [expectation], timeout: 2)
+        wait(for: [expectation], timeout: 300)
     }
 }

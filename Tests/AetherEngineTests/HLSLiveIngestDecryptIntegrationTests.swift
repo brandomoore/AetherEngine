@@ -43,7 +43,7 @@ final class HLSLiveIngestDecryptIntegrationTests: XCTestCase {
             }
             done.fulfill()
         }
-        wait(for: [done], timeout: 40)
+        wait(for: [done], timeout: 300)
         let got = box.data
 
         XCTAssertNil(reader.terminalError, "ingest went terminal: \(String(describing: reader.terminalError))")

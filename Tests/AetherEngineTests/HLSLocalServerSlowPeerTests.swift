@@ -22,8 +22,7 @@ struct HLSLocalServerSlowPeerTests {
         // The old per-recv timeout was 60 s, so closing well inside that is the fix.
         #expect(await Self.onOwnThread { Self.peerCloses(fd: fd, within: 20) },
                 "an idle unauthenticated connection kept its slot")
-        let released = try await waitFor(upTo: .seconds(20)) { server.activeConnectionCount == 0 }
-        #expect(released)
+        try await waitFor { server.activeConnectionCount == 0 }
     }
 
     @Test("A peer trickling its head one byte at a time is dropped at the head deadline")
@@ -38,8 +37,7 @@ struct HLSLocalServerSlowPeerTests {
 
         #expect(await Self.onOwnThread { Self.peerCloses(fd: fd, within: 20) },
                 "a byte every 200 ms kept an unauthenticated connection open")
-        let released = try await waitFor(upTo: .seconds(20)) { server.activeConnectionCount == 0 }
-        #expect(released)
+        try await waitFor { server.activeConnectionCount == 0 }
     }
 
     @Test("A connection that presented the token keeps its keep-alive idle past the stranger deadline")
@@ -167,7 +165,7 @@ struct HLSLocalServerSlowPeerTests {
     /// One keep-alive GET on an open connection; the status, or 0. Reads until the declared body
     /// has arrived so the next request on the same socket starts clean.
     private static func requestStatus(fd: Int32, path: String) -> Int {
-        var timeout = timeval(tv_sec: 10, tv_usec: 0)
+        var timeout = timeval(tv_sec: 120, tv_usec: 0)
         _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
         let request = "GET \(path) HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
         let sent = Array(request.utf8).withUnsafeBytes { send(fd, $0.baseAddress, $0.count, 0) }

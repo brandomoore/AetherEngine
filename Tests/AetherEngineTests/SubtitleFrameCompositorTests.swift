@@ -18,6 +18,32 @@ struct SubtitleFrameCompositorTests {
         #expect(SubtitleFrameCompositor.activeCues(in: cues, at: 12.0).isEmpty)
     }
 
+    @Test("software PiP delay and advance use media time for both subtitle channels")
+    func adjustedCueWindow() {
+        let cues = [cue(1, 10, 12), cue(2, 10, 11), cue(3, 12, 14)]
+        #expect(SubtitleFrameCompositor.activeCues(in: cues, at: 10.5, delaySeconds: 1.5).isEmpty)
+        #expect(SubtitleFrameCompositor.activeCues(in: cues, at: 11.5, delaySeconds: 1.5).map(\.id) == [1, 2])
+        #expect(SubtitleFrameCompositor.activeCues(in: cues, at: 13.5, delaySeconds: 1.5).map(\.id) == [3])
+        #expect(SubtitleFrameCompositor.activeCues(in: cues, at: 8.5, delaySeconds: -1.5).map(\.id) == [1, 2])
+        #expect(SubtitleFrameCompositor.activeCues(in: cues, at: .nan).isEmpty)
+        #expect(SubtitleFrameCompositor.activeCues(in: cues, at: 11, delaySeconds: .infinity).isEmpty)
+    }
+
+    @MainActor
+    @Test("software subtitle preference survives PiP transitions and rejects invalid values")
+    func delayPreference() throws {
+        let engine = try AetherEngine()
+        engine.setSoftwareSubtitleDelay(1.5)
+        engine.pictureInPictureActive = true
+        engine.pictureInPictureActive = false
+        engine.setSoftwareSubtitleDelay(.nan)
+        #expect(engine.softwareSubtitleDelaySeconds == 1.5)
+        engine.setSoftwareSubtitleDelay(-0.5)
+        #expect(engine.softwareSubtitleDelaySeconds == -0.5)
+        engine.stop()
+        #expect(engine.softwareSubtitleDelaySeconds == -0.5)
+    }
+
     @Test("text layout scales with frame height and keeps a safe bottom margin")
     func textLayoutScales() {
         let layout = SubtitleFrameCompositor.textLayout(frameWidth: 1920, frameHeight: 1080)
@@ -70,11 +96,11 @@ struct SubtitleFrameCompositorTests {
         CVPixelBufferUnlockBaseAddress(buffer, [])
 
         // Disabled: passthrough must be the same instance.
-        compositor.update(cues: [SubtitleCue(id: 1, startTime: 0, endTime: 10, body: .text("HELLO"))], enabled: false)
+        compositor.update(cues: [SubtitleCue(id: 1, startTime: 0, endTime: 10, body: .text("HELLO"))], enabled: false, delaySeconds: 0)
         #expect(compositor.composite(buffer, ptsSeconds: 5) === buffer)
 
         // Enabled with an active cue: output keeps the format and the bottom region gains bright pixels.
-        compositor.update(cues: [SubtitleCue(id: 1, startTime: 0, endTime: 10, body: .text("HELLO"))], enabled: true)
+        compositor.update(cues: [SubtitleCue(id: 1, startTime: 0, endTime: 10, body: .text("HELLO"))], enabled: true, delaySeconds: 0)
         let out = compositor.composite(buffer, ptsSeconds: 5)
         #expect(CVPixelBufferGetPixelFormatType(out) == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
         #expect(out !== buffer)
@@ -95,6 +121,21 @@ struct SubtitleFrameCompositorTests {
         #expect(compositor.composite(buffer, ptsSeconds: 20) === buffer)
     }
 
+    @Test("rendered PiP frames apply timing changes without a cue or transport update")
+    func compositeAppliesDelay() throws {
+        let compositor = SubtitleFrameCompositor()
+        let buffer = try blackFrame(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+        let cues = [cue(1, 10, 12)]
+        compositor.update(cues: cues, enabled: true, delaySeconds: 1.5)
+        #expect(compositor.composite(buffer, ptsSeconds: 10.5) === buffer)
+        #expect(compositor.composite(buffer, ptsSeconds: 11.5) !== buffer)
+        #expect(compositor.composite(buffer, ptsSeconds: 13.5) === buffer)
+        compositor.update(cues: cues, enabled: true, delaySeconds: -1.5)
+        #expect(compositor.composite(buffer, ptsSeconds: 8.5) !== buffer)
+        compositor.update(cues: cues, enabled: false, delaySeconds: -1.5)
+        #expect(compositor.composite(buffer, ptsSeconds: 8.5) === buffer)
+    }
+
     private func blackFrame(_ format: OSType) throws -> CVPixelBuffer {
         var pb: CVPixelBuffer?
         let attrs: [CFString: Any] = [kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary]
@@ -112,7 +153,7 @@ struct SubtitleFrameCompositorTests {
     @Test("a composited frame keeps the source's pixel aspect ratio and colour tags")
     func compositedFrameKeepsSourceAttachments() throws {
         let compositor = SubtitleFrameCompositor()
-        compositor.update(cues: [SubtitleCue(id: 1, startTime: 0, endTime: 10, body: .text("HELLO"))], enabled: true)
+        compositor.update(cues: [SubtitleCue(id: 1, startTime: 0, endTime: 10, body: .text("HELLO"))], enabled: true, delaySeconds: 0)
 
         let hdr = try blackFrame(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
         let aspect: NSDictionary = [
@@ -143,7 +184,7 @@ struct SubtitleFrameCompositorTests {
     @Test("a recycled output buffer does not keep an earlier source's pixel aspect ratio")
     func recycledBufferDropsStaleAspect() throws {
         let compositor = SubtitleFrameCompositor()
-        compositor.update(cues: [SubtitleCue(id: 1, startTime: 0, endTime: 10, body: .text("HELLO"))], enabled: true)
+        compositor.update(cues: [SubtitleCue(id: 1, startTime: 0, endTime: 10, body: .text("HELLO"))], enabled: true, delaySeconds: 0)
         let format = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
 
         let anamorphic = try blackFrame(format)

@@ -17,7 +17,7 @@ import Foundation
 ///
 /// They run a loopback HTTP/1.1 origin that counts every body byte it manages to write and
 /// records every Range it is asked for.
-@Suite("AVIOReader persistent backpressure (#174/#220/#310)")
+@Suite("AVIOReader persistent backpressure (#174/#220/#310)", .offCooperativePool, .timeLimit(.minutes(2)))
 struct Issue174PersistentReadBackpressureTests {
 
 
@@ -33,7 +33,10 @@ struct Issue174PersistentReadBackpressureTests {
 
         // Nobody consumes: the demux side is deliberately parked, the exact #174 shape
         // (muxer backpressured on SegmentCache high water, no read ever advances position).
-        try await Task.sleep(for: .seconds(3))
+        // Wait for the high-water end itself, then leave a window in which a refill with
+        // nothing draining would have to show up.
+        try await waitFor { reader.windowDiagnostics.parked && !reader.hasLiveConnectionForTesting }
+        try await Task.sleep(for: .seconds(1))
 
         // The #310 contract, in order of importance: the flow is GONE (a suspended task is a
         // dormant flow), the end is recorded as backpressure so the refill path owns it, the
@@ -63,15 +66,14 @@ struct Issue174PersistentReadBackpressureTests {
 
         // Stall long enough for the high-water end to engage, then consume far more than the
         // window: delivery must keep flowing, which proves the frontier refill runs.
-        try await Task.sleep(for: .seconds(2))
+        try await waitFor { reader.windowDiagnostics.parked }
 
         let sliceCap = 256 * 1024
         let target = 48 * 1024 * 1024
         let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: sliceCap)
         defer { buf.deallocate() }
         var got = 0
-        let deadline = Date().addingTimeInterval(30)
-        while got < target && Date() < deadline {
+        while got < target {
             let n = reader.read(into: buf, size: Int32(sliceCap))
             if n <= 0 { break }
             got += Int(n)
@@ -95,7 +97,7 @@ struct Issue174PersistentReadBackpressureTests {
         let reader = AVIOReader(url: URL(string: "http://127.0.0.1:\(server.port)/movie.bin")!)
         try reader.open()
 
-        try await Task.sleep(for: .seconds(2))
+        try await waitFor { reader.windowDiagnostics.parked }
 
         // Completing without a hang is the assertion: nothing may be left waiting on a
         // connection that was deliberately ended and will never refill after close.

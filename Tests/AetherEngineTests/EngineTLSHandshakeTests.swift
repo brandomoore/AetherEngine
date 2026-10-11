@@ -71,8 +71,7 @@
             let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: sliceCap)
             defer { buf.deallocate() }
             var got = 0
-            let deadline = Date().addingTimeInterval(20)
-            while got < sliceCap && Date() < deadline {
+            while got < sliceCap {
                 let n = reader.read(into: buf, size: Int32(sliceCap - got))
                 if n <= 0 { break }
                 got += Int(n)

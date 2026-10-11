@@ -109,7 +109,9 @@ extension AetherEngine {
     /// - **Dolby Atmos**, which for E-AC-3 means the JOC flag in the dependent substream and only exists
     ///   post-decode (`.atmos`, see `AtmosDetectionOptions`), and
     /// - **HDR10+**, whose ST 2094-40 metadata rides an in-band ITU-T T.35 SEI that no demuxer parses
-    ///   (`.hdr10Plus`, see `HDR10PlusDetectionOptions`).
+    ///   (`.hdr10Plus`, see `HDR10PlusDetectionOptions`), and
+    /// - **HDR Vivid**, whose CUVA metadata rides the same kind of SEI in HEVC (`.hdrVivid`, scanned in
+    ///   the same pass and under the same `HDR10PlusDetectionOptions` budget).
     ///
     /// Both cost reads past `avformat_find_stream_info`, which is why `probe(url:)` does neither.
     /// Neither is for the playback-start critical path. Asking for both runs both
@@ -117,7 +119,7 @@ extension AetherEngine {
     /// queued, then the queue-flushing seek the Atmos decode pass needs.
     ///
     /// Both passes are additive and one-directional. They can only ever SET `isAtmos` /
-    /// `carriesHDR10PlusMetadata`, never clear what the container already declared, and a pass that hits a cap
+    /// `carriesHDR10PlusMetadata` / `carriesHDRVividMetadata`, never clear what the container already declared, and a pass that hits a cap
     /// leaves the base probe's answer exactly where it was.
     ///
     /// - Parameters:
@@ -125,7 +127,7 @@ extension AetherEngine {
     ///   - options: Forwarded verbatim to `probe(url:)` (`httpHeaders` only).
     ///   - detecting: Which extra passes to run. Empty is the header probe with the same controls.
     ///   - atmosDetection: Bounds + optional track override for the Atmos decode pass. Ignored without `.atmos`.
-    ///   - hdr10PlusDetection: Bounds for the HDR10+ scan. Ignored without `.hdr10Plus`.
+    ///   - hdr10PlusDetection: Bounds for the HDR10+ / HDR Vivid scan. Ignored without either.
     ///   - limits: Whole-probe limits, shared across open, stream analysis, seeks and both passes.
     ///   - cancellation: Cancellation reaches HTTP I/O or the custom reader's `cancel()`.
     /// - Throws: Open errors, `ProbeError` for whole-probe stops, or `CancellationError`. Ordinary
@@ -216,12 +218,17 @@ extension AetherEngine {
         // HDR10+ first, and before any seek: `avformat_find_stream_info` leaves its packets queued and
         // `av_read_frame` hands those back first, so at the head of a container the scan gets video packets
         // that have already been paid for. Running it after the Atmos pass would mean re-reading them.
-        if detecting.contains(.hdr10Plus) {
+        let dynamicTargets = detecting.intersection([.hdr10Plus, .hdrVivid])
+        if !dynamicTargets.isEmpty {
             let outcome = Self.detectHDR10Plus(
-                demuxer: demuxer, videoIndex: demuxer.videoStreamIndex, options: hdr10PlusDetection)
+                demuxer: demuxer, videoIndex: demuxer.videoStreamIndex, options: hdr10PlusDetection,
+                targets: dynamicTargets)
             try control?.check()
             if outcome.carriesHDR10Plus {
                 probe = Self.enrichHDR10Plus(base: probe)
+            }
+            if outcome.carriesHDRVivid {
+                probe.carriesHDRVividMetadata = true
             }
         }
 
@@ -566,17 +573,34 @@ extension AetherEngine {
     ///
     /// `formatKnown` is false when the open-time probe failed: the real range is then unknown and a DV write
     /// may still be inbound, so a suppressed host keeps the full budget.
+    ///
+    /// `noWriterExpected` is a `.secondary` load (Sodalite#175): nobody writes criteria for it, so there is
+    /// no inbound switch to wait for.
     nonisolated static func playGateGrace(
         criteriaUnchanged: Bool,
         engineIsCriteriaWriter: Bool,
         formatKnown: Bool,
-        effectiveFormat: VideoFormat
+        effectiveFormat: VideoFormat,
+        noWriterExpected: Bool = false
     ) -> DisplayCriteriaController.StartGrace {
         // #133: the criteria were already active, nothing was written, nothing can settle.
-        if criteriaUnchanged { return .skip }
+        if criteriaUnchanged || noWriterExpected { return .skip }
         if engineIsCriteriaWriter { return .brief }
         guard formatKnown else { return .full }
         return effectiveFormat == .sdr ? .brief : .full
+    }
+
+    /// Sodalite#175: a secondary never writes criteria, whatever the host passed.
+    nonisolated static func applyingSharedOutputRole(_ options: LoadOptions) -> LoadOptions {
+        guard options.sharedOutputRole == .secondary else { return options }
+        var adjusted = options
+        adjusted.suppressDisplayCriteria = true
+        return adjusted
+    }
+
+    /// Sodalite#175: Now Playing belongs to the primary; a secondary never takes it.
+    nonisolated static func ownsNowPlaying(hostOptIn: Bool, role: SharedOutputRole) -> Bool {
+        hostOptIn && role == .primary
     }
 
     /// Whitelist (not blacklist) of AVPlayer-native audio codecs: AAC, MP3, MP2, ALAC, AC-3/E-AC-3, LPCM, FLAC (native since iOS/tvOS 11). Anything else falls back to `AudioPlaybackHost` (FFmpeg).
@@ -611,22 +635,58 @@ extension AetherEngine {
     nonisolated static func selectAudioIndex(
         tracks: [TrackInfo],
         override: Int32?,
-        preferredLanguages: [String]
+        preferredLanguages: [String],
+        prefersTrueHDAtmos: Bool = false,
+        defaultIndex: Int32 = -1
     ) -> Int32? {
         // Explicit host override wins, but only when it names a real audio track (else fall through).
         if let override, tracks.contains(where: { $0.id == Int(override) }) {
             return override
         }
+        // #731: with object rendering on, TrueHD Atmos keeps its heights, which no other track of the
+        // same language does better, so it wins ties within a language. Never across one.
+        let atmosRank: ((Int) -> Int)? = prefersTrueHDAtmos
+            ? { isRenderableTrueHDAtmos(tracks[$0]) ? 0 : 1 }
+            : nil
         // Each preference is scanned across all tracks in order, so an earlier preference on a later
         // track still beats a later preference on an earlier track. Within one preference the most
         // specific tag wins, so an "en-GB" preference takes en-GB over eng over en-US (#590).
-        guard let index = bestLanguageMatchIndex(
+        if let index = bestLanguageMatchIndex(
             languages: tracks.map(\.language),
             preferredLanguages: preferredLanguages,
-            kind: .audio
-        ) else { return nil }
-        return Int32(tracks[index].id)
+            kind: .audio,
+            secondaryRank: atmosRank
+        ) {
+            return Int32(tracks[index].id)
+        }
+        // No language preference decided it: the session would take its default track, so a TrueHD
+        // Atmos track in that track's language replaces it.
+        // Same dub only: a script or region both tags state and disagree on (es-ES against es-419) is
+        // another dub, not another format of this one.
+        guard prefersTrueHDAtmos,
+              let fallback = tracks.first(where: { $0.id == Int(defaultIndex) }),
+              !isRenderableTrueHDAtmos(fallback),
+              let language = fallback.language
+        else { return nil }
+        let candidates = tracks.compactMap { track -> (track: TrackInfo, rank: Int)? in
+            guard isRenderableTrueHDAtmos(track),
+                  let rank = languageMatchRank(track.language, language, kind: .audio),
+                  rank / 3 < 2, rank % 3 < 2 else { return nil }
+            return (track, rank)
+        }
+        guard let atmos = candidates.min(by: { $0.rank < $1.rank })?.track else { return nil }
+        return Int32(atmos.id)
     }
+
+    /// TrueHD that FFmpeg marked Atmos while probing (mlpdec sets the profile from the major sync), and
+    /// not a commentary. `TrackInfo.isAtmos` stays the E-AC-3 JOC answer it is documented as.
+    nonisolated static func isRenderableTrueHDAtmos(_ track: TrackInfo) -> Bool {
+        track.codec.lowercased() == "truehd" && !track.isCommentary && !track.isExternal
+            && track.profile == trueHDAtmosProfileName
+    }
+
+    nonisolated private static let trueHDAtmosProfileName =
+        VideoStreamFormat.profileName(codecID: AV_CODEC_ID_TRUEHD, profile: AV_PROFILE_TRUEHD_ATMOS)
 
     /// Resolve the subtitle track to auto-activate from `LoadOptions.preferredSubtitleLanguages`: within the
     /// first preference (scanned in order) that has any language match, the best track by language

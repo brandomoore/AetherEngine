@@ -77,7 +77,10 @@ struct StreamingBufferTrimTests {
             after = reader.streamChunkAddressesForTesting
         }
         #expect(after.count < before.count, "the trim released nothing before the body ended")
-        #expect(after.count > 1)
+        // One kept chunk is enough for the address check below. Asking for two made the result
+        // depend on how URLSession cut the body, which a loaded machine coalesces into fewer chunks:
+        // a release at the first boundary then leaves exactly one (measured, `after.count -> 1`).
+        #expect(!after.isEmpty, "the trim released the chunk the read position is in")
         #expect(Array(before.suffix(after.count)) == after,
                 "a trim reallocated the chunks it kept: the buffer was copied, not sliced")
     }

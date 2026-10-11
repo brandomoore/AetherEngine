@@ -1,6 +1,17 @@
 import Foundation
 import CoreGraphics
 
+/// A bounded one-shot still. nil PTS means the source supplied no timestamp;
+/// callers must label the requested time rather than claim a measured one.
+// CGImage is immutable; all other stored properties are immutable Sendable values.
+public struct BoundedStillFrame: @unchecked Sendable {
+    public let image: CGImage
+    public let actualSeconds: Double?
+    public init(image: CGImage, actualSeconds: Double?) {
+        self.image = image; self.actualSeconds = actualSeconds
+    }
+}
+
 /// Produces still images from a media URL via an isolated FFmpeg decode context,
 /// separate from playback. Two modes share one decode core: `snapshot` (frame-accurate,
 /// full-res) and `thumbnail` (keyframe-snapped, low-res, fast). Lazy: context opens on
@@ -27,6 +38,7 @@ public actor FrameExtractor {
         func cancel() { lock.lock(); _cancelled = true; lock.unlock() }
     }
     private var currentToken: CancelToken?
+    private var boundedCancellation: ProbeCancellation?
 
     /// Set by `shutdown()`. Once true, the extractor refuses further
     /// work instead of lazily reopening a closed context.
@@ -34,18 +46,61 @@ public actor FrameExtractor {
 
     private let idleInterval: Duration = .seconds(10)
     private var idleTask: Task<Void, Never>?
+    private var residentApproximation: (width: Int, frame: ScrubFrame)?
+    nonisolated let residentIdentity: String?
+    func clearResidentPreviewCache() {
+        currentToken?.cancel()
+        residentApproximation = nil
+    }
 
-    private init(context: FrameDecodeContext, yieldWhile: (@Sendable () -> Bool)?) {
+    /// Only used with a one-segment DataIOReader. No URL or provider fallback.
+    /// Refined results bypass the old 0.1 s snapshot bucket entirely.
+    func residentPreview(rawTarget: Double, refined: Bool, maxWidth: Int,
+                                isCancelled: @escaping @Sendable () -> Bool) async -> ScrubFrame? {
+        guard !isShutDown, rawTarget.isFinite,
+              !Task.isCancelled, !isCancelled() else { return nil }
+        guard maxWidth > 0 else { return nil }
+        let width = maxWidth
+        if !refined, let cached = residentApproximation, cached.width == width {
+            scheduleIdleClose()
+            return cached.frame
+        }
+        currentToken?.cancel()
+        boundedCancellation?.cancel()
+        let token = CancelToken(); currentToken = token
+        let context = self.context
+        let result: ScrubFrame? = await withTaskCancellationHandler {
+            await runOnQueue {
+                guard !token.isCancelled, !isCancelled() else { return nil }
+                do { try context.ensureOpen() } catch { return nil }
+                var actual: Double?
+                var didRefine = false
+                let image = context.decodeFrame(at: 0, mode: refined ? .snapshot : .thumbnail,
+                    targetWidth: width, maxSize: CGSize(width: CGFloat(width), height: CGFloat(width)),
+                    isCancelled: { token.isCancelled || isCancelled() }, residentTarget: rawTarget,
+                    reportResidentTime: { actual = $0; didRefine = $1 })
+                guard let image, let actual, !token.isCancelled, !isCancelled() else { return nil }
+                return ScrubFrame(image: image, actualSeconds: actual, refined: didRefine)
+            }
+        } onCancel: { token.cancel() }
+        guard !Task.isCancelled, !isCancelled(), !token.isCancelled else { return nil }
+        if !refined, let result, result.image.bytesPerRow * result.image.height <= 512 * 1_024 {
+            residentApproximation = (width, result)
+        }
+        scheduleIdleClose()
+        return result
+    }
+
+    private init(context: FrameDecodeContext, yieldWhile: (@Sendable () -> Bool)?, residentIdentity: String? = nil) {
         self.context = context
+        self.residentIdentity = residentIdentity
         self.yieldWhile = yieldWhile
         self.cache = FrameCache(
             thumbnailLimit: 24,
             snapshotLimit: 2,
             thumbnailBucketSeconds: 1.0
         )
-        // .utility (not .userInitiated): the disposable thumbnail decode must yield to
-        // the real-time software playback decode under CPU contention so it cannot
-        // starve playback on a weak box (issue #27).
+        // Still extraction is elective work and must yield to playback under CPU contention.
         self.decodeQueue = DispatchQueue(label: "com.aetherengine.frameextractor", qos: .utility)
     }
 
@@ -65,6 +120,11 @@ public actor FrameExtractor {
                 yieldWhile: (@Sendable () -> Bool)? = nil) {
         self.init(context: FrameDecodeContext(reader: reader, formatHint: formatHint),
                   yieldWhile: yieldWhile)
+    }
+
+    init(residentReader: IOReader, formatHint: String, identity: String) {
+        self.init(context: FrameDecodeContext(reader: residentReader, formatHint: formatHint),
+                  yieldWhile: nil, residentIdentity: identity)
     }
 
     /// Yield decision for elective (thumbnail) extraction. The disposable decode's demuxer pulls
@@ -94,6 +154,63 @@ public actor FrameExtractor {
         await produce(at: seconds, mode: .snapshot, targetWidth: 0, maxSize: maxSize)
     }
 
+    /// AE#711 follow-up: the frame `offset` seconds after the first one this source decodes, for a
+    /// one-segment cache source whose timestamps may sit on either axis. Frame-accurate like
+    /// `snapshot`, uncached (the cache keys on stream time), and with the same Dolby Vision and HDR
+    /// conversion as every still.
+    func snapshot(afterFirstFrameBy offset: Double, maxSize: CGSize? = nil) async -> CGImage? {
+        guard !isShutDown, offset.isFinite else { return nil }
+        let context = self.context
+        let image = await runOnQueue { () -> CGImage? in
+            do { try context.ensureOpen() } catch {
+                EngineLog.emit("[FrameExtractor] open failed: \(error)", category: .swPlayback)
+                return nil
+            }
+            return context.decodeFrame(at: 0, mode: .snapshot, targetWidth: 0, maxSize: maxSize,
+                                       afterFirstFrame: offset, isCancelled: { false })
+        }
+        scheduleIdleClose()
+        return image
+    }
+
+    /// Disposable source-backed preview with one budget spanning open, stream
+    /// analysis, seek and decode. The controlled reader counts every input byte,
+    /// the monotonic deadline interrupts I/O, and a late result is discarded.
+    /// Unlike snapshot(), this never uses a previously opened or cached context.
+    public func boundedSnapshot(at seconds: Double, maxSize: CGSize,
+                                limits: ProbeLimits, cancellation: ProbeCancellation) async -> BoundedStillFrame? {
+        guard !isShutDown, seconds.isFinite, !Task.isCancelled, !cancellation.isCancelled,
+              let control = try? ProbeControl(limits: limits, cancellation: cancellation) else { return nil }
+        currentToken?.cancel()
+        boundedCancellation?.cancel()
+        boundedCancellation = cancellation
+        let token = CancelToken(); currentToken = token
+        let context = self.context
+        let result = await withTaskCancellationHandler {
+            await runOnQueue { () -> BoundedStillFrame? in
+                // A previously opened demuxer was outside this budget. Reject
+                // it instead of letting its teardown extend this one-shot work.
+                guard !context.isOpen else { control.finish(); return nil }
+                defer { context.close(); control.finish() }
+                guard !token.isCancelled, !cancellation.isCancelled else { return nil }
+                do { try context.ensureOpen(control: control) } catch { return nil }
+                var actual: Double?
+                guard let image = context.decodeFrame(at: seconds, mode: .snapshot,
+                    targetWidth: 0, maxSize: maxSize,
+                    isCancelled: { token.isCancelled || cancellation.isCancelled || control.isStopped },
+                    reportDecodedTime: { actual = $0 }),
+                    !token.isCancelled, !cancellation.isCancelled else { return nil }
+                do { try control.complete() } catch { return nil }
+                return BoundedStillFrame(image: image, actualSeconds: actual)
+            }
+        } onCancel: {
+            token.cancel()
+            cancellation.cancel()
+        }
+        if boundedCancellation === cancellation { boundedCancellation = nil }
+        return !Task.isCancelled && !cancellation.isCancelled && !token.isCancelled ? result : nil
+    }
+
     /// Open the decode context ahead of the first request to hide cold-start latency
     /// (e.g. at the start of a scrub gesture).
     public func prewarm() async {
@@ -111,7 +228,10 @@ public actor FrameExtractor {
         idleTask?.cancel()
         isShutDown = true
         currentToken?.cancel()
+        boundedCancellation?.cancel()
+        boundedCancellation = nil
         cache.clear()
+        residentApproximation = nil
         let context = self.context
         await runOnQueue { context.close() }
     }
@@ -133,6 +253,7 @@ public actor FrameExtractor {
             return nil
         }
         currentToken?.cancel()
+        boundedCancellation?.cancel()
         let token = CancelToken()
         currentToken = token
 
@@ -200,6 +321,7 @@ public actor FrameExtractor {
     /// shutdown() this does NOT set `isShutDown`, so the next request lazily reopens.
     private func idleClose() {
         cache.clear()
+        residentApproximation = nil
         let context = self.context
         // Fire-and-forget: best-effort, no caller awaits it; runOnQueue would block the actor for nothing.
         decodeQueue.async { context.close() }
