@@ -43,9 +43,6 @@ final class AudioAVPlayerHost {
     /// shared singletons is what produces the half-working state.
     let nowPlayingSession: MPNowPlayingSession
     #endif
-    /// Sodalite#175: false for a `.secondary` engine, which never claims Now Playing. Set per load, the
-    /// host outlives a role change.
-    var ownsNowPlaying: Bool
 
     // MARK: - Private state
 
@@ -87,10 +84,8 @@ final class AudioAVPlayerHost {
 
     // MARK: - Init
 
-    init(ownsNowPlaying: Bool = true,
-         diagnosticPool: ItemDiagnosticReadPool = .shared,
+    init(diagnosticPool: ItemDiagnosticReadPool = .shared,
          diagnosticRead: @escaping AVPlayerItemDiagnostics.Read = ItemDiagnosticSnapshot.read) {
-        self.ownsNowPlaying = ownsNowPlaying
         self.diagnosticPool = diagnosticPool
         self.diagnosticRead = diagnosticRead
         #if os(tvOS) || os(iOS)
@@ -103,7 +98,7 @@ final class AudioAVPlayerHost {
         // manual-publish design whose MPMediaItemArtwork closure was non-@Sendable and tripped
         // dispatch_assert_queue_fail when MediaPlayer requested the bitmap off-actor.
         nowPlayingSession.automaticallyPublishesNowPlayingInfo = true
-        if ownsNowPlaying { nowPlayingSession.becomeActiveIfPossible(completion: { _ in }) }
+        nowPlayingSession.becomeActiveIfPossible(completion: { _ in })
         #endif
     }
 
@@ -111,7 +106,6 @@ final class AudioAVPlayerHost {
     /// Home overlay + remote commands alive across a background pause).
     func becomeActiveNowPlaying() {
         #if os(tvOS) || os(iOS)
-        guard ownsNowPlaying else { return }
         nowPlayingSession.becomeActiveIfPossible(completion: { _ in })
         #endif
     }

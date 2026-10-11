@@ -26,7 +26,7 @@ struct NativeReaderDeferralTests {
         engine.cancelNativeSubtitleReaders()
     }
 
-    @Test("lazy readers defer while a restart is in flight and start once it settles", .timeLimit(.minutes(2)))
+    @Test("lazy readers defer while a restart is in flight and start once it settles")
     func deferThenStart() async throws {
         let engine = try prepared()
         engine.testHookRestartInFlightOverride = true
@@ -34,7 +34,8 @@ struct NativeReaderDeferralTests {
         #expect(engine.nativeSubtitleReadersTask == nil)
         #expect(engine.nativeSubtitleReaderDeferralTask != nil)
         engine.testHookRestartInFlightOverride = false
-        try await waitFor { engine.nativeSubtitleReadersTask != nil }
+        try await Task.sleep(nanoseconds: 700_000_000)
+        #expect(engine.nativeSubtitleReadersTask != nil)
         engine.cancelNativeSubtitleReaders()
     }
 

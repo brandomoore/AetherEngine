@@ -11,7 +11,7 @@ import Testing
 /// `bufferedPosition` stuck at the end of the current island. And a coverage that reached its range
 /// cap stopped describing new packets (plain) or invalidated itself (successor model) instead of
 /// forgetting the history behind the playhead.
-@Suite("Software VOD packet coverage (#613)", .offCooperativePool)
+@Suite("Software VOD packet coverage (#613)")
 struct Issue613PacketCoverageTests {
 
     private static let tickRate: Int32 = 1000
@@ -57,13 +57,15 @@ struct Issue613PacketCoverageTests {
         return try body(root)
     }
 
-    /// Waits for the producer to park. The park itself, not a packet count that held still: a
-    /// producer that is merely slow on a loaded machine looks parked to that. Sync, so the bound is
-    /// a generous hang catcher rather than a verdict.
+    /// Waits for the producer to park, read as a packet count that stops moving.
     private func waitForPark(_ source: SoftwarePacketReadAhead) {
-        let deadline = Date().addingTimeInterval(120)
-        while !source.producerParkedForTesting, Date() < deadline {
-            Thread.sleep(forTimeInterval: 0.02)
+        let deadline = Date().addingTimeInterval(10)
+        var previous = -1
+        while Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.15)
+            let now = source.snapshot.packetCount
+            if now == previous, now > 0 { return }
+            previous = now
         }
     }
 
@@ -116,7 +118,7 @@ struct Issue613PacketCoverageTests {
     private func frontierAfterConsuming(_ count: Int, source: SoftwarePacketReadAhead) throws -> Double? {
         source.start()
         for _ in 0..<count {
-            let deadline = Date().addingTimeInterval(120)
+            let deadline = Date().addingTimeInterval(5)
             while source.snapshot.packetCount < 40, Date() < deadline {
                 Thread.sleep(forTimeInterval: 0.001)
             }

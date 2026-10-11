@@ -219,8 +219,7 @@ extension HLSVideoEngine {
                 codecTagOverride: vcfg.codecTagOverride,
                 doviConfig: vcfg.doviConfig,
                 colorOverride: vcfg.colorOverride,
-                extradataOverride: vcfg.extradataOverride,
-                convertsAnnexBSamples: vcfg.convertsAnnexBSamples
+                extradataOverride: vcfg.extradataOverride
             )
             let probeAudio = MP4SegmentMuxer.AudioConfig(
                 codecpar: cfg.codecpar,
@@ -278,18 +277,6 @@ extension HLSVideoEngine {
                 "[HLSVideoEngine] WARNING: Atmos source pre-routed to FLAC bridge without stream-copy attempt, Atmos lost. Investigate the codec compatibility table.",
                 category: .session
             )
-        }
-
-        // #731: TrueHD Atmos with object rendering requested. Tried before the channel bridges, which it
-        // falls back to on any failure (see buildSpatialAudioProducerIfEligible).
-        if !forcedDrop, let audioStream = sourceAudioStream, sourceAudioStreamIndex >= 0,
-           let prod = buildSpatialAudioProducerIfEligible(
-               audioStream: audioStream,
-               sourceAudioStreamIndex: sourceAudioStreamIndex,
-               sourceCodecLabel: sourceCodecLabel,
-               audioHLSCodecs: &audioHLSCodecs,
-               audioLanguage: audioLanguage) {
-            return prod
         }
 
         if !forcedDrop, let audioStream = sourceAudioStream, sourceAudioStreamIndex >= 0 {

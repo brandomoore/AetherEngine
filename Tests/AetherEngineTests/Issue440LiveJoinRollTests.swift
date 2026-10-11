@@ -79,16 +79,14 @@ struct Issue440LiveJoinRollTests {
     func firesOnTheHold() {
         #expect(NativeAVPlayerHost.shouldStartLiveJoinImmediately(
             armed: true, alreadySpent: false, hostWantsToPlay: true,
-            isWaitingToMinimizeStalls: true, playbackBufferEmpty: false, bufferedAheadSeconds: 4.0,
-            itemIsReadyToPlay: true))
+            isWaitingToMinimizeStalls: true, playbackBufferEmpty: false, bufferedAheadSeconds: 4.0))
     }
 
     @Test("never without the opt-in")
     func offByDefault() {
         #expect(!NativeAVPlayerHost.shouldStartLiveJoinImmediately(
             armed: false, alreadySpent: false, hostWantsToPlay: true,
-            isWaitingToMinimizeStalls: true, playbackBufferEmpty: false, bufferedAheadSeconds: 4.0,
-            itemIsReadyToPlay: true))
+            isWaitingToMinimizeStalls: true, playbackBufferEmpty: false, bufferedAheadSeconds: 4.0))
     }
 
     /// One shot, and it belongs to the join. Past it AVPlayer's stall policy is the right one: a live
@@ -97,8 +95,7 @@ struct Issue440LiveJoinRollTests {
     func onceOnly() {
         #expect(!NativeAVPlayerHost.shouldStartLiveJoinImmediately(
             armed: true, alreadySpent: true, hostWantsToPlay: true,
-            isWaitingToMinimizeStalls: true, playbackBufferEmpty: false, bufferedAheadSeconds: 4.0,
-            itemIsReadyToPlay: true))
+            isWaitingToMinimizeStalls: true, playbackBufferEmpty: false, bufferedAheadSeconds: 4.0))
     }
 
     /// An empty buffer is the documented failure shape: `AVPlayer.h` says the call then behaves as if
@@ -107,8 +104,7 @@ struct Issue440LiveJoinRollTests {
     func refusesEmptyBuffer() {
         #expect(!NativeAVPlayerHost.shouldStartLiveJoinImmediately(
             armed: true, alreadySpent: false, hostWantsToPlay: true,
-            isWaitingToMinimizeStalls: true, playbackBufferEmpty: true, bufferedAheadSeconds: 0.0,
-            itemIsReadyToPlay: true))
+            isWaitingToMinimizeStalls: true, playbackBufferEmpty: true, bufferedAheadSeconds: 0.0))
     }
 
     /// `EvaluatingBufferingRate` is the brief monitoring period Apple documents as not worth showing a
@@ -117,8 +113,7 @@ struct Issue440LiveJoinRollTests {
     func refusesEvaluatingReason() {
         #expect(!NativeAVPlayerHost.shouldStartLiveJoinImmediately(
             armed: true, alreadySpent: false, hostWantsToPlay: true,
-            isWaitingToMinimizeStalls: false, playbackBufferEmpty: false, bufferedAheadSeconds: 4.0,
-            itemIsReadyToPlay: true))
+            isWaitingToMinimizeStalls: false, playbackBufferEmpty: false, bufferedAheadSeconds: 4.0))
     }
 
     /// A host that paused during the join asked for a still picture; overriding into motion would
@@ -127,8 +122,7 @@ struct Issue440LiveJoinRollTests {
     func refusesWithoutPlayIntent() {
         #expect(!NativeAVPlayerHost.shouldStartLiveJoinImmediately(
             armed: true, alreadySpent: false, hostWantsToPlay: false,
-            isWaitingToMinimizeStalls: true, playbackBufferEmpty: false, bufferedAheadSeconds: 4.0,
-            itemIsReadyToPlay: true))
+            isWaitingToMinimizeStalls: true, playbackBufferEmpty: false, bufferedAheadSeconds: 4.0))
     }
 
     /// The reason string the host compares against is AVFoundation's own, not a literal of ours.
@@ -148,8 +142,7 @@ struct Issue440LiveJoinRollTests {
             #expect(NativeAVPlayerHost.shouldStartLiveJoinImmediately(
                 armed: true, alreadySpent: false, hostWantsToPlay: true,
                 isWaitingToMinimizeStalls: true, playbackBufferEmpty: false,
-                bufferedAheadSeconds: ahead,
-            itemIsReadyToPlay: true))
+                bufferedAheadSeconds: ahead))
         }
     }
 
@@ -164,8 +157,7 @@ struct Issue440LiveJoinRollTests {
             #expect(!NativeAVPlayerHost.shouldStartLiveJoinImmediately(
                 armed: true, alreadySpent: false, hostWantsToPlay: true,
                 isWaitingToMinimizeStalls: true, playbackBufferEmpty: false,
-                bufferedAheadSeconds: ahead,
-            itemIsReadyToPlay: true))
+                bufferedAheadSeconds: ahead))
         }
     }
 
@@ -174,8 +166,7 @@ struct Issue440LiveJoinRollTests {
         #expect(NativeAVPlayerHost.shouldStartLiveJoinImmediately(
             armed: true, alreadySpent: false, hostWantsToPlay: true,
             isWaitingToMinimizeStalls: true, playbackBufferEmpty: false,
-            bufferedAheadSeconds: NativeAVPlayerHost.minimumLiveJoinBufferAhead,
-            itemIsReadyToPlay: true))
+            bufferedAheadSeconds: NativeAVPlayerHost.minimumLiveJoinBufferAhead))
     }
 
     /// A non-finite reading is an absent one. `currentTime()` on an item that has not resolved yields
@@ -186,13 +177,11 @@ struct Issue440LiveJoinRollTests {
         #expect(!NativeAVPlayerHost.shouldStartLiveJoinImmediately(
             armed: true, alreadySpent: false, hostWantsToPlay: true,
             isWaitingToMinimizeStalls: true, playbackBufferEmpty: false,
-            bufferedAheadSeconds: .nan,
-            itemIsReadyToPlay: true))
+            bufferedAheadSeconds: .nan))
         #expect(!NativeAVPlayerHost.shouldStartLiveJoinImmediately(
             armed: true, alreadySpent: false, hostWantsToPlay: true,
             isWaitingToMinimizeStalls: true, playbackBufferEmpty: false,
-            bufferedAheadSeconds: .infinity,
-            itemIsReadyToPlay: true))
+            bufferedAheadSeconds: .infinity))
     }
 
     /// Both readings have to agree. AVPlayer calling the buffer empty outranks a span that looks deep,
@@ -202,8 +191,7 @@ struct Issue440LiveJoinRollTests {
         #expect(!NativeAVPlayerHost.shouldStartLiveJoinImmediately(
             armed: true, alreadySpent: false, hostWantsToPlay: true,
             isWaitingToMinimizeStalls: true, playbackBufferEmpty: true,
-            bufferedAheadSeconds: 4.0,
-            itemIsReadyToPlay: true))
+            bufferedAheadSeconds: 4.0))
     }
 
     /// The depth is the CONTIGUOUS span ahead of the playhead, not the sum of every loaded range: an
@@ -217,8 +205,7 @@ struct Issue440LiveJoinRollTests {
         #expect(!NativeAVPlayerHost.shouldStartLiveJoinImmediately(
             armed: true, alreadySpent: false, hostWantsToPlay: true,
             isWaitingToMinimizeStalls: true, playbackBufferEmpty: false,
-            bufferedAheadSeconds: ahead,
-            itemIsReadyToPlay: true))
+            bufferedAheadSeconds: ahead))
     }
 
     /// The default is what a host gets without asking, and since 6.55.0 that is on: the device A/B
@@ -285,8 +272,7 @@ struct Issue440LiveJoinRollTests {
             #expect(NativeAVPlayerHost.shouldStartLiveJoinImmediately(
                 armed: true, alreadySpent: false, hostWantsToPlay: true,
                 isWaitingToMinimizeStalls: true, playbackBufferEmpty: empty,
-                bufferedAheadSeconds: ahead,
-            itemIsReadyToPlay: true) == expected)
+                bufferedAheadSeconds: ahead) == expected)
         }
     }
 

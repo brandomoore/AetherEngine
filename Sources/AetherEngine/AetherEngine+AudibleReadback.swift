@@ -17,8 +17,7 @@ extension AetherEngine {
         audibleReadbackTask?.cancel()
         guard let item = host.avPlayer.currentItem else { return }
         let servingMaster = nativeVideoSession?.servingMasterPlaylist ?? false
-        let rendition = nativeVideoSession?.provider?.masterAudioRendition
-        let served = rendition?.language
+        let served = nativeVideoSession?.provider?.masterAudioRendition?.language
         audibleReadbackTask = Task { @MainActor [weak self] in
             for await ready in host.$isReady.values where ready { break }
             guard !Task.isCancelled, let self,
@@ -36,7 +35,6 @@ extension AetherEngine {
             EngineLog.emit(
                 AudibleSelectionReadback.line(
                     served: served,
-                    declaredUntagged: rendition != nil && served == nil,
                     servingMaster: servingMaster,
                     groupPresent: group != nil,
                     options: options,

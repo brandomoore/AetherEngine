@@ -16,13 +16,9 @@ final class SubtitleFrameCompositor: @unchecked Sendable {
         let maxTextWidth: CGFloat
     }
 
-    /// Cue times and frame PTS share the source axis. Shift subtitle presentation only;
-    /// playback rate already advances the frame clock in media seconds.
-    nonisolated static func activeCues(in cues: [SubtitleCue], at seconds: Double,
-                                       delaySeconds: Double = 0) -> [SubtitleCue] {
-        let subtitleTime = seconds - delaySeconds
-        guard seconds.isFinite, delaySeconds.isFinite, subtitleTime.isFinite else { return [] }
-        return cues.filter { $0.startTime <= subtitleTime && subtitleTime < $0.endTime }
+    /// Plain window check; cue times and SW frame PTS share the source axis.
+    nonisolated static func activeCues(in cues: [SubtitleCue], at seconds: Double) -> [SubtitleCue] {
+        cues.filter { $0.startTime <= seconds && seconds < $0.endTime }
     }
 
     /// Default look: readable in a small window, resolution-independent.
@@ -65,7 +61,6 @@ final class SubtitleFrameCompositor: @unchecked Sendable {
     private let lock = NSLock()
     private var cues: [SubtitleCue] = []
     private var enabled = false
-    private var delaySeconds: Double = 0
     /// Cache key of the overlay currently rendered (active cue ids); nil = no overlay cached.
     private var cachedCueIDs: [Int]?
     private var cachedOverlay: CIImage?
@@ -76,11 +71,10 @@ final class SubtitleFrameCompositor: @unchecked Sendable {
     private var poolFormat: (width: Int, height: Int, pixelFormat: OSType)?
 
     /// Any thread; called by the engine when its published cues or the PiP flag change.
-    func update(cues: [SubtitleCue], enabled: Bool, delaySeconds: Double) {
+    func update(cues: [SubtitleCue], enabled: Bool) {
         lock.lock()
         self.cues = cues
         self.enabled = enabled
-        if delaySeconds.isFinite { self.delaySeconds = delaySeconds }
         lock.unlock()
     }
 
@@ -89,11 +83,10 @@ final class SubtitleFrameCompositor: @unchecked Sendable {
         lock.lock()
         let enabled = self.enabled
         let cues = self.cues
-        let delay = self.delaySeconds
         lock.unlock()
         guard enabled else { return buffer }
 
-        let active = Self.activeCues(in: cues, at: ptsSeconds, delaySeconds: delay)
+        let active = Self.activeCues(in: cues, at: ptsSeconds)
         guard !active.isEmpty else {
             lock.lock(); cachedCueIDs = nil; cachedOverlay = nil; lock.unlock()
             return buffer

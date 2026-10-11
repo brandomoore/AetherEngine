@@ -8,7 +8,6 @@ import Foundation
 /// request accumulated -12889 strikes toward failedToPlayToEndTime. A serve
 /// that cannot deliver promptly must now emit response headers early
 /// (Transfer-Encoding: chunked) and stream the body when the segment lands.
-@Suite(.offCooperativePool)
 struct Issue93SlowSegmentServeTests {
 
     private final class Counter: @unchecked Sendable {
@@ -32,7 +31,7 @@ struct Issue93SlowSegmentServeTests {
             fired.bump()
             didFire.signal()
         }
-        let armed = didFire.wait(timeout: .now() + 120) == .success
+        let armed = didFire.wait(timeout: .now() + 15) == .success
         signal.complete()
         #expect(armed)
         #expect(fired.value == 1)
@@ -216,10 +215,8 @@ struct Issue93SlowSegmentServeTests {
         }
     }
 
-    /// Raw-socket GET: returns the response bytes plus the time to first byte, reading until the
-    /// response is complete, the server ends the connection, or `deadline` elapses with no new
-    /// bytes. The server keeps the connection alive, so without the completion check the idle
-    /// deadline would be what ends a good response, and a slow body on a loaded runner would be cut.
+    /// Raw-socket GET: returns the response bytes plus the time to first byte,
+    /// reading until EOF or `deadline` elapses with no new bytes.
     private static func rawGET(port: UInt16, path: String,
                                deadline: TimeInterval) -> (bytes: Data, firstByteAfter: TimeInterval) {
         let fd = socket(AF_INET, SOCK_STREAM, 0)
@@ -257,31 +254,14 @@ struct Issue93SlowSegmentServeTests {
                 }
                 collected.append(contentsOf: buf[0..<n])
                 lastByteAt = DispatchTime.now()
-                if responseIsComplete(collected) { break }
             } else if n == 0 {
                 break   // orderly close
-            } else if errno != EAGAIN && errno != EWOULDBLOCK {
-                break   // reset
             } else {
                 let idle = Double(DispatchTime.now().uptimeNanoseconds - lastByteAt.uptimeNanoseconds) / 1e9
                 if idle > deadline { break }
             }
         }
         return (collected, firstByteAfter)
-    }
-
-    private static func responseIsComplete(_ raw: Data) -> Bool {
-        guard raw.range(of: Data("\r\n\r\n".utf8)) != nil else { return false }
-        let (header, body) = splitResponse(raw)
-        if header.contains("Transfer-Encoding: chunked") {
-            return body.suffix(HLSLocalServer.chunkedFinal.count).elementsEqual(HLSLocalServer.chunkedFinal)
-        }
-        for line in header.split(whereSeparator: \.isNewline)
-        where line.lowercased().hasPrefix("content-length:") {
-            let value = line.split(separator: ":", maxSplits: 1).last ?? ""
-            if let length = Int(value.trimmingCharacters(in: .whitespaces)) { return body.count >= length }
-        }
-        return false
     }
 
     /// Splits an HTTP/1.1 response blob into (headerString, bodyData).
@@ -316,7 +296,7 @@ struct Issue93SlowSegmentServeTests {
         try server.start()
         defer { server.stop() }
 
-        let (raw, _) = Self.rawGET(port: server.port, path: "/\(server.pathToken)/seg1.mp4", deadline: 30)
+        let (raw, _) = Self.rawGET(port: server.port, path: "/\(server.pathToken)/seg1.mp4", deadline: 1.0)
         let (header, body) = Self.splitResponse(raw)
         #expect(header.contains("200 OK"))
         #expect(header.contains("Content-Length: \(payload.count)"))
@@ -334,7 +314,7 @@ struct Issue93SlowSegmentServeTests {
         try server.start()
         defer { server.stop() }
 
-        let (raw, firstByteAfter) = Self.rawGET(port: server.port, path: "/\(server.pathToken)/seg1.mp4", deadline: 30)
+        let (raw, firstByteAfter) = Self.rawGET(port: server.port, path: "/\(server.pathToken)/seg1.mp4", deadline: 1.0)
         let (header, body) = Self.splitResponse(raw)
         #expect(firstByteAfter >= 0)
         #expect(firstByteAfter < 0.7, "header must arrive near the slow signal, got \(firstByteAfter)s")
@@ -350,7 +330,7 @@ struct Issue93SlowSegmentServeTests {
         try server.start()
         defer { server.stop() }
 
-        let (raw, firstByteAfter) = Self.rawGET(port: server.port, path: "/\(server.pathToken)/seg1.mp4", deadline: 30)
+        let (raw, firstByteAfter) = Self.rawGET(port: server.port, path: "/\(server.pathToken)/seg1.mp4", deadline: 1.5)
         let (header, body) = Self.splitResponse(raw)
         #expect(firstByteAfter >= 0)
         #expect(header.contains("Transfer-Encoding: chunked"))

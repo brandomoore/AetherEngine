@@ -11,7 +11,7 @@ import Testing
 /// disk budget as the only bound, which in a session is the difference between a window and the
 /// whole file. The limit is measured on the reservoir instead: the newest stored video timestamp
 /// against the one the consumer last took.
-@Suite("Software VOD read-ahead park (#512)", .offCooperativePool)
+@Suite("Software VOD read-ahead park (#512)")
 struct SoftwarePacketReadAheadParkTests {
 
     private final class SourceCounter: @unchecked Sendable {

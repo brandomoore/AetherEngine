@@ -26,7 +26,7 @@ Interlaced sources (DVD-rip MPEG-2, SD / HD broadcast H.264) are deinterlaced th
 
 ### MP4 without composition offsets
 
-Some writers emit a sample table with no `ctts` while the H.264 or HEVC bitstream still reorders pictures.
+Some writers emit a sample table with no `ctts` while the H.264 bitstream still reorders pictures.
 Every sample then reports `PTS == DTS`, and since the native route stream-copies those timestamps
 into fMP4, AVPlayer is handed decode order as presentation order: each future reference picture is
 shown before the B pictures that precede it. Measured through AVFoundation's own decoder on a twin
@@ -34,8 +34,8 @@ pair (one encode muxed twice, composition offsets removed from one), 45 of 66 pi
 time belonging to a different picture, with the content order stepping backwards 30 times (#409).
 
 The container lost the information, but the bitstream did not: every slice header carries a picture
-order count, which is display order, and libavcodec's H.264 and HEVC parsers read it without decoding
-a pixel and take MP4's length-prefixed payload directly. `H264CompositionOffsetRepair` samples the head
+order count, which is display order, and libavcodec's H.264 parser reads it without decoding a pixel
+and takes MP4's length-prefixed payload directly. `H264CompositionOffsetRepair` samples the head
 (twelve pictures at most, held rather than re-read, so no rewind and no second fetch) and repairs a
 confirmed source at the demuxer boundary:
 
@@ -54,12 +54,10 @@ built from index entries and then filled with these packets.
 Detection is fail-closed and costs a healthy file almost nothing: the first real PTS-DTS offset ends
 the sample (usually on the first packet, since a reordered file's head sample sits one delay below
 zero). A source is only repaired when every sampled pair is equal, the decode ladder is uniform, the
-picture order regresses, and the ranks it produces are distinct and fill the sampled window (or a
-decode-order prefix of at least nine pictures fills its own range exactly, which covers a
-hierarchical mini-GOP longer than the reorder delay, #699). Anything
+picture order regresses, and the ranks it produces are distinct and fill the sampled window. Anything
 short of that (variable frame timing, a picture order that does not advance one rank per picture, a
 sample that starts nowhere it can be anchored) is delivered exactly as the container wrote it.
-Reported by @orut34iop; the HEVC case (#699) by @ijuniorfu.
+Reported by @orut34iop.
 
 ### Matroska with presentation slots in coding order
 
@@ -216,22 +214,6 @@ sets `SourceProbe.carriesHDR10PlusMetadata` independently of the primary format,
 See [whole-probe limits and cancellation](api.md#whole-probe-limits-and-cancellation) for bounded source
 reads; absence of confirmation is not proof of absence or a statement about the connected display.
 
-### HDR Vivid (CUVA) dynamic metadata
-
-HDR Vivid (CUVA T/UWA 005.1) is built to be backward compatible: the base layer is plain HLG or PQ in
-BT.2020, and its dynamic metadata is an optional registered T.35 SEI on top (country 0x26, provider
-0x0004, oriented code 0x0005). The engine plays that base exactly like any HLG or HDR10 source and the
-SEI is stream-copied with the rest of the bitstream; no Apple platform applies it, and a display
-without Vivid support shows the static base, which is the format's intended fallback. There is no
-host-side tone mapping: the native route has no pixel stage, tvOS gives an app no EDR or panel-peak
-reading to map against, and the TV maps the HDR signal itself (#699).
-
-`probe(url:detecting: .hdrVivid)` reports carriage as `SourceProbe.carriesHDRVividMetadata`, in the
-same packet pass and budget as `.hdr10Plus`. libavcodec's CUVA parser is internal, so
-`HDRVividMetadataScan` walks the body with the same field widths and only counts a message whose
-`system_start_code` is one of the defined 1 to 7, whose fields are all present, and whose bits after
-the last field are zero. HEVC only, as in libavcodec. `videoFormat` stays `.hlg` / `.hdr10`.
-
 The label can also be taken back from the item itself, where the platform has no capability table to clamp it against (AE#515). A Dolby Vision source on macOS resolves to `.hdr10`, because `supportsDolbyVision` is unclaimable there without a host assertion, while AVFoundation goes on playing the `dvh1` sample entry the engine served. Measured with the assertion off on a 16" XDR, a Profile 5 and a Profile 8.1 grade of Dolby's reference content both strobe, so the RPU reaches the pixels with no claim set anywhere and the clamp was moving nothing but the label. When the item's sample entry reads `dvh1` / `dvhe` and the probe agrees the source is Dolby Vision, the label is upgraded from `.hdr10` to `.dolbyVision` at `readyToPlay`. It is an upgrade and not a mirror of what AVFoundation parsed, for two reasons that both matter: an `.sdr` label is the clamp being right about a display presenting no HDR at all, and on tvOS and iOS the per-mode table answers the capability question, so the label follows it rather than a sample entry that a Profile 5 master carries on every panel. Profile 8.1 keeps `.hdr10` on macOS: it reports `hvc1` with the DV configuration alongside it, it composes on that display all the same, and nothing in the stack reports that.
 
 ## Audio
@@ -301,34 +283,13 @@ tag in a fixed reference locale, which is the validity signal canonicalization c
 (`canonicalLanguageIdentifier` echoes `dub` and `xyz` back unchanged exactly as it echoes `cnr`).
 The locale is fixed rather than the device's, or a file would resolve on an English Apple TV and not
 on a German one. A label that resolves to nothing writes nothing, so an untagged source keeps the
-master it had before. The one exception is a stream-copied E-AC-3 JOC track (AE#726, next section),
-which gets a rendition without `LANGUAGE` because its `CHANNELS` has nowhere else to go.
+master it had before.
 
 ### Dolby Atmos
 
-EAC3+JOC packets are stream-copied through the muxer untouched, on every output route. AVPlayer reads the segment and recognises JOC from the `dec3` box's ETSI TS 103 420 extension (`flag_ec3_extension_type_a = 1` followed by `complexity_index_type_a`, the object count), with the height channels a dependent substream adds named by that substream's `chan_loc` bits, and then lets the downstream renderer decide: over HDMI it tunnels out as Dolby MAT 2.0 and the AVR lights up the Atmos indicator; over AirPods it renders spatially; over plain Bluetooth A2DP / LE it downmixes the bed channels to stereo natively. The route never changes the engine's decision (a JOC track is signaled in the playlist as `ec-3`, the same CODECS string as a non-JOC EAC3 5.1 track, so AVPlayer accepts it everywhere and the bitstream is never re-encoded for a route reason). The engine emits an explicit `[HLSVideoEngine] EAC3+JOC Atmos: stream-copy engaged; ...` diagnostic on every Atmos session.
-
-**`CHANNELS` on the audio rendition.** `CODECS` cannot carry the distinction. A JOC track is signaled `ec-3`, the same string a non-JOC E-AC-3 5.1 track gets (#34: never `ec+3`, which tvOS 26.5 refuses), so that attribute says nothing about objects either way, and the `dec3` box sits a layer below the playlist. The master's `EXT-X-MEDIA:TYPE=AUDIO` tag therefore carries `CHANNELS`, which Apple's HLS Authoring Specification makes required on every audio rendition and which Dolby's DD+ Online Delivery Kit defines for object audio as the count of decodable objects, a slash, then `JOC`. The engine writes `CHANNELS="16/JOC"` for a stream-copied E-AC-3 JOC rendition and the plain served channel count otherwise (`CHANNELS="6"` for a 5.1 bed); a source whose audio never reached the variant advertises no rendition and so gets no attribute. An untagged JOC stream copy still gets a rendition (AE#726): `NAME="Dolby Atmos"`, no `LANGUAGE`, `CHANNELS="16/JOC"`, and that rendition forces the master on an SDR source the same way a language does. AVFoundation lists it as one audible option named "Unknown" (measured on macOS against Dolby's untagged JOC test signal), where the tag-less master before built no audible group at all. An untagged track that is not object audio still gets no rendition, so no other untagged source changes route. Two things decide the value rather than one. The JOC form is gated on the delivery being a stream copy as well as on the source probe, because a JOC source whose stream-copy probe was rejected and which fell back to the audio bridge has no objects left in its segments and must claim none; and the count is read from the codec parameters the muxer was configured with, not the source's, so a bridged track reports the encoder's layout. The literal `16` is the object count Dolby's delivery kit and Apple's own Atmos masters carry: strictly it is `complexity_index_type_a` from the `EC3SpecificBox`, which is not available at the playlist layer.
+EAC3+JOC packets are stream-copied through the muxer untouched, on every output route. AVPlayer reads the segment, recognises JOC from the `dec3` box (`numDepSub=1`, `depChanLoc=0x0100`), and lets the downstream renderer decide: over HDMI it tunnels out as Dolby MAT 2.0 and the AVR lights up the Atmos indicator; over AirPods it renders spatially; over plain Bluetooth A2DP / LE it downmixes the bed channels to stereo natively. The route never changes the engine's decision (a JOC track is signaled in the playlist as `ec-3`, the same CODECS string as a non-JOC EAC3 5.1 track, so AVPlayer accepts it everywhere and the bitstream is never re-encoded for a route reason). The engine emits an explicit `[HLSVideoEngine] EAC3+JOC Atmos: stream-copy engaged; ...` diagnostic on every Atmos session.
 
 Matroska CodecPrivate doesn't usually carry the pre-parsed `dec3` / `dac3` box content the mov muxer needs at `avformat_write_header` time, so the muxer is configured with `+delay_moov` (alongside `+empty_moov+default_base_moof+frag_custom`). The moov atom is deferred until the first fragment-cut flush, by which point packets have flowed through `mov_write_packet` and libavformat's `handle_eac3` / `handle_ac3` have populated the sample-entry boxes from the actual packet bitstream. The first cut emits the deferred ftyp+moov (routed by `FragmentSplitter` to init.mp4); subsequent cuts emit normal moof+mdat. Net effect: EAC3 / AC3 from matroska direct-play stream-copies cleanly with valid sample-entries, no manual bitstream parsing on the host side.
-
-**A dependent substream needs FFmpegBuild 3.7.0 or later.** A Blu-ray style DD+ track is an AC-3 core syncframe (`bsid 6`) followed by an E-AC-3 dependent syncframe that carries the height channels and the objects. Stock `handle_eac3()` gets two `dec3` fields wrong for that shape: `chan_loc` is taken from the dependent `chanmap` with a shift and mask that do not match ETSI TS 102 366 F.6.2.3 (fixed upstream as `f10fdd6310`, master only), and `complexity_index_type_a` is read from the independent substream alone, so the TS 103 420 extension is dropped. The box then describes a bare 5.1 bed and an Atmos receiver reports multichannel PCM (AE#728). FFmpegBuild's `patch_ffmpeg_eac3_dec3` fixes both in the muxer; measured on a 5.1.2 source with `chanmap = 0xA010`, the payload goes from `14 00 0C 0F 02 00` to `14 00 0C 0F 02 40 01 10` (`chan_loc` `0x040` is Lvh/Rvh, `01 10` states the extension and 16 objects). A track whose objects sit in the independent substream already got a correct box and is unchanged.
-
-### TrueHD Atmos with heights
-
-Apple TV cannot bitstream TrueHD, and no Apple platform hands a third-party app a compressed bitstream output, so the audio bridge decodes a TrueHD track and re-encodes its 7.1 channel presentation (`audioBridgeMode`). For TrueHD Atmos that loses every height and every object position before the audio leaves the engine. `LoadOptions.objectAudioRendering = .apac(layout)` keeps them (AetherEngine#731): the engine decodes the Atmos object presentation (the bed, up to 15 dynamic objects and their object audio metadata, through [LibTrueHD](https://github.com/superuser404notfound/LibTrueHD)), renders it into the `SpatialSpeakerLayout` bed the host names (5.1.2, 5.1.4, 7.1.2, 7.1.4 or 9.1.6, as `SpatialSpeaker` positions in CoreAudio's channel order), and encodes that bed as Apple Positional Audio. tvOS sends APAC to an Atmos receiver or soundbar as Dolby MAT, the same way it delivers its own spatial content, and iOS plays it as Spatial Audio.
-
-The renderer is allocentric, the model Atmos metadata is authored in: the room is a unit cube, and an object is balanced constant-power between the two speaker planes that bracket its height, the two rows that bracket its depth and the two speakers that bracket its width, so moving an object never changes its loudness. Object size spreads it over a grid of points summed by power, snap sends it to the nearest speaker, zone masks keep it off the speakers they exclude, and an object without elevation stays off the ceiling. Bed channels the layout has route discretely, LFE goes to the LFE channel, and metadata updates ramp gains sample-accurately as the stream specifies.
-
-**Track choice.** With the option on, the automatic audio pick prefers a TrueHD Atmos track over the other tracks of the same language: of the `preferredAudioLanguages` match, or of the session's default track when no preference decides it. It never crosses a language or a dub (a region or script both tags state and disagree on), never picks a commentary for it, applies only where the bed can be rendered (a VOD video session off the software path), and an explicit `audioSourceStreamIndexOverride` still wins. Without that, a film carrying DTS-HD and TrueHD Atmos in one language usually opened on whichever the container listed first.
-
-It is opt-in because it is a trade: APAC is lossy, at several Mbit/s, in place of the lossless 7.1 the channel bridge delivers. It applies only to TrueHD that FFmpeg marks as Atmos, at 48 kHz, on OS 26 or later where the APAC encoder exists; anything else, and any failure to start, keeps `audioBridgeMode` with the audio intact. Silo built the first implementation in its fork and offered it as the reference this one is ported from.
-
-A linked peak limiter sits between the renderer and the encoder: the APAC encoder carries samples over full scale through unchanged (a tone at amplitude 4.0 decodes back at 4.001), and a rendered bed can get there, since object gains reach +15 dB and up to sixteen elements sum into one speaker. One gain for every channel, so no object moves; instant attack, so nothing leaves above −0.18 dBFS without a lookahead delay that would shift the audio against the picture; a 250 ms release. A bed under the threshold passes bit for bit.
-
-**Cost.** Decoding the object presentation and encoding APAC each take about one core: on Dolby's Unfold demo (27 s, M1, release build) the TrueHD decode took 1.36 s (0.92 s since LibTrueHD 2.2.0), the APAC encode 1.26 s and rendering plus limiting 0.06 s. Apple's encoder runs on one thread, so the bridge hands each rendered 2048-frame chunk to a serial encode queue and decodes the next one meanwhile (`APACEncodePipeline`), which took the whole sample from 2.73 s to 1.75 s, and with LibTrueHD 2.2.0's faster decode to 1.40 s, 19x real time against 10x in series. The encoder is now the slower half, so the decoder no longer sets the pace. That time is what a seek past the produced range waits for before its first segment, so it is the one place the trade shows. The queue inherits the producer's QoS, a pool of three chunk buffers holds the producer at most two chunks ahead of the encoder, and the producer waits for the queue (`settle()`) before a keyframe advances its segment cutter or a write cuts the open segment, so every packet is routed as the encode in series routed it and every segment carries the same audio, byte for byte. Those waits cost about 0.1 s of the sample's overlap.
-
-**What the session log says.** `[SpatialAudioBridge] object configuration` names the presentation (`LFE + 15 objects` for Dolby's Unfold demo). A `bed levels` line gives each bed channel's RMS and peak with its CoreAudio name, how many objects were active and how many elevated, the LFE element's level and gain, and the limiter's work over the same window when it had any; it comes after the first 5 s of audio (and again after every seek), then every 30 s. The decoder waits for a major sync after a start or seek, so a decoder that returns nothing for 1200 packets in a row, a second of TrueHD, is reported as one that produces nothing, the same failure the channel bridge reports.
 
 ## Subtitles
 

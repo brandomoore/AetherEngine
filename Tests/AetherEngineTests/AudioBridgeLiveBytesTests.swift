@@ -82,7 +82,6 @@ struct AudioBridgeLiveBytesTests {
             }
         }
         poller.start()
-        while tally.snapshot.polls == 0 { usleep(1000) }
 
         var produced = 0
         for round in 0..<40 {

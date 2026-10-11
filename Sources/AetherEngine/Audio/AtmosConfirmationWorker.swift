@@ -66,7 +66,7 @@ extension AetherEngine {
         let formatHint = customFormatHint
         let probesize = loadedOptions.probesize
         let maxAnalyzeDuration = loadedOptions.maxAnalyzeDuration
-        atmosConfirmationTask = BlockingWork.detached(priority: .utility) { [weak self] in
+        atmosConfirmationTask = Task.detached(priority: .utility) { [weak self] in
             await self?.runAtmosConfirmation(
                 url: url, formatHint: formatHint, headers: headers,
                 callerProbesize: probesize, callerMaxAnalyzeDuration: maxAnalyzeDuration,

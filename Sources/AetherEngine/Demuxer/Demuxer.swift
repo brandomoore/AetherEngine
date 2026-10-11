@@ -81,13 +81,6 @@ struct DemuxerOpenProfile: Sendable {
     /// one reader's generation counter as several concurrent connections, because nothing in the line
     /// distinguished them. Defaults to the pump, since every other path builds its profile explicitly.
     var readerLabel: String = "pump"
-    var sourceOpenPolicy: SourceOpenPolicy = .init()
-
-    func withSourceOpenPolicy(_ policy: SourceOpenPolicy) -> DemuxerOpenProfile {
-        var copy = self
-        copy.sourceOpenPolicy = policy
-        return copy
-    }
 
     /// Whether a probe of an untagged 10-bit HEVC source may read its first RPU to find a Dolby Vision
     /// Profile 5 the container never recorded (`DolbyVisionRecordAudit.addRecordIfProfile5`). On for every
@@ -123,17 +116,6 @@ struct DemuxerOpenProfile: Sendable {
         readerLabel: "extract",
         auditsRecordlessDolbyVision: false
     )
-
-    /// AE#682: the I-frame rendition's side reader. Reads one keyframe per request, so it takes the
-    /// still extractor's tuning under a name of its own (#240: a connection line without a name
-    /// cannot say which reader opened it).
-    static let iFrameSideDemuxer = stillExtraction.withReaderLabel("iframe")
-
-    /// Readers that fetch single keyframes and publish no timestamp axis, so the #409 repair's
-    /// sample window would be packets read for nothing.
-    static let labelsWithoutCompositionRepair: Set<String> = [
-        stillExtraction.readerLabel, iFrameSideDemuxer.readerLabel,
-    ]
 
     /// A copy of `self` with only the open-time probe budget overridden (#68).
     /// A non-nil `probesize` / `maxAnalyzeDuration` replaces the matching field;
@@ -417,51 +399,6 @@ public final class Demuxer: @unchecked Sendable {
     /// leaves it nil and emits nothing.
     var onOpenProgress: (@Sendable (DemuxerOpenStage) -> Void)?
 
-    /// AE#678: when this open started and when each stage finished, for the one timing line an open
-    /// emits. `#361`'s checkpoints carry the same boundaries to the host, but only as a ladder with no
-    /// durations, and a downstream integrator had to guess whether the connect, the container or the
-    /// stream analysis was the slow leg.
-    private var openStartedAt: DispatchTime?
-    private var openStageTimes: [DemuxerOpenStage: DispatchTime] = [:]
-
-    private func beginOpenTiming() {
-        openStartedAt = DispatchTime.now()
-        openStageTimes = [:]
-    }
-
-    private func reportOpenStage(_ stage: DemuxerOpenStage) {
-        openStageTimes[stage] = DispatchTime.now()
-        onOpenProgress?(stage)
-        if stage == .streamsProbed { emitOpenTimings(outcome: nil) }
-    }
-
-    /// Stills and the subtitle side reader open far too often to narrate, and the latter skips the
-    /// stream analysis the line exists to time.
-    private var reportsOpenTimings: Bool {
-        openProfile.readerLabel != DemuxerOpenProfile.stillExtraction.readerLabel && !openProfile.skipStreamInfo
-    }
-
-    private func emitOpenTimings(outcome: String?) {
-        guard reportsOpenTimings, let start = openStartedAt else { return }
-        openStartedAt = nil
-        func ms(_ from: DispatchTime?, _ to: DispatchTime?) -> String {
-            guard let from, let to, to.uptimeNanoseconds >= from.uptimeNanoseconds else { return "-" }
-            return "\((to.uptimeNanoseconds - from.uptimeNanoseconds) / 1_000_000)ms"
-        }
-        let source = openStageTimes[.sourceOpened]
-        let container = openStageTimes[.containerOpened]
-        let probed = openStageTimes[.streamsProbed] ?? (outcome == nil ? nil : DispatchTime.now())
-        let streams = formatContext.map { Int($0.pointee.nb_streams) } ?? 0
-        EngineLog.emit(
-            "[Demuxer] open timings (\(openProfile.readerLabel)): connect \(ms(start, source)), "
-            + "open_input \(ms(source ?? start, container)), find_stream_info \(ms(container, probed)), "
-            + "total \(ms(start, probed)); \(streams) stream(s), probesize \(openProfile.probesize / 1_048_576) MiB, "
-            + "analyzeduration \(openProfile.maxAnalyzeDuration / 1_000_000) s"
-            + (outcome.map { "; \($0)" } ?? ""),
-            category: .demux
-        )
-    }
-
     // MARK: - Disc titles / chapters (#67)
 
     private(set) var discTitles: [DiscTitle] = []
@@ -640,7 +577,6 @@ public final class Demuxer: @unchecked Sendable {
     func open(url: URL, extraHeaders: [String: String] = [:], profile: DemuxerOpenProfile = .playback, isLive: Bool = false, selectTitleID: Int? = nil) throws {
         if isCloseRequested { throw DemuxerError.openFailed(code: -1) }
         self.openProfile = profile
-        beginOpenTiming()
         self.auditSource = isLive ? nil : (url, extraHeaders)
         let isHTTP = url.scheme == "http" || url.scheme == "https"
 
@@ -682,13 +618,13 @@ public final class Demuxer: @unchecked Sendable {
         formatContext = openedCtx
         // #361: a local file has no connection to come up, so the source stage is credited by this
         // one rather than reported separately.
-        reportOpenStage(.containerOpened)
+        onOpenProgress?(.containerOpened)
 
         try probeStreams(openedCtx)
         accessLock.lock()
         refreshStreamTableLocked()
         accessLock.unlock()
-        reportOpenStage(.streamsProbed)
+        onOpenProgress?(.streamsProbed)
     }
 
     /// Open a custom `IOReader` source. `formatHint` disambiguates probing when
@@ -699,7 +635,6 @@ public final class Demuxer: @unchecked Sendable {
     func open(reader: IOReader, formatHint: String? = nil, profile: DemuxerOpenProfile = .playback, isLive: Bool = false, selectTitleID: Int? = nil, discCacheKey: String? = nil) throws {
         if isCloseRequested { throw DemuxerError.openFailed(code: -1) }
         self.openProfile = profile
-        beginOpenTiming()
         self.auditSource = nil
         if reader.discImageProbeEnabled,
            let discInfo = try DiscReader.wrap(reader, selectTitleID: selectTitleID, cacheKey: discCacheKey) {
@@ -770,8 +705,7 @@ public final class Demuxer: @unchecked Sendable {
             chunkMaxRetries: openProfile.avioMaxRetries,
             boundedInitialFetch: openProfile.boundedInitialFetch,
             sequentialOnly: openProfile.avioSequentialOnly,
-            heldConnection: openProfile.avioHeldConnection,
-            sourceOpenPolicy: openProfile.sourceOpenPolicy
+            heldConnection: openProfile.avioHeldConnection
         )
         reader.onNetworkPhaseChanged = onNetworkPhaseChanged
         reader.playIntentProvider = playIntentProvider
@@ -812,7 +746,7 @@ public final class Demuxer: @unchecked Sendable {
             abandonProvider(provider)
             throw DemuxerError.openFailed(code: -1)
         }
-        reportOpenStage(.sourceOpened)   // #361
+        onOpenProgress?(.sourceOpened)   // #361
 
         // AE#460 follow-up: a live source rebuilt on a RETAINED reader resumes where that reader
         // is, not at the host's base. A fresh AVIOContext starts its byte axis at 0 regardless, so
@@ -889,14 +823,14 @@ public final class Demuxer: @unchecked Sendable {
             throw DemuxerError.openFailed(code: ret)
         }
         formatContext = ctxPtr  // avformat_open_input may reallocate
-        reportOpenStage(.containerOpened)   // #361
+        onOpenProgress?(.containerOpened)   // #361
         declareDiscSubpictureStreams(ctxPtr!)
 
         try probeStreams(ctxPtr!)
         accessLock.lock()
         refreshStreamTableLocked()
         accessLock.unlock()
-        reportOpenStage(.streamsProbed)     // #361
+        onOpenProgress?(.streamsProbed)     // #361
         // #281: every parse seek this open performs has happened by now, so the provider can drop
         // the cold-start state that only exists to serve them. Deliberately after probeStreams:
         // find_stream_info is where the trailing-index ping-pong lives, not avformat_open_input.
@@ -1039,7 +973,6 @@ public final class Demuxer: @unchecked Sendable {
         let findRet = avformat_find_stream_info(ctx, nil)
         unparkUnresolvableAudio(ctx, parked)
         guard findRet >= 0 else {
-            emitOpenTimings(outcome: "find_stream_info failed (\(findRet))")
             throw DemuxerError.streamInfoFailed(code: findRet)
         }
         logStreams(ctx)
@@ -1895,16 +1828,6 @@ public final class Demuxer: @unchecked Sendable {
         decideCompositionRepairLocked()
     }
 
-    /// #409: a seek moves the read position, so the repair drops its picture-order anchor and
-    /// re-anchors on the landing keyframe. A seek that comes before the first read (the software
-    /// host's resume, #699) settles the verdict at the head first: sampled at the landing, the
-    /// stream would start on an open-GOP keyframe whose picture order is not 0, and the classifier
-    /// refuses that, so the whole session played in decode order. Caller holds `accessLock`.
-    private func noteCompositionRepairSeekLocked() {
-        if !compositionRepairEvaluated { decideCompositionRepairLocked() }
-        compositionRepair?.noteSeek()
-    }
-
     /// #409: reads far enough into the source for the verdict, holding every
     /// packet it consumed so nothing is lost. Called before anything reads a timestamp axis off this
     /// demuxer: the container index and the packets must describe the same ladder, and only the
@@ -1937,7 +1860,7 @@ public final class Demuxer: @unchecked Sendable {
         // reader, #104) has no pictures to sample at all, and a non-seekable source is a live feed,
         // where holding a dozen packets for a defect that lives in a VOD sample table is latency
         // spent for nothing.
-        guard !DemuxerOpenProfile.labelsWithoutCompositionRepair.contains(openProfile.readerLabel),
+        guard openProfile.readerLabel != DemuxerOpenProfile.stillExtraction.readerLabel,
               isSourceSeekable else { return nil }
         let index = max(-1, av_find_best_stream(ctx, AVMEDIA_TYPE_VIDEO, -1, -1, nil, 0))
         guard index >= 0, index < Int32(ctx.pointee.nb_streams),
@@ -2157,7 +2080,7 @@ public final class Demuxer: @unchecked Sendable {
               let timestamp = Self.ticks(forSeconds: seconds, timeBase: Self.avTimeBase) else { return false }
         // #409: the read position moves, so the repair drops its picture-order anchor and
         // re-anchors on the next keyframe (a seek always lands on one).
-        noteCompositionRepairSeekLocked()
+        compositionRepair?.noteSeek()
         if let reader = timeSeekableReader {
             dropPeekedPacketsLocked()
             guard repositionTimeSeekable(reader, toSourceSeconds: seconds, streamIndex: -1) else { return false }
@@ -2191,7 +2114,7 @@ public final class Demuxer: @unchecked Sendable {
               streamIndex < Int32(ctx.pointee.nb_streams) else { return false }
         // #409: the read position moves, so the repair drops its picture-order anchor and
         // re-anchors on the next keyframe (a seek always lands on one).
-        noteCompositionRepairSeekLocked()
+        compositionRepair?.noteSeek()
         if let reader = timeSeekableReader,
            let stream = ctx.pointee.streams[Int(streamIndex)] {
             let timeBase = stream.pointee.time_base
@@ -2331,7 +2254,7 @@ public final class Demuxer: @unchecked Sendable {
         guard let timestamp = Self.ticks(forSeconds: seconds, timeBase: timeBase) else { return false }
         // #409: the read position moves, so the repair drops its picture-order anchor and
         // re-anchors on the next keyframe (a seek always lands on one).
-        noteCompositionRepairSeekLocked()
+        compositionRepair?.noteSeek()
         // #268: a time-seekable source repositions itself instead of paying libavformat's byte-space
         // binary search, which on an index-less MPEG-TS is either wedged or broken (round 10 below) and
         // over HTTP would additionally be a request storm. No read deadline is armed: the reader's
@@ -2547,7 +2470,7 @@ public final class Demuxer: @unchecked Sendable {
         accessLock.lock()
         defer { accessLock.unlock() }
         guard let ctx = formatContext else { return false }
-        noteCompositionRepairSeekLocked()  // #409: re-anchor on the next keyframe
+        compositionRepair?.noteSeek()  // #409: re-anchor on the next keyframe
         guard isSourceSeekable else { return false }  // audit HLS-103, see `seek(to:)`
         dropPeekedPacketsLocked()
         let ret = avformat_seek_file(ctx, -1, Int64.min, byteTarget, Int64.max, AVSEEK_FLAG_BYTE)

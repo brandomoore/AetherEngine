@@ -15,14 +15,18 @@ import Foundation
 /// to the #377 budget, which caps it to one request and takes the detour out of service
 /// (`originRequiresSerialRequests`), while the spans keep serving. That is the field shape #380
 /// described as "one served byte reset the whole ladder and it started over".
-@Suite(.offCooperativePool)
 struct ServedFromMemoryProgressTests {
 
     /// The frontier refill is only requested once the initial range has COMPLETED (`activeTask`
     /// cleared by the completion callback), so the test waits on that state rather than on a
     /// sleep long enough to probably work.
-    private static func awaitRangeDelivered(_ reader: AVIOReader) async throws {
-        try await waitFor { !reader.hasLiveConnectionForTesting }
+    private static func awaitRangeDelivered(_ reader: AVIOReader) -> Bool {
+        let deadline = Date().addingTimeInterval(20)
+        while Date() < deadline {
+            if !reader.hasLiveConnectionForTesting { return true }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        return false
     }
 
     @discardableResult
@@ -51,14 +55,13 @@ struct ServedFromMemoryProgressTests {
     /// Serves from inside the resident window until the refused frontier has charged the ladder.
     /// The charge is paced (`nextFaultedRefillAt`), so this re-reads rather than sleeping once and
     /// hoping the ladder ran; each iteration's read is itself the thing that can charge it.
-    private static func chargeLadderFromWindow(_ reader: AVIOReader, near offset: Int64) async throws -> Int {
-        var step = 0
-        while true {
+    private static func chargeLadderFromWindow(_ reader: AVIOReader, near offset: Int64) -> Int {
+        for step in 0..<200 {
             readOnce(reader, at: offset + Int64(step % 8) * 64 * 1024, bytes: 32 * 1024)
             if reader.rateLimitStreakForTesting > 0 { return reader.rateLimitStreakForTesting }
-            step += 1
-            try await Task.sleep(for: .milliseconds(10))
+            Thread.sleep(forTimeInterval: 0.01)
         }
+        return reader.rateLimitStreakForTesting
     }
 
     /// A metered origin refusing the frontier while the parser returns to the retained head: the
@@ -87,7 +90,7 @@ struct ServedFromMemoryProgressTests {
         try reader.open()
 
         #expect(Self.readOnce(reader, at: 0, bytes: 64 * 1024) > 0)
-        try await Self.awaitRangeDelivered(reader)
+        #expect(Self.awaitRangeDelivered(reader), "the bounded initial range never completed")
 
         // Past winLookback (2 MB) + winTrimBatch (4 MB), so the window has trimmed and a read at 0
         // can no longer be served from it.
@@ -95,7 +98,7 @@ struct ServedFromMemoryProgressTests {
         #expect(walked == 6 * 1024 * 1024 + 512 * 1024,
                 "need a trimmed window for the read at 0 to reach the head span (read \(walked))")
 
-        let charged = try await Self.chargeLadderFromWindow(reader, near: 6 * 1024 * 1024)
+        let charged = Self.chargeLadderFromWindow(reader, near: 6 * 1024 * 1024)
         #expect(charged > 0, "the refused frontier must have charged the rate-limit ladder")
 
         // The parse's return to the head, repeatedly. Every one of these is a memcpy out of bytes

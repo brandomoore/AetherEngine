@@ -113,8 +113,9 @@ struct AudioOutputFlushEpochTests {
         }
         feed.start()
 
-        // A feed thread parked on a lock it holds itself never returns; the time limit reports that.
-        try await waitFor { returned.isSet }
+        let finished = try await waitFor(upTo: .seconds(10)) { returned.isSet }
+        #expect(finished, "the feed thread is parked on a lock it holds itself")
+        guard finished else { return }
 
         try await waitFor { output.automaticFlushCount == 1 }
         #expect(output.automaticFlushCount == 1, "the flush still happens, serialized with enqueueing")

@@ -50,7 +50,7 @@ read is discarded: its observed totals remain, but final totals are incomplete, 
 session rather than fabricated. A new playback session (including an episode handover on the same
 player) clears those totals and rejects any old reconciliation.
 
-The playlist's segment boundaries come from a keyframe-aligned plan that mirrors the `hls` muxer's cut algorithm (segment N ends at the first IRAP at-or-after `(N+1) * targetSegmentDuration`), built in `HLSVideoEngine+SegmentPlanning.swift`. It needs the source's keyframe positions, which for MKV / MP4 come from a brief cue prewarm (a bounded seek that loads the Cues / `stss` index) and for MPEG-TS / M2TS come only from whatever `avformat_find_stream_info` plus that seek happened to scan. `keyframeIndexIsTrustworthy` gates the plan on three witnesses before trusting that index, falling back to a uniform-stride plan otherwise: the largest **gap** between consecutive keyframes must stay under a cap (a clustered TS index gaps by thousands of seconds; trusting it builds a multi-thousand-second first segment the `frag_custom` muxer buffers whole in RAM, #64), and the **coverage** from first to last indexed keyframe must span at least one `targetSegmentDuration`. The coverage check catches a remote MKV whose Cues tail read fails: the prewarm loads nothing, only the open-time keyframes survive bunched in the first few seconds, their gaps are tiny so the gap check passes, yet no keyframe reaches the first segment boundary, so the keyframe planner would degenerate to a single whole-file segment AVPlayer loads zero tracks from (`kFigAssetError_TrackNotFound`, #91). The **tail** check requires that coverage to reach within 60 s of the source duration: a dense index that stops minutes short is a partial scan (an MKV whose Cues are missing or point past EOF leaves only what the capped prewarm walked), and trusting it cuts a last segment from the final scanned keyframe to the end of the title that the producer can never finish (PR #703). The uniform fallback anchors segment 0 at the content start so a late-starting title doesn't advertise empty leading segments.
+The playlist's segment boundaries come from a keyframe-aligned plan that mirrors the `hls` muxer's cut algorithm (segment N ends at the first IRAP at-or-after `(N+1) * targetSegmentDuration`), built in `HLSVideoEngine+SegmentPlanning.swift`. It needs the source's keyframe positions, which for MKV / MP4 come from a brief cue prewarm (a bounded seek that loads the Cues / `stss` index) and for MPEG-TS / M2TS come only from whatever `avformat_find_stream_info` plus that seek happened to scan. `keyframeIndexIsTrustworthy` gates the plan on two witnesses before trusting that index, falling back to a uniform-stride plan otherwise: the largest **gap** between consecutive keyframes must stay under a cap (a clustered TS index gaps by thousands of seconds; trusting it builds a multi-thousand-second first segment the `frag_custom` muxer buffers whole in RAM, #64), and the **coverage** from first to last indexed keyframe must span at least one `targetSegmentDuration`. The coverage check catches a remote MKV whose Cues tail read fails: the prewarm loads nothing, only the open-time keyframes survive bunched in the first few seconds, their gaps are tiny so the gap check passes, yet no keyframe reaches the first segment boundary, so the keyframe planner would degenerate to a single whole-file segment AVPlayer loads zero tracks from (`kFigAssetError_TrackNotFound`, #91). The uniform fallback anchors segment 0 at the content start so a late-starting title doesn't advertise empty leading segments.
 
 At runtime the producer honors those boundaries with a keyframe-gated, decode-order cut (`VODSegmentCutter`): a segment opens only at the IRAP that reaches the next boundary, so the IRAP is the segment's first sample and its open-GOP leading pictures stay with it, matching the live path and the `hls` muxer. The earlier routing keyed each packet to a segment by its DTS against the PTS-valued boundaries, so under B-frame reorder a keyframe whose DTS trailed its PTS fell into the previous segment and the next one started mid-GOP, decode-dependent on its predecessor; a fresh decode at that boundary (rebuffer recovery) surfaced it as transient blocky corruption (#92).
 
@@ -90,7 +90,7 @@ A seek holds the last frame on screen rather than blanking it. `SampleBufferRend
 
 `AudioDecoder` stamps each `CMSampleBuffer` from a running sample count anchored to the first frame (`AudioClockAnchor`), not from the container-quantized per-packet PTS. Container timebases are coarse (1 ms in MKV), so when a frame's duration is not an integer number of ticks (a 1536-sample AC-3 frame is 34.83 ms at 44.1 kHz but exactly 32 ms at 48 kHz) the quantized PTS leave a sub-millisecond gap or overlap at every buffer boundary, and `AVSampleBufferAudioRenderer` reconciles a discontinuity at each one (~29 clicks/sec, a continuous crackle). Anchoring to the sample clock makes consecutive buffers abut exactly; a real source discontinuity (> 100 ms off the predicted clock, i.e. a seek or edit) re-anchors so genuine gaps are not papered over, and `flush()` drops the anchor. The clock advances only on a successfully emitted buffer, so a dropped buffer injects no phantom samples.
 
-AV1+DV (Profile 10.0 / 10.1 / 10.4) routes through the native path on hardware-AV1 hosts via the `dav1` / `av01` track type plus the source's `dvvC` box. AV1+Atmos is genuinely rare in the wild (mastering still runs in HEVC overwhelmingly), so the SW pipeline's lack of Atmos passthrough is a theoretical limitation rather than a real one. AV1 capability registration is lazy and runs only when routing an AV1 source; loading H.264, HEVC or audio-only content does not consult it. The dispatch happens once at load time; hosts see a unified `@Published` state surface either way.
+AV1+DV (Profile 10.0 / 10.1 / 10.4) routes through the native path on hardware-AV1 hosts via the `dav1` / `av01` track type plus the source's `dvvC` box. AV1+Atmos is genuinely rare in the wild (mastering still runs in HEVC overwhelmingly), so the SW pipeline's lack of Atmos passthrough is a theoretical limitation rather than a real one. The dispatch happens once at load time; hosts see a unified `@Published` state surface either way.
 
 **Background audio (iOS).** When the app backgrounds while playing, the engine keeps audio going rather than tearing the pipeline down. The decision is a pure, unit-tested policy, `backgroundAction(isAudioBackend:hasSoftwareHost:keepVideoAlive:state:)`, driven from the `UIApplication` lifecycle observers; `keepVideoAlive` comes from `shouldKeepVideoAlive(enabled:pipActive:state:)` and is gated to iOS (tvOS always tears down, wedge-safe: a frozen decode session crossing a multi-hour suspension wedged `mediaserverd`). On the native path "keep audio alive" is just declining to tear down: `AVPlayer` under the `.playback` session keeps decoding. The software path has no `AVPlayer`, and its combined demux loop normally paces the whole loop (audio and video) on the video renderer's `isReadyForMoreMediaData`; once `AVSampleBufferDisplayLayer` stops draining in the background that gate never reopens and audio would starve. So the host enters `backgroundAudioOnly`: the loop drops video packets and paces on the audio renderer (`AudioOutput.isReadyForMoreMediaData`) instead, keeping `AVSampleBufferAudioRenderer` fed and the synchronizer advancing. On foreground return the flag clears, the video decoder and renderer flush, and video resyncs at the next keyframe with audio uninterrupted. Scope is the combined VOD loop (and live-without-DVR, which shares it); the DVR feeder loop is unchanged. Exercise it headless with `aetherctl bgaudio` (see [cli.md](cli.md)).
 
@@ -271,23 +271,6 @@ struct TrackMenuButton: UIViewRepresentable {
 
 SwiftUI diffing can re-run `updateUIView` as often as it likes; the guard means an open menu only rebuilds on a real item change. Credit to [@ohjey](https://github.com/ohjey) for isolating the mechanism and the pattern (AetherEngine#29).
 
-## Blocking work and the cooperative pool
-
-Engine code that blocks its thread (a demuxer open or packet read, a FIFO write under
-backpressure, a `close()` that joins a pump, a `waitForFinish`) never runs on the Swift
-cooperative pool. That pool has one thread per core and does not grow, so each blocked job takes
-a core's worth of async work out of the whole process, the host app's included. A detached engine
-task is therefore created through `BlockingWork.detached` (`BlockingWork.swift`), never
-`Task.detached`: the task prefers `BlockingExecutor`, which runs its jobs on GCD's global queues,
-and GCD adds a thread when one blocks. The task otherwise behaves as before (it awaits, hops to
-the main actor, is cancelled). `BlockingWorkTests` pins both halves, and a test fails the build
-of any `Task.detached` that comes back into `Sources/AetherEngine`.
-
-The trigger was CI: on a 3-core runner the suite parked all three pool threads for half a minute
-at a time, until a 120 s time limit fired at 151 s because its watchdog is a task on the same
-pool. `LIBDISPATCH_COOPERATIVE_POOL_STRICT=1` narrows the pool to one thread and reproduces that
-on any Mac; the full suite has to pass under it.
-
 ## Subtitle recognition scheduling
 
 Bitmap subtitle OCR awaits each image's recognition on a dedicated utility thread.
@@ -456,13 +439,13 @@ Sources/AetherEngine/
 │   ├── RemoteHLSSubtitleProvider.swift      Serves only what the proxy injected (`/master.m3u8`, `/subs_N.m3u8`, `/subs_N_0.vtt`); the A/V variants still point at the origin, so no media byte moves off it (#316)
 │   ├── RemoteHLSReadinessDeadline.swift     The terminal state the bypass never had: an origin that answers everything while AVFoundation can build no track from what it serves, which no failure signal ever reports (#334)
 │   ├── RerouteVerdictMemory.swift           Bounded, expiring memory of master URLs whose carriage watchdog fired, so a retune after an ingest death relands on the working path instead of re-paying a full mount plus grace (#199)
-│   ├── SWClockAnchorPolicy.swift            Where the SW demux loop anchors the synchronizer clock on the first decoded sample: verbatim for files and resumes (intrinsic A/V lead-in survives), at the sample for a mid-stream-joined source (#107); a sample BEHIND the anchor is resume preroll and never moves it (AE#724)
+│   ├── SWClockAnchorPolicy.swift            Where the SW demux loop anchors the synchronizer clock on the first decoded sample: verbatim for files and resumes (intrinsic A/V lead-in survives), at the sample for a mid-stream-joined source (#107)
 │   ├── SeekResumeIntent.swift               Whether a seek on a demuxer-driven host re-arms the clock at `lastRate` or parks it at 0, for the second seek issued inside the window its predecessor cleared (#292)
 │   ├── SoftwareBufferFrontier.swift         How far ahead of the clock the software path is actually holding decoded video, and how that folds into the `bufferedPosition` a host reads (#303)
 │   ├── SoftwarePiPSource.swift              Everything a host needs to build an `AVPictureInPictureController` content source around the software path without AVKit entering the engine: the layer plus the four transport answers behind the sample-buffer delegate
 │   └── StartupReadinessGate.swift           Outcome of one startup-readiness attempt: the reloaded item reached a playable state, died, or ran out the settle window without doing either
 ├── Network/
-│   └── HLSLocalServer.swift                 Native path: local HTTP server (all interfaces for AirPlay, every path behind a per-session token, loopback URLs handed to the local player) serving playlist + segments. It writes the master, so the audio rendition's attributes are decided here: `EXT-X-MEDIA:TYPE=AUDIO` carries `LANGUAGE` (AE#458) and `CHANNELS`, the latter answered by the segment provider (`"16/JOC"` for a stream-copied E-AC-3 JOC track, the served bed count otherwise) and omitted entirely when the provider has no rendition to attribute. An untagged track has no rendition unless it is a stream-copied JOC one, which gets one without `LANGUAGE` for the sake of its `CHANNELS` (AE#726)
+│   └── HLSLocalServer.swift                 Native path: local HTTP server (all interfaces for AirPlay, every path behind a per-session token, loopback URLs handed to the local player) serving playlist + segments
 ├── Renderer/
 │   ├── SampleBufferRenderer.swift           SW path: AVSampleBufferDisplayLayer + B-frame reorder, HDR10+ attachments; `flush(removingDisplayedImage:)` holds the last frame through a seek (#90); the decode thread reaches the layer only through its `sampleBufferRenderer`, taken once on the main actor (#351)
 │   └── SubtitleFrameCompositor.swift        Composites active cues into decoded software-path frames while PiP is active, since the system PiP window renders only the sample-buffer layer; playback wins, every failure path returns the original buffer untouched
@@ -489,7 +472,6 @@ Sources/AetherEngine/
 │   ├── HLSVideoEngine+SegmentPlanning.swift Native path: keyframe / uniform segment plans, extradata + AAC fixups
 │   ├── HLSVideoEngine+LiveReopen.swift      Native path: live source-loss recovery (capped-backoff reopen on the same timeline); VOD backpressure-wedge re-anchor + consumer re-engage nudge, which re-reads the rendered position at nudge time so the zero-tolerance seek never lands behind the on-screen frame (#115)
 │   ├── CodecRoutePolicy.swift               Native path: DV / HDR / codec routing decisions (track types, CODECS strings, VIDEO-RANGE)
-│   ├── AnnexBSampleConverter.swift          Native path: Annex-B HEVC samples rewritten to length-prefixed NALs by the session muxer, in-band VPS/SPS/PPS kept. movenc's own conversion under `hvc1` drops them, so a stream that sends a new PPS mid-title stopped decoding at the change (PR #703)
 │   ├── DoviRpuConverter.swift               Native path: per-packet DV Profile 7 → 8.1 RPU conversion via libdovi (NAL surgery: convert type-62 RPU, drop type-63 EL)
 │   ├── DoviRpuConverter+Probe.swift         Diagnostic DV-conversion probe (`doviConvertProbe` / `DoviConvertProbeResult`), backs `aetherctl dovitest`
 │   ├── Issue65LivelockBreakers.swift        Pure backpressure-wedge detection (`BackpressureWedgeDetector`) breaking the VOD HLS scrub-burst livelock (#65); `seekIsWedged` starvation check + `SeekResumeGuard` single-resume latch for the deadline-bounded seek
@@ -501,7 +483,7 @@ Sources/AetherEngine/
 │   ├── PlanBoundaryAxis.swift               Which axis a container stamps its index entries on, and therefore which packet timestamp the cutter gate may compare against a plan boundary: decode for a mov/mp4 sample table, presentation for a Matroska Cue (#358, AE#561)
 │   ├── VideoConfigRecord.swift              The `hvcC` / `avcC` config record and the framing question hanging off it (#365): movenc decides whether to Annex-B-convert every sample from the EXTRADATA rather than the packet, so a source carrying Annex-B parameter sets while muxing length-prefixed NALs has each sample rewritten by a converter that finds no start codes. Mirrors movenc's own two tests instead of an equivalent-looking predicate, since predicting that decision wrong is the whole defect
 │   ├── H264SPS.swift                        Hand-rolled H.264 SPS parser (SSAI ad-creative coded dimensions / codec config)
-│   ├── H264CompositionOffsetRepair.swift    Rebuilds the presentation axis of an MP4 whose writer dropped `ctts` while the bitstream still reorders pictures: libavcodec's H.264 or HEVC parser supplies each access unit's picture order count without decoding, a fail-closed head sample settles the ladder and the shift, and packets are rewritten to the timeline a correct muxer would have written, so the native path and hardware decode are kept (#409, HEVC #699)
+│   ├── H264CompositionOffsetRepair.swift    Rebuilds the presentation axis of an MP4 whose writer dropped `ctts` while the bitstream still reorders pictures: libavcodec's H.264 parser supplies each access unit's picture order count without decoding, a fail-closed head sample settles the ladder and the shift, and packets are rewritten to the timeline a correct muxer would have written, so the native path and hardware decode are kept (#409)
 │   ├── OutputTimestampSanitizer.swift       Final-stage DTS/PTS monotonicity guard before the fMP4 mux (SSAI splices, program restarts)
 │   ├── RestartCoalescer.swift               Coalesces a burst of producer-restart requests into one in-flight + one settled target (rapid-seek, AetherEngine#35)
 │   ├── LiveWindow.swift                     Live path: session-relative DVR timeline (seconds since first frame), shared by the native and SW live paths
@@ -514,8 +496,7 @@ Sources/AetherEngine/
 │   ├── SegmentCache.swift                   Native path: producer/consumer segment store with backpressure, scrub-aware eviction + byte-budgeted VOD backward retention (restart-free back-seeks)
 │   ├── VTCapabilityProbe.swift              AV1 system-decode probe + per-format `canHardwareDecode` HW-decodability check for H.264 / HEVC profiles (Intel Macs, older chips, #2); gates codec routing (VP9 / VP8 / MPEG-4 Part 2 / MPEG-2 / VC-1 and interlaced H.264 always route SW, see VideoRoutingPolicy)
 │   ├── LiveCadencePolicy.swift              Turns the observed arrival cadence into the two LL-HLS decisions (served TARGETDURATION, blocking-reload eligibility), re-evaluated on every manifest render, instead of trusting a bursty origin's own number
-│   ├── PrefetchDiskBudget.swift             Disk bound for an opt-in whole-source prefetch: the hard window is never evicted, so the budget bounds only what lives outside it (#207)
-│   └── RetentionClaims.swift                Process-wide ledger of the running sessions' disk allowances: a new session is sized from the free space minus what the others may still write, so concurrent engines cannot each claim a quarter of the same space (#687)
+│   └── PrefetchDiskBudget.swift             Disk bound for an opt-in whole-source prefetch: the hard window is never evicted, so the budget bounds only what lives outside it (#207)
 └── View/
     └── AetherPlayerView.swift               Polymorphic surface: hosts either AVPlayerLayer (native) or AVSampleBufferDisplayLayer (SW)
 ```
@@ -543,17 +524,3 @@ The `aetherctl` CLI target (`Sources/aetherctl/`) is documented separately in [d
 | VideoToolbox | System | Native path video decode (HW where available, Apple's bundled SW dav1d on iOS / macOS) |
 | AVFoundation | System | AVPlayer + AVDisplayManager (native path); AVSampleBufferDisplayLayer + AVSampleBufferRenderSynchronizer (SW path) |
 | CoreMedia | System | Sample descriptions, format-description tagging, CMTimebase |
-
-
-### Exact overlap after a live source reconnect
-
-On the single-demuxer stream-copy path, rollback alone is never treated as proof
-of replay. A candidate packet must match an accepted packet's source DTS, PTS and
-compressed-payload SHA-256 signature. Candidate packets are buffered until both
-tracks have passed their previous frontier. A mismatch, read error, EOF or bounded
-history/payload limit forwards the pending packets to ordinary discontinuity
-handling. Bridged audio and separate side-audio sources are excluded.
-
-The cutter watchdog distinguishes an intentional overlap scan from a stuck cut
-while continuing to detect source starvation. No host API or resource policy is
-added; the guard and its packet history belong to the producer thread.

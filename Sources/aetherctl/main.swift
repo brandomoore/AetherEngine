@@ -66,8 +66,8 @@ func printUsage() {
     aetherctl: standalone AetherEngine repro harness
 
     Usage:
-      aetherctl probe [--detect-hdr10plus] [--detect-hdr-vivid] [--detect-atmos] <url>
-      aetherctl serve [--no-dv] [--force-dv] [--dv-base-layer] [--start-position S] [--iframes] [--atmos-bed 7.1.4] [--audio-index N] <url>
+      aetherctl probe [--detect-hdr10plus] [--detect-atmos] <url>
+      aetherctl serve [--no-dv] [--force-dv] [--dv-base-layer] [--start-position S] <url>
       aetherctl validate [--no-dv] [--force-dv] [--dv-base-layer] <url>
       aetherctl swdecode [--frames N] <url>
       aetherctl play [--seconds N] [--live] [--no-sw-escalation] [--fast-zap] [--live-start-immediately] [--dvr-window N] [--subs <codec-or-lang>]
@@ -691,16 +691,11 @@ if first == "play" {
     // drain cycle. This is the knob for an origin that refuses new requests in windows: run it
     // against one and count the ranges in its own log, or read `conn start ... held` here.
     let heldConnection = takeFlag("--held-connection", from: &rest)
-    // LoadOptions.progressiveSegmentDelivery: serve each VOD segment while it is written. Pair it
-    // with a throttled origin to see the startup difference; on a fast source nothing changes.
-    let progressiveSegments = takeFlag("--progressive-segments", from: &rest)
     let declaredDuration = takeDoubleFlag("--declared-duration", from: &rest)
     // #311: install the software frame-time observer and read the presentation timebase, so the
     // per-frame boundaries and the clock a host would pace an overlay against are both observable.
     let frameTimes = takeFlag("--frame-times", from: &rest)
     let presentTimes = takeFlag("--present-times", from: &rest)
-    // AE#684: print the loopback URL of every native item, so its init and segments can be fetched.
-    let servedURL = takeFlag("--served-url", from: &rest)
     let pictureProbe = takeFlag("--picture-probe", from: &rest)
     // AE#534: the source axis's origin, for a container whose timeline does not start at zero.
     // The picture states a frame index, which an -output_ts_offset remux does not move.
@@ -883,7 +878,7 @@ if first == "play" {
         done.wait()
     }
     exit(runPlay(url: parseSourceURL(urlArg), seconds: seconds, live: live, nativeHLS: nativeHLS, liveIngest: liveIngest, fastZap: playFastZap, liveStartImmediately: liveStartImmediately, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats, seekEvery: seekEvery, seekPattern: seekPattern, seekCount: seekCount, startPosition: playStartPosition, mallocCensus: mallocCensus, forceSoftware: playForceSW, softwareEscalation: playSoftwareEscalation,
-                 censusThresholdMB: censusThresholdMB, censusHz: censusHz, frameTimes: frameTimes, presentTimes: presentTimes, servedURL: servedURL, pictureProbe: pictureProbe, pictureOrigin: pictureOrigin, sidecars: sidecars,
+                 censusThresholdMB: censusThresholdMB, censusHz: censusHz, frameTimes: frameTimes, presentTimes: presentTimes, pictureProbe: pictureProbe, pictureOrigin: pictureOrigin, sidecars: sidecars,
                  audioSwitch: audioSwitch,
                  teletextPage: teletextPage, teletextSwitch: teletextSwitch,
                  audioDelayMs: audioDelayMs, audioDelaySwitches: audioDelaySwitches,
@@ -891,7 +886,6 @@ if first == "play" {
                  optionCorrection: optionCorrection,
                  sequentialOrigin: sequentialOrigin, maxConcurrentRequests: maxConcurrentRequests,
                  heldConnection: heldConnection,
-                 progressiveSegments: progressiveSegments,
                  declaredDuration: declaredDuration,
                  httpHeaders: playHeaders,
                  deinterlaceFieldRate: playFieldRate,
@@ -917,7 +911,6 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     // instead of only through a host. Each costs reads past find_stream_info; the bare `probe` does neither.
     var probeDetail: ProbeDetail = []
     if takeFlag("--detect-hdr10plus", from: &rest) { probeDetail.insert(.hdr10Plus) }
-    if takeFlag("--detect-hdr-vivid", from: &rest) { probeDetail.insert(.hdrVivid) }
     if takeFlag("--detect-atmos", from: &rest) { probeDetail.insert(.atmos) }
     let inMemory = takeFlag("--memory", from: &rest)
     let forwardOnly = takeFlag("--forward-only", from: &rest)
@@ -981,8 +974,6 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     let audioSeconds = secondsFlag ?? 10
     // --native-subs: diagnostics affordance for mov_text subtitle track (#55); serve only.
     let nativeSubsIndex = takeIntFlag("--native-subs", from: &rest)
-    // AE#682: list an I-frame rendition in the master; serve only.
-    let serveIFrames = takeFlag("--iframes", from: &rest)
     // --throttle-kbps: slow-CDN simulation; starves the producer below real-time to provoke rebuffers.
     let throttleKbps = takeIntFlag("--throttle-kbps", from: &rest)
     // --start-position: anchor the first producer at a resume position like load(startPosition:) (#99); serve only.
@@ -991,18 +982,6 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     // be read straight off the segments (ffprobe the audio and video first-packet PTS) instead of
     // being judged by ear.
     let serveAudioDelayMs = takeIntFlag("--audio-delay", from: &rest) ?? 0
-    // #731: TrueHD Atmos rendered into a speaker bed and served as APAC (LoadOptions.objectAudioRendering).
-    let atmosBedFlag = takeStringFlag("--atmos-bed", from: &rest)
-    let serveObjectAudioRendering: ObjectAudioRendering
-    if let atmosBedFlag {
-        guard let layout = SpatialSpeakerLayout(rawValue: atmosBedFlag) else {
-            print("ERROR: --atmos-bed expects one of \(SpatialSpeakerLayout.allCases.map(\.rawValue)), got '\(atmosBedFlag)'")
-            exit(64)
-        }
-        serveObjectAudioRendering = .apac(layout)
-    } else {
-        serveObjectAudioRendering = .off
-    }
     rejectStrayFlags(rest, subcommand: first)
     guard let urlArg = rest.first else {
         print("ERROR: \(first) requires a <url> argument")
@@ -1023,10 +1002,7 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
         runServe(url: url, dvModeAvailable: dvModeAvailable, forceDVWithoutDisplay: forceDV,
                  dolbyVisionHandling: dvHandling,
                  nativeSubsIndex: nativeSubsIndex, startPosition: startPosition,
-                 audioDelayMs: serveAudioDelayMs, iFrames: serveIFrames,
-                 objectAudioRendering: serveObjectAudioRendering,
-                 // `--audio-index` (parsed once above, shared with customio): serve that source stream.
-                 audioStreamIndex: customAudioIndex)
+                 audioDelayMs: serveAudioDelayMs)
     case "validate":
         exit(runValidate(url: url, dvModeAvailable: dvModeAvailable, forceDVWithoutDisplay: forceDV,
                          dolbyVisionHandling: dvHandling))
