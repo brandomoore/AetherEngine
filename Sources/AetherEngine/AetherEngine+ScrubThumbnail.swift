@@ -8,6 +8,72 @@ extension AetherEngine {
     /// warm; each extractor maps its segment file (audit SEG-2), so the entries hold clean
     /// file-backed pages rather than heap copies, and the bound remains fixed.
     nonisolated static let scrubThumbnailExtractorLimit = 6
+    public func clearResidentPreviewFrames() {
+        for entry in scrubThumbnailExtractors {
+            Task { await entry.extractor.clearResidentPreviewCache() }
+        }
+    }
+
+    /// Timestamped production preview. All reads come from existing resident
+    /// bytes; a missing target never opens a second connection or seeks playback.
+    public func scrubPreviewFrame(atSeconds seconds: Double, refined: Bool, maxWidth: Int = 320,
+                                  isCancelled: @escaping @Sendable () -> Bool) async -> ScrubFrame? {
+        guard seconds.isFinite, !Task.isCancelled, !isCancelled() else { return nil }
+        let gen = loadGeneration
+        guard let session = nativeVideoSession else {
+            guard let host = softwareHost else { return nil }
+            let result = await host.scrubPreviewFrame(atSessionSeconds: seconds, refined: refined,
+                                                     maxWidth: maxWidth, isCancelled: isCancelled)
+            return gen == loadGeneration && !Task.isCancelled && !isCancelled() ? result : nil
+        }
+        // Freeze both axes. VOD segment indices use the plan's keyframe origin;
+        // the segment's bytes retain their own epoch normalization after restart.
+        let origin = sourcePresentationOrigin
+        let live = isLive
+        // Live: the same stable session-to-output shift `liveScrubThumbnail` uses (#712), frozen
+        // here so the request and its result convert on one axis even if the shift moves meanwhile.
+        let liveShift = liveSessionShiftSeconds
+        let sourceTarget = PresentationAxis.source(displayTime: seconds, origin: origin)
+        let output = live ? seconds - liveShift
+            : sourceTarget - session.firstKeyframeSeconds
+        let planOrigin = session.firstKeyframeSeconds - origin
+        let source = await BlockingWork.detached(priority: .utility) { [session] in
+            session.scrubThumbnailSource(atSeconds: output)
+        }.value
+        guard let source, let carried = source.carriedOffset,
+              gen == loadGeneration, !Task.isCancelled, !isCancelled() else { return nil }
+        let extractor: FrameExtractor
+        if let index = scrubThumbnailExtractors.firstIndex(where: { $0.segmentIndex == source.segmentIndex }) {
+            let hit = scrubThumbnailExtractors.remove(at: index)
+            if hit.extractor.residentIdentity == source.identity {
+                scrubThumbnailExtractors.append(hit); extractor = hit.extractor
+            } else {
+                Task { await hit.extractor.shutdown() }
+                guard let reader = source.makeReader() else { return nil }
+                extractor = FrameExtractor(residentReader: reader, formatHint: "mp4", identity: source.identity)
+                scrubThumbnailExtractors.append((source.segmentIndex, extractor))
+            }
+        } else {
+            guard let reader = source.makeReader() else { return nil }
+            extractor = FrameExtractor(residentReader: reader, formatHint: "mp4", identity: source.identity)
+            scrubThumbnailExtractors.append((source.segmentIndex, extractor))
+            trimScrubThumbnailExtractors()
+        }
+        guard let frame = await extractor.residentPreview(rawTarget: live ? output : sourceTarget - carried,
+                    refined: refined, maxWidth: maxWidth, isCancelled: isCancelled),
+              gen == loadGeneration, !Task.isCancelled, !isCancelled() else { return nil }
+        let stillOwned = await BlockingWork.detached(priority: .utility) { [session] in
+            guard let current = session.scrubThumbnailSource(atSeconds: output) else { return false }
+            return current.identity == source.identity && current.carriedOffset == source.carriedOffset
+        }.value
+        guard stillOwned, gen == loadGeneration, !Task.isCancelled, !isCancelled() else { return nil }
+        guard let actual = live ? Optional(frame.actualSeconds + liveShift)
+            : ScrubSegmentTime.displayTime(rawPTS: frame.actualSeconds, carriedOffset: carried, displayOrigin: origin)
+        else { return nil }
+        let rangeStart = live ? source.startSeconds + liveShift : source.startSeconds + planOrigin
+        return ScrubFrame(image: frame.image, actualSeconds: actual, refined: frame.refined,
+                         validRange: rangeStart..<(rangeStart + source.durationSeconds))
+    }
 
     /// Cache-backed scrub still for the active native session (live or VOD). Decodes from
     /// already-produced SegmentCache bytes, so it never opens a second connection and works
@@ -43,7 +109,7 @@ extension AetherEngine {
             return loadGeneration == gen ? image : nil
         }
         let gen = loadGeneration
-        let source = await Task.detached(priority: .userInitiated) { [session] in
+        let source = await BlockingWork.detached(priority: .userInitiated) { [session] in
             session.scrubThumbnailSource(atSeconds: seconds)
         }.value
         // Guard against zap/stop clearing the LRU: a stale extractor's segment indices

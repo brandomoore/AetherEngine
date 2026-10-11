@@ -64,3 +64,22 @@ struct SWPlaybackDiagStateTests {
         #expect(diag.snapshot.lastAudioPts == 4.0)
     }
 }
+
+/// AE#395: the DVR feeder arm delivers audio through the ring pump and never writes `demuxDiag`.
+@Suite("SWDiag audio marker source")
+struct SWDiagAudioMarkerSourceTests {
+
+    @Test("A DVR session reads the pump's fed PTS, not the demux loop's empty marker")
+    func dvrSessionReadsThePump() {
+        let marker = SoftwarePlaybackHost.diagAudioMarker(
+            demuxLoopPts: .nan, dvrPumpPts: 1234.5, isDVRSession: true)
+        #expect(marker == 1234.5)
+    }
+
+    @Test("Every other session keeps the demux loop's marker")
+    func otherSessionsKeepTheDemuxMarker() {
+        let marker = SoftwarePlaybackHost.diagAudioMarker(
+            demuxLoopPts: 16.11, dvrPumpPts: .nan, isDVRSession: false)
+        #expect(marker == 16.11)
+    }
+}

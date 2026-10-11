@@ -148,13 +148,14 @@ final class LiveProductionHaltTests: XCTestCase {
         let released = expectation(description: "held blocking-reload waiter released")
         Thread.detachNewThread {
             // The reporter's shape: playlist ends at segment 11, AVPlayer holds ?_HLS_msn=12.
-            box.value = provider.waitForLiveSegment(index: 12, timeout: 10)
+            // A timeout out of reach, so only the halt can release it.
+            box.value = provider.waitForLiveSegment(index: 12, timeout: 600)
             released.fulfill()
         }
         while provider.parkedWaiterCount == 0 { usleep(200) }  // the park, not a guess at it
         provider.markLiveProductionHalted()
-        wait(for: [released], timeout: 2.0)
-        XCTAssertFalse(box.value, "released waiter must report the segment as unavailable, well before its 10s timeout")
+        wait(for: [released], timeout: 300)
+        XCTAssertFalse(box.value, "released waiter must report the segment as unavailable, well before its own timeout")
         XCTAssertFalse(provider.liveBlockingReloadEnabled,
                        "halted session must stop advertising CAN-BLOCK-RELOAD, beating the host override")
     }
@@ -176,7 +177,7 @@ final class LiveProductionHaltTests: XCTestCase {
             semaphore.signal()
         }
         task.resume()
-        XCTAssertEqual(semaphore.wait(timeout: .now() + 5), .success, "request to \(url) timed out")
+        XCTAssertEqual(semaphore.wait(timeout: .now() + 120), .success, "request to \(url) timed out")
         if let error = box.error { throw error }
         return (box.status, box.body)
     }

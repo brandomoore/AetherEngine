@@ -7,10 +7,13 @@ import Combine
 @MainActor
 public final class PlaybackClock: ObservableObject {
 
-    /// ~10 Hz. On native HLS: unified source-PTS clock (AVPlayer time folded with `playlistShiftSeconds`).
+    /// ~10 Hz. On native HLS, AVPlayer item time folded onto the display axis. Live loopback
+    /// retains its initial shift across source timestamp rollbacks.
     @Published public internal(set) var currentTime: Double = 0
 
-    /// Source PTS of the currently displayed frame. On native: rides AVPlayer's rendered position -- equals `currentTime` in steady play, but holds the on-screen frame during a seek or rebuffer, not the scrub target (issue #49). SW/audio: always equals `currentTime`.
+    /// Source PTS of the currently displayed frame. On native, rides AVPlayer's rendered position;
+    /// live loopback may differ from `currentTime` after a source timestamp rollback. During a seek
+    /// it holds the on-screen frame, not the scrub target (issue #49). SW/audio equals currentTime.
     ///
     /// `nativeRemoteHLS` (AE#616): item time, less the lead over the picture the engine measured on its
     /// own injected subtitle renditions (#316). The lead exists where an origin restarts a transcode at the

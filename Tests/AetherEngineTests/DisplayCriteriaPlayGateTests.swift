@@ -58,6 +58,17 @@ struct DisplayCriteriaPlayGateTests {
             formatKnown: false, effectiveFormat: .sdr) == .full)
     }
 
+    @Test("A secondary load skips the gate: nobody writes criteria for it (Sodalite#175)")
+    func secondaryLoadSkips() {
+        for format: VideoFormat in [.sdr, .hdr10, .dolbyVision] {
+            for known in [true, false] {
+                #expect(AetherEngine.playGateGrace(
+                    criteriaUnchanged: false, engineIsCriteriaWriter: false,
+                    formatKnown: known, effectiveFormat: format, noWriterExpected: true) == .skip)
+            }
+        }
+    }
+
     @Test("Budgets are the documented millisecond values")
     func graceBudgets() {
         #expect(DisplayCriteriaController.StartGrace.skip.budgetMs == 0)

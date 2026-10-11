@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import AetherLibavcodec
 @testable import AetherEngine
 
 /// Issue #72: the engine resolves the first-frame audio track from its single internal probe,
@@ -80,5 +81,75 @@ struct AudioLanguageSelectionTests {
             tracks: tracks, override: nil, preferredLanguages: ["en"]) == 1)
         #expect(AetherEngine.selectAudioIndex(
             tracks: tracks, override: nil, preferredLanguages: ["ja"]) == 0)
+    }
+
+    // MARK: - #731: TrueHD Atmos wins within a language when object rendering is on
+
+    private func audio(_ id: Int, _ lang: String?, codec: String, atmos: Bool = false, commentary: Bool = false) -> TrackInfo {
+        TrackInfo(id: id, name: "a\(id)", codec: codec, language: lang, channels: 8, isDefault: id == 1,
+                  isCommentary: commentary,
+                  profile: atmos ? VideoStreamFormat.profileName(codecID: AV_CODEC_ID_TRUEHD, profile: AV_PROFILE_TRUEHD_ATMOS) : nil)
+    }
+
+    @Test("with rendering on, TrueHD Atmos beats DTS and plain TrueHD of the preferred language")
+    func trueHDAtmosWinsWithinLanguage() {
+        let tracks = [audio(1, "eng", codec: "dts"), audio(2, "eng", codec: "truehd", atmos: true),
+                      audio(3, "ger", codec: "truehd", atmos: true)]
+        #expect(AetherEngine.selectAudioIndex(tracks: tracks, override: nil, preferredLanguages: ["en"],
+                                              prefersTrueHDAtmos: true) == 2)
+        #expect(AetherEngine.selectAudioIndex(tracks: tracks, override: nil, preferredLanguages: ["en"]) == 1,
+                "rendering off keeps the container order")
+        let plain = [audio(1, "eng", codec: "truehd"), audio(2, "eng", codec: "truehd", atmos: true)]
+        #expect(AetherEngine.selectAudioIndex(tracks: plain, override: nil, preferredLanguages: ["en"],
+                                              prefersTrueHDAtmos: true) == 2)
+    }
+
+    @Test("it never crosses a language, and an override still wins")
+    func neverAcrossLanguage() {
+        let tracks = [audio(1, "ger", codec: "dts"), audio(2, "eng", codec: "truehd", atmos: true)]
+        #expect(AetherEngine.selectAudioIndex(tracks: tracks, override: nil, preferredLanguages: ["de"],
+                                              prefersTrueHDAtmos: true) == 1)
+        #expect(AetherEngine.selectAudioIndex(tracks: tracks, override: 1, preferredLanguages: ["en"],
+                                              prefersTrueHDAtmos: true) == 1)
+    }
+
+    @Test("without a language preference it replaces the default track with TrueHD Atmos in that track's language")
+    func replacesDefaultInItsLanguage() {
+        let tracks = [audio(1, "eng", codec: "dts"), audio(2, "ger", codec: "truehd", atmos: true),
+                      audio(3, "eng", codec: "truehd", atmos: true)]
+        #expect(AetherEngine.selectAudioIndex(tracks: tracks, override: nil, preferredLanguages: [],
+                                              prefersTrueHDAtmos: true, defaultIndex: 1) == 3)
+        #expect(AetherEngine.selectAudioIndex(tracks: tracks, override: nil, preferredLanguages: [],
+                                              prefersTrueHDAtmos: false, defaultIndex: 1) == nil)
+        let untagged = [audio(1, nil, codec: "dts"), audio(2, nil, codec: "truehd", atmos: true)]
+        #expect(AetherEngine.selectAudioIndex(tracks: untagged, override: nil, preferredLanguages: [],
+                                              prefersTrueHDAtmos: true, defaultIndex: 1) == nil,
+                "no language to compare, so the default stays")
+    }
+
+    @Test("a commentary in TrueHD Atmos does not displace the film")
+    func commentaryStaysBehind() {
+        let tracks = [audio(1, "eng", codec: "dts"), audio(2, "eng", codec: "truehd", atmos: true, commentary: true)]
+        #expect(AetherEngine.selectAudioIndex(tracks: tracks, override: nil, preferredLanguages: ["en"],
+                                              prefersTrueHDAtmos: true) == 1)
+    }
+
+    @Test("a preference nothing matches still lets the default's language take its TrueHD Atmos track")
+    func unmatchedPreferenceFallsBackToDefaultLanguage() {
+        // Sodalite always sends the device locale; on a German box a film with only English audio
+        // matches nothing and plays its default track.
+        let tracks = [audio(1, "eng", codec: "dts"), audio(2, "eng", codec: "truehd", atmos: true)]
+        #expect(AetherEngine.selectAudioIndex(tracks: tracks, override: nil, preferredLanguages: ["de"],
+                                              prefersTrueHDAtmos: true, defaultIndex: 1) == 2)
+    }
+
+    @Test("the fallback keeps the dub: a region both tags state and disagree on is another track")
+    func fallbackKeepsTheDub() {
+        let tracks = [audio(1, "es-ES", codec: "dts"), audio(2, "es-419", codec: "truehd", atmos: true)]
+        #expect(AetherEngine.selectAudioIndex(tracks: tracks, override: nil, preferredLanguages: [],
+                                              prefersTrueHDAtmos: true, defaultIndex: 1) == nil)
+        let same = [audio(1, "es-ES", codec: "dts"), audio(2, "es", codec: "truehd", atmos: true)]
+        #expect(AetherEngine.selectAudioIndex(tracks: same, override: nil, preferredLanguages: [],
+                                              prefersTrueHDAtmos: true, defaultIndex: 1) == 2)
     }
 }

@@ -30,13 +30,19 @@ final class ProbeHTTPTestOrigin: @unchecked Sendable {
     private let wakeWrite: Int32
     private let data: Data
     private let stage: Stage?
+    private let stallOpenEndedBody: Bool
     private let onBlocked: @Sendable () -> Void
+    private let response: (@Sendable (Request, Int) -> Data?)?
     private let state = ProbeTestBox(State())
 
-    init(data: Data, stage: Stage? = nil, onBlocked: @escaping @Sendable () -> Void = {}) throws {
+    init(data: Data, stage: Stage? = nil, stallOpenEndedBody: Bool = false,
+         onBlocked: @escaping @Sendable () -> Void = {},
+         response: (@Sendable (Request, Int) -> Data?)? = nil) throws {
         self.data = data
         self.stage = stage
+        self.stallOpenEndedBody = stallOpenEndedBody
         self.onBlocked = onBlocked
+        self.response = response
         let fd = socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
         var wake: [Int32] = [-1, -1]
@@ -177,6 +183,11 @@ final class ProbeHTTPTestOrigin: @unchecked Sendable {
         if holding.value { held.wait() }
         guard !state.value.stopping else { return }
 
+        if let custom = response?(request, index) {
+            _ = writeFully(fd, data: custom)
+            return
+        }
+
         var start = 0
         var end = data.count - 1
         if let range = request.range {
@@ -196,6 +207,7 @@ final class ProbeHTTPTestOrigin: @unchecked Sendable {
         }
         let ranged = request.range != nil
         let header = "HTTP/1.1 \(ranged ? "206 Partial Content" : "200 OK")\r\n"
+            + "Content-Type: application/octet-stream\r\n"
             + "Content-Length: \(end - start + 1)\r\n"
             + (ranged ? "Content-Range: bytes \(start)-\(end)/\(data.count)\r\n" : "")
             + "Accept-Ranges: bytes\r\nConnection: close\r\n\r\n"
@@ -203,7 +215,8 @@ final class ProbeHTTPTestOrigin: @unchecked Sendable {
         guard request.method != "HEAD" else { return }
         // The open-ended GET is the response-header-only size probe. Park the subsequent
         // finite chunk request only, after its headers but before its first payload byte.
-        if stage == .body, request.range != nil, request.range != "bytes=0-" { park() }
+        if stage == .body, request.range != nil,
+           stallOpenEndedBody || request.range != "bytes=0-" { park() }
         guard !state.value.stopping else { return }
         _ = writeFully(fd, data: data.subdata(in: start..<(end + 1)))
     }

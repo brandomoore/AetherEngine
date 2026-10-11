@@ -28,6 +28,15 @@ public protocol IOReader: AnyObject, Sendable {
     var discImageProbeEnabled: Bool { get }
 }
 
+/// Internal seam for a custom reader that pulls its bytes over the network and counts them, so a
+/// session reading through it can report `LiveTelemetry.demuxerBytesFetched` like an `AVIOReader`
+/// one does. The engine's own `HTTPDiscIOReader` counts; a host's reader is never asked, and its
+/// sessions keep reporting 0 (`AVIOProvider.cumulativeBytesFetched`).
+protocol SourceTransferCounting: AnyObject {
+    /// Bytes received from the origin since the reader was created.
+    var sourceBytesFetched: Int64 { get }
+}
+
 /// Internal seam for finite segmented sources whose natural seek axis is time,
 /// not a synthetic concatenated byte offset.
 protocol TimeSeekableIOReader: IOReader {

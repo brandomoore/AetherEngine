@@ -9,7 +9,7 @@ import Foundation
 /// reader must run ONE unranged GET from byte 0 - no bounded-range windowing, no suffix/tail
 /// probe, no size probe, no detour fills - and must report a lost connection as EIO, never EOF
 /// (the consumer treats EOF as played-to-the-end and deliberately never retries it).
-@Suite("Sequential-origin reader")
+@Suite("Sequential-origin reader", .offCooperativePool)
 struct SequentialOriginReaderTests {
 
     private func drain(_ reader: AVIOReader, upTo target: Int64, chunk: Int = 256 * 1024) -> (read: Int64, lastReturn: Int32) {

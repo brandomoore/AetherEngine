@@ -21,7 +21,11 @@ final class CustomIOReaderBridge: AVIOProvider, @unchecked Sendable {
         reader as? TimeSeekableIOReader
     }
 
-    var cumulativeBytesFetched: Int64 { 0 }  // custom readers don't track network bytes
+    /// What the reader reports pulling from the origin. A remote disc image reads through the
+    /// engine's `HTTPDiscIOReader`, which counts; before, every custom source reported 0, so a disc
+    /// session showed no source bytes and no software-path throughput at all. A host's own reader
+    /// still reports 0: the engine cannot tell its network bytes from a local read.
+    var cumulativeBytesFetched: Int64 { (reader as? SourceTransferCounting)?.sourceBytesFetched ?? 0 }
 
     /// #112 round 9: same demux-thread-only contract as AVIOReader's deadline. Armed by
     /// `Demuxer.seekBounded` around a positioning seek; `performRead` checks it between callbacks, so

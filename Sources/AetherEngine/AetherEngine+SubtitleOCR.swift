@@ -14,7 +14,7 @@ extension AetherEngine {
         let language = ordinal < nativeSubtitleTrackTable.count
             ? nativeSubtitleTrackTable[ordinal].language : nil
         EngineLog.emit("[SubtitleOCR] worker armed: ordinal=\(ordinal) stream=\(streamIndex)", category: .engine)
-        subtitleOCRWorkerTask = Task.detached(priority: .utility) { [weak self] in
+        subtitleOCRWorkerTask = BlockingWork.detached(priority: .utility) { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
                 // AE#628: plan on the MainActor, decode here, off it, then resolve ends back on it.
@@ -156,7 +156,7 @@ extension AetherEngine {
         let language = nativeSubtitleTrackTable[ordinal].language
         subtitleOCRSidecarFillTask?.cancel()
         EngineLog.emit("[SubtitleOCR] sidecar fill starting: track=\(id) cues=\(cues.count)", category: .engine)
-        subtitleOCRSidecarFillTask = Task.detached(priority: .utility) {
+        subtitleOCRSidecarFillTask = BlockingWork.detached(priority: .utility) {
             await SubtitleImageOCR.appendRecognized(cues: cues, language: language, to: store)
             if !Task.isCancelled { store.markFinished() }
         }

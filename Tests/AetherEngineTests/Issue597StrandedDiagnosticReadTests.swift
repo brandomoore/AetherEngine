@@ -54,7 +54,7 @@ struct Issue597StrandedDiagnosticReadTests {
         // pool's occupancy here: on a loaded runner the lanes' own budget can expire before the
         // assertion runs, which would pin the harness's timing rather than the contract. That the
         // reads started at all is the fact this arm needs, and the two below are the contract.
-        try await waitFor(upTo: .seconds(5)) {
+        try await waitFor {
             stranded.count == ItemDiagnosticReadPool.maximumConcurrentReads
         }
 
@@ -62,10 +62,10 @@ struct Issue597StrandedDiagnosticReadTests {
         let later = AVPlayerItemDiagnostics(item: item(), pool: pool, read: answering.read)
         later.request(.counters)
 
-        try await waitFor(upTo: .seconds(5)) { answering.count == 1 }
+        try await waitFor { answering.count == 1 }
         #expect(answering.count == 1, "the pool never admitted a read after the stranded ones")
 
-        try await waitFor(upTo: .seconds(5)) { pool.runningCount == 0 }
+        try await waitFor { pool.runningCount == 0 }
         #expect(pool.runningCount == 0, "lanes were still held after every read had settled")
         _ = blockers
     }
@@ -80,16 +80,16 @@ struct Issue597StrandedDiagnosticReadTests {
 
         let reader = AVPlayerItemDiagnostics(item: item(), pool: pool, read: stranded.read)
         reader.request(.counters)
-        try await waitFor(upTo: .seconds(5)) { stranded.count == 1 }
+        try await waitFor { stranded.count == 1 }
 
         // Deliberately not asserting that it is in flight first: under a loaded runner the lane's
         // own budget can expire before the assertion runs, and that would pin the harness rather
         // than the contract. What is being pinned is that it does not STAY in flight.
-        try await waitFor(upTo: .seconds(5)) { !reader.inFlight }
+        try await waitFor { !reader.inFlight }
         #expect(!reader.inFlight, "the reader stayed in flight behind a read nobody will answer")
 
         reader.request(.counters)
-        try await waitFor(upTo: .seconds(5)) { stranded.count == 2 }
+        try await waitFor { stranded.count == 2 }
         #expect(stranded.count == 2, "a second request never reached the read")
     }
 }

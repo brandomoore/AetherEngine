@@ -6,7 +6,8 @@ import AetherEngine
 func runServe(url: URL, dvModeAvailable: Bool, forceDVWithoutDisplay: Bool = false,
               dolbyVisionHandling: DolbyVisionHandling = .automatic,
               nativeSubsIndex: Int? = nil, startPosition: Double? = nil,
-              audioDelayMs: Int = 0) -> Never {
+              audioDelayMs: Int = 0, iFrames: Bool = false,
+              objectAudioRendering: ObjectAudioRendering = .off, audioStreamIndex: Int32? = nil) -> Never {
     EngineLog.handler = { line in
         let timestamp = ISO8601DateFormatter.string(
             from: Date(),
@@ -22,6 +23,9 @@ func runServe(url: URL, dvModeAvailable: Bool, forceDVWithoutDisplay: Bool = fal
     if let idx = nativeSubsIndex { flagSuffix += " [--native-subs \(idx)]" }
     if let pos = startPosition { flagSuffix += " [--start-position \(pos)]" }
     if audioDelayMs != 0 { flagSuffix += " [--audio-delay \(audioDelayMs)]" }
+    if iFrames { flagSuffix += " [--iframes]" }
+    if case .apac(let layout) = objectAudioRendering { flagSuffix += " [--atmos-bed \(layout.rawValue)]" }
+    if let audioStreamIndex { flagSuffix += " [--audio-index \(audioStreamIndex)]" }
     print(EngineLog.redacted("aetherctl serve: \(url.absoluteString)\(flagSuffix)"))
     print("")
 
@@ -32,7 +36,9 @@ func runServe(url: URL, dvModeAvailable: Bool, forceDVWithoutDisplay: Bool = fal
         dolbyVisionHandling: dolbyVisionHandling,
         // AE#532: a session gates this on its own probe; the harness has none, so it asks the audit
         // for the whole verdict. A source with nothing to correct never gets past the gate inside.
-        dolbyVisionRPUProfile: DolbyVisionRecordAudit.rpuCorrection(url: url)
+        dolbyVisionRPUProfile: DolbyVisionRecordAudit.rpuCorrection(url: url),
+        audioSourceStreamIndexOverride: audioStreamIndex,
+        objectAudioRendering: objectAudioRendering
     )
     // Resume anchor exactly like AetherEngine.loadNative's load(startPosition:) (#99 repro).
     engine.initialStartSeconds = startPosition
@@ -42,6 +48,10 @@ func runServe(url: URL, dvModeAvailable: Bool, forceDVWithoutDisplay: Bool = fal
     // Enable native WebVTT subtitle renditions before start() so the master declares the SUBTITLES group (#55). Must precede start().
     if nativeSubsIndex != nil {
         engine.requestNativeSubtitleTrack()
+    }
+    // AE#682: the LoadOptions.serveIFramePlaylist path. Must precede start().
+    if iFrames {
+        engine.requestIFramePlaylist()
     }
     let playbackURL: URL
     do {

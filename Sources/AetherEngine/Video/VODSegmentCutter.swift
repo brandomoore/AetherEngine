@@ -59,4 +59,10 @@ struct VODSegmentCutter {
         }
         return current
     }
+
+    /// What `index` would return, without advancing.
+    func peekIndex(pts: Int64, isKeyframe: Bool) -> Int {
+        var copy = self
+        return copy.index(pts: pts, isKeyframe: isKeyframe)
+    }
 }

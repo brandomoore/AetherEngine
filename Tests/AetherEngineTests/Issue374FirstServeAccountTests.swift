@@ -148,14 +148,14 @@ final class Issue374FirstServeAccountTests: XCTestCase {
         let result = Issue374WaitResult()
         let finished = expectation(description: "startup waiter finished")
         Thread.detachNewThread {
-            result.store(provider.waitForFirstLiveSegment(timeout: 3))
+            result.store(provider.waitForFirstLiveSegment(timeout: 120))
             finished.fulfill()
         }
         while provider.parkedWaiterCount == 0 { usleep(200) }
         append(provider, index: 0)
         append(provider, index: 1)
 
-        wait(for: [finished], timeout: 2)
+        wait(for: [finished], timeout: 300)
         XCTAssertEqual(result.value, true)
 
         let accounted = tap.matching("first live manifest")

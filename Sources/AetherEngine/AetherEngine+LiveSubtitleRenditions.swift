@@ -133,7 +133,7 @@ extension AetherEngine {
                 // that is hours behind the picture and gets pruned on arrival. Everything older than
                 // the backfill span is marked seen without being fetched, so the loop starts at the
                 // playhead and the poll after it only ever sees the new tail.
-                let playheadWall = anchorWall.addingTimeInterval(clock.currentTime - anchorEngineTime)
+                let playheadWall = anchorWall.addingTimeInterval(clock.currentTime - liveSessionShiftSeconds)
                 let backfillFrom = playheadWall.addingTimeInterval(-Self.liveSubtitleBackfillSeconds)
                 for segment in media.segments {
                     if let end = segment.programDateTime?.addingTimeInterval(segment.duration),
@@ -195,7 +195,7 @@ extension AetherEngine {
     /// Keep the published array bounded: a channel left running for hours would otherwise carry every
     /// line it ever showed, and #271 is the standing reminder that this array is paid for per publish.
     private func pruned(_ cues: [SubtitleCue]) -> [SubtitleCue] {
-        let horizon = clock.currentTime - (loadedOptions.dvrWindowSeconds ?? 600) - 60
+        let horizon = clock.sourceTime - (loadedOptions.dvrWindowSeconds ?? 600) - 60
         guard horizon > 0 else { return Self.capLiveSubtitleCues(cues) }
         return Self.capLiveSubtitleCues(cues.filter { $0.endTime >= horizon })
     }

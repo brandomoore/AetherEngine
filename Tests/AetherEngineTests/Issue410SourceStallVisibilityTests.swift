@@ -9,7 +9,7 @@ import Foundation
 /// place, which is what makes the exit's honest `.exhausted` survive long enough to be read.
 ///
 /// `.serialized`: these tests mutate the process-wide backoff-scale test hook.
-@Suite("Source-stall visibility (#410)", .serialized)
+@Suite("Source-stall visibility (#410)", .serialized, .offCooperativePool)
 struct Issue410SourceStallVisibilityTests {
 
     /// The refusal these tests stage arms the request-rate pacer's wall-clock quiet ladder, which
@@ -144,7 +144,7 @@ struct Issue410SourceStallVisibilityTests {
         try reader.open()
 
         #expect(Self.readOnce(reader, at: 0, bytes: 64 * 1024) > 0)
-        #expect(Self.awaitRangeDelivered(reader), "the bounded initial range never completed")
+        try await Self.awaitRangeDelivered(reader)
 
         // Past winLookback + winTrimBatch, so a later read at 0 reaches the retained head span rather
         // than the window it walked out of.
@@ -173,13 +173,8 @@ struct Issue410SourceStallVisibilityTests {
 
     // MARK: - Reader drivers (same shape as ServedFromMemoryProgressTests)
 
-    private static func awaitRangeDelivered(_ reader: AVIOReader) -> Bool {
-        let deadline = Date().addingTimeInterval(20)
-        while Date() < deadline {
-            if !reader.hasLiveConnectionForTesting { return true }
-            Thread.sleep(forTimeInterval: 0.01)
-        }
-        return false
+    private static func awaitRangeDelivered(_ reader: AVIOReader) async throws {
+        try await waitFor { !reader.hasLiveConnectionForTesting }
     }
 
     @discardableResult

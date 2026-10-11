@@ -74,7 +74,7 @@ struct Issue259A53CaptionAxisTests {
           .enabled(if: fixtureExists("a53-captions.mp4"),
                    "run Scripts/fetch-fixtures.sh to generate the A/53 caption clip"),
           .timeLimit(.minutes(2)))
-    func a53ObservationsStayOnTheSourceAxis() throws {
+    func a53ObservationsStayOnTheSourceAxis() async throws {
         let witnessCount = 24
         let (expected, sourceTimeBase) = try sourceA53PacketPTS("a53-captions.mp4", limit: witnessCount)
         #expect(expected.count == witnessCount,
@@ -95,8 +95,7 @@ struct Issue259A53CaptionAxisTests {
         let prov = try #require(engine.provider)
         #expect(prov.mediaSegment(at: 0) != nil)
 
-        let deadline = Date().addingTimeInterval(30)
-        while collector.count < witnessCount, Date() < deadline { usleep(50_000) }
+        try await waitFor { collector.count >= witnessCount }
         let observed = Array(collector.snapshot().prefix(witnessCount))
         try #require(observed.count == witnessCount,
                      "producer emitted only \(observed.count)/\(witnessCount) A/53 observations")

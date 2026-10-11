@@ -10,7 +10,7 @@ import Foundation
 /// into the cause of the next one, forever. The live threshold absorbs the burst ONCE;
 /// the end-and-refill stays as the memory backstop for a "live" source that sustainedly
 /// outruns realtime (a misdeclared VOD). These tests pin both halves.
-@Suite("AVIOReader live window backpressure")
+@Suite("AVIOReader live window backpressure", .offCooperativePool)
 struct LiveWindowBackpressureTests {
 
     @Test("a live join burst past the VOD high water keeps its one connection",
@@ -34,20 +34,14 @@ struct LiveWindowBackpressureTests {
 
         // The origin must be able to FINISH its burst: on the 16 MB threshold the reader
         // cancelled the task mid-burst and the remaining bytes were never accepted.
-        let deadline = Date().addingTimeInterval(30)
-        while server.bytesWritten < burst && Date() < deadline {
-            try await Task.sleep(for: .milliseconds(50))
-        }
+        try await waitFor { server.bytesWritten >= burst }
         #expect(server.bytesWritten >= burst,
                 "origin only placed \(server.bytesWritten / (1024 * 1024)) MB of its \(burst / (1024 * 1024)) MB burst; the reader ended the connection")
 
         // Let the in-flight tail land in the window, then pin the live contract: the
         // burst is absorbed, the connection is NOT voluntarily ended, and no re-request
         // was ever issued.
-        let settle = Date().addingTimeInterval(10)
-        while reader.windowDiagnostics.aheadBytes < Int(burst) && Date() < settle {
-            try await Task.sleep(for: .milliseconds(50))
-        }
+        try await waitFor { reader.windowDiagnostics.aheadBytes >= Int(burst) }
         let diag = reader.windowDiagnostics
         #expect(diag.aheadBytes >= Int(burst),
                 "window holds \(diag.aheadBytes / (1024 * 1024)) MB of the burst")
@@ -77,10 +71,7 @@ struct LiveWindowBackpressureTests {
 
         // A "live" origin outrunning realtime into a stalled consumer: the backstop must
         // end the connection (bounded memory, the #310 contract, unchanged for live).
-        let deadline = Date().addingTimeInterval(15)
-        while reader.hasLiveConnectionForTesting && Date() < deadline {
-            try await Task.sleep(for: .milliseconds(50))
-        }
+        try await waitFor { !reader.hasLiveConnectionForTesting }
         #expect(!reader.hasLiveConnectionForTesting,
                 "the live backstop must still end a connection that outruns the consumer")
         #expect(reader.windowDiagnostics.parked,
@@ -96,8 +87,7 @@ struct LiveWindowBackpressureTests {
         let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: sliceCap)
         defer { buf.deallocate() }
         var got = 0
-        let readDeadline = Date().addingTimeInterval(30)
-        while got < target && Date() < readDeadline {
+        while got < target {
             let n = reader.read(into: buf, size: Int32(sliceCap))
             if n <= 0 { break }
             got += Int(n)
@@ -145,8 +135,7 @@ struct LiveWindowBackpressureTests {
         let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: sliceCap)
         defer { buf.deallocate() }
         var got = 0
-        let deadline = Date().addingTimeInterval(30)
-        while got < target && Date() < deadline {
+        while got < target {
             let n = reader.read(into: buf, size: Int32(sliceCap))
             if n <= 0 { break }
             got += Int(n)

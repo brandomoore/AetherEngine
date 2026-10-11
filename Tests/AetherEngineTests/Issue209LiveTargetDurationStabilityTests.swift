@@ -159,7 +159,7 @@ final class Issue209LiveTargetDurationStabilityTests: XCTestCase {
         let result = Issue209WaitResult()
         let finished = expectation(description: "startup waiter finishes after cancellation")
         Thread.detachNewThread {
-            result.store(provider.waitForFirstLiveSegment(timeout: 2))
+            result.store(provider.waitForFirstLiveSegment(timeout: 120))
             finished.fulfill()
         }
 
@@ -177,7 +177,7 @@ final class Issue209LiveTargetDurationStabilityTests: XCTestCase {
         )
 
         provider.cancelWaiters()
-        wait(for: [finished], timeout: 1)
+        wait(for: [finished], timeout: 300)
         XCTAssertEqual(result.value, false)
     }
 

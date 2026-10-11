@@ -1,4 +1,5 @@
 import Foundation
+import CoreGraphics
 import Testing
 @testable import AetherEngine
 
@@ -6,6 +7,35 @@ import Testing
 /// playback is already on the hardware path, so issue #27's software-playback starvation does
 /// not apply. A codec VideoToolbox declines must remain a successful software still, not a miss.
 struct FrameDecodeContextHardwareTests {
+    @Test("cancelled resident request never opens or decodes a source")
+    func cancelledResidentRequest() async {
+        let extractor = FrameExtractor(reader: DataIOReader(data: Data()), formatHint: "mp4")
+        #expect(await extractor.residentPreview(rawTarget: 1, refined: true, maxWidth: 320, isCancelled: { true }) == nil)
+        await extractor.shutdown()
+    }
+    @Test("resident refinement reports actual PTS and cannot invent a target frame past EOF")
+    func residentActualPTSAndMissingTarget() throws {
+        let data = try #require(Data(base64Encoded: Self.mpeg4FixtureBase64, options: .ignoreUnknownCharacters))
+        let context = FrameDecodeContext(reader: DataIOReader(data: data), formatHint: "mp4", allowsHardwareDecode: false)
+        defer { context.close() }
+        try context.ensureOpen()
+        var actual: Double?
+        var refined = false
+        let image = context.decodeFrame(at: 0, mode: .snapshot, targetWidth: 64,
+            maxSize: CGSize(width: 64, height: 64), isCancelled: { false }, residentTarget: 0,
+            reportResidentTime: { actual = $0; refined = $1 })
+        #expect(image != nil)
+        #expect(actual == 0)
+        #expect(refined)
+        actual = nil
+        let missing = context.decodeFrame(at: 0, mode: .snapshot, targetWidth: 64,
+            maxSize: CGSize(width: 64, height: 64), isCancelled: { false }, residentTarget: 0.9,
+            reportResidentTime: { actual = $0; refined = $1 })
+        #expect(missing == nil)
+        #expect(actual == nil)
+        #expect(context.decodeFrame(at: 0, mode: .thumbnail, targetWidth: 64, maxSize: nil,
+            isCancelled: { true }, residentTarget: 0) == nil)
+    }
 
     @Test("hardware-allowed still falls back for an MPEG-4 Part 2 fixture")
     func declinedCodecStillDecodes() throws {

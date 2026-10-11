@@ -81,7 +81,7 @@ final class RemoteHLSSubtitleProvider: HLSSegmentProvider, @unchecked Sendable {
         cancelFill()
         let jobs = Self.fillJobs(tracks: tracks, stores: stores, defaultHeaders: defaultHeaders)
         guard !jobs.isEmpty else { return }
-        let task = Task.detached(priority: .utility) { [jobs] in
+        let task = BlockingWork.detached(priority: .utility) { [jobs] in
             for job in jobs {
                 if Task.isCancelled { return }
                 await AetherEngine.runExternalSubtitleFill(job: job)

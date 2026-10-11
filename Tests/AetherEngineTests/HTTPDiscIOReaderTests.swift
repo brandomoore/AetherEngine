@@ -8,7 +8,7 @@ import Testing
 
 // Serialized: the tests share MockRangeURLProtocol's static byte store keyed by URL; running them
 // in parallel would let one test's fixture bytes answer another's request.
-@Suite("HTTPDiscIOReader (#64 remote disc images)", .serialized)
+@Suite("HTTPDiscIOReader (#64 remote disc images)", .serialized, .offCooperativePool)
 struct HTTPDiscIOReaderTests {
 
     // MARK: - Pure helpers
@@ -161,6 +161,49 @@ struct HTTPDiscIOReaderTests {
         let r = try #require(makeReader([UInt8](disc)))
         let wrapped = try DiscReader.wrap(r)
         #expect(wrapped != nil)
+    }
+
+    // MARK: - Source byte accounting
+
+    @Test("The reader counts the bytes it pulled from the origin")
+    func countsPulledBytes() throws {
+        let src = (0..<200_000).map { UInt8($0 & 0xff) }
+        let r = try #require(makeReader(src))
+        #expect(r.sourceBytesFetched == 0)
+        var out = [UInt8](repeating: 0, count: 6000)
+        let n = out.withUnsafeMutableBufferPointer { r.read($0.baseAddress, size: 6000) }
+        #expect(n == 6000)
+        // One refill at the 64 KiB floor covers the 6000 bytes read: the count is the transfer.
+        #expect(r.sourceBytesFetched == 65_536)
+        // A re-read inside the buffer pulls nothing new.
+        #expect(r.seek(offset: 4500, whence: SEEK_SET) == 4500)
+        _ = out.withUnsafeMutableBufferPointer { r.read($0.baseAddress, size: 100) }
+        #expect(r.sourceBytesFetched == 65_536)
+        // A seek out of the buffer refills, and that refill counts.
+        #expect(r.seek(offset: 150_000, whence: SEEK_SET) == 150_000)
+        _ = out.withUnsafeMutableBufferPointer { r.read($0.baseAddress, size: 100) }
+        #expect(r.sourceBytesFetched == 65_536 + 50_000)
+    }
+
+    // A disc session reports `LiveTelemetry.demuxerBytesFetched` and the software-path throughput
+    // from this counter. It read 0 for every custom source, so a remote disc image showed no source
+    // bytes at all while the reader pulled the whole title.
+    @Test("A remote disc reports the reader's bytes through its extent map and the demuxer bridge")
+    func discBridgeReportsPulledBytes() throws {
+        let disc = ISO9660Fixture.make(files: [
+            .init(name: "VTS_01_1.VOB", length: 2048),
+        ])
+        let r = try #require(makeReader([UInt8](disc)))
+        let wrapped = try #require(try DiscReader.wrap(r))
+        let bridge = CustomIOReaderBridge(reader: wrapped.reader)
+        #expect(r.sourceBytesFetched > 0)
+        #expect(bridge.cumulativeBytesFetched == r.sourceBytesFetched)
+    }
+
+    @Test("A host's own reader still reports no source bytes")
+    func hostReaderReportsNothing() {
+        let bridge = CustomIOReaderBridge(reader: DataIOReader(data: Data(repeating: 1, count: 4096)))
+        #expect(bridge.cumulativeBytesFetched == 0)
     }
 }
 

@@ -68,28 +68,58 @@ final class SoftwareStillExtractor: @unchecked Sendable {
     ///
     /// Every request is an independent landing, so the decoder is flushed first: a still is a seek,
     /// and carrying references across two unrelated positions is what produces a smeared picture.
-    func still(from ring: PacketRingBuffer, targetPts: Double, maxWidth: Int) -> CGImage? {
+    func still(from ring: PacketRingBuffer, targetPts: Double, maxWidth: Int,
+               precise: Bool = true, isCancelled: @escaping () -> Bool = { false },
+               reportTime: ((Double, Bool) -> Void)? = nil,
+               reportRange: ((Range<Double>) -> Void)? = nil) -> CGImage? {
         guard isOpen, timeBaseSeconds > 0, maxWidth > 0 else { return nil }
         guard let run = ring.stillRun(target: targetPts,
                                       maxPackets: limits.maxPackets,
                                       maxSpanSeconds: limits.maxSpanSeconds,
-                                      reorderTail: limits.reorderTail),
+                                      reorderTail: limits.reorderTail, isCancelled: reportTime == nil ? nil : isCancelled),
               !run.isEmpty else { return nil }
+        // Preview is stricter than the legacy ring's end clamp: no live-edge
+        // picture can stand in for a target beyond the retained packet frontier.
+        if reportTime != nil && !run.contains(where: { $0.pts >= targetPts }) { return nil }
 
-        return decodeRun(targetPts: targetPts, maxWidth: maxWidth) {
-            for packet in run { feed(packet) }
+        if let first = run.first {
+            let end = run.dropFirst().first(where: { $0.isKeyframe })?.pts
+                ?? run.map(\.pts).max()
+            if let end, end > first.pts { reportRange?(first.pts..<end) }
+        }
+        return decodeRun(targetPts: targetPts, maxWidth: maxWidth, precise: precise,
+                         isCancelled: isCancelled, reportTime: reportTime) { shouldStop in
+            for packet in run {
+                if shouldStop() { break }
+                feed(packet)
+            }
         }
     }
 
     /// AE#605: the same still out of a software VOD session's retained packets. They arrive as the
     /// demuxer produced them, envelope and all, so they are replayed as is: a VOD stream carries real
     /// decode timestamps and side data that the ring's pts-only shape has no room for.
-    func still(from run: [SoftwareStoredPacket], targetPts: Double, maxWidth: Int) -> CGImage? {
+    func still(from run: [SoftwareStoredPacket], targetPts: Double, maxWidth: Int,
+               precise: Bool = true, isCancelled: @escaping () -> Bool = { false },
+               reportTime: ((Double, Bool) -> Void)? = nil,
+               reportRange: ((Range<Double>) -> Void)? = nil) -> CGImage? {
         guard isOpen, maxWidth > 0, let first = run.first, first.flags & AV_PKT_FLAG_KEY != 0 else {
             return nil
         }
-        return decodeRun(targetPts: targetPts, maxWidth: maxWidth) {
+        let video = run.filter { $0.streamIndex == videoStreamIndex && $0.pts != Int64.min && $0.timeBaseDenominator > 0 }
+        func seconds(_ packet: SoftwareStoredPacket) -> Double {
+            Double(packet.pts) * Double(packet.timeBaseNumerator) / Double(packet.timeBaseDenominator)
+        }
+        if let first = video.first {
+            let end = video.dropFirst().first(where: { $0.flags & AV_PKT_FLAG_KEY != 0 }).map(seconds)
+                ?? video.map(seconds).max()
+            let start = seconds(first)
+            if let end, end > start { reportRange?(start..<end) }
+        }
+        return decodeRun(targetPts: targetPts, maxWidth: maxWidth, precise: precise,
+                         isCancelled: isCancelled, reportTime: reportTime) { shouldStop in
             for stored in run {
+                if shouldStop() { break }
                 guard let p = try? stored.makeAVPacket() else { continue }
                 var packet: UnsafeMutablePointer<AVPacket>? = p
                 defer { trackedPacketFree(&packet) }
@@ -99,7 +129,9 @@ final class SoftwareStillExtractor: @unchecked Sendable {
         }
     }
 
-    private func decodeRun(targetPts: Double, maxWidth: Int, feedRun: () -> Void) -> CGImage? {
+    private func decodeRun(targetPts: Double, maxWidth: Int, precise: Bool,
+                           isCancelled: @escaping () -> Bool, reportTime: ((Double, Bool) -> Void)?,
+                           feedRun: (() -> Bool) -> Void) -> CGImage? {
         let collector = FrameCollector(target: targetPts)
         decoder.onFrame = { pixelBuffer, pts, _ in
             collector.append(pixelBuffer: pixelBuffer, seconds: pts.seconds)
@@ -107,10 +139,16 @@ final class SoftwareStillExtractor: @unchecked Sendable {
         decoder.flush(resetFilterGraph: false)
         defer { decoder.onFrame = nil }
 
-        feedRun()
+        let deadline = ContinuousClock.now.advanced(by: .milliseconds(750))
+        feedRun { isCancelled() || (reportTime != nil && ContinuousClock.now >= deadline)
+            || (!precise && collector.hasFrame) }
 
-        guard let best = collector.best else { return nil }
-        return Self.image(from: best, maxWidth: maxWidth)
+        let didRefine = precise && collector.coversTarget
+        let selected = reportTime != nil && didRefine ? collector.refinedBest : collector.best
+        guard !isCancelled(), reportTime == nil || ContinuousClock.now < deadline,
+              let best = selected else { return nil }
+        reportTime?(best.seconds, didRefine)
+        return Self.image(from: best.pixelBuffer, maxWidth: maxWidth)
     }
 
     // MARK: - Feeding
@@ -139,8 +177,8 @@ final class SoftwareStillExtractor: @unchecked Sendable {
 
     /// Keeps the best candidate as the run decodes rather than every frame it produced. The buffers
     /// come out of the decoder's own pool, so holding a whole GOP of them would starve the pool the
-    /// next run has to draw from. Two are enough: the one the target asks for, and the oldest as the
-    /// fallback below.
+    /// next run has to draw from. Keep at most two: before/after the target, or
+    /// the earliest fallback and the candidate after an evicted target.
     ///
     /// `onFrame` is `@Sendable` and the decoder calls it from its own drain, so the box is locked
     /// even though the run itself is serial.
@@ -149,6 +187,8 @@ final class SoftwareStillExtractor: @unchecked Sendable {
         private let target: Double
         private var atOrBefore: (pixelBuffer: CVPixelBuffer, seconds: Double)?
         private var earliest: (pixelBuffer: CVPixelBuffer, seconds: Double)?
+        private var atOrAfter: (pixelBuffer: CVPixelBuffer, seconds: Double)?
+        private var reachedTarget = false
 
         init(target: Double) {
             self.target = target
@@ -158,12 +198,17 @@ final class SoftwareStillExtractor: @unchecked Sendable {
             guard seconds.isFinite else { return }
             lock.lock()
             defer { lock.unlock() }
-            if earliest == nil || seconds < earliest!.seconds {
+            if seconds >= target { reachedTarget = true }
+            if seconds >= target, atOrAfter == nil || seconds < atOrAfter!.seconds {
+                atOrAfter = (pixelBuffer, seconds)
+            }
+            if atOrBefore == nil && (earliest == nil || seconds < earliest!.seconds) {
                 earliest = (pixelBuffer, seconds)
             }
             guard seconds <= target else { return }
             if atOrBefore == nil || seconds > atOrBefore!.seconds {
                 atOrBefore = (pixelBuffer, seconds)
+                earliest = nil
             }
         }
 
@@ -174,10 +219,22 @@ final class SoftwareStillExtractor: @unchecked Sendable {
         /// keyframe was dropped between the index snapshot and the disk read and the run therefore
         /// begins AFTER the target. Returning the earliest frame there is a picture from up to one
         /// GOP late, which is a better answer than an empty card.
-        var best: CVPixelBuffer? {
+        var hasFrame: Bool {
+            lock.lock(); defer { lock.unlock() }
+            return earliest != nil || atOrBefore != nil
+        }
+        var coversTarget: Bool {
+            lock.lock(); defer { lock.unlock() }
+            return atOrBefore != nil && reachedTarget
+        }
+        var best: (pixelBuffer: CVPixelBuffer, seconds: Double)? {
             lock.lock()
             defer { lock.unlock() }
-            return (atOrBefore ?? earliest)?.pixelBuffer
+            return atOrBefore ?? earliest
+        }
+        var refinedBest: (pixelBuffer: CVPixelBuffer, seconds: Double)? {
+            lock.lock(); defer { lock.unlock() }
+            return atOrAfter
         }
     }
 

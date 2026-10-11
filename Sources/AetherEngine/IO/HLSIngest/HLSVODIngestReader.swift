@@ -204,7 +204,7 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         finished = false
         failed = false
         producerStartIndex = startIndex
-        producer = Task.detached(priority: .userInitiated) { [self] in
+        producer = BlockingWork.detached(priority: .userInitiated) { [self] in
             await produce(
                 resolved: resolved,
                 startIndex: startIndex,
@@ -294,7 +294,7 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         let currentGeneration = generation
         let preResolved = resolved
         producerStartIndex = 0
-        producer = Task.detached(priority: .userInitiated) { [self] in
+        producer = BlockingWork.detached(priority: .userInitiated) { [self] in
             do {
                 let media: ResolvedMedia
                 if let preResolved {
@@ -590,11 +590,15 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
     }
 }
 
-/// Bounded MPEG-TS PMT inspection. HEVC is stream_type 0x24; no URL suffix or
-/// response MIME type is treated as codec evidence.
+/// Bounded MPEG-TS PMT inspection. HEVC is stream_type 0x24, or private PES (0x06) carrying a
+/// well-formed `registration_descriptor("HEVC")` (AE#718); no URL suffix or response MIME type is
+/// treated as codec evidence.
 enum MPEGTransportStreamCodecProbe {
     private static let packetSize = 188
     private static let hevcStreamType: UInt8 = 0x24
+    private static let privatePESStreamType: UInt8 = 0x06
+    private static let registrationDescriptorTag: UInt8 = 0x05
+    private static let hevcFormatIdentifier: [UInt8] = Array("HEVC".utf8)
 
     enum Verdict: Equatable {
         /// PMT declares HEVC: AVFoundation builds no video track for this carriage (HLS Authoring
@@ -660,9 +664,32 @@ enum MPEGTransportStreamCodecProbe {
             let infoLength =
                 (Int(bytes[stream + 3] & 0x0F) << 8)
                     | Int(bytes[stream + 4])
-            stream += 5 + infoLength
+            let descriptorsEnd = stream + 5 + infoLength
+            if bytes[stream] == privatePESStreamType,
+               descriptorsEnd <= sectionEnd,
+               registersHEVC(bytes, descriptors: (stream + 5)..<descriptorsEnd) {
+                return .hevcInMPEGTS
+            }
+            stream = descriptorsEnd
         }
         return .otherCarriage
+    }
+
+    /// AE#718: a descriptor loop that runs past its own bounds is not evidence, so a truncated
+    /// registration descriptor never counts.
+    private static func registersHEVC(_ bytes: [UInt8], descriptors: Range<Int>) -> Bool {
+        var descriptor = descriptors.lowerBound
+        while descriptor + 2 <= descriptors.upperBound {
+            let length = Int(bytes[descriptor + 1])
+            let body = descriptor + 2
+            guard body + length <= descriptors.upperBound else { return false }
+            if bytes[descriptor] == registrationDescriptorTag, length >= 4,
+               Array(bytes[body..<(body + 4)]) == hevcFormatIdentifier {
+                return true
+            }
+            descriptor = body + length
+        }
+        return false
     }
 }
 

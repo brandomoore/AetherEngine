@@ -10,7 +10,7 @@ import Foundation
 /// only ended when the segment provider tore the demuxer down from outside.
 ///
 /// `.serialized`: these tests mutate the process-wide backoff-scale test hook.
-@Suite("Error-ended zero-byte reconnects", .serialized)
+@Suite("Error-ended zero-byte reconnects", .serialized, .offCooperativePool)
 struct ErrorEndedReconnectTests {
 
     private final class PhaseLog: @unchecked Sendable {

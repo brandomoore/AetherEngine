@@ -27,10 +27,23 @@ protocol LiveIngestSourceInfo: AnyObject, Sendable {
     var closedLiveCadenceSeconds: Double? { get }
 
     /// Longest segment duration (EXTINF) the upstream has actually SERVED, nil until the first arrival.
-    /// The measured counterpart to `upstreamTargetDuration`, and the term that keeps the served
-    /// TARGETDURATION honest when a join burst makes the arrival intervals look shorter than the steady
-    /// state ever will be: an upstream cutting 4 s segments cannot sustain a 0.5 s cadence (AE#447).
+    /// The measured counterpart to `upstreamTargetDuration`. Two things are read off it: a bound on
+    /// the steady-state cadence when a join burst makes the arrival intervals look shorter than they
+    /// will ever be (an upstream cutting 4 s segments cannot sustain 0.5 s, AE#447), and the unit the
+    /// source delivers in, which the served TARGETDURATION covers whole (AE#684).
     var upstreamSegmentDurationSeconds: Double? { get }
+
+    /// Summed EXTINF of the segments this reader joined with, nil until it has joined. Reported in
+    /// the seal line; nothing is decided from it, because an upstream's EXTINF and its media need
+    /// not agree (AE#684).
+    var joinBacklogSeconds: Double? { get }
+
+    /// Whether the join has been handed over in full AND consumed: every byte of the join batch has
+    /// been committed to the reader (and to its companion audio reader, where there is one), and the
+    /// consumer is parked on an empty reader, either of the two, waiting for the next upstream
+    /// delivery. From then on nothing more can be cut until that delivery, which is
+    /// what the first-serve gate needs to know before it waits for a deeper cushion (AE#684).
+    var joinIsSpent: Bool { get }
 
     /// OBSERVED upstream segment-arrival cadence in seconds (recent max inter-arrival interval, widened by
     /// the currently-open gap), nil until the first arrival. Unlike `upstreamTargetDuration` this reflects

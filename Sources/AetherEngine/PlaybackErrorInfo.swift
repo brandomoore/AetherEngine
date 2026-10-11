@@ -83,6 +83,12 @@ public struct PlaybackErrorKind: RawRepresentable, Sendable, Equatable, Hashable
     /// neither gone nor unreadable, and a second player that decodes the track itself will play it.
     /// A host with a fallback ladder should DEMOTE on this one, not end the ladder.
     public static let audioBridgeProducedNoOutput = PlaybackErrorKind(rawValue: "audioBridgeProducedNoOutput")
+    /// The volume holding the loopback segment cache (the temporary directory) ran out of space, so
+    /// the session could not write its segments and the muxer revive budget ran out. Distinct from
+    /// `vodSourceFailed` and `audioBridgeProducedNoOutput`, which this used to arrive as: the source
+    /// and its audio are fine, and the same load succeeds once space is freed. A host should free
+    /// its own caches or ask the user to, not demote to another player.
+    public static let storageExhausted = PlaybackErrorKind(rawValue: "storageExhausted")
 }
 
 /// Machine-readable companion to the text inside `PlaybackState.error` (#376).

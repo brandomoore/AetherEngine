@@ -18,23 +18,25 @@ enum AudibleSelectionReadback {
 
     /// One line, bounded: it lands in a 300-line ring buffer a reporter copies out of.
     ///
-    /// `served` is the language the master declared, nil when it declared none. `servingMaster`
+    /// `served` is the language the master declared, nil when it declared none. `declaredUntagged` is a
+    /// rendition without a LANGUAGE (AE#726, untagged E-AC-3 JOC), which AVFoundation should still list. `servingMaster`
     /// separates the two ways that happens: a media-direct session has no master to declare anything in,
     /// and the absent group there is the documented consequence rather than a finding.
     static func line(
         served: String?,
+        declaredUntagged: Bool = false,
         servingMaster: Bool,
         groupPresent: Bool,
         options: [Option],
         selected: Option?
     ) -> String {
-        var parts = ["[AetherEngine] AE#458 audible readback: served=\(served ?? "none")"]
+        var parts = ["[AetherEngine] AE#458 audible readback: served=\(served ?? (declaredUntagged ? "untagged" : "none"))"]
         parts.append(servingMaster ? "master" : "media playlist")
 
         guard groupPresent, !options.isEmpty else {
             // A declared rendition that came back as nothing is the reported defect; nothing declared is
             // not, so only the first earns the AVKit consequence.
-            parts.append(served != nil
+            parts.append(served != nil || declaredUntagged
                 ? "no audible group (AVKit labels the track Not Specified)"
                 : "no audible group, as declared")
             return parts.joined(separator: ", ")

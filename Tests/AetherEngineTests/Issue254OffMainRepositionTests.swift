@@ -36,7 +36,7 @@ struct Issue254OffMainRepositionTests {
 
     @MainActor
     @Test("a reposition waiting on the demuxer leaves the main actor free", .timeLimit(.minutes(3)))
-    func blockedRepositionKeepsMainActorLive() async {
+    func blockedRepositionKeepsMainActorLive() async throws {
         let demuxer = Demuxer()
         let queue = DispatchQueue(label: "test.issue254.blocked")
         let release = DispatchSemaphore(value: 0)
@@ -62,7 +62,7 @@ struct Issue254OffMainRepositionTests {
 
         // 100 ms of main-actor work while the reposition is stuck behind the queue. The inline call
         // this replaces could not reach here at all: it held the thread these hops need.
-        for _ in 0..<5 { try? await Task.sleep(for: .milliseconds(20)) }
+        for _ in 0..<5 { try await Task.sleep(for: .milliseconds(20)) }
         #expect(finished.isSet == false)
 
         release.signal()

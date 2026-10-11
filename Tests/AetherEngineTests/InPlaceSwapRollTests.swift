@@ -30,7 +30,7 @@ struct InPlaceSwapRollTests {
         let body = String(text[sink.upperBound...].prefix(3000))
         let gate = try #require(body.range(of: "Self.playingIsThisItemsRoll(itemIsReadyToPlay:"))
         let latch = try #require(body.range(of: "self.hasEverPlayed = true"))
-        let release = try #require(body.range(of: "self.inPlaceSwapMountPending = false"))
+        let release = try #require(body.range(of: "self.mountSeekPending = false"))
         #expect(gate.lowerBound < latch.lowerBound)
         #expect(gate.lowerBound < release.lowerBound)
     }

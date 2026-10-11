@@ -7,7 +7,7 @@ import Foundation
 /// that never saturates the socket the transport keeps delivering and the window grows without
 /// bound. Asking for a fixed amount at a time makes the overshoot impossible rather than caught:
 /// the origin cannot send more than was requested.
-@Suite("Bounded persistent ranges (#220)")
+@Suite("Bounded persistent ranges (#220)", .offCooperativePool, .timeLimit(.minutes(2)))
 struct Issue220BoundedRangeTests {
 
     private func makeReader(_ server: ThrottledOriginServer) -> AVIOReader {
@@ -23,13 +23,11 @@ struct Issue220BoundedRangeTests {
     /// exists to catch also landed too late to be seen. Quiescence is the state the assertions
     /// actually want, and it is reachable without a fixed sleep.
     private func waitForOriginToSettle(_ server: ThrottledOriginServer,
-                                       quietFor: TimeInterval = 0.2,
-                                       cap: TimeInterval = 5) async {
-        let deadline = Date().addingTimeInterval(cap)
+                                       quietFor: TimeInterval = 0.2) async throws {
         var last = server.rangeRequestCount
         var quietSince = Date()
-        while Date() < deadline {
-            try? await Task.sleep(nanoseconds: 20_000_000)
+        while true {
+            try await Task.sleep(nanoseconds: 20_000_000)
             let now = server.rangeRequestCount
             if now != last {
                 last = now
@@ -99,7 +97,7 @@ struct Issue220BoundedRangeTests {
         // The defect reconnected at the READ position, so it asked again for a byte inside the
         // range already in hand. Nothing may do that: the opening request is the only one allowed
         // to touch [0, firstRange), and the refill starts at firstRange exactly.
-        await waitForOriginToSettle(server)
+        try await waitForOriginToSettle(server)
         let refetches = server.requestedRanges.filter { $0.start > 0 && $0.start < firstRange }
         #expect(refetches.isEmpty,
                 "a completed range was re-fetched instead of read: \(server.requestedRanges)")
@@ -125,12 +123,12 @@ struct Issue220BoundedRangeTests {
         // Baseline only counts as a baseline once the open's own requests have all landed; the
         // speculative tail fetch is issued concurrently and would otherwise arrive afterwards and
         // read as a connection this EOF read opened.
-        await waitForOriginToSettle(server)
+        try await waitForOriginToSettle(server)
         let requestsBefore = server.rangeRequestCount
 
         #expect(reader.seek(offset: size, whence: SEEK_SET) == size)
         #expect(reader.read(into: buf, size: 4096) == FFmpegErr.eof)
-        await waitForOriginToSettle(server)
+        try await waitForOriginToSettle(server)
         #expect(server.rangeRequestCount == requestsBefore,
                 "a read at EOF opened a connection: \(server.requestedRanges)")
     }

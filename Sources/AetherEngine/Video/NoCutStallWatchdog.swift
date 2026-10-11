@@ -80,6 +80,8 @@ final class NoCutStallWatchdog: @unchecked Sendable {
     private var holdRearmedAt: Date?
     private var consecutiveHolds = 0
     private var reading = true
+    private var replayChecking = false
+    private var replayLastPacketAt: Date?
     private var exitLatched = false
 
     private var packetsRead = 0
@@ -129,6 +131,26 @@ final class NoCutStallWatchdog: @unchecked Sendable {
     func notePacketRead() {
         lock.lock()
         packetsRead += 1
+        lock.unlock()
+    }
+
+    /// A verified-overlap scan intentionally cannot cut a segment. Keep watching the source for
+    /// starvation without classifying those packets as a stuck cutter.
+    func setReplayChecking(_ checking: Bool, at now: Date) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard replayChecking != checking else { return }
+        replayChecking = checking
+        replayLastPacketAt = checking ? now : nil
+        holdRearmedAt = now
+        consecutiveHolds = 0
+        resetWindowCounters()
+    }
+
+    func noteReplayPacketRead(at now: Date) {
+        lock.lock()
+        packetsRead += 1
+        replayLastPacketAt = now
         lock.unlock()
     }
 
@@ -187,6 +209,16 @@ final class NoCutStallWatchdog: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard !exitLatched, reading, let finalizeAt = lastFinalizeAt else { return nil }
+        if replayChecking {
+            // The producer is checking an already-muxed overlap and cannot finalize yet. A dead
+            // source must still be interruptible while it is parked inside av_read_frame.
+            let quietFor = now.timeIntervalSince(replayLastPacketAt ?? finalizeAt)
+            guard quietFor > HLSSegmentProducer.liveSourceStarvationTimeoutSeconds else { return nil }
+            exitLatched = true
+            return .exitForRetune(makeWindow(stalledFor: quietFor,
+                                             progress: packetsRead - packetsReadAtWindowStart,
+                                             readRate: 0, ptsAdvance: -1))
+        }
         let stalledFor = now.timeIntervalSince(holdRearmedAt ?? finalizeAt)
         let progress = packetsRead - packetsReadAtWindowStart
         let readRate = stalledFor > 0 ? Double(progress) / stalledFor : 0

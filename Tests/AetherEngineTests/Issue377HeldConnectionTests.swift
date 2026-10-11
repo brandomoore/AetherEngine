@@ -39,7 +39,7 @@ private final class RecordingHeldDelegate: HeldSourceConnectionDelegate, @unchec
     var endError: Error? { lock.lock(); defer { lock.unlock() }; return _endError }
 
     @discardableResult
-    func waitForEnd(seconds: Double = 20) -> Bool {
+    func waitForEnd(seconds: Double = 120) -> Bool {
         finished.wait(timeout: .now() + seconds) == .success
     }
 
@@ -354,7 +354,7 @@ struct Issue377HeldConnectionTests {
 /// fills, which is why #220's defect survived every local test it had). Each test that asserts a
 /// held count carries the pushed count next to it, because a harness in which the known shape looks
 /// the same as the new one decides nothing.
-@Suite("#377 held connection in the reader")
+@Suite("#377 held connection in the reader", .offCooperativePool)
 struct Issue377HeldReaderTests {
 
     /// Ranges the DATA path asked for, with the open-time speculative tail fetch excluded: it
@@ -363,7 +363,7 @@ struct Issue377HeldReaderTests {
         server.requestedRanges.map(\.start).filter { $0 < totalSize - 1024 * 1024 }
     }
 
-    private func drain(_ reader: AVIOReader, bytes target: Int, timeout: TimeInterval = 60) -> Int {
+    private func drain(_ reader: AVIOReader, bytes target: Int, timeout: TimeInterval = 120) -> Int {
         let sliceCap = 256 * 1024
         let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: sliceCap)
         defer { buf.deallocate() }
@@ -417,7 +417,8 @@ struct Issue377HeldReaderTests {
                 "a held connection asked \(heldAsks.count) times for one continuous read: \(heldAsks)")
     }
 
-    @Test("a PAUSED consumer ends the held connection inside its budget and holds no flow")
+    @Test("a PAUSED consumer ends the held connection inside its budget and holds no flow",
+          .timeLimit(.minutes(2)))
     func pausedConsumerEndsTheHeldConnection() async throws {
         let totalSize: Int64 = 256 * 1024 * 1024
         let server = try #require(ThrottledOriginServer(totalSize: totalSize))
@@ -430,8 +431,11 @@ struct Issue377HeldReaderTests {
         try reader.open()
 
         // Nobody consumes AND the consumer says it is paused. #310's worst episode came out of
-        // exactly this state, so the connection has to be gone rather than merely quiet.
-        try await Task.sleep(for: .seconds(8))
+        // exactly this state, so the connection has to be gone rather than merely quiet. The budget
+        // runs from the moment the window is full, which is the origin's pace, so wait for the end
+        // itself and then leave a window in which a re-request with nothing draining would show.
+        try await waitFor { !reader.hasLiveConnectionForTesting && reader.windowDiagnostics.parked }
+        try await Task.sleep(for: .seconds(1))
 
         #expect(!reader.hasLiveConnectionForTesting,
                 "a paused consumer must hold no flow, which is the #310 invariant 6.11.0 shipped")
@@ -506,7 +510,8 @@ struct Issue377HeldReaderTests {
                 "a stretch with no read outstanding is not a gap; drawing again must not cost a request: \(asks)")
     }
 
-    @Test("consumption after an idle end refills at the frontier without going backwards")
+    @Test("consumption after an idle end refills at the frontier without going backwards",
+          .timeLimit(.minutes(2)))
     func refillAfterIdleEnd() async throws {
         let totalSize: Int64 = 256 * 1024 * 1024
         let server = try #require(ThrottledOriginServer(totalSize: totalSize))
@@ -520,7 +525,10 @@ struct Issue377HeldReaderTests {
         reader.heldPausedBudgetSeconds = 3
         try reader.open()
 
-        try await Task.sleep(for: .seconds(8))   // past the paused budget
+        // The paused budget runs from the moment the window is full, and filling it is the origin's
+        // pace: on a loaded runner that alone outlasted a fixed 8 s sleep, the connection was never
+        // ended, and the drain below rode it (`[0]`). Wait for the end itself.
+        try await waitFor { !reader.hasLiveConnectionForTesting }
         let afterIdle = dataRanges(server, totalSize: totalSize)
         #expect(afterIdle.count == 1)
 
@@ -530,8 +538,10 @@ struct Issue377HeldReaderTests {
                 "the reader did not resume after the pause ended")
 
         let asks = dataRanges(server, totalSize: totalSize)
-        #expect(asks.count == 2,
-                "resuming should cost exactly one re-request at the frontier, got \(asks)")
+        // `#require`, not `#expect`: `asks[1]` below traps on a shorter list, and a trap takes the
+        // whole test process down with every result still buffered in it.
+        try #require(asks.count == 2,
+                     "resuming should cost exactly one re-request at the frontier, got \(asks)")
         #expect(asks == asks.sorted(), "a refill went backwards past the frontier: \(asks)")
         #expect(asks[1] > 0, "the refill asked from byte 0 again instead of at the frontier")
     }

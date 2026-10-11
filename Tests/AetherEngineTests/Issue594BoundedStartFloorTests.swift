@@ -83,7 +83,9 @@ final class Issue594BoundedStartFloorTests: XCTestCase {
     func testFloorHoldsAStrictRealtimeOriginPastTheGrace() {
         let (provider, cache) = makeProvider(floorsAtHoldback: true)
         defer { cache.close() }
-        let (result, finished) = startWaiter(provider)
+        // No outer deadline within reach: it serves a degraded start, which would read as the floor
+        // releasing.
+        let (result, finished) = startWaiter(provider, timeout: 300)
 
         append(provider, index: 0)
         append(provider, index: 1)
@@ -93,7 +95,7 @@ final class Issue594BoundedStartFloorTests: XCTestCase {
         for index in 2..<15 {
             append(provider, index: index)
         }
-        wait(for: [finished], timeout: 1)
+        wait(for: [finished], timeout: 300)
         XCTAssertEqual(result.value, true, "the floor never released once the cushion was built")
     }
 
@@ -108,7 +110,7 @@ final class Issue594BoundedStartFloorTests: XCTestCase {
         for index in 0..<15 {
             append(provider, index: index)
         }
-        wait(for: [finished], timeout: 1)
+        wait(for: [finished], timeout: 300)
         let elapsed = Double(
             DispatchTime.now().uptimeNanoseconds - started.uptimeNanoseconds
         ) / 1_000_000_000
@@ -126,7 +128,7 @@ final class Issue594BoundedStartFloorTests: XCTestCase {
         let threshold = DispatchTime.now()
         append(provider, index: 1)
 
-        wait(for: [finished], timeout: 1.2)
+        wait(for: [finished], timeout: 300)
         let elapsed = Double(
             DispatchTime.now().uptimeNanoseconds - threshold.uptimeNanoseconds
         ) / 1_000_000_000

@@ -6,7 +6,7 @@ import Foundation
 /// `Range`) answered every 32 MB refill with a 200, which the reader rejects, so playback ended at
 /// the first range boundary. Such an origin is now caught at the open and played forward-only with
 /// the streaming path's bounded buffer, and an origin that does honour ranges is left alone.
-@Suite("Range-ignoring origins")
+@Suite("Range-ignoring origins", .offCooperativePool)
 struct RangeIgnoringOriginTests {
 
     private static let avseekSize: Int32 = 65536

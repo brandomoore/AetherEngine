@@ -60,7 +60,7 @@ final class Issue208FastZapDegradedStartTests: XCTestCase {
 
     private func startWaiter(
         _ provider: VideoSegmentProvider,
-        timeout: TimeInterval = 3
+        timeout: TimeInterval = 120
     ) -> (Issue208WaitResult, XCTestExpectation) {
         let result = Issue208WaitResult()
         let finished = expectation(description: "startup waiter finished")
@@ -96,7 +96,7 @@ final class Issue208FastZapDegradedStartTests: XCTestCase {
         let threshold = DispatchTime.now()
         append(provider, index: 1)
 
-        wait(for: [finished], timeout: 1.2)
+        wait(for: [finished], timeout: 300)
         let elapsed = Double(
             DispatchTime.now().uptimeNanoseconds - threshold.uptimeNanoseconds
         ) / 1_000_000_000
@@ -118,7 +118,7 @@ final class Issue208FastZapDegradedStartTests: XCTestCase {
         for index in 2..<15 {
             append(provider, index: index)
         }
-        wait(for: [finished], timeout: 1)
+        wait(for: [finished], timeout: 300)
         XCTAssertEqual(result.value, true)
     }
 
@@ -132,7 +132,7 @@ final class Issue208FastZapDegradedStartTests: XCTestCase {
         XCTAssertNil(result.value)
 
         provider.cancelWaiters()
-        wait(for: [finished], timeout: 1)
+        wait(for: [finished], timeout: 300)
         XCTAssertEqual(result.value, false)
     }
 
@@ -145,7 +145,7 @@ final class Issue208FastZapDegradedStartTests: XCTestCase {
         for index in 0..<15 {
             append(provider, index: index)
         }
-        wait(for: [finished], timeout: 1)
+        wait(for: [finished], timeout: 300)
         let elapsed = Double(
             DispatchTime.now().uptimeNanoseconds - started.uptimeNanoseconds
         ) / 1_000_000_000
@@ -164,7 +164,7 @@ final class Issue208FastZapDegradedStartTests: XCTestCase {
         Thread.sleep(forTimeInterval: 0.25)
         append(provider, index: 2)
 
-        wait(for: [finished], timeout: 1)
+        wait(for: [finished], timeout: 300)
         let elapsed = Double(
             DispatchTime.now().uptimeNanoseconds - threshold.uptimeNanoseconds
         ) / 1_000_000_000

@@ -124,6 +124,39 @@ struct Issue436ResumeRateTests {
         #expect(host.avPlayer.defaultRate == 1.0)
     }
 
+    // MARK: - #730: a speed set while paused
+
+    @Test("a speed set while paused is kept for the resume and does not start playback")
+    func speedWhilePausedStaysPaused() throws {
+        let engine = try AetherEngine()
+        let host = NativeAVPlayerHost()
+        engine.nativeHost = host
+        engine.state = .paused
+
+        engine.setRate(1.5)
+        #expect(!host.transportIntentIsPlaying, "a speed change must not be a play press")
+        #expect(host.avPlayer.rate == 0)
+        #expect(host.avPlayer.defaultRate == 1.5, "the next play() has to start at the new speed")
+        #expect(engine.desiredRate == 1.5)
+        #expect(engine.state == .paused)
+
+        // Zero while paused is still a pause, and must not overwrite the speed just set.
+        engine.setRate(0)
+        #expect(host.avPlayer.defaultRate == 1.5)
+    }
+
+    @Test("a speed set while playing still re-rates the transport")
+    func speedWhilePlayingReRates() throws {
+        let engine = try AetherEngine()
+        let host = NativeAVPlayerHost()
+        engine.nativeHost = host
+        engine.state = .playing
+
+        engine.setRate(1.25)
+        #expect(host.transportIntentIsPlaying)
+        #expect(host.avPlayer.defaultRate == 1.25)
+    }
+
     // MARK: - What the memory belongs to
 
     @Test("a speed belongs to the item it was set on")

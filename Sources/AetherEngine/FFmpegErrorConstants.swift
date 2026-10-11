@@ -19,6 +19,8 @@ enum FFmpegErr {
     /// `AVERROR(EIO)`; EIO is POSIX 5. "The source is lost", as distinct from `eof`, which every
     /// consumer reads as played-to-the-end and deliberately never retries.
     static let eio: Int32 = -5
+    /// `AVERROR(ENOSPC)`; ENOSPC is POSIX 28. The volume a write went to is full.
+    static let enospc: Int32 = -28
 
     /// FFmpeg's own text for an AVERROR code, with the raw number appended so a report never loses it
     /// ("Invalid data found when processing input (-1094995529)"). Falls back to the bare number when

@@ -69,4 +69,16 @@ struct DisplayCriteriaUnchangedSkipTests {
         #expect(DisplayCriteriaController.applyOutcome(
             didApply: false, last: nil, target: sdr50()) == .applied)
     }
+
+    @Test("Identical criteria are written again when the display manager no longer holds any (AE#678)")
+    func hostClearedCriteriaAreRewritten() {
+        // A host that nils preferredDisplayCriteria itself (leaving full screen) left lastApplied stale,
+        // and the next same-format load kept the panel in its UI mode.
+        #expect(DisplayCriteriaController.applyOutcome(
+            didApply: true, last: sdr50(), target: sdr50(), managerHoldsCriteria: false) == .applied)
+        let hdr = DisplayCriteriaController.AppliedCriteria(
+            isHDR: true, effectiveRate: 50, codecType: dvh1, hasExtensions: true)
+        #expect(DisplayCriteriaController.applyOutcome(
+            didApply: true, last: hdr, target: hdr, managerHoldsCriteria: false) == .willSwitch)
+    }
 }
