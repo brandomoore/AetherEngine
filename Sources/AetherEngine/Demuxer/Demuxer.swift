@@ -489,6 +489,9 @@ public final class Demuxer: @unchecked Sendable {
     /// A clip's observed base is only trusted on a clean forward crossing (`idx == lastReadClipIdx + 1`),
     /// so a seek landing mid-clip cannot mis-anchor that clip's fold offset. AE#105.
     private var lastReadClipIdx: Int = -1
+    /// The selected Blu-ray title's EP-map seek table, when every clip has one: a seek then goes to the
+    /// keyframe's byte instead of searching by timestamp (`seekByDiscTableLocked`). Under `accessLock`.
+    private var discSeekTable: DiscSeekTable?
     /// Observed raw STC base (seconds) of clip 0's first read packet. The fold anchors every clip to this so
     /// the folded timeline stays in clip 0's raw domain (the producer gate then zero-bases it). NaN until the
     /// first packet is read. Guarded by `accessLock`. AE#105.
@@ -497,6 +500,11 @@ public final class Demuxer: @unchecked Sendable {
     /// the first time it is read and cached (stable across seeks). NaN = not yet resolved. Guarded by
     /// `accessLock`. AE#105.
     private var clipResolvedShiftSec: [Double] = []
+    /// The selected DVD title is folded by cell (`DiscReader.dvdCellTimeline`): each cell's timestamp base
+    /// comes from its navigation packs (`adoptDVDNav`). Under `accessLock`.
+    private var dvdCellFold = false
+    /// The selected DVD title's time map: a seek goes to the VOBU's byte (`seekByDVDTimeMapLocked`).
+    private var dvdTimeMap: DVDTimeMap?
     /// AE#105 diag: last clip index we logged a boundary crossing for, and the last folded PTS
     /// (seconds) seen, so a crossing can print the true raw jump against the applied offset.
     private var diagLastLoggedClipIndex: Int = -1
@@ -508,6 +516,9 @@ public final class Demuxer: @unchecked Sendable {
         discStreamLanguages = info.selectedTitle?.streamLanguages ?? [:]
         discSubpictureStreamIDs = info.selectedTitle?.dvdSubpictureStreamIDs
         clipTimeline = info.clipTimeline
+        discSeekTable = info.seekTable
+        dvdTimeMap = info.dvdTimeMap
+        dvdCellFold = info.formatHint == "mpeg" && !info.clipTimeline.isEmpty
         lastClipIndex = 0
         lastReadClipIdx = -1
         clipBase0Sec = .nan
@@ -1043,6 +1054,11 @@ public final class Demuxer: @unchecked Sendable {
             throw DemuxerError.streamInfoFailed(code: findRet)
         }
         logStreams(ctx)
+        // A cell-folded DVD title is anchored on cell 0's base, which is where the stream starts (the
+        // engine's source axis starts there too), so a resume that lands in a later cell can fold at once.
+        if dvdCellFold, clipBase0Sec.isNaN, ctx.pointee.start_time != Int64.min {
+            clipBase0Sec = Double(ctx.pointee.start_time) / Double(AV_TIME_BASE)
+        }
         armGeneratedPTSSuppression(ctx)
         if openProfile.auditsRecordlessDolbyVision, let source = auditSource {
             let idx = av_find_best_stream(ctx, AVMEDIA_TYPE_VIDEO, -1, -1, nil, 0)
@@ -1231,9 +1247,23 @@ public final class Demuxer: @unchecked Sendable {
 
     /// AVFormatContext.bit_rate in bps, or 0 if unknown. Used by
     /// HLSVideoEngine.masterBandwidth to populate HLS BANDWIDTH attributes.
+    ///
+    /// A disc title takes its rate from its own size over its playlist duration instead, whenever
+    /// libavformat produced one. libavformat divides the source size by the duration it read off the
+    /// timestamps, and that duration is as unreliable over a multi-clip title whose clips restart their
+    /// clock as it is for `duration` (AE#105): a 6537 s title whose two clips both start at 11.6 s probed
+    /// as 388 s, and its 54.6 GB declared 1.1 Gbit/s on average and 2.25 Gbit/s at peak, a variant no
+    /// AVPlayer ever chose (it waited with no item to play). A title libavformat gives no rate for keeps
+    /// the 0 and the caller's over-declared fallback.
     var bitRate: Int64 {
         guard let ctx = formatContext else { return 0 }
-        return ctx.pointee.bit_rate
+        let declared = ctx.pointee.bit_rate
+        guard declared > 0, let titleSeconds = selectedDiscTitleDurationSeconds, let pb = ctx.pointee.pb else {
+            return declared
+        }
+        let size = avio_size(pb)
+        guard size > 0 else { return declared }
+        return Int64((Double(size) * 8 / titleSeconds).rounded())
     }
 
     /// AVFormatContext.start_time in AV_TIME_BASE units. Non-zero on re-muxed
@@ -1779,6 +1809,10 @@ public final class Demuxer: @unchecked Sendable {
             // AVDISCARD_DEFAULT = 0 (= passthrough), AVDISCARD_NONKEY = 32, AVDISCARD_ALL = 48.
             if keep.contains(i) {
                 stream.pointee.discard = AVDISCARD_DEFAULT
+            } else if dvdCellFold, stream.pointee.codecpar.pointee.codec_id == AV_CODEC_ID_DVD_NAV {
+                // A cell-folded DVD title reads its navigation packs for the cell bases; `readPacketLocked`
+                // absorbs them, so they never reach a caller.
+                stream.pointee.discard = AVDISCARD_DEFAULT
             } else if i == pacing {
                 stream.pointee.discard = AVDISCARD_NONKEY
             } else {
@@ -1984,6 +2018,11 @@ public final class Demuxer: @unchecked Sendable {
     private func readPacketLocked() throws -> UnsafeMutablePointer<AVPacket>? {
         while true {
             guard let read = try readDemuxedPacketLocked() else { return nil }
+            if dvdCellFold, adoptDVDNav(read) {
+                var owned: UnsafeMutablePointer<AVPacket>? = read
+                trackedPacketFree(&owned)
+                continue
+            }
             var packet: UnsafeMutablePointer<AVPacket>? = read
             let index = read.pointee.stream_index
             guard subpictureAssemblers[index] != nil else { return read }
@@ -2179,6 +2218,8 @@ public final class Demuxer: @unchecked Sendable {
         // seekable by design, so live callers keep their own rules.
         guard isSourceSeekable else { return false }
         dropPeekedPacketsLocked()
+        if seekByDiscTableLocked(ctx, sourceSeconds: seconds) { return true }
+        if seekByDVDTimeMapLocked(ctx, sourceSeconds: seconds) { return true }
         let ret = avformat_seek_file(ctx, -1, Int64.min, timestamp, Int64.max, 0)
         if ret < 0 {
             #if DEBUG
@@ -2217,6 +2258,11 @@ public final class Demuxer: @unchecked Sendable {
         }
         guard isSourceSeekable else { return false }  // audit HLS-103, see `seek(to:)`
         dropPeekedPacketsLocked()
+        if dvdTimeMap != nil, let timeBase = ctx.pointee.streams[Int(streamIndex)]?.pointee.time_base,
+           timeBase.num > 0, timeBase.den > 0,
+           seekByDVDTimeMapLocked(ctx, sourceSeconds: Double(timestamp) * Double(timeBase.num) / Double(timeBase.den)) {
+            return true
+        }
         let ret = avformat_seek_file(
             ctx,
             streamIndex,
@@ -2361,6 +2407,11 @@ public final class Demuxer: @unchecked Sendable {
         // seek on a remote ISO sat wedged ~230 s and every later re-arm queued behind it.
         avioProvider?.beginReadDeadline(secondsFromNow: timeout)
         defer { avioProvider?.endReadDeadline() }
+        // The software path and the subtitle side reader reposition here, so a disc title seeks by its
+        // EP maps or its DVD time map here too, whichever stream anchors the request.
+        if seekByDiscTableLocked(ctx, sourceSeconds: seconds) || seekByDVDTimeMapLocked(ctx, sourceSeconds: seconds) {
+            return !(avioProvider?.readDeadlineFired ?? false) && probeControl?.isStopped != true
+        }
         let ret = avformat_seek_file(ctx, anchor, Int64.min, timestamp, Int64.max, 0)
         avformat_flush(ctx)
         resetSubpictureAssembly()  // #651: libavformat just dropped the parsers this stands in for
@@ -2550,6 +2601,85 @@ public final class Demuxer: @unchecked Sendable {
         return Self.sourceStartOrigin(
             formatStartUs: ctx.pointee.start_time, videoStreamStart: videoStart,
             videoTimeBaseNum: tbNum, videoTimeBaseDen: tbDen)
+    }
+
+    /// Repositions a Blu-ray title to the keyframe at or before `seconds` (the folded source axis) by its
+    /// clips' EP maps, in one byte seek. A timestamp search over a title whose clips each run their own
+    /// clock from the same start cannot tell the clips apart: a 3000 s seek on a two-clip title whose
+    /// clips both start at 11.6 s landed in the second clip, four packets before its end. Returns false,
+    /// with nothing moved, when the title has no table; the caller searches by timestamp then. Caller
+    /// holds `accessLock`.
+    private func seekByDiscTableLocked(_ ctx: UnsafeMutablePointer<AVFormatContext>, sourceSeconds seconds: Double) -> Bool {
+        guard let table = discSeekTable,
+              let hit = table.keyframe(forSourceSeconds: seconds, base0Sec: clipBase0Sec),
+              avformat_seek_file(ctx, -1, hit.offset, hit.offset, hit.offset, AVSEEK_FLAG_BYTE) >= 0 else { return false }
+        EngineLog.emit("[Demuxer] EP map seek: source=\(String(format: "%.3f", seconds))s -> clip \(hit.clip) keyframe "
+                       + "\(String(format: "%.3f", hit.keyframeSec))s on its clock, byte \(hit.offset)", category: .demux)
+        avformat_flush(ctx)
+        resetSubpictureAssembly()  // #651
+        lastReadClipIdx = -1  // AE#105: a landing mid-clip is not a clean crossing
+        return true
+    }
+
+    /// Repositions a DVD title to the VOBU at or before `seconds` (the folded source axis: cell 0's base
+    /// plus title time) by its time map, in one byte seek. Over a title whose cells restart their
+    /// timestamps, a timestamp search lands nowhere near: a 2000 s seek read straight to the end of the
+    /// title and the session ended. Returns false, with nothing moved, without a time map or before cell 0's
+    /// base is known; the caller searches by timestamp then. Caller holds `accessLock`.
+    private func seekByDVDTimeMapLocked(_ ctx: UnsafeMutablePointer<AVFormatContext>, sourceSeconds seconds: Double) -> Bool {
+        guard let map = dvdTimeMap, clipBase0Sec.isFinite else { return false }
+        let titleSeconds = max(0, seconds - clipBase0Sec)
+        let offset = map.byteOffset(forTitleSeconds: titleSeconds)
+        guard avformat_seek_file(ctx, -1, offset, offset, offset, AVSEEK_FLAG_BYTE) >= 0 else { return false }
+        EngineLog.emit("[Demuxer] DVD time map seek: title=\(String(format: "%.3f", titleSeconds))s -> byte \(offset)",
+                       category: .demux)
+        avformat_flush(ctx)
+        resetSubpictureAssembly()  // #651
+        lastReadClipIdx = -1  // landing mid-cell; its offset comes from the next navigation pack
+        return true
+    }
+
+    /// Absorbs a DVD navigation pack, recording the timestamp base of the cell it is in; true when the
+    /// packet was one (the caller drops it). A navigation pack leads every VOBU, so a cell entered in
+    /// order and a seek landing mid-cell both meet it before that cell's audio and video, and the cell's
+    /// offset is in place before its first packet is folded. Caller holds `accessLock`.
+    private func adoptDVDNav(_ packet: UnsafeMutablePointer<AVPacket>) -> Bool {
+        guard let ctx = formatContext,
+              let stream = ctx.pointee.streams[Int(packet.pointee.stream_index)],
+              stream.pointee.codecpar.pointee.codec_id == AV_CODEC_ID_DVD_NAV else { return false }
+        guard let data = packet.pointee.data, packet.pointee.size > 0,
+              let cellBase = Self.dvdCellBaseSeconds(pci: UnsafeBufferPointer(start: data, count: Int(packet.pointee.size)))
+        else { return true }
+        let idx = ClipSpan.index(forPos: packet.pointee.pos, in: clipTimeline, fallback: lastClipIndex)
+        if idx == 0 {
+            if clipBase0Sec.isNaN { clipBase0Sec = cellBase }
+            return true
+        }
+        guard clipBase0Sec.isFinite, idx < clipResolvedShiftSec.count else { return true }
+        let shift = ClipFold.offsetSeconds(observedBaseSec: cellBase, base0Sec: clipBase0Sec,
+                                           cumulativeBeforeSec: clipTimeline[idx].cumulativeBeforeSec)
+        if !clipResolvedShiftSec[idx].isFinite || abs(clipResolvedShiftSec[idx] - shift) > 0.05 {
+            clipResolvedShiftSec[idx] = shift
+            EngineLog.emit("[Demuxer] DVD cell \(idx): base=\(String(format: "%.3f", cellBase))s "
+                           + "cumBefore=\(String(format: "%.1f", clipTimeline[idx].cumulativeBeforeSec))s -> shift "
+                           + "\(String(format: "%.3f", shift))s", category: .demux)
+        }
+        return true
+    }
+
+    /// The raw timestamp (seconds) at which the cell a navigation pack's PCI belongs to starts: the
+    /// VOBU's start PTS (90 kHz) less the cell's elapsed time (C_ELTM, BCD with a frame count). nil for a
+    /// DSI or a PCI too short to read; libavformat hands the two over as separate packets, the PCI's
+    /// first byte 0x00, the DSI's 0x01.
+    static func dvdCellBaseSeconds(pci data: UnsafeBufferPointer<UInt8>) -> Double? {
+        guard data.count >= 0x1D, data[0] == 0x00 else { return nil }
+        let startPTS = (UInt32(data[0x0D]) << 24) | (UInt32(data[0x0E]) << 16) | (UInt32(data[0x0F]) << 8) | UInt32(data[0x10])
+        func bcd(_ b: UInt8) -> Double { Double(Int(b >> 4) * 10 + Int(b & 0x0F)) }
+        let frameByte = data[0x1C]
+        let fps: Double = (frameByte >> 6) == 1 ? 25 : ((frameByte >> 6) == 3 ? 30000.0 / 1001.0 : 0)
+        let elapsed = bcd(data[0x19]) * 3600 + bcd(data[0x1A]) * 60 + bcd(data[0x1B])
+            + (fps > 0 ? bcd(frameByte & 0x3F) / fps : 0)
+        return Double(startPTS) / 90000 - elapsed
     }
 
     /// One AVSEEK_FLAG_BYTE positioning seek + flush. Shared by the estimate probe loop.

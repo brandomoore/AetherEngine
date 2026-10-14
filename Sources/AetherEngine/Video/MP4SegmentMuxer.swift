@@ -47,10 +47,10 @@ final class MP4SegmentMuxer {
     enum DoviConfigPolicy: Sendable, Equatable {
         /// Stream-copy the record unchanged. Genuine P5, and P8.x on a DV panel.
         case keep
-        /// Drop `AV_PKT_DATA_DOVI_CONF` before write_header. P7's base layer and P8.2 (hvc1 + dvcC
-        /// trips VT -12906), and P8.x on a non-DV panel (-11868).
+        /// Drop `AV_PKT_DATA_DOVI_CONF` before write_header. P8.2 (hvc1 + dvcC trips VT -12906), AVC
+        /// Profile 9, and any source served as its base layer (`dolbyVisionHandling = .baseLayerOnly`).
         case strip
-        /// Rewrite to a valid P8.1: `dv_profile=8`, `compat=1`, `el_present=0`. P7-on-DV-panel
+        /// Rewrite to a valid P8.1: `dv_profile=8`, `compat=1`, `el_present=0`. P7 on every display
         /// (paired with the per-packet RPU conversion) and the malformed "P8.6" compat id (#53).
         case rewriteToProfile81
         /// Rewrite to P5: `dv_profile=5`, `compat=0`, `el_present=0`. AE#455, opt-in. The bitstream
@@ -970,6 +970,10 @@ final class MP4SegmentMuxer {
             return nil
         }
 
+        // Drain first, as the cut does. A fragment flush with packets still in the interleaver takes the
+        // first queued packet's DTS as the track end, and when check_pkt had clamped the written samples
+        // above it, movenc's get_cluster_duration aborts the process (StreamX crash 2026-10-10).
+        _ = av_interleaved_write_frame(ctx, nil)
         _ = av_write_frame(ctx, nil)
         _ = av_write_trailer(ctx)
 

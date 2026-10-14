@@ -160,6 +160,37 @@ struct Issue455ForcedDVRouteTests {
         #expect(r.supplementalCodecs == "dvh1.08.06/db4h")
     }
 
+    @Test("P7 without the opt-in is converted and served as 8.1 on a non-DV display")
+    func profile7DefaultRouteOnNonDVDisplay() throws {
+        let r = try Self.route(profile: 7, compat: 6, dvDisplay: false, forceDV: false)
+        #expect(r.codecTagOverride == "hvc1")
+        #expect(r.videoRange == .pq)
+        #expect(r.supplementalCodecs == "dvh1.08.06/db1p")
+        #expect(r.doviConfig == .rewriteToProfile81)
+        #expect(r.convertP7ToProfile81)
+        #expect(r.dvVariant == .profile7)
+    }
+
+    @Test("P7 with the opt-in gets the Profile 5 packaging of the 8.1 it is converted to")
+    func profile7ForcedRouteClaimsProfile5() throws {
+        let r = try Self.route(profile: 7, compat: 6, dvLevel: 9, dvDisplay: false, forceDV: true)
+        #expect(r.codecTagOverride == "dvh1")
+        #expect(r.primaryCodecs == "dvh1.05.09")
+        #expect(r.supplementalCodecs == nil)
+        #expect(r.doviConfig == .rewriteToProfile5)
+        // The packets still have to become 8.1: a P5 claim over a P7 RPU and its EL is the mixed shape #135 guards.
+        #expect(r.convertP7ToProfile81)
+    }
+
+    @Test("P7 on a DV display ignores the opt-in")
+    func profile7DVDisplayIgnoresTheOptIn() throws {
+        let r = try Self.route(profile: 7, compat: 6, dvDisplay: true, forceDV: true)
+        #expect(r.codecTagOverride == "hvc1")
+        #expect(r.supplementalCodecs == "dvh1.08.06/db1p")
+        #expect(r.doviConfig == .rewriteToProfile81)
+        #expect(r.convertP7ToProfile81)
+    }
+
     @Test("P5 is unaffected: it was already served this way")
     func profile5Untouched() throws {
         let r = try Self.route(profile: 5, compat: 0, dvDisplay: false, forceDV: true)

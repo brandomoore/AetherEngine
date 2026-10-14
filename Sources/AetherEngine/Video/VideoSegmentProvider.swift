@@ -2543,6 +2543,13 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         stateLock.unlock()
         cancelWaiters()
     }
+
+    /// A host-authorized source retry continues this same cache and playlist.
+    func resumeLiveProduction() {
+        stateLock.lock()
+        _liveProductionHalted = false
+        stateLock.unlock()
+    }
     var liveTargetDurationFloorSeconds: Double? {
         // The floor tracks observed cadence regardless of the gate override: patience must cover the real
         // inter-batch gap even when a host forces blocking-reload on/off (#167).

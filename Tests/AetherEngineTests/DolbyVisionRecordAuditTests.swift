@@ -252,14 +252,14 @@ struct DolbyVisionRecordAuditTests {
         #expect(r.dvVariant == .profile7)
     }
 
-    @Test("the same correction on a display without Dolby Vision plays the HDR10 base")
+    @Test("the same correction on a display without Dolby Vision is converted and served as 8.1 too")
     func relabelledSevenOnNonDVDisplay() throws {
         let r = try Self.route(Self.relabelledProfile5(), dvDisplay: false, rpuProfile: 7)
         #expect(r.codecTagOverride == "hvc1")
         #expect(r.videoRange == .pq)
-        #expect(r.supplementalCodecs == nil)
-        #expect(r.doviConfig == .strip)
-        #expect(r.convertP7ToProfile81 == false)
+        #expect(r.supplementalCodecs == "dvh1.08.06/db1p")
+        #expect(r.doviConfig == .rewriteToProfile81)
+        #expect(r.convertP7ToProfile81)
     }
 
     @Test("without a verdict the record stands and the route does not move")

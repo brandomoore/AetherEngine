@@ -33,8 +33,10 @@ enum DiscReader {
     /// Emits `.demux` diagnostics once the UDF anchor is confirmed so a disc image
     /// that fails recognition is debuggable (it would otherwise fall back to a raw
     /// FFmpeg open that reports a bare INVALIDDATA). Non-disc sources stay silent.
-    static func wrapBluRay(_ reader: IOReader, selectTitleID: Int? = nil, cacheKey: String? = nil) throws -> DiscInfo? {
-        guard looksLikeUDF(reader) else { return nil }
+    /// `udfAnchorChecked`: the caller has already found the UDF anchor, so it is not read again.
+    static func wrapBluRay(_ reader: IOReader, selectTitleID: Int? = nil, cacheKey: String? = nil,
+                           udfAnchorChecked: Bool = false) throws -> DiscInfo? {
+        guard udfAnchorChecked || looksLikeUDF(reader) else { return nil }
         EngineLog.emit("[disc] UDF anchor present; attempting Blu-ray BDMV", category: .demux)
         let udf: UDFReader
         do { udf = try UDFReader(reader: reader) }
@@ -80,12 +82,18 @@ enum DiscReader {
         }
         let totalBytes = allExtents.reduce(Int64(0)) { $0 + max(0, $1.length) }
         EngineLog.emit("[disc] Blu-ray recognized: \(titles.count) title(s), selected \(selectedIndex) clips=\(selected.bdClipIDs ?? []) m2ts-extents=\(allExtents.count) bytes=\(totalBytes) clipSpans=\(clipTimeline.count) stnLanguages=\(selected.streamLanguages.count)", category: .demux)
+        let clipInfoDir = (try? udf.list(path: ["BDMV", "CLIPINF"])) ?? []
+        let seekTable = buildSeekTable(title: selected, resolved: assembled.resolved) { clip in
+            guard let entry = clipInfoDir.first(where: { $0.name.caseInsensitiveCompare("\(clip).clpi") == .orderedSame }),
+                  let extents = try? udf.extents(of: entry), !extents.isEmpty else { return nil }
+            return readAll(reader, extents)
+        }
         storeRecognition(cacheKey: cacheKey, selectTitleID: selectTitleID,
                          formatHint: "mpegts", titles: titles, selectedIndex: selectedIndex,
-                         extents: allExtents, clipTimeline: clipTimeline)
+                         extents: allExtents, clipTimeline: clipTimeline, seekTable: seekTable)
         return DiscInfo(reader: ConcatIOReader(base: reader, extents: allExtents),
                         formatHint: "mpegts", titles: titles, selectedTitleIndex: selectedIndex,
-                        clipTimeline: clipTimeline)
+                        clipTimeline: clipTimeline, seekTable: seekTable)
     }
 
     // MARK: - Bounds on what a disc image can make recognition do (audit NET-103)
@@ -103,7 +111,7 @@ enum DiscReader {
     /// A run of this many unreadable playlists means the source is gone (cancelled or closed reader).
     private static let maxConsecutiveShortReads = 16
     /// `readAll`'s ceiling.
-    private static let maxSmallFileBytes: Int64 = 8 * 1024 * 1024
+    static let maxSmallFileBytes: Int64 = 8 * 1024 * 1024
 
     /// Reads and parses the `.mpls` entries of a PLAYLIST directory under the bounds above. Stops at the
     /// first bound that trips and keeps what was parsed before it.
@@ -112,12 +120,23 @@ enum DiscReader {
         extents: (UDFEntry) -> [(offset: Int64, length: Int64)],
         read: ([(offset: Int64, length: Int64)]) -> [UInt8]
     ) -> [MPLSPlaylist] {
+        scanPlaylists(entries, name: \.name, extents: extents, read: { _, exts in read(exts) })
+    }
+
+    /// The same scan over any directory listing: a UDF directory, or the files of a disc folder
+    /// (`DiscDirectoryReader`), where each playlist is one whole file rather than a set of extents.
+    static func scanPlaylists<Entry>(
+        _ entries: [Entry],
+        name: (Entry) -> String,
+        extents: (Entry) -> [(offset: Int64, length: Int64)],
+        read: (Entry, [(offset: Int64, length: Int64)]) -> [UInt8]
+    ) -> [MPLSPlaylist] {
         var parsed: [MPLSPlaylist] = []
         var examined = 0
         var bytesRead: Int64 = 0
         var items = 0
         var shortReads = 0
-        for e in entries where e.name.hasSuffix(".mpls") {
+        for e in entries where name(e).hasSuffix(".mpls") {
             examined += 1
             guard examined <= maxPlaylistFiles else {
                 EngineLog.emit("[disc] PLAYLIST scan stopped at \(maxPlaylistFiles) .mpls entries", category: .demux)
@@ -132,7 +151,7 @@ enum DiscReader {
                 EngineLog.emit("[disc] PLAYLIST scan stopped after \(maxPlaylistBytes) bytes of playlists", category: .demux)
                 break
             }
-            let bytes = read(exts)
+            let bytes = read(e, exts)
             if Int64(bytes.count) < declared {
                 shortReads += 1
                 if shortReads >= maxConsecutiveShortReads {
@@ -156,21 +175,36 @@ enum DiscReader {
     /// Resolves a title's clips into the concatenated extent list plus one `ClipSpan` per resolved clip
     /// (byte start in the concat stream, and how far to pull its timestamps back so it continues
     /// contiguously from clip 0, AE#105). Each distinct clip is looked up once, a repeated clip reuses its
-    /// extents, and the title ends at the clip that would pass `maxTitleExtents`.
+    /// extents, and the title ends at the clip that would pass `maxTitleExtents`. `resolved` names each
+    /// clip that made it in, by play item index, parallel to `clipTimeline`.
     static func assembleBluRayTitle(
         clipIDs: [String], subtractTicks: [Int64], cumulativeBeforeTicks: [UInt64],
         extentsOfClip: (String) -> [(offset: Int64, length: Int64)]?
-    ) -> (extents: [(offset: Int64, length: Int64)], clipTimeline: [ClipSpan]) {
-        var allExtents: [(offset: Int64, length: Int64)] = []
+    ) -> (extents: [(offset: Int64, length: Int64)], clipTimeline: [ClipSpan],
+          resolved: [(item: Int, clip: String, byteStart: Int64)]) {
+        let assembled = assembleBluRayTitle(clipIDs: clipIDs, subtractTicks: subtractTicks,
+                                            cumulativeBeforeTicks: cumulativeBeforeTicks,
+                                            piecesOfClip: extentsOfClip, length: \.length)
+        return (assembled.pieces, assembled.clipTimeline, assembled.resolved)
+    }
+
+    /// The same assembly over any byte source of a clip: the extents of an image, or the one file a clip is
+    /// in a disc folder. `length` is a piece's byte count in the concatenated stream.
+    static func assembleBluRayTitle<Piece>(
+        clipIDs: [String], subtractTicks: [Int64], cumulativeBeforeTicks: [UInt64],
+        piecesOfClip: (String) -> [Piece]?, length: (Piece) -> Int64
+    ) -> (pieces: [Piece], clipTimeline: [ClipSpan], resolved: [(item: Int, clip: String, byteStart: Int64)]) {
+        var allExtents: [Piece] = []
         var clipTimeline: [ClipSpan] = []
-        var resolved: [String: [(offset: Int64, length: Int64)]?] = [:]
+        var resolvedClips: [(item: Int, clip: String, byteStart: Int64)] = []
+        var resolved: [String: [Piece]?] = [:]
         var byteStart: Int64 = 0
         for (k, clip) in clipIDs.enumerated() {
-            let lookup: [(offset: Int64, length: Int64)]?
+            let lookup: [Piece]?
             if let known = resolved[clip] {
                 lookup = known
             } else {
-                lookup = extentsOfClip(clip)
+                lookup = piecesOfClip(clip)
                 resolved[clip] = .some(lookup)
             }
             guard let exts = lookup else { continue }
@@ -180,14 +214,15 @@ enum DiscReader {
             }
             let predictedShift = k < subtractTicks.count ? Double(subtractTicks[k]) / discTickRate : 0
             let cumBeforeSec = k < cumulativeBeforeTicks.count ? Double(cumulativeBeforeTicks[k]) / discTickRate : 0
+            resolvedClips.append((k, clip, byteStart))
             clipTimeline.append(ClipSpan(concatByteStart: byteStart,
                                          cumulativeBeforeSec: cumBeforeSec,
                                          predictedShiftSec: predictedShift))
             EngineLog.emit("[disc] AE#105 clip[\(k)] id=\(clip) subTicks=\(k < subtractTicks.count ? subtractTicks[k] : 0) predictedSec=\(String(format: "%.3f", predictedShift)) cumBeforeSec=\(String(format: "%.3f", cumBeforeSec)) byteStart=\(byteStart)", category: .demux, level: .verbose)
             allExtents += exts
-            byteStart += exts.reduce(Int64(0)) { $0 + max(0, $1.length) }
+            byteStart += exts.reduce(Int64(0)) { $0 + max(0, length($1)) }
         }
-        return (allExtents, clipTimeline)
+        return (allExtents, clipTimeline, resolvedClips)
     }
 
     /// Memoize a successful recognition so a re-open of the same source (track switch on a remote ISO)
@@ -195,12 +230,13 @@ enum DiscReader {
     private static func storeRecognition(
         cacheKey: String?, selectTitleID: Int?,
         formatHint: String, titles: [DiscTitle], selectedIndex: Int,
-        extents: [(offset: Int64, length: Int64)], clipTimeline: [ClipSpan] = []
+        extents: [(offset: Int64, length: Int64)], clipTimeline: [ClipSpan] = [],
+        seekTable: DiscSeekTable? = nil, dvdTimeMap: DVDTimeMap? = nil
     ) {
         guard let cacheKey else { return }
         let recognition = DiscRecognition(formatHint: formatHint, titles: titles,
                                           selectedTitleIndex: selectedIndex, extents: extents,
-                                          clipTimeline: clipTimeline)
+                                          clipTimeline: clipTimeline, seekTable: seekTable, dvdTimeMap: dvdTimeMap)
         DiscRecognitionCache.store(key: cacheKey, selectTitleID: selectTitleID, recognition)
         // The probe opens with selectTitleID == nil (default title), but the rest of the engine
         // references that same title by its resolved id (== selectedIndex): reloads and the subtitle
@@ -237,13 +273,27 @@ enum DiscReader {
     /// Blu-ray ISO, else nil. `selectTitleID` chooses the title (default = main). DVD titles are the
     /// per-VTS VOB groups, filtered by the VMGI TT_SRPT title list (whole-VTS; per-cell splitting deferred).
     static func wrap(_ reader: IOReader, selectTitleID: Int? = nil, cacheKey: String? = nil) throws -> DiscInfo? {
+        // A disc folder is a set of files, not one byte range, so it is recognized before the cache,
+        // which rebuilds a reader from extents of a single image.
+        if let folder = reader as? DiscDirectoryReader {
+            return wrapBluRayFolder(folder, selectTitleID: selectTitleID)
+        }
         if let cacheKey, let cached = DiscRecognitionCache.lookup(key: cacheKey, selectTitleID: selectTitleID) {
             return DiscInfo(reader: ConcatIOReader(base: reader, extents: cached.extents),
                             formatHint: cached.formatHint, titles: cached.titles,
                             selectedTitleIndex: cached.selectedTitleIndex,
-                            clipTimeline: cached.clipTimeline)
+                            clipTimeline: cached.clipTimeline, seekTable: cached.seekTable,
+                            dvdTimeMap: cached.dvdTimeMap)
         }
-        guard looksLikeISO9660(reader) else { return try wrapBluRay(reader, selectTitleID: selectTitleID, cacheKey: cacheKey) }
+        guard looksLikeISO9660(reader) else {
+            // The anchor is read once: a probe's input budget counts every read recognition makes.
+            guard looksLikeUDF(reader) else { return nil }
+            if let bluRay = try wrapBluRay(reader, selectTitleID: selectTitleID, cacheKey: cacheKey,
+                                           udfAnchorChecked: true) {
+                return bluRay
+            }
+            return wrapUDFDVD(reader, selectTitleID: selectTitleID, cacheKey: cacheKey)
+        }
         let iso: ISO9660Reader
         do {
             iso = try ISO9660Reader(reader: reader)
@@ -256,15 +306,52 @@ enum DiscReader {
         } catch DiscError.directoryNotFound {
             return try wrapBluRay(reader, selectTitleID: selectTitleID, cacheKey: cacheKey)  // ISO9660 but not a DVD-Video disc (Blu-ray / data disc)
         }
+        if let dvd = wrapDVD(reader, files: files, sectorSize: iso.sectorSize, selectTitleID: selectTitleID,
+                             cacheKey: cacheKey) {
+            return dvd
+        }
+        return try wrapBluRay(reader, selectTitleID: selectTitleID, cacheKey: cacheKey)
+    }
+
+    /// A DVD-Video image with no ISO9660 bridge volume: sector 16 starts UDF's BEA01 directly, so the image
+    /// used to go down the Blu-ray branch, find no BDMV, and play as a raw file, which is the first VOB's
+    /// menu (8 s of a 6364 s film). `VIDEO_TS` is listed through UDF instead, and the title is built the
+    /// same way as from ISO9660. DVD files are one contiguous run on disc; a file recorded as runs that do
+    /// not continue each other is left out. The caller has found the UDF anchor.
+    static func wrapUDFDVD(_ reader: IOReader, selectTitleID: Int?, cacheKey: String?) -> DiscInfo? {
+        guard let udf = try? UDFReader(reader: reader),
+              let root = try? udf.list(path: []),
+              let dir = root.first(where: { $0.isDir && $0.name.uppercased() == "VIDEO_TS" }),
+              let entries = try? udf.list(path: [dir.name]) else { return nil }
+        let sectorSize = 2048
+        let files: [DiscFile] = entries.compactMap { entry in
+            guard !entry.isDir, let extents = try? udf.extents(of: entry), let first = extents.first,
+                  first.offset % Int64(sectorSize) == 0 else { return nil }
+            var end = first.offset
+            for extent in extents {
+                guard extent.offset == end else { return nil }
+                end += extent.length
+            }
+            return DiscFile(name: entry.name, startSector: Int(first.offset / Int64(sectorSize)),
+                            length: Int(end - first.offset))
+        }
+        EngineLog.emit("[disc] UDF-only image with VIDEO_TS (\(files.count) files); attempting DVD-Video", category: .demux)
+        return wrapDVD(reader, files: files, sectorSize: sectorSize, selectTitleID: selectTitleID, cacheKey: cacheKey)
+    }
+
+    /// A DVD-Video title set from a `VIDEO_TS` listing, whichever filesystem it came from; nil when the
+    /// listing holds no title VOBs.
+    private static func wrapDVD(_ reader: IOReader, files: [DiscFile], sectorSize: Int, selectTitleID: Int?,
+                                cacheKey: String?) -> DiscInfo? {
         let groups = DVDTitleSelector.enumerateTitleVOBGroups(files)
-        guard !groups.isEmpty else { return try wrapBluRay(reader, selectTitleID: selectTitleID, cacheKey: cacheKey) }
+        guard !groups.isEmpty else { return nil }
         // VIDEO_TS.IFO's TT_SRPT names which title sets are real titles; filter the VOB groups to those so
         // incidental content VTS are excluded. Any parse failure (or a filter that would empty the list)
         // falls back to the full VOB-grouped set, so a disc with an unreadable VMGI still plays multi-title.
         var orderedGroups = groups
         let filesByName = Dictionary(files.map { ($0.name.uppercased(), $0) }, uniquingKeysWith: { first, _ in first })
         if let ifoFile = filesByName["VIDEO_TS.IFO"] {
-            let ifoBytes = readAll(reader, [(offset: Int64(ifoFile.startSector * iso.sectorSize),
+            let ifoBytes = readAll(reader, [(offset: Int64(ifoFile.startSector * sectorSize),
                                              length: Int64(ifoFile.length))])
             if let ifoTitles = DVDIFOParser.parseTitles(ifoBytes) {
                 let titleVTSNs = Set(ifoTitles.map(\.vtsn))
@@ -274,11 +361,12 @@ enum DiscReader {
         }
         let selectedIndex = selectTitleID.flatMap { orderedGroups.indices.contains($0) ? $0 : nil } ?? 0
         let extents = orderedGroups[selectedIndex].vobs.map {
-            (offset: Int64($0.startSector * iso.sectorSize), length: Int64($0.length))
+            (offset: Int64($0.startSector * sectorSize), length: Int64($0.length))
         }
         // Whole-VTS titles. Each VTS_NN_0.IFO's main PGC gives the title duration and chapter starts; a disc
         // with an unreadable VTS IFO keeps duration 0 / no chapters but still plays. dvdVTSN keeps the
         // title -> title-set mapping.
+        var selectedIFO: [UInt8]?  // the cell table and time map come from the selected title's VTS IFO
         let titles = orderedGroups.enumerated().map { idx, g -> DiscTitle in
             var durationTicks: UInt64 = 0
             var chapters: [DiscChapter] = []
@@ -288,8 +376,9 @@ enum DiscReader {
             let nn = g.vtsn < 10 ? "0\(g.vtsn)" : "\(g.vtsn)"
             let ifoName = "VTS_\(nn)_0.IFO"
             if let vtsIFO = filesByName[ifoName] {
-                let bytes = readAll(reader, [(offset: Int64(vtsIFO.startSector * iso.sectorSize),
+                let bytes = readAll(reader, [(offset: Int64(vtsIFO.startSector * sectorSize),
                                              length: Int64(vtsIFO.length))])
+                if idx == selectedIndex { selectedIFO = bytes }
                 if let detail = DVDIFOParser.parseTitleDetail(bytes) {
                     durationTicks = detail.durationTicks
                     chapters = detail.chapterStartTicks.enumerated().map { i, start in
@@ -303,9 +392,42 @@ enum DiscReader {
                              streamLanguages: streamLanguages,
                              dvdSubpictureStreamIDs: subpictureStreamIDs)
         }
+        let (cellTimeline, timeMap) = selectedIFO.map(dvdCellTimeline) ?? ([], nil)
         storeRecognition(cacheKey: cacheKey, selectTitleID: selectTitleID,
-                         formatHint: "mpeg", titles: titles, selectedIndex: selectedIndex, extents: extents)
+                         formatHint: "mpeg", titles: titles, selectedIndex: selectedIndex, extents: extents,
+                         clipTimeline: cellTimeline, dvdTimeMap: timeMap)
         return DiscInfo(reader: ConcatIOReader(base: reader, extents: extents),
-                        formatHint: "mpeg", titles: titles, selectedTitleIndex: selectedIndex)
+                        formatHint: "mpeg", titles: titles, selectedTitleIndex: selectedIndex,
+                        clipTimeline: cellTimeline, dvdTimeMap: timeMap)
+    }
+
+    /// The selected DVD title's cells as AE#105 clip spans, and its time map.
+    ///
+    /// A title's VOBs are read as one MPEG-PS, but many discs restart the presentation timestamps at each
+    /// cell: one title's 14 cells put cell 7, at 3569 s of title time, at 147.9 s. Past such a cell the
+    /// playhead and every timestamp search over the title go wrong. Each cell is handed to the Blu-ray
+    /// clip fold as a clip (its first byte in the concatenation, its start on the title timeline); its
+    /// actual timestamp base is measured from the navigation packs as they are read (`Demuxer.adoptDVDNav`).
+    /// The time map turns title time into a VOBU's byte, so a seek is one byte reposition.
+    /// Only the common shape is folded: the main PGC starts at the first title sector, its cells follow each
+    /// other sector by sector, and none is in an angle block. Anything else gets neither, and reads as before.
+    static func dvdCellTimeline(_ ifo: [UInt8]) -> ([ClipSpan], DVDTimeMap?) {
+        guard let cells = DVDIFOParser.parseMainPGCCells(ifo), cells.count >= 2, cells[0].firstSector == 0,
+              !cells.contains(where: \.inAngleBlock),
+              zip(cells, cells.dropFirst()).allSatisfy({ $1.firstSector == $0.lastSector + 1 }) else { return ([], nil) }
+        let sector: Int64 = 2048
+        var spans: [ClipSpan] = []
+        var cumulative = 0.0
+        for cell in cells {
+            // Predicted as if every cell restarts from cell 0's base; the navigation pack replaces it.
+            spans.append(ClipSpan(concatByteStart: Int64(cell.firstSector) * sector,
+                                  cumulativeBeforeSec: cumulative, predictedShiftSec: -cumulative))
+            cumulative += cell.durationSec
+        }
+        let timeMap = DVDIFOParser.parseMainTimeMap(ifo).map {
+            DVDTimeMap(unitSec: $0.unitSec, titleStartByte: 0, byteOffsets: $0.sectors.map { Int64($0) * sector })
+        }
+        EngineLog.emit("[disc] DVD title: \(cells.count) cells, time map \(timeMap.map { "\($0.byteOffsets.count) x \(Int($0.unitSec))s" } ?? "none")", category: .demux)
+        return (spans, timeMap)
     }
 }

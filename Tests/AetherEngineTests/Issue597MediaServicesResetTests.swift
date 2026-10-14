@@ -49,6 +49,19 @@ struct Issue597MediaServicesResetTests {
         #expect(!engine.consumeMediaServicesReset())
     }
 
+    /// PR #740: the Atmos output activator holds an `AVQueuePlayer` of its own, which a reset invalidates
+    /// like the engine's, so the reset drops it and the next native player builds a fresh one.
+    @Test("a reset drops the Atmos output activator with its invalidated player")
+    @MainActor
+    func resetDropsTheAtmosOutputActivator() throws {
+        let engine = try AetherEngine()
+        engine.atmosOutputActivator = AtmosOutputActivator()
+
+        engine.noteMediaServicesReset(lost: false)
+
+        #expect(engine.atmosOutputActivator == nil)
+    }
+
     /// Audit LIF-104: `reloadWithAudioOverride` (the audio pick, the disc-title pick, the custom-source
     /// reload) keeps the native host on the native route, and it never read the flag, so the first
     /// rebuild after a reset mounted the item on the invalidated AVPlayer while the flag stayed up.

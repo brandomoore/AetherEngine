@@ -210,8 +210,10 @@ struct Issue493HostDisplayAssertionTests {
     /// `videoFormat`, the tvOS criteria request, and the HDR readiness that rides along. Measured the
     /// same day against the matched Dolby P5 / P8.1 / P8.4 grades on macOS: master, media playlist,
     /// init.mp4 and seg0.mp4 came back md5-identical with and without the claim.
-    @Test("AE#493: the assertion does not move the packaging of P5, P8.1 or P8.4",
-          arguments: [(UInt8(5), UInt8(0)), (UInt8(8), UInt8(1)), (UInt8(8), UInt8(4))])
+    /// Profile 7 joined them once its conversion to 8.1 stopped being gated on the display: the converted
+    /// stream is a P8.1 and is packaged as one either way.
+    @Test("AE#493: the assertion does not move the packaging of P5, P7, P8.1 or P8.4",
+          arguments: [(UInt8(5), UInt8(0)), (UInt8(7), UInt8(6)), (UInt8(8), UInt8(1)), (UInt8(8), UInt8(4))])
     func assertionLeavesTheHEVCPackagingAlone(grade: (profile: UInt8, compat: UInt8)) throws {
         let trc: AVColorTransferCharacteristic = grade.compat == 4 ? AVCOL_TRC_ARIB_STD_B67 : AVCOL_TRC_SMPTE2084
         let asserted = try Self.route(profile: grade.profile, compat: grade.compat, trc: trc, dvDisplay: true)
@@ -219,19 +221,13 @@ struct Issue493HostDisplayAssertionTests {
         #expect(Self.packaging(asserted) == Self.packaging(control))
     }
 
-    /// The two grades where it still does, so "the claim changes nothing" cannot quietly become the rule:
-    /// P7 needs the per-packet RPU conversion to 8.1 and its supplemental, and the AV1 DV record is read
-    /// only on a display that takes it, so a non-DV display gets the base layer with no supplemental and
-    /// no Dolby Vision variant at all. Since #547 both AV1 branches carry the same `av01` sample entry,
-    /// the base layer's own; what the claim moves there is the supplemental entry beside it.
-    @Test("AE#493: P7 and AV1 Dolby Vision are still packaged by the claim")
+    /// The grade where it still does, so "the claim changes nothing" cannot quietly become the rule: the
+    /// AV1 DV record is read only on a display that takes it, so a non-DV display gets the base layer with
+    /// no supplemental and no Dolby Vision variant at all. Since #547 both AV1 branches carry the same
+    /// `av01` sample entry, the base layer's own; what the claim moves there is the supplemental entry
+    /// beside it.
+    @Test("AE#493: AV1 Dolby Vision is still packaged by the claim")
     func assertionStillMovesTheGatedGrades() throws {
-        let p7Asserted = try Self.route(profile: 7, compat: 0, dvDisplay: true)
-        let p7Control = try Self.route(profile: 7, compat: 0, dvDisplay: false)
-        #expect(Self.packaging(p7Asserted) != Self.packaging(p7Control))
-        #expect(p7Asserted.convertP7ToProfile81)
-        #expect(p7Control.convertP7ToProfile81 == false)
-
         let av1Asserted = try Self.route(codecID: AV_CODEC_ID_AV1, profile: 10, compat: 1, dvDisplay: true)
         let av1Control = try Self.route(codecID: AV_CODEC_ID_AV1, profile: 10, compat: 1, dvDisplay: false)
         #expect(Self.packaging(av1Asserted) != Self.packaging(av1Control))

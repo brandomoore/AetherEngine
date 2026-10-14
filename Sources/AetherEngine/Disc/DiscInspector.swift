@@ -119,6 +119,13 @@ enum DiscInspector {
                     } else {
                         kind = .udfNoTitle
                     }
+                } else if let videoTS = root.first(where: { $0.isDir && $0.name.uppercased() == "VIDEO_TS" }) {
+                    // A DVD-Video image with no ISO9660 bridge, as `DiscReader.wrapUDFDVD` reads it.
+                    let names = ((try? udf.list(path: [videoTS.name])) ?? []).filter { !$0.isDir }.map(\.name)
+                    d.dvdVOBFiles = names
+                    let groups = DVDTitleSelector.enumerateTitleVOBGroups(
+                        names.map { DiscFile(name: $0, startSector: 0, length: 1) })
+                    kind = groups.isEmpty ? .udfNoBDMV : .dvdVideo
                 } else {
                     kind = .udfNoBDMV
                 }

@@ -73,7 +73,7 @@ open 'http://127.0.0.1:<port>/<token>/master.m3u8'   # macOS QuickTime
 
 `--start-position S` starts the session at S seconds, the resume anchor a host passes to `load(url:startPosition:)`. Also available on `play`.
 
-`--atmos-bed <layout>` is `LoadOptions.objectAudioRendering = .apac(layout)` (`5.1.2`, `5.1.4`, `7.1.2`, `7.1.4` or `9.1.6`, #731): a TrueHD Atmos track is rendered into that bed and served as APAC, so a master reads `CODECS="…,apac.31.03"` (up to 12 channels) or `apac.31.04` (16), and the log carries `TrueHD Atmos: objects rendered into …` and the `[SpatialAudioBridge] bed levels` lines. `--audio-index <n>` serves source stream `n`, as a host's audio picker would. Dolby's Unfold demo, whose TrueHD Atmos track is stream 1: `serve --no-dv --atmos-bed 7.1.4 --audio-index 1 unfold.m2ts`.
+`--atmos-bed <layout>` is `LoadOptions.objectAudioRendering = .apac(layout)` (`5.1.2`, `5.1.4`, `7.1.2`, `7.1.4` or `9.1.6`, #731, #744): a TrueHD Atmos or DTS:X track is rendered into that bed and served as APAC, so a master reads `CODECS="…,apac.31.03"` (up to 12 channels) or `apac.31.04` (16), and the log carries `TrueHD Atmos: objects rendered into …` (or `DTS:X: bed, heights and objects rendered into …`) and the `[SpatialAudioBridge] bed levels` lines. A DTS-HD MA track that LibDTSX does not confirm as DTS:X logs `DTS-HD MA track is not DTS:X LibDTSX renders (…); keeping the channel bridge` instead. `--audio-index <n>` serves source stream `n`, as a host's audio picker would. Dolby's Unfold demo, whose TrueHD Atmos track is stream 1: `serve --no-dv --atmos-bed 7.1.4 --audio-index 1 unfold.m2ts`.
 
 `--audio-delay <ms>` parks the server with the AE#464 audio offset already in its muxer, which is how the DELIVERED offset is measured rather than argued about: fetch the media playlist and walk its segments, then read the first audio and video packet timestamps out of `init.mp4` + a segment with `ffprobe -show_entries packet=stream_index,pts_time`. On a 30 fps H.264 + AAC fixture the source's own alignment is +21.8 ms, `--audio-delay 200` reads +221.8 ms and `--audio-delay -150` reads -128.2 ms, i.e. exactly the offset asked for, with the video timestamp unchanged in every arm.
 
@@ -273,6 +273,10 @@ asking again every drain cycle. The observable is the range count, in the origin
 point is that there is no second ask to refuse. Two shapes are worth running deliberately, because
 they are the two the flag has to survive: a long uninterrupted read, and a PAUSE, which must end the
 connection after five seconds and cost exactly one re-request at the frontier when playback resumes.
+On a finite HEVC-in-MPEG-TS HLS VOD (the AE#268 ingest) the same flag puts the playlist and every
+segment on one persistent HTTP/1.1 connection (AE#732); the observable there is the
+`[HLSVODIngest] AE#732 connection ... open` and `... closed after N requests reason=...` lines, one
+pair per connection, and a run without seeks should show exactly one.
 
 `--progressive-segments` sets `LoadOptions.progressiveSegmentDelivery`: each VOD segment is served
 while it is written. Run it against a throttled origin and compare the `FIRSTFRAME` and first
@@ -283,6 +287,13 @@ AVPlayer asks and the two runs look the same.
 `--max-concurrent-requests N` sets `LoadOptions.maxConcurrentSourceRequests` (#377): the most requests the reader may have open against the origin at once, across every path it fetches on. `1` also switches off the speculative parallel paths, which is the shape of a connection-metered CDN. Count the requests in the origin's own log, or read the `[AVIOReader]` connection lines, with and without the flag.
 
 `--assert-dv` sets `LoadOptions.panelPresentsDolbyVision` (AE#493), the host's assertion that its display presents Dolby Vision. macOS has no per-mode display capability API, so a Mac run plays a Dolby Vision source as its HDR10 base layer (`effective-format=hdr10`) until the host says otherwise; the flag moves that label and the tvOS criteria request. It does not change the packaging of a Profile 5 / 8.1 / 8.4 source (those carry their `dvcC` and `SUPPLEMENTAL-CODECS` on every display since 6.72.0 / 6.73.0), while Profile 7 and AV1 Dolby Vision are still gated on it. A wrong claim costs one in-place media-playlist fallback, not the item.
+
+`--native-video-frame-diagnostics` enables the opt-in SDR native-loopback decoded-output
+observer from `LoadOptions.nativeVideoFrameDiagnostics`. It logs progress, output gaps and
+observation delays without suppressing the player layer or claiming physical display proof.
+
+`play --native-video-frame-recovery` separately enables bounded SDR native decoded-output repair;
+it is off by default and does not follow from enabling diagnostics. See [diagnostics](api.md#diagnostics).
 
 `--picture-probe` attaches an `AVPlayerItemVideoOutput` to the running item and decodes the source
 time out of the picture itself, which is the one axis question nothing else here can answer: every
@@ -505,6 +516,8 @@ Brings up the loopback session headless, decodes the audio tap (#95) as fast as 
 ## bgaudio
 
 Verifies SW-path background audio (iOS keepalive) headless on macOS, where the `UIApplication` background lifecycle that normally drives it does not exist. Loads a software-routed source through the full engine, plays a foreground baseline, toggles the SW host into background-audio-only (`--fg N` foreground seconds, `--bg N` background seconds; defaults 3 / 6), then returns to foreground. Reports per-tick the audio clock, the SW video-frame count, and the process memory footprint, and a verdict. A healthy run shows the clock advancing through the background phase (audio alive), the video-frame count flat (video dropped), the footprint roughly flat (the loop paces on the audio renderer rather than buffering the rest of the file), and the video-frame count rising again on foreground return (resync at the next keyframe). The flag and counters are exposed through DEBUG-only engine hooks, so this command is unavailable in a Release build. Generate a quick software-path clip with `ffmpeg -f lavfi -i testsrc2 -f lavfi -i sine -c:v libvpx-vp9 -c:a aac -shortest clip.mkv`.
+
+`--lose-session` (AE#739) reproduces what an iOS screen lock does to the SW host's VideoToolbox session: halfway through the foreground phase, and again right after entering background-audio-only, it invalidates the session in place, so the next decode returns `kVTInvalidSessionErr` (-12903) exactly as in a field log. It forces the software path and needs an HEVC source, since only HEVC reaches the hardware decoder there (`ffmpeg -f lavfi -i testsrc2=size=1920x1080:rate=24 -f lavfi -i sine -t 30 -c:v libx265 -x265-params keyint=48 -tag:v hvc1 -c:a aac clip.mp4`), and it prints the engine log so the loss, rebuild and reposition lines are visible. It fails unless video frames rise again after the foreground loss (the host rebuilds the session and repositions to the playhead) and after the foreground return (rebuilt unconditionally, resumes at the next keyframe). Before the fix both counts stayed at +0.
 
 ## customio
 

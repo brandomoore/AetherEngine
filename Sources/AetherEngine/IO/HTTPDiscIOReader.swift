@@ -65,11 +65,12 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
                       maxRetries: Int = 3,
                       requestTimeout: TimeInterval = 30,
                       sessionConfiguration: URLSessionConfiguration? = nil,
-                      prewarmed: PrewarmedSource? = nil) {
+                      prewarmed: PrewarmedSource? = nil,
+                      knownSize: Int64? = nil) {
         let session = Self.makeSession(sessionConfiguration)
         guard case .size(let size) = Self.resolveSize(
             url: url, extraHeaders: extraHeaders, session: session, requestTimeout: requestTimeout,
-            maxRetries: maxRetries, knownSize: prewarmed?.contentLength) else {
+            maxRetries: maxRetries, knownSize: knownSize ?? prewarmed?.contentLength) else {
             session.invalidateAndCancel()
             return nil
         }
@@ -141,7 +142,8 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
     }
 
     /// `knownSize` skips the range probe. Only a source that has already answered a range request
-    /// with its total may pass it: the warm, or the reader a fork is made from.
+    /// with its total may pass it: the warm, or the reader a fork is made from. The one exception is a
+    /// small file of a disc folder, read whole, where a range-blind origin costs nothing.
     private static func resolveSize(url: URL, extraHeaders: [String: String], session: URLSession,
                                     requestTimeout: TimeInterval, maxRetries: Int,
                                     knownSize: Int64?) -> SizeProbe {

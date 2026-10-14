@@ -37,15 +37,15 @@ struct Issue667MasterAfterSwitchTests {
     @Test("A refusal raised mid-switch does not latch, even on an eligible display")
     func midSwitchRefusalDoesNotLatch() {
         #expect(!MasterFallbackDecision.shouldLatchPanelRefusal(
-            code: -11868, displayEligibleForHDRNow: true, displaySwitchInProgress: true))
+            code: -11868, servedMasterIsHDR: true, displayEligibleForHDRNow: true, displaySwitchInProgress: true))
         #expect(!MasterFallbackDecision.shouldLatchPanelRefusal(
-            code: -11848, displayEligibleForHDRNow: true, displaySwitchInProgress: true))
+            code: -11848, servedMasterIsHDR: true, displayEligibleForHDRNow: true, displaySwitchInProgress: true))
     }
 
     @Test("A refusal after the switch settled still latches")
     func settledRefusalStillLatches() {
         #expect(MasterFallbackDecision.shouldLatchPanelRefusal(
-            code: -11868, displayEligibleForHDRNow: true, displaySwitchInProgress: false))
+            code: -11868, servedMasterIsHDR: true, displayEligibleForHDRNow: true, displaySwitchInProgress: false))
     }
 
     /// A policy test cannot see the call site, so this one reads it: the wait sits between the route and the

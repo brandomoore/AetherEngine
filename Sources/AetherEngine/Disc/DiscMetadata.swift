@@ -78,13 +78,17 @@ struct DiscTitle: Sendable, Equatable {
     /// happens to reach it (#651). Empty when the IFO declares none, nil when it is unreadable: only a
     /// title whose IFO was read gets the short probe, since only then is nothing left to discover.
     let dvdSubpictureStreamIDs: [Int]?
+    /// Blu-ray: each play item's `in_time` (45 kHz, on its clip's own clock), parallel to `bdClipIDs`.
+    /// A seek by the clips' EP maps turns title time back into clip time with it (`DiscSeekTable`).
+    let bdClipInTimes: [UInt64]?
 
     init(id: Int, durationTicks: UInt64, chapters: [DiscChapter] = [],
          bdClipIDs: [String]? = nil, bdClipSubtractTicks: [Int64]? = nil,
          bdClipCumulativeBeforeTicks: [UInt64]? = nil,
          dvdVTSN: Int? = nil, dvdTitleNumber: Int? = nil,
          streamLanguages: [Int: String] = [:],
-         dvdSubpictureStreamIDs: [Int]? = nil) {
+         dvdSubpictureStreamIDs: [Int]? = nil,
+         bdClipInTimes: [UInt64]? = nil) {
         self.id = id
         self.durationTicks = durationTicks
         self.chapters = chapters
@@ -95,6 +99,7 @@ struct DiscTitle: Sendable, Equatable {
         self.dvdTitleNumber = dvdTitleNumber
         self.streamLanguages = streamLanguages
         self.dvdSubpictureStreamIDs = dvdSubpictureStreamIDs
+        self.bdClipInTimes = bdClipInTimes
     }
 }
 
@@ -137,6 +142,21 @@ extension ClipSpan {
 /// back so its content continues right after all earlier clips' presentation duration, anchored to clip 0's
 /// observed base. Using the observed (already 33-bit-unwrapped by the demuxer) base instead of the MPLS
 /// `inTime` field is what makes it correct when a clip's STC base crosses the 32-bit `inTime` wrap (~95443s).
+/// A DVD title's time map: the byte, in the concatenated title VOBs, of the VOBU playing at every
+/// `unitSec` of title time. Entry i is at (i + 1) x `unitSec`; the first unit seeks to the title start.
+struct DVDTimeMap: Sendable, Equatable {
+    let unitSec: Double
+    let titleStartByte: Int64
+    let byteOffsets: [Int64]
+
+    /// The byte of the VOBU at or before `t` seconds of title time.
+    func byteOffset(forTitleSeconds t: Double) -> Int64 {
+        let i = Int((max(0, t) / unitSec).rounded(.down)) - 1
+        guard i >= 0, !byteOffsets.isEmpty else { return titleStartByte }
+        return byteOffsets[min(i, byteOffsets.count - 1)]
+    }
+}
+
 enum ClipFold {
     static func offsetSeconds(observedBaseSec: Double, base0Sec: Double, cumulativeBeforeSec: Double) -> Double {
         observedBaseSec - base0Sec - cumulativeBeforeSec
@@ -177,9 +197,16 @@ struct DiscInfo: Sendable {
     /// Per-clip presentation-offset spans for the SELECTED multi-clip Blu-ray title, sorted by
     /// `concatByteStart`. Empty for single-clip / DVD / non-disc sources (Demuxer normalization no-ops).
     let clipTimeline: [ClipSpan]
+    /// The selected Blu-ray title's seek table from its clips' EP maps; nil for DVD, or when a clip has
+    /// no readable CLPI (seeks then search by timestamp).
+    let seekTable: DiscSeekTable?
+    /// The selected DVD title's time map (VTS_TMAPT); nil for Blu-ray and for a disc without one.
+    let dvdTimeMap: DVDTimeMap?
 
     init(reader: IOReader, formatHint: String, titles: [DiscTitle], selectedTitleIndex: Int,
-         clipTimeline: [ClipSpan] = []) {
+         clipTimeline: [ClipSpan] = [], seekTable: DiscSeekTable? = nil, dvdTimeMap: DVDTimeMap? = nil) {
+        self.seekTable = seekTable
+        self.dvdTimeMap = dvdTimeMap
         self.reader = reader
         self.formatHint = formatHint
         self.titles = titles

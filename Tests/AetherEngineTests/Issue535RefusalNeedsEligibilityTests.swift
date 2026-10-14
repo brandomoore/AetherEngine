@@ -13,21 +13,28 @@ struct Issue535RefusalNeedsEligibilityTests {
 
     @Test("A display rejection while the display is ineligible for HDR does not latch")
     func ineligibleWindowDoesNotLatch() {
-        #expect(!MasterFallbackDecision.shouldLatchPanelRefusal(code: -11868, displayEligibleForHDRNow: false, displaySwitchInProgress: false))
-        #expect(!MasterFallbackDecision.shouldLatchPanelRefusal(code: -11848, displayEligibleForHDRNow: false, displaySwitchInProgress: false))
+        #expect(!MasterFallbackDecision.shouldLatchPanelRefusal(code: -11868, servedMasterIsHDR: true, displayEligibleForHDRNow: false, displaySwitchInProgress: false))
+        #expect(!MasterFallbackDecision.shouldLatchPanelRefusal(code: -11848, servedMasterIsHDR: true, displayEligibleForHDRNow: false, displaySwitchInProgress: false))
     }
 
     @Test("A display rejection on an eligible display still latches")
     func eligibleRefusalStillLatches() {
-        #expect(MasterFallbackDecision.shouldLatchPanelRefusal(code: -11868, displayEligibleForHDRNow: true, displaySwitchInProgress: false))
-        #expect(MasterFallbackDecision.shouldLatchPanelRefusal(code: -11848, displayEligibleForHDRNow: true, displaySwitchInProgress: false))
+        #expect(MasterFallbackDecision.shouldLatchPanelRefusal(code: -11868, servedMasterIsHDR: true, displayEligibleForHDRNow: true, displaySwitchInProgress: false))
+        #expect(MasterFallbackDecision.shouldLatchPanelRefusal(code: -11848, servedMasterIsHDR: true, displayEligibleForHDRNow: true, displaySwitchInProgress: false))
+    }
+
+    /// cmcpherson274, 2026-10-11: two SDR titles' masters refused with -11848 latched the HDR route.
+    @Test("A refusal of an SDR master never latches the HDR route")
+    func sdrMasterRefusalNeverLatches() {
+        #expect(!MasterFallbackDecision.shouldLatchPanelRefusal(code: -11848, servedMasterIsHDR: false, displayEligibleForHDRNow: true, displaySwitchInProgress: false))
+        #expect(!MasterFallbackDecision.shouldLatchPanelRefusal(code: -11868, servedMasterIsHDR: false, displayEligibleForHDRNow: true, displaySwitchInProgress: false))
     }
 
     /// -1002 is a manifest filtered at parse time (#130), a statement about the playlist, never the display.
     @Test("The parse-time rejection never latches, eligible or not")
     func parseRejectionNeverLatches() {
-        #expect(!MasterFallbackDecision.shouldLatchPanelRefusal(code: -1002, displayEligibleForHDRNow: true, displaySwitchInProgress: false))
-        #expect(!MasterFallbackDecision.shouldLatchPanelRefusal(code: -1002, displayEligibleForHDRNow: false, displaySwitchInProgress: false))
+        #expect(!MasterFallbackDecision.shouldLatchPanelRefusal(code: -1002, servedMasterIsHDR: true, displayEligibleForHDRNow: true, displaySwitchInProgress: false))
+        #expect(!MasterFallbackDecision.shouldLatchPanelRefusal(code: -1002, servedMasterIsHDR: true, displayEligibleForHDRNow: false, displaySwitchInProgress: false))
     }
 
     /// The fallback itself is unaffected: the item still reloads the media playlist whatever the latch does.
@@ -52,5 +59,7 @@ struct Issue535RefusalNeedsEligibilityTests {
         let set = try #require(body.range(of: "Self.panelRefusedHDRMaster = true"))
         #expect(gate.lowerBound < set.lowerBound)
         #expect(body.contains("AVPlayer.eligibleForHDRPlayback"))
+        let sdrGuard = try #require(body.range(of: "!session.servedSourceIsHDR"))
+        #expect(sdrGuard.lowerBound < set.lowerBound)
     }
 }

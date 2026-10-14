@@ -49,6 +49,8 @@ The message inside `.error` is worth logging verbatim, and it comes from two dif
 
 So the string is a payload, not a key, and `$errorInfo` is the key. It publishes a `PlaybackErrorInfo` beside the state: a `PlaybackErrorKind` naming what failed in a form that survives a locale and a release, plus the underlying `NSError` domain and code wherever a Foundation / AVFoundation failure is involved. A non-nil `underlyingDomain` also marks the messages whose text the OS has localized.
 
+A failed custom-source probe publishes `.customSourceProbeFailed` with the probe error's `underlyingDomain` and `underlyingCode` when available. That information is set before the terminal `.error` state is delivered, so a state observer can read the cause from `errorInfo` without parsing the message.
+
 Two kinds carry a number a host will want to read, and both mean the same thing happened: the origin answered the source request with an HTTP status instead of media, and `underlyingCode` is that status. `.sourceRefused` is the origin's verdict on the resource or on itself (a 401/403 refusal, which on a connection-capped IPTV panel most often means "the slot is still held", a 404, a 5xx). `.sourceRateLimited` is the same answer in the rate-limit shapes (429/503/509), split off because the recovery differs: the source is being metered, not lost, so the same request is expected to work later and a handoff to a second player meets the same meter (AE#377). Both are distinct from `.sourceOpenFailed`, which is what a corrupt or unreadable source produces; before `.sourceRefused` existed a refusal and a corrupt file arrived alike as "Invalid data found when processing input".
 
 `.sourceCertificateRejected` is the same argument one layer lower: the transport was refused over certificate trust, so there was never a response to carry a status. `underlyingCode` is the `NSURLErrorDomain` code (-1200 through -1206), and the message is the engine's own English sentence rather than the OS one, so a pasted report says the same thing on every device. It reaches a host from either path: on the FFmpeg path the reader types the failed open, and on the native path the URL error is found under AVFoundation's own error, which is where it sits and where nothing used to look. Nothing about the media is wrong and no retry helps; a self-signed or private-CA origin needs a trust decision the host makes (AE#495).
@@ -68,6 +70,12 @@ player.$state
 
 It is assigned before `state`, so a `$state` sink reads this failure's own info rather than the previous one's, and it is cleared by the state's move away from `.error`, so the two cannot drift. Substring rules over the message instead bucket every non-English device into "other".
 
+Software live source read failures, including an interrupted verified replay,
+report `liveSourceUnavailable` rather than `softwarePipelineFailed`. This is a
+source continuity failure, not evidence that the codec requires a different
+engine. Hosts choose retry timing through their existing live recovery policy.
+The software route's error remains available through `$errorInfo` and `.error`.
+
 ### `.ended` is terminal
 
 `.ended` means the source played to completion, on any backend. It is not a pause at the last frame:
@@ -85,9 +93,53 @@ The clock stops with it, on both backends: `clock.currentTime` and `clock.source
 player.liveSourceReset            // PassthroughSubject<Void, Never>; subscribe per session
 ```
 
-Live's counterpart to a terminal `.error`, and a host that plays live has to subscribe. It fires where the session cannot be revived from inside the engine and only a new `load` can: a source restarted from byte 0 (a transcode respawn), a playlist still frozen after the stall ladder's last reload rung (#65), an in-engine reopen transport whose budget is spent (#199). Production is halted before it fires.
+An interrupted exact replay first tries the bounded in-engine source reopen when
+there is a URL or fresh-reader factory. It retains the same cache, player item and
+bounded exact-packet history, so media already in the DVR window is not appended
+again even when the viewer is behind live. The failed connection is retired before
+opening the replacement. A changed track layout or ordinary source loss that
+exhausts in-engine recovery requests host negotiation through this subject.
+Verified replay that cannot reach new media also ends here by default. A host that sets
+`LoadOptions.hostRetriesExhaustedLiveReplay` gets `liveSourceReplayExhausted` below
+instead, so its own retry keeps the retained evidence rather than a full load discarding it.
+A complete overlap continues in place; an ambiguous clock reset retains ordinary
+discontinuity handling. Fresh-source recovery ends an active recording with
+`sourceReset` rather than silently splicing a new source into the old file.
 
-Answering it: negotiate a fresh URL and `load` again, or, where the URL is fixed (an IPTV channel), load the same one again. Guard the answer with one retune in flight, a minimum spacing and a bounded count per session, then surface the exhausted case the way a terminal `.error` would be surfaced, because a ladder that ends on a silent `return` leaves the same dead channel behind a counter.
+A live host subscribes to this event when acquisition cannot continue under the
+engine's bounded recovery round, or the stalled consumer requests renewed source
+acquisition. After its own backoff, first try `retryLiveSourceRecovery()`: a
+previously productive native live session can renew its source while retaining
+its DVR timeline, including before any replay has been detected. A `false` return
+requires fresh negotiation (for example a changed track layout or a custom reader
+without a reopen factory); use a bounded full-load policy for that case.
+
+Keep one recovery in flight. Do not turn ordinary source loss into a decoder
+compatibility failure merely because an origin remains unavailable.
+
+### Live: exhausted verified replay
+
+`liveSourceReplayExhausted` is a per-session subject for native HLS recovery that
+cannot reach new media after verifying previously admitted packets. It fires only for a
+session loaded with `LoadOptions.hostRetriesExhaustedLiveReplay = true`; without it the same
+exhaustion publishes `liveSourceReset`, so a host that only knows that event still retunes. Production
+parks while cached DVR media and replay history remain available. This is a
+source recovery event, not a codec failure or a requirement to show an error.
+
+After its own backoff, a host can call `retryLiveSourceRecovery() -> Bool` to
+resume source acquisition into the same cache and consumer item. It returns
+`true` when that retained session accepts the request or has a retry in flight, and
+`false` after stop/replacement, on unsupported routes, or when a changed track
+layout requires fresh negotiation. Concurrent calls coalesce. A stalled live producer can also be renewed through
+this method: its reader is cancelled and its pump must finish before history is
+transferred to a replacement. A new exhaustion
+publishes the subject again; retry delays, cancellation and any overall limit
+belong to the host. Calling `load` or switching decoders instead discards this
+history and can replay the old broadcast.
+
+Once a session has verified replay, later source-open exhaustion keeps this same
+retained recovery contract even if an earlier reconnect produced new media.
+A changed track layout still uses `liveSourceReset` for fresh negotiation.
 
 ### Live: a resume that had to move
 
@@ -442,6 +494,7 @@ try await player.reloadAtCurrentPosition()
 | --- | --- |
 | `load(url:startPosition:options:audioSourceStreamIndex:discTitleID:)` | `async throws -> SourceProbe?`. Discardable. Tears down any running session first. |
 | `load(source:startPosition:options:audioSourceStreamIndex:discTitleID:)` | Same, for `MediaSource.url` or `.custom(IOReader, formatHint:)`. A custom source whose initial probe fails throws, since it cannot be reopened by URL. |
+| `DiscDirectoryReader`, `HTTPDiscDirectoryReader` | A Blu-ray ripped as a `BDMV` folder, for `.custom(reader)`: `discFiles` lists the files (root-relative path and size), `openDiscFile(_:)` opens one, `preferredPlaylist` optionally names the title's `.mpls`. `HTTPDiscDirectoryReader(files:preferredPlaylist:httpHeaders:)` serves each `File` (path, size, url) from its own `Range` origin. See [Blu-ray folders](formats.md#disc-dvd--blu-ray-iso). |
 | `reloadAtCurrentPosition()` | `async throws`. Background reopen at the current position, preserving options. Session-preserving: it finishes an installed audio tap and keeps the native host where it can. It also preserves the session's TRANSPORT rather than replaying `autoplay`, so a session that was playing comes back playing and one that was paused comes back paused, whatever the mount was given (AE#464 round 2). A `play()` or `pause()` that arrives while it runs is the newer word and decides how it comes back. The one exception is the resume after a background teardown, which has no transport left to read and is the host's call, so there the mount flag still decides. |
 | `prepareForItemReplacement()` | One-shot. Keeps the current native `AVPlayerItem` attached until the next `load()` replaces it atomically, for a host that mounts the engine's own player layer and would otherwise show a black layer across the nil-item gap of a foreground episode or playlist change. Consumed by the next `load()`, cancelled by `stop()`, no effect when the outgoing session is not native. PiP hosts do not need it: an active PiP window already forces the handover (AE#158). |
 | `stop(resetDisplayCriteria:finalTeardown:)` | Ends the session, `state` becomes `.idle`, `startupProgress` becomes nil. `resetDisplayCriteria: false` keeps the panel in its current mode across an item handoff. |
@@ -694,6 +747,7 @@ suppressing `AVPlayerItemLegibleOutput` to keep the measurement running.
 | `nativeLiveDVRMandatoryBytes` | The finite pinned playback payload that may exceed that allowance. Excludes init and subtitle data, muxer staging, AVPlayer's buffers, filesystem overhead and recordings. |
 | `setSoftwareLiveDVRLimits(_:availableCapacityBytes:)`, `softwareLiveDVRBytes` | The same lease for the software live spool, which needs `LoadOptions.softwareDVRRetention`. Expiry withdraws seekable history and prunes at the next append, so it is not an immediate physical reclaim while no packets arrive. A feeder whose cursor was evicted re-anchors through its normal seek before pumping again; a newer seek, pause, stop or source change wins over that recovery. `softwareLiveDVRBytes` is the retained packet payload. |
 | `liveSourceReset` | The retune contract above. |
+| `liveSourceReplayExhausted` | Verified replay exhausted one bounded recovery round. Cached DVR stays readable; retry via `retryLiveSourceRecovery()` under the host’s backoff without losing packet history. |
 | Timestamp resets | On the native loopback path `currentTime`, the seekable range, item placement and seek targets keep the session's initial timeline shift when the origin resets its timestamps, so the display time stays continuous. `clock.sourceTime` stays the presented frame's source PTS for cue matching, so the two intentionally differ after a reset. |
 | `liveResumeClamped`, `LiveResumeClamp` | A resume that found the playhead outside the window and moved it; see above. |
 | `liveScrubThumbnail(atSessionSeconds:maxWidth:)` | Still on the live session axis, decoded from what the session already holds. A native session reads its DVR segment cache; a software session reads its DVR packet ring (#544), so a tuner channel the box decodes in software has a scrub preview too. |
@@ -1063,6 +1117,39 @@ as well.
 
 ## Diagnostics
 
+`LoadOptions.nativeVideoFrameDiagnostics` opts into decoded-frame observation on SDR native
+loopback playback. It defaults to `false`; remote bypass, HDR, external playback, mobile
+background activity, PiP (including its foreground transition), pause and seek are excluded. An additional `AVPlayerItemVideoOutput`
+samples frame timestamps without suppressing the player layer or retaining pixel buffers.
+`EngineLog` reports output progress, gaps/resumption and observation-task delays. A decoded
+output gap is not proof of a physical screen freeze; unavailable output is reported explicitly,
+and the observation never seeks, retries, changes decoder routing or publishes a playback error.
+
+`LoadOptions.nativeVideoFrameRecovery` separately opts into bounded recovery when an SDR
+native-loopback output that previously yielded pictures stops advancing while the item clock
+continues. It defaults to `false`; enabling diagnostics alone does not enable this policy.
+Recovery enables the same sampling, excludes unavailable/stale observations and the modes above,
+and uses the same bounded, current-position repair as missing-layer recovery. Short gaps are
+observed without intervention; recovery does not promise to reconstruct source pictures that
+never arrived. Healthy decoded progress, not a transient readiness flag after a swap, rearms it.
+The `aetherctl play --native-video-frame-recovery` flag exercises the same policy.
+`ReplayVideoBoundary` logs numeric counts of damaged, replaced and unreplaced pictures at
+confirmed seams, separately from the number of duplicates removed. `superseded` counts
+conflicting unflagged copies resolved within the verified pending batch; `untimed` counts
+unpositioned fragments discarded from the held damaged boundary. Unrelated source
+timestamp resets do not grant this authority.
+
+Native presentation recovery, also enabled by `nativeVideoFrameRecovery` and off by default, watches the player layer's readiness. If a previously
+visible, attached video layer stays unready while foreground playback has both clock progress
+and buffered media, the engine first seeks to its current position and can then replace the
+consumer item in place. It preserves the live source, retained DVR and current position; a live
+replacement is deferred when that position cannot be placed in retained media. Recovery is
+bounded until a sustained healthy presentation rearms it. PiP, external playback, user pauses,
+seeks, hidden surfaces and buffering are excluded. `pictureInPictureActive` must be set before
+the PiP transition starts and cleared when it ends (also on a failed start), so a legitimately
+unready inline layer is never treated as missing video. `EngineLog` reports readiness, buffer,
+PiP/foreground eligibility and repair/resumption separately from optional decoded-output samples.
+
 | Symbol | Notes |
 | --- | --- |
 | `AetherEngine.version` | The engine release this source descends from, as the string a published tag carries. SwiftPM resolves a package to a revision rather than to a tag, so an About panel or the header of a diagnostic log has nothing else to name the engine with. Between releases, and under a pin on an unreleased commit, it names the last published version the checkout descends from. |
@@ -1099,7 +1186,7 @@ All flags default to safe values; the table is the full set. Depth for the media
 | `nativeRemoteHLSIngestFallback` | true | The #168 / #293 carriage recovery and the #363 401/403 bypass refusal recovery. Setting it false turns both off. |
 | `audioOnly` | false | Lean audio pipeline, no video machinery. Also set automatically when the probe finds no video stream. |
 | `audioBridgeMode` | `.surroundCompat` | Bridge encoder for codecs that cannot stream-copy into fMP4. `.surroundCompat` uses EAC3 for a source with more than two channels and FLAC for one with two or fewer (no surround to carry). `.lossless` uses FLAC up to 7.1 throughout and needs a sink that accepts multichannel LPCM. |
-| `objectAudioRendering` | `.off` | TrueHD Atmos with heights (#731). `.apac(SpatialSpeakerLayout)` decodes the Atmos objects, renders them into that bed (`.l512`, `.l514`, `.l712`, `.l714`, `.l916`) and delivers Apple Positional Audio, which tvOS sends to an Atmos receiver as Dolby MAT and iOS plays as Spatial Audio. Lossy (320 kbps per bed channel) in place of the lossless 7.1 the bridge delivers, so it is the host's choice. Only TrueHD that FFmpeg marks Atmos, at 48 kHz, on OS 26+; anything else, or any failure to start, keeps `audioBridgeMode`. With it on, the automatic audio pick prefers a TrueHD Atmos track over the other tracks of the same language (of the `preferredAudioLanguages` match, or of the default track when no preference decides), never across a language or dub and never over `audioSourceStreamIndexOverride`, and only where the bed can be rendered (a VOD video session off the software path). `SpatialSpeaker` names the positions. See [formats.md](formats.md#truehd-atmos-with-heights). |
+| `objectAudioRendering` | `.off` | TrueHD Atmos and DTS:X with heights (#731). `.apac(SpatialSpeakerLayout)` decodes the Atmos objects, or DTS:X's heights and objects, renders them into that bed (`.l512`, `.l514`, `.l712`, `.l714`, `.l916`) and delivers Apple Positional Audio, which tvOS sends to an Atmos receiver as Dolby MAT and iOS plays as Spatial Audio. Lossy (320 kbps per bed channel) in place of the lossless 7.1 the bridge delivers, so it is the host's choice. Only TrueHD that FFmpeg marks Atmos, and DTS-HD Master Audio that LibDTSX confirms as DTS:X on its first frames (whatever FFmpeg's label), at 48 kHz, on OS 26+; anything else, or any failure to start, keeps `audioBridgeMode`. With it on, the automatic audio pick prefers a TrueHD Atmos or DTS:X-labelled track over the other tracks of the same language (of the `preferredAudioLanguages` match, or of the default track when no preference decides), never across a language or dub and never over `audioSourceStreamIndexOverride`, and only where the bed can be rendered (a VOD video session off the software path, on OS 26 or later). `SpatialSpeaker` names the positions. See [formats.md](formats.md#truehd-atmos-with-heights) and [DTS:X](formats.md#dtsx-with-heights). |
 | `confirmAtmos` | false | Background per-track JOC confirmation, republishing `audioTracks` as tracks confirm. Never on the start path; skipped for live and forward-only readers. |
 | `preferredAudioLanguages` | empty | First-frame audio pick from the engine's single probe. Ordered BCP-47 / ISO 639 tags; region and script are normalized and rank within one preference (#590). An explicit `audioSourceStreamIndex` still wins. |
 | `preferredSubtitleLanguages` | empty | Post-load subtitle activation on the host-overlay path. Ranks language specificity (an explicitly opposite script is rejected, not demoted) before the descriptor axis. Pure convenience: no reload and no pre-probe, unlike the audio equivalent. |
@@ -1121,6 +1208,7 @@ All flags default to safe values; the table is the full set. Depth for the media
 | `forceDolbyVisionOnNonDVDisplay` | false | **Experimental (AE#455).** On a display with no Dolby Vision of its own, serve an HEVC Profile 8.1 source the way a Profile 5 source is served (`dvh1` sample entry, `dvcC` rewritten to profile 5 / compatibility 0, `CODECS="dvh1.05.LL"`), so AVPlayer composes the RPU itself instead of handing the panel the static-metadata HDR10 base layer. The bitstream is untouched; only the container's claim about it changes. Ignored on a display that does Dolby Vision, and Profile 8.1 only. See [formats.md](formats.md#dolby-vision-signaling) for what it buys and what it risks. |
 | `dolbyVisionHandling` | `.automatic` | A `DolbyVisionHandling`. `.baseLayerOnly` presents the HDR10 / HLG base layer of a Dolby Vision source and leaves the Dolby Vision out of the container on every display: plain `hvc1` / `av01` sample entry, `dvcC` stripped, no `SUPPLEMENTAL-CODECS`, HDR10 / HLG display criteria, `videoFormat` reads the base layer's format while `sourceVideoFormat` and `sourceDVProfile` keep saying what the file carries. The route a host offers as "Dolby Vision: off (HDR10)", for a source whose Dolby Vision is wrong and whose base layer is right: the reported shape is a remux carrying a Profile 7 RPU under a container record claiming Profile 5, where a player that believes the record decodes YCbCr as IPT and the picture comes out green / violet. Applies to HEVC Profile 7 / 8.1 / 8.4, AV1 Profile 10.1 / 10.4, and a Profile 5 (or AV1 10.0) record whose VUI declares a BT.2020 YCbCr PQ or HLG base; a Profile 5 whose VUI is unspecified carries IPT-PQ-c2, has no base layer to present, keeps its route, and the engine says so in the log. Takes precedence over `forceDolbyVisionOnNonDVDisplay`. A tuning field, correctable through `reloadAtCurrentPosition(applying:)`; a Profile 5 record the VUI contradicts also stops refusing the software path under it. See [formats.md](formats.md#dolby-vision-signaling). |
 | `preferredDecodePath` | `.automatic` | A `DecodePath`. `.software` serves this source through `SoftwarePlaybackHost` whatever the routing concluded, scoped to this session and costing the source nothing (seeks, the audio switch and the title switch all keep working). The escape for the formats `VTCapabilityProbe` deliberately cannot classify, and for live H.264 / HEVC, which never reaches that gate at all. One-way: there is no `.native`. See [Overriding the decode path](#overriding-the-decode-path). |
+| `hostRetriesExhaustedLiveReplay` | `false` | The host owns the retry after a verified live replay exhausts the in-engine reopen: the engine publishes `liveSourceReplayExhausted` and holds production until `retryLiveSourceRecovery()`. `false` publishes `liveSourceReset` for the same exhaustion. |
 | `escalatesToSoftwarePath` | `true` | Whether a native session AVPlayer refuses on its merits (`CoreMediaErrorDomain`), or a live join without an entry point the native route can open (`AetherEngine.LiveJoin`, AE#627), may be rebuilt once on the software path (AE#561). `false` surfaces the failure as `.error` instead, for a host with its own fallback ladder (AE#629). Correctable. |
 | `sharedOutputRole` | `.primary` (default) or `.secondary` | A `SharedOutputRole`. A secondary engine never writes display criteria and never owns Now Playing, whatever `suppressDisplayCriteria` and `ownsVideoNowPlayingSession` say, on the audio-only path too. It also skips the play gate's wait for a criteria write and the panel readout (`criteriaPanelReadout` is nil, as for any suppressed load), so its HDR labelling relies on `panelIsInHDRMode`. The role is fixed for a session, but a later `load()` may change it: as an identity field it only blocks corrections (Sodalite#175). A host that opted into `ownsVideoNowPlayingSession` and changes the role without a `stop()` keeps the native host's original Now Playing ownership until the next stop. |
 | `deinterlaceMode` | `.auto` | A `DeinterlaceMode` for the software path: the Metal / VideoToolbox graph with a CPU bwdif fallback, or `.software` to force the CPU path. |
@@ -1132,7 +1220,7 @@ All flags default to safe values; the table is the full set. Depth for the media
 | `declaredDurationSeconds` | nil | Trusted duration, overriding the container's. Required alongside `sequentialOrigin` on VOD, where the tail read is gone. |
 | `maxConcurrentSourceRequests` | nil | Most requests the reader may have open against this origin at once, across every path it fetches on (pump ranges, detour blocks, size probes, tail prefetch, subtitle side reader, and the HLS live ingest's playlist, segment and key fetches, whose prefetch window narrows to it, AE#678). nil counts without capping and lowers the ceiling on its own after a 429/503/509. Set it when the provider states a limit; `1` also switches off the speculative parallel paths, which exist only to overlap with the pump. Counts **requests**, not TCP connections, because over HTTP/2 a session multiplexes every request onto one connection while the origin still counts each one (AE#377). It is also the only ceiling: several engines playing from one origin are bounded by this value and by what the origin refuses, not by a transport pool underneath it (AE#450). |
 | `sourceOpenPolicy` | `SourceOpenPolicy()` | HTTP VOD opening budgets for the playback reader and its reopens: `firstByteTimeout` (15 s) bounds the first data wait, `sizeProbeTimeout` (25 s) bounds the one retry and the whole size discovery, slot waits included. Nonpositive or nonfinite values take the defaults, anything above 120 s is capped. A request that gets no response is retried once with an open-ended Range and that connection stays the playback connection; two unanswered requests fail as `.sourceOpenFailed` instead of demoting the source to forward-only. A real length-less or Range-ignoring response keeps the ordinary sequential handling. Single-request origins run the size probes serially, others race them and join the losers before playback starts. Live, `sequentialOrigin`, remote HLS and disposable probes keep their own budgets. |
-| `heldSourceConnection` | false | Ask the source **once** and pull it, instead of ending the connection at the reader's window high water and asking again every 8 to 16 MB of drain (AE#377). For an origin that punishes repeated requests rather than concurrency: some CDNs refuse new requests for minutes at a stretch while serving an already open connection at full rate, and against one of those the request cadence is the defect, at any range size (measured at the reporting origin: 32 MB ranges raised to 256 MB, eight times fewer requests, the refusals unchanged). Where `maxConcurrentSourceRequests` bounds how many requests are in flight, this removes the second request. The read path is the engine's own HTTP/1.1 over a demand-driven stream task, so: **HTTP/1.1 only** (no ALPN, an HTTP/2-only origin is out of scope), the **system proxy configuration does not apply**, and TLS is the OS's through the same host trust decision as every other engine session but has not been exercised against a self-signed origin. A viewer who pauses ends the connection after five seconds and resuming costs one request at the frontier, because a held flow nobody reads is the process-wide Network.framework starvation of AE#310. Applies to the playback reader; the subtitle and enrichment side readers keep the default transport, since they park for minutes at a time. The open-time detection of an origin that ignores `Range` (see `sequentialOrigin`) does not cover it, because its open is open-ended. **Names the session**: the transport is chosen at open, so a reload that changes it is refused. |
+| `heldSourceConnection` | false | Ask the source **once** and pull it, instead of ending the connection at the reader's window high water and asking again every 8 to 16 MB of drain (AE#377). For an origin that punishes repeated requests rather than concurrency: some CDNs refuse new requests for minutes at a stretch while serving an already open connection at full rate, and against one of those the request cadence is the defect, at any range size (measured at the reporting origin: 32 MB ranges raised to 256 MB, eight times fewer requests, the refusals unchanged). Where `maxConcurrentSourceRequests` bounds how many requests are in flight, this removes the second request. The read path is the engine's own HTTP/1.1 over a demand-driven stream task, so: **HTTP/1.1 only** (no ALPN, an HTTP/2-only origin is out of scope), the **system proxy configuration does not apply**, and TLS is the OS's through the same host trust decision as every other engine session but has not been exercised against a self-signed origin. A viewer who pauses ends the connection after five seconds and resuming costs one request at the frontier, because a held flow nobody reads is the process-wide Network.framework starvation of AE#310. Applies to the playback reader; the subtitle and enrichment side readers keep the default transport, since they park for minutes at a time. The open-time detection of an origin that ignores `Range` (see `sequentialOrigin`) does not cover it, because its open is open-ended. A finite HLS VOD on the HEVC-in-MPEG-TS ingest (AE#268) is covered too (AE#732): playlist, key and segment requests run over one persistent HTTP/1.1 connection per origin, reused across segments and fetched one at a time, for origins that refuse h2 or new connections but serve consecutive requests on one keep-alive connection; a new connection opens only on a server close, an origin change, or a seek that abandons a body, and the log names each connection's protocol and request count. **Names the session**: the transport is chosen at open, so a reload that changes it is refused. |
 | `autoplay` | true | False mounts paused: the load skips the terminal `play()` and settles at `.paused` for a host that resumes later. It describes THIS MOUNT and nothing after it: the rebuilds a session makes on its own (`reloadAtCurrentPosition`, an option correction, the AirPlay LAN swap, an audio-delay nudge) come back in the transport state the session is in, not in this one. Correcting it through `reloadAtCurrentPosition(applying:)` therefore does nothing (the log names it as not applied rather than as applied, AE#464 round 3, and the call returns it as `sessionOwned` with `rebuilt` false rather than spending a teardown on it, AE#464 round 4); call `play()` or `pause()` instead. |
 
 ## Value types
@@ -1168,7 +1256,7 @@ All flags default to safe values; the table is the full set. Depth for the media
 
 Public for the CLI, the test suite, or a diagnostic overlay, and outside the shape this reference documents. They stay source-compatible under semver like everything else, but nothing here should carry playback logic:
 
-- **Test hooks**: `setForceSoftwarePathForTesting`, `setSourceThrottleKbpsForTesting`, `setSoftwareBackgroundAudioOnlyForTesting`, `softwareVideoFramesEnqueuedForTesting`, `setLargeAllocationCensusEnabled`, `forceStalledConsumerReloadForTesting`, `stallRendererClockForTesting`, `rendererClockRateForTesting`.
+- **Test hooks**: `setForceSoftwarePathForTesting`, `setSourceThrottleKbpsForTesting`, `setSoftwareBackgroundAudioOnlyForTesting`, `softwareVideoFramesEnqueuedForTesting`, `invalidateSoftwareVideoSessionForTesting`, `setLargeAllocationCensusEnabled`, `forceStalledConsumerReloadForTesting`, `stallRendererClockForTesting`, `rendererClockRateForTesting`.
 - **`playbackBackend`**: the internal rendering backend, exposed read-only for overlays. Hosts must not branch on it; `videoRoute` is the surface that answers the same question honestly.
 - **`HLSVideoEngine`** and its `DiagnosticStats`: the loopback session's own machinery, public because `aetherctl` drives it directly.
 - **`DiscInspector` / `DiscInspection`**, `DoviRpuConverter` and its probe, `AudioTapProbe`, `SoftwareDecodeProbeResult`, `A53SEIParser`: repro and inspection surfaces behind `aetherctl` subcommands.

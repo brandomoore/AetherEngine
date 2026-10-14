@@ -79,7 +79,11 @@ enum DVDIFOParser {
     /// Byte offset of the title set's main program chain: the longest PGC across the VTS_PGCIT search
     /// pointers. nil when the bytes are not a recognizable VTSI or the PGCIT is malformed. Shared, so the
     /// duration, the chapters and the stream-language tables all describe the same chain.
-    private static func mainPGCOffset(_ data: [UInt8]) -> Int? {
+    private static func mainPGCOffset(_ data: [UInt8]) -> Int? { mainPGC(data)?.offset }
+
+    /// The main program chain's byte offset and its index among the VTS_PGCIT search pointers, which is
+    /// also its index in the time map table (VTS_TMAPT).
+    private static func mainPGC(_ data: [UInt8]) -> (offset: Int, index: Int)? {
         guard data.count >= vtsPgcitPointerOffset + 4,
               Array(data[0..<12]) == vtsMagic else { return nil }
         let pgcitSector = be32(data, vtsPgcitPointerOffset)
@@ -89,6 +93,7 @@ enum DVDIFOParser {
         let nrSrp = be16(data, pgcitBase)
         guard nrSrp > 0 else { return nil }
         var bestOffset = -1
+        var bestIndex = -1
         var bestTicks: UInt64 = 0
         for i in 0..<nrSrp {
             let srp = pgcitBase + 8 + i * 8
@@ -96,9 +101,58 @@ enum DVDIFOParser {
             let pgcOffset = pgcitBase + be32(data, srp + 4)
             guard pgcOffset >= 0, pgcOffset + pgcHeaderLength <= data.count else { continue }
             let ticks = dvdTimeTicks(data, pgcOffset + pgcPlaybackTimeOffset)
-            if bestOffset < 0 || ticks > bestTicks { bestOffset = pgcOffset; bestTicks = ticks }
+            if bestOffset < 0 || ticks > bestTicks { bestOffset = pgcOffset; bestIndex = i; bestTicks = ticks }
         }
-        return bestOffset >= 0 ? bestOffset : nil
+        return bestOffset >= 0 ? (bestOffset, bestIndex) : nil
+    }
+
+    // MARK: - Main PGC cells and time map (cell-folded timeline, byte seeks)
+
+    /// One cell of the main program chain: its first and last sector in the title VOBs (VTSTT_VOBS,
+    /// numbered from the start of VTS_NN_1.VOB), its playback time, and whether it sits in an angle block.
+    struct Cell: Sendable, Equatable {
+        let firstSector: Int
+        let lastSector: Int
+        let durationSec: Double
+        let inAngleBlock: Bool
+    }
+
+    /// The VTS_TMAPT sector pointer in the VTSI.
+    private static let vtsTmaptiPointerOffset = 0xD4
+
+    /// The main PGC's cells in playback order; nil when the IFO is not readable that far.
+    static func parseMainPGCCells(_ data: [UInt8]) -> [Cell]? {
+        guard let pgc = mainPGC(data) else { return nil }
+        let nrCells = Int(data[pgc.offset + pgcNrCellsOffset])
+        guard nrCells > 0 else { return nil }
+        let cellTable = pgc.offset + be16(data, pgc.offset + pgcCellPlaybackOffsetField)
+        guard cellTable + nrCells * cellPlaybackEntrySize <= data.count else { return nil }
+        return (0..<nrCells).map { c in
+            let e = cellTable + c * cellPlaybackEntrySize
+            // Byte 0: block mode (top 2 bits), then block type (next 2 bits; 1 = angle block).
+            let blockType = (Int(data[e]) >> 4) & 0x3
+            return Cell(firstSector: be32(data, e + 8), lastSector: be32(data, e + 20),
+                        durationSec: dvdTimeSeconds(data, e + pgcPlaybackTimeOffset), inAngleBlock: blockType == 1)
+        }
+    }
+
+    /// The main PGC's time map (VTS_TMAPT): entry i is the first sector, in VTSTT_VOBS, of the VOBU playing
+    /// at title time (i + 1) x `unitSec`. A disc does not have to carry one; nil then.
+    static func parseMainTimeMap(_ data: [UInt8]) -> (unitSec: Double, sectors: [Int])? {
+        guard let pgc = mainPGC(data), data.count >= vtsTmaptiPointerOffset + 4 else { return nil }
+        let tmaptiSector = be32(data, vtsTmaptiPointerOffset)
+        guard tmaptiSector > 0 else { return nil }
+        let base = tmaptiSector * sectorSize
+        guard base + 8 <= data.count else { return nil }
+        let count = be16(data, base)
+        guard pgc.index < count, base + 8 + (pgc.index + 1) * 4 <= data.count else { return nil }
+        let tmap = base + be32(data, base + 8 + pgc.index * 4)
+        guard tmap + 4 <= data.count else { return nil }
+        let unit = Int(data[tmap])
+        let entries = be16(data, tmap + 2)
+        guard unit > 0, entries > 0, tmap + 4 + entries * 4 <= data.count else { return nil }
+        // The top bit flags a discontinuity; the other 31 are the sector.
+        return (Double(unit), (0..<entries).map { be32(data, tmap + 4 + $0 * 4) & 0x7FFF_FFFF })
     }
 
     /// Title-relative chapter starts from a PGC's program map + cumulative cell playback times. A chapter

@@ -42,9 +42,13 @@ enum MasterFallbackDecision {
     ///
     /// AE#667: nor while a display mode switch is in progress. AVPlayer answers for the mode the panel is
     /// in at that moment, which mid-switch is the one it is leaving, so the refusal is about the moment.
-    static func shouldLatchPanelRefusal(code: Int, displayEligibleForHDRNow: Bool,
+    ///
+    /// AE#535 (2026-10-11): nor when the refused master advertised `VIDEO-RANGE=SDR`. A refusal of an SDR
+    /// master says nothing about HDR presentation, yet it latched the HDR route for every later title
+    /// (cmcpherson274, two SDR titles' -11848 refusals at 7.15.1 and 7.17.1).
+    static func shouldLatchPanelRefusal(code: Int, servedMasterIsHDR: Bool, displayEligibleForHDRNow: Bool,
                                         displaySwitchInProgress: Bool) -> Bool {
-        isDisplayRejectionCode(code) && displayEligibleForHDRNow && !displaySwitchInProgress
+        isDisplayRejectionCode(code) && servedMasterIsHDR && displayEligibleForHDRNow && !displaySwitchInProgress
     }
 
     /// Any code that means "AVPlayer rejected the served master itself": the display-rejection pair

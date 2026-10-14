@@ -410,6 +410,22 @@ public struct LoadOptions: Sendable, Equatable {
     /// Extra HTTP headers for HEAD probe, Range chunks, side-demuxer fetches. On the loopback paths they are NOT forwarded to AVPlayer (it hits the local server); on `nativeRemoteHLS` they ride into the AVURLAsset so header-enforcing origins (IPTV Referer / User-Agent / Authorization) work (#119). Forwarded to `selectSidecarSubtitle` by default; pass explicit headers to override (#32). Default empty.
     public var httpHeaders: [String: String]
 
+    /// Opt-in decoded-frame diagnostics for SDR native loopback playback. Default off.
+    /// Samples an additional AVPlayerItemVideoOutput; reports output gaps, not physical display
+    /// freezes. Disabled during seek/pause, external playback and mobile background activity.
+    public var nativeVideoFrameDiagnostics: Bool = false
+
+    /// Opt-in bounded repair of stalled SDR decoded output on native loopback playback.
+    /// Enables frame observation independently of diagnostics. Default off; short gaps,
+    /// unavailable output, PiP, background, external playback, pause and seeks never repair.
+    public var nativeVideoFrameRecovery: Bool = false
+
+    /// The host owns the retry after a verified live replay exhausts in-engine recovery: the engine
+    /// publishes `liveSourceReplayExhausted` and waits for `retryLiveSourceRecovery()`. Default off,
+    /// where that exhaustion publishes `liveSourceReset` like any other source loss, so a host that
+    /// only knows that event still retunes instead of holding the last frame.
+    public var hostRetriesExhaustedLiveReplay: Bool = false
+
     /// Diagnostic lever: force dvh1 codec tags + master playlist regardless of display capability. OFF by default: non-DV displays route DV through the media playlist (no master) so AVPlayer auto-tonemaps the HEVC base layer (only path that avoids AVFoundationErrorDomain -11868 on tvOS 26). AetherEngine#4.
     public var keepDvh1TagWithoutDV: Bool
 
@@ -425,8 +441,8 @@ public struct LoadOptions: Sendable, Equatable {
     /// the profile field means, and a tvOS build that reads the base layer's colorimetry from the profile
     /// rather than the RPU would render IPT out of YCbCr (the green/violet cast of AE#4 and AE#176).
     ///
-    /// Ignored when the display does support Dolby Vision, and applies to HEVC Profile 8.1 only. Reported by
-    /// DrHurt against a Samsung HDR10 panel.
+    /// Ignored when the display does support Dolby Vision, and applies to HEVC Profile 8.1 and to Profile 7,
+    /// which is served as the Profile 8.1 it is converted to. Reported by DrHurt against a Samsung HDR10 panel.
     public var forceDolbyVisionOnNonDVDisplay: Bool
 
     /// A `DolbyVisionHandling`. Default `.automatic`. `.baseLayerOnly` presents the HDR10 / HLG base layer
@@ -522,9 +538,10 @@ public struct LoadOptions: Sendable, Equatable {
     /// - `.lossless`: FLAC up to 7.1. Needs a sink that accepts multichannel LPCM (Denon / Marantz / NAD AVRs); stereo-only routes silently downmix.
     public var audioBridgeMode: AudioBridgeMode
 
-    /// TrueHD Atmos delivery (#731). `.off` (default) keeps `audioBridgeMode`'s 7.1 channel decode;
-    /// `.apac(layout)` renders the Atmos objects into `layout` and delivers Apple Positional Audio,
-    /// which reaches an Atmos receiver as Dolby MAT with its heights. See `ObjectAudioRendering`.
+    /// TrueHD Atmos and DTS:X delivery (#731). `.off` (default) keeps `audioBridgeMode`'s 7.1 channel
+    /// decode; `.apac(layout)` renders the objects and heights into `layout` and delivers Apple
+    /// Positional Audio, which reaches an Atmos receiver as Dolby MAT with its heights. See
+    /// `ObjectAudioRendering`.
     public var objectAudioRendering: ObjectAudioRendering
 
     /// Treat the source as a live stream. `seek(to:)` becomes a no-op; `isLive` surface reflects this for host UIs. Set explicitly: auto-detection from `probe.durationSeconds == 0` is too noisy (VOD MKVs with broken duration headers). Default `false`.
@@ -757,6 +774,14 @@ public struct LoadOptions: Sendable, Equatable {
     /// transport: they park deliberately for minutes, which is the one shape a held connection
     /// must not take.
     ///
+    /// AE#732: it also covers a finite HLS VOD that takes the AE#268 ingest (HEVC in MPEG-TS). Its
+    /// playlist, key and segment requests then run over one persistent HTTP/1.1 connection per
+    /// origin, reused across segment boundaries, one segment at a time instead of four in parallel,
+    /// for origins that refuse h2 or a freshly opened connection but serve consecutive requests on
+    /// one keep-alive connection. The connection is replaced only when the origin closes it, the
+    /// origin changes, or a seek abandons a body mid-transfer; each open and close is logged with
+    /// its protocol and request count. Other HLS routes keep their transport.
+    ///
     /// Names the session rather than tuning it: the transport is chosen when the source is opened,
     /// so a reload cannot change it. Default false, which is every reader shipped so far.
     public var heldSourceConnection: Bool = false
@@ -964,7 +989,10 @@ public struct LoadOptions: Sendable, Equatable {
         deinterlaceFieldRate: DeinterlaceFieldRate = .field,
         preferredDecodePath: DecodePath = .automatic,
         escalatesToSoftwarePath: Bool = true,
-        sharedOutputRole: SharedOutputRole = .primary
+        sharedOutputRole: SharedOutputRole = .primary,
+        nativeVideoFrameDiagnostics: Bool = false,
+        nativeVideoFrameRecovery: Bool = false,
+        hostRetriesExhaustedLiveReplay: Bool = false
     ) {
         self.omitCriteriaColorExtensions = omitCriteriaColorExtensions
         self.suppressDisplayCriteria = suppressDisplayCriteria
@@ -1015,6 +1043,9 @@ public struct LoadOptions: Sendable, Equatable {
         self.preferredDecodePath = preferredDecodePath
         self.escalatesToSoftwarePath = escalatesToSoftwarePath
         self.sharedOutputRole = sharedOutputRole
+        self.nativeVideoFrameRecovery = nativeVideoFrameRecovery
+        self.nativeVideoFrameDiagnostics = nativeVideoFrameDiagnostics
+        self.hostRetriesExhaustedLiveReplay = hostRetriesExhaustedLiveReplay
     }
 }
 
@@ -1029,8 +1060,9 @@ public enum VideoFormat: Sendable, Equatable {
 
 /// A Dolby Vision profile rewrite the engine applies to the served stream (`AetherEngine.dolbyVisionConversion`).
 public enum DolbyVisionConversion: Sendable, Equatable {
-    /// Dual-layer Profile 7 rewritten per packet to single-layer Profile 8.1 for a display presenting Dolby
-    /// Vision. The enhancement layer is discarded: a MEL carries next to nothing, a FEL loses its refinement.
+    /// Dual-layer Profile 7 rewritten per packet to single-layer Profile 8.1, on every display (a display
+    /// without Dolby Vision gets the RPU-driven tone map a Profile 8.1 gets). The enhancement layer is
+    /// discarded: a MEL carries next to nothing, a FEL loses its refinement.
     case profile7ToProfile81
 }
 

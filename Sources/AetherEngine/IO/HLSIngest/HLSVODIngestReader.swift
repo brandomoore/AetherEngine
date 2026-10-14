@@ -29,6 +29,12 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
     private let httpHeaders: [String: String]
     private let session: URLSession
     private let ownsSession: Bool
+    /// AE#732: set under `LoadOptions.heldSourceConnection`. Every request of this reader then goes over
+    /// one persistent HTTP/1.1 connection per origin, segments one at a time, instead of `session`.
+    private let transport: PersistentHTTP1Transport?
+    /// AE#732: the first segment, downloaded whole by the carriage probe on the persistent path (a probe
+    /// that stopped mid-body would cost the connection), handed to the producer that starts there.
+    private var primedSegment: (url: URL, bytes: Data)?
     private let condition = NSCondition()
     private let keyCacheLock = NSLock()
     private var keyCache: [String: Data] = [:]
@@ -51,10 +57,12 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
     init(
         playlistURL: URL,
         httpHeaders: [String: String],
-        session: URLSession? = nil
+        session: URLSession? = nil,
+        persistentHTTP1: Bool = false
     ) {
         self.playlistURL = playlistURL
         self.httpHeaders = httpHeaders
+        transport = persistentHTTP1 ? PersistentHTTP1Transport(label: "vod") : nil
         if let session {
             self.session = session
             ownsSession = false
@@ -77,12 +85,14 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
     static func makeIfHEVCMPEGTS(
         playlistURL: URL,
         httpHeaders: [String: String],
-        session: URLSession? = nil
+        session: URLSession? = nil,
+        persistentHTTP1: Bool = false
     ) async throws -> HLSVODIngestReader? {
         let reader = HLSVODIngestReader(
             playlistURL: playlistURL,
             httpHeaders: httpHeaders,
-            session: session
+            session: session,
+            persistentHTTP1: persistentHTTP1
         )
         var accepted = false
         defer {
@@ -98,7 +108,7 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
                   ) else {
                 return nil
             }
-            guard try await reader.probeCarriage(segmentURL) == .hevcInMPEGTS else {
+            guard try await reader.probeCarriage(segmentURL, duration: first.duration) == .hevcInMPEGTS else {
                 return nil
             }
             reader.condition.withLock {
@@ -272,6 +282,7 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         condition.broadcast()
         condition.unlock()
         task?.cancel()
+        transport?.close()
         if ownsSession {
             session.invalidateAndCancel()
         }
@@ -376,6 +387,11 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
             return (segment, url)
         }
 
+        if transport != nil {
+            try await ingestSequentially(resolvedSegments, mediaURL: mediaURL, generation: generation)
+            return
+        }
+
         try await withThrowingTaskGroup(of: (Int, Data).self) { group in
             var nextToSpawn = 0
             var nextToCommit = 0
@@ -422,6 +438,36 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
                     }
                 }
             }
+        }
+    }
+
+    /// AE#732: one segment at a time, so the persistent connection carries them back to back. The FIFO
+    /// is the read-ahead; a parallel window would need a connection per in-flight segment, and a second
+    /// connection is what the origins this path exists for refuse.
+    private func ingestSequentially(
+        _ segments: [(HLSMediaSegment, URL)],
+        mediaURL: URL,
+        generation: UInt64
+    ) async throws {
+        let primed = condition.withLock { () -> (url: URL, bytes: Data)? in
+            defer { primedSegment = nil }
+            return primedSegment
+        }
+        for (offset, (segment, url)) in segments.enumerated() {
+            try Task.checkCancellation()
+            var bytes: Data
+            if offset == 0, let primed, primed.url == url {
+                bytes = primed.bytes
+            } else {
+                bytes = try await fetch(url, limit: BoundedFetch.segmentLimit(forDuration: segment.duration))
+            }
+            if let crypt = segment.crypt {
+                bytes = try await decrypt(bytes, crypt: crypt, baseURL: mediaURL)
+            }
+            if offset == 0, LiveSegmentFormat.classify(bytes) != .mpegts {
+                throw HLSIngestError.unsupportedSegmentFormat
+            }
+            guard append(bytes, generation: generation) else { return }
         }
     }
 
@@ -514,16 +560,30 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
     /// Credentials only where the host's playlist is (audit NET-7).
     func makeRequest(_ url: URL) -> URLRequest {
         var request = URLRequest(url: url)
-        for (field, value) in RedirectHeaderPolicy.scoped(
-            httpHeaders, grantedFor: playlistURL, sentTo: url) {
+        for (field, value) in scopedHeaders(url) {
             request.setValue(value, forHTTPHeaderField: field)
         }
         return request
     }
 
+    private func scopedHeaders(_ url: URL) -> [String: String] {
+        RedirectHeaderPolicy.scoped(httpHeaders, grantedFor: playlistURL, sentTo: url)
+    }
+
     private func fetchPlaylist(_ url: URL) async throws -> (HLSPlaylist, URL) {
-        let (data, response) = try await BoundedPlaylistFetch.data(
-            for: makeRequest(url), session: session, limit: Self.maximumPlaylistBytes)
+        let data: Data
+        let response: URLResponse
+        if let transport {
+            do {
+                let answer = try await transport.get(url, headers: scopedHeaders(url), limit: Self.maximumPlaylistBytes)
+                (data, response) = (answer.body, answer.response)
+            } catch let error as BoundedFetch.Exceeded {
+                throw HLSIngestError.playlistInvalid(reason: "playlist exceeds \(error.limit) bytes")
+            }
+        } else {
+            (data, response) = try await BoundedPlaylistFetch.data(
+                for: makeRequest(url), session: session, limit: Self.maximumPlaylistBytes)
+        }
         let status = (response as? HTTPURLResponse)?.statusCode ?? -1
         guard (200..<300).contains(status) else {
             throw HLSIngestError.playlistUnreachable(status: status)
@@ -539,7 +599,12 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         let data: Data
         let response: URLResponse
         do {
-            (data, response) = try await BoundedFetch.data(for: makeRequest(url), session: session, limit: limit)
+            if let transport {
+                let answer = try await transport.get(url, headers: scopedHeaders(url), limit: limit)
+                (data, response) = (answer.body, answer.response)
+            } else {
+                (data, response) = try await BoundedFetch.data(for: makeRequest(url), session: session, limit: limit)
+            }
         } catch is BoundedFetch.Exceeded {
             throw HLSIngestError.playlistInvalid(reason: "body exceeds \(limit) bytes")
         }
@@ -552,8 +617,19 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
 
     /// Reads the head of the first segment and classifies its carriage (AE#293 shares this read with the
     /// live probe, so both paths judge a source the same way).
-    private func probeCarriage(_ url: URL) async throws -> MPEGTransportStreamCodecProbe.Verdict {
-        try await HLSCarriageProbe.classifySegmentHead(
+    private func probeCarriage(
+        _ url: URL, duration: Double
+    ) async throws -> MPEGTransportStreamCodecProbe.Verdict {
+        if transport != nil {
+            let bytes = try await fetch(url, limit: BoundedFetch.segmentLimit(forDuration: duration))
+            let verdict = MPEGTransportStreamCodecProbe.classify(
+                bytes.prefix(HLSCarriageProbe.maximumSegmentHeadBytes))
+            if verdict == .hevcInMPEGTS {
+                condition.withLock { primedSegment = (url, bytes) }
+            }
+            return verdict
+        }
+        return try await HLSCarriageProbe.classifySegmentHead(
             url: url,
             httpHeaders: RedirectHeaderPolicy.scoped(httpHeaders, grantedFor: playlistURL, sentTo: url),
             session: session

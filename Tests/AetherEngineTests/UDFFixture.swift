@@ -84,7 +84,11 @@ enum UDFFixture {
     /// the physical partition AFTER the metadata region.
     /// `m2tsViaAED`: place the m2ts EFE's second extent behind a type-3 allocation-extent
     /// continuation (an AED at vblock 13) instead of inline, to exercise AED chaining.
-    static func make(mplsBytes: [UInt8], m2tsBytes: [UInt8], m2tsViaAED: Bool = false) -> Data {
+    /// `clpiBytes`: add `BDMV/CLIPINF/00001.clpi` (vblocks 14-17, one sector of data). A CLPI fixture
+    /// carries a real stream whose EP map points into it, so the m2ts is then written whole rather than
+    /// a sector per extent; each half has to fit the 10 blocks between the two extents.
+    static func make(mplsBytes: [UInt8], m2tsBytes: [UInt8], m2tsViaAED: Bool = false,
+                     clpiBytes: [UInt8]? = nil) -> Data {
         let partStart = 270
         // metadata partition extent = physical blocks 2.. of partition 0.
         // virtual block V -> physical sector partStart + 2 + V.
@@ -104,8 +108,14 @@ enum UDFFixture {
         let half = m2tsBytes.count / 2
         let m2tsExt1 = Array(m2tsBytes[0..<half])
         let m2tsExt2 = Array(m2tsBytes[half...])
-        put(padTo(m2tsExt1, ss * 4), atSector: partStart + frag1Block)
-        put(padTo(m2tsExt2, ss * 4), atSector: partStart + frag2Block)
+        if clpiBytes != nil {
+            precondition(m2tsExt2.count <= 10 * ss, "a whole-stream fixture half must fit 10 blocks")
+            for (i, v) in m2tsExt1.enumerated() { image[(partStart + frag1Block) * ss + i] = v }
+            for (i, v) in m2tsExt2.enumerated() { image[(partStart + frag2Block) * ss + i] = v }
+        } else {
+            put(padTo(m2tsExt1, ss * 4), atSector: partStart + frag1Block)
+            put(padTo(m2tsExt2, ss * 4), atSector: partStart + frag2Block)
+        }
 
         // mpls data (virtual block 11)
         putV(padTo(mplsBytes, ss), vblock: 11)
@@ -145,10 +155,25 @@ enum UDFFixture {
         putV(efe(location: 6, fileType: 4, partRefOfSelf: 1, adType: 1, infoLen: plData.count,
                  ads: longAD(lenBytes: ss, block: 7, partRef: 1)), vblock: 6)
 
-        // BDMV dir data (vblock 5): FIDs PLAYLIST (vblock 6) and STREAM (vblock 8)
-        let bdmvData = fid(location: 5, name: "", isDir: true, childBlock: 2, childPartRef: 1)
+        // CLIPINF dir (vblocks 14-15) and its one clpi (EFE 16, data 17), when asked for.
+        if let clpiBytes {
+            putV(padTo(clpiBytes, ss), vblock: 17)
+            putV(efe(location: 16, fileType: 5, partRefOfSelf: 1, adType: 1, infoLen: clpiBytes.count,
+                     ads: longAD(lenBytes: clpiBytes.count, block: 17, partRef: 1)), vblock: 16)
+            let clipInfoData = fid(location: 15, name: "", isDir: true, childBlock: 4, childPartRef: 1)
+                             + fid(location: 15, name: "00001.clpi", isDir: false, childBlock: 16, childPartRef: 1)
+            putV(padTo(clipInfoData, ss), vblock: 15)
+            putV(efe(location: 14, fileType: 4, partRefOfSelf: 1, adType: 1, infoLen: clipInfoData.count,
+                     ads: longAD(lenBytes: ss, block: 15, partRef: 1)), vblock: 14)
+        }
+
+        // BDMV dir data (vblock 5): FIDs PLAYLIST (vblock 6) and STREAM (vblock 8), and CLIPINF (14)
+        var bdmvData = fid(location: 5, name: "", isDir: true, childBlock: 2, childPartRef: 1)
                      + fid(location: 5, name: "PLAYLIST", isDir: true, childBlock: 6, childPartRef: 1)
                      + fid(location: 5, name: "STREAM", isDir: true, childBlock: 8, childPartRef: 1)
+        if clpiBytes != nil {
+            bdmvData += fid(location: 5, name: "CLIPINF", isDir: true, childBlock: 14, childPartRef: 1)
+        }
         putV(padTo(bdmvData, ss), vblock: 5)
         putV(efe(location: 4, fileType: 4, partRefOfSelf: 1, adType: 1, infoLen: bdmvData.count,
                  ads: longAD(lenBytes: ss, block: 5, partRef: 1)), vblock: 4)
@@ -166,6 +191,80 @@ enum UDFFixture {
         fsd[400..<416] = ArraySlice(longAD(lenBytes: ss, block: 2, partRef: 1))
         putV(fsd, vblock: 1)
 
+        writeVolume(into: &image, partStart: partStart)
+
+        return Data(image)
+    }
+
+    /// A DVD-Video image with no ISO9660 bridge: UDF only, `VIDEO_TS` holding `files` in order. Directories
+    /// live in the metadata partition as in `make`; each file's data is one run in the physical partition
+    /// from block 40, unless it is named in `fragmented`, whose two halves are recorded as runs that do not
+    /// continue each other.
+    /// metadata vblock layout: 1=FSD, 2=root EFE, 3=root data, 4=VIDEO_TS EFE, 5=VIDEO_TS data, 6+i=file EFE.
+    static func makeDVD(files: [(name: String, bytes: [UInt8])], fragmented: Set<String> = []) -> Data {
+        let partStart = 270
+        func phys(_ vblock: Int) -> Int { partStart + 2 + vblock }
+        var block = 40
+        var placed: [(name: String, ads: [UInt8], length: Int)] = []
+        var data: [(block: Int, bytes: [UInt8])] = []
+        for file in files {
+            let sectors = { (count: Int) in max(1, (count + ss - 1) / ss) }
+            if fragmented.contains(file.name) {
+                let half = (file.bytes.count / 2 / ss) * ss
+                let first = Array(file.bytes[0..<half]), second = Array(file.bytes[half...])
+                data.append((block, first))
+                let gap = block + sectors(first.count) + 1  // one block of nothing between the runs
+                data.append((gap, second))
+                placed.append((file.name, longAD(lenBytes: first.count, block: block, partRef: 0)
+                                          + longAD(lenBytes: second.count, block: gap, partRef: 0), file.bytes.count))
+                block = gap + sectors(second.count)
+            } else {
+                data.append((block, file.bytes))
+                placed.append((file.name, longAD(lenBytes: file.bytes.count, block: block, partRef: 0), file.bytes.count))
+                block += sectors(file.bytes.count)
+            }
+        }
+        var image = [UInt8](repeating: 0, count: (partStart + max(64, block + 1)) * ss)
+        func put(_ bytes: [UInt8], atSector s: Int) {
+            for (i, v) in bytes.enumerated() where i < ss { image[s*ss + i] = v }
+        }
+        func putV(_ bytes: [UInt8], vblock: Int) { put(bytes, atSector: phys(vblock)) }
+        for run in data {
+            for (i, v) in run.bytes.enumerated() { image[(partStart + run.block) * ss + i] = v }
+        }
+
+        var dirData = fid(location: 5, name: "", isDir: true, childBlock: 2, childPartRef: 1)
+        for (i, file) in placed.enumerated() {
+            putV(efe(location: 6 + i, fileType: 5, partRefOfSelf: 1, adType: 1, infoLen: file.length, ads: file.ads),
+                 vblock: 6 + i)
+            dirData += fid(location: 5, name: file.name, isDir: false, childBlock: 6 + i, childPartRef: 1)
+        }
+        precondition(dirData.count <= ss, "VIDEO_TS listing must fit one sector")
+        putV(padTo(dirData, ss), vblock: 5)
+        putV(efe(location: 4, fileType: 4, partRefOfSelf: 1, adType: 1, infoLen: dirData.count,
+                 ads: longAD(lenBytes: ss, block: 5, partRef: 1)), vblock: 4)
+
+        let rootData = fid(location: 3, name: "", isDir: true, childBlock: 2, childPartRef: 1)
+                     + fid(location: 3, name: "VIDEO_TS", isDir: true, childBlock: 4, childPartRef: 1)
+        putV(padTo(rootData, ss), vblock: 3)
+        putV(efe(location: 2, fileType: 4, partRefOfSelf: 1, adType: 1, infoLen: rootData.count,
+                 ads: longAD(lenBytes: ss, block: 3, partRef: 1)), vblock: 2)
+
+        var fsd = [UInt8](repeating: 0, count: ss)
+        tag(256, location: 1, into: &fsd)
+        fsd[400..<416] = ArraySlice(longAD(lenBytes: ss, block: 2, partRef: 1))
+        putV(fsd, vblock: 1)
+
+        writeVolume(into: &image, partStart: partStart)
+        return Data(image)
+    }
+
+    /// The volume around the metadata partition: its Metadata File, the LVD, the Partition Descriptor and
+    /// the AVDP. Shared by every image here; the metadata partition is physical blocks 2..33.
+    private static func writeVolume(into image: inout [UInt8], partStart: Int) {
+        func put(_ bytes: [UInt8], atSector s: Int) {
+            for (i, v) in bytes.enumerated() where i < ss { image[s*ss + i] = v }
+        }
         // --- Metadata File (E)FE at physical block 0 of partition 0 (sector partStart) ---
         // one extent: metadata partition = physical blocks 2.. (short_ad, partition-relative)
         let metaExtentBlocks = 32
@@ -211,8 +310,6 @@ enum UDFFixture {
         tag(2, location: 256, into: &avdp)
         avdp[16..<24] = ArraySlice(extentAD(lenBytes: 2*ss, location: 257)) // MainVDS extent
         put(avdp, atSector: 256)
-
-        return Data(image)
     }
 
     static func padTo(_ b: [UInt8], _ n: Int) -> [UInt8] {

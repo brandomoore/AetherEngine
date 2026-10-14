@@ -13,7 +13,7 @@ extension HLSVideoEngine {
         case profile5          // HEVC P5  (IPT-PQ-c2, no base)     → dvh1 + PQ
         case profile81         // HEVC P8.1 with HDR10-compat base  → dvh1 + PQ  (on DV display)
         case profile84         // HEVC P8.4 with HLG-compat base    → hvc1 + HLG + SUPPLEMENTAL dvh1/db4h
-        case profile7          // HEVC P7 dual-layer (BL = HDR10)   → hvc1 + PQ (BL only)
+        case profile7          // HEVC P7 dual-layer (BL = HDR10)   → RPU converted to 8.1, EL dropped, routed as P8.1
         case profile82         // HEVC P8.2 with SDR-compat base    → play Rec.709 base as plain hvc1
         case av1Profile10      // AV1 P10.0 (no base)               → dav1 + PQ
         case av1Profile101     // AV1 P10.1 with HDR10-compat base  → av01 + PQ + SUPPLEMENTAL dav1
@@ -97,7 +97,7 @@ extension HLSVideoEngine {
         /// What the muxer does with the source dvcC on the way into init.mp4.
         /// See `MP4SegmentMuxer.DoviConfigPolicy`.
         let doviConfig: MP4SegmentMuxer.DoviConfigPolicy
-        /// Per-packet RPU rewrite P7 -> P8.1 via DoviRpuConverter; true only for P7 on a DV panel.
+        /// Per-packet RPU rewrite P7 -> P8.1 via DoviRpuConverter; true for every P7 not served as its base layer.
         let convertP7ToProfile81: Bool
         let dvVariant: DVVariant
 
@@ -651,25 +651,44 @@ extension HLSVideoEngine {
                 dvVariant: dvVariant
             )
         case .profile7:
-            // P7 dual-layer (UHD-BD). DV panel: convert RPU P7->P8.1 per-packet (DoviRpuConverter),
-            // drop EL, rewrite container dvcC to P8.1, route as hvc1 + SUPPLEMENTAL dvh1.08.XX/db1p.
-            // Non-DV panel: no Apple P7 decoder; strip dvcC, play PQ HEVC HDR10 base.
-            let supplemental: String?
-            let doviConfig: MP4SegmentMuxer.DoviConfigPolicy
-            if effectiveDvMode {
-                supplemental = "dvh1.08.\(dvLevelStr)/db1p"
-                doviConfig = .rewriteToProfile81
-            } else {
-                supplemental = nil
-                doviConfig = .strip
+            // P7 dual-layer (UHD-BD): convert the RPU P7 -> P8.1 per packet (DoviRpuConverter, libdovi
+            // mode 2), drop the EL, rewrite the container dvcC to P8.1, and from there on serve exactly
+            // what a P8.1 source is served, on every display. The way mpv treats Profile 7 without an EL
+            // decoder: base layer plus RPU, never the bare base layer.
+            //
+            // The non-DV branch used to strip the record and skip the conversion, playing the HDR10 base
+            // with its static metadata only. That was the P8.1 non-DV route of the same era (tvOS 26.0
+            // -11868), and P8.1 dropped the strip once it stopped reproducing on 26.6 (see that branch):
+            // the kept dvvC is what makes AVPlayer tone-map from the RPU on a panel without DV, the
+            // SUPPLEMENTAL is inert there. A converted P7 is a P8.1 bitstream, so the reasoning carries
+            // over unchanged; leaving P7 behind cost every P7 source its RPU on HDR10 / SDR panels, on
+            // every Mac (no per-mode table, so `effectiveDvMode` is false unless the host asserts DV),
+            // and shipped the EL NAL units (up to a FEL's bitrate) into segments that nothing decodes.
+            // AE#455 applies to the converted stream the way it applies to a native P8.1.
+            if !effectiveDvMode && forceDolbyVisionOnNonDVDisplay {
+                EngineLog.emit(
+                    "[HLSVideoEngine] AE#455: serving HEVC DV Profile 7 (converted to 8.1) as Profile 5 "
+                    + "(dvh1 sample entry, dvcC profile=5 compat=0, CODECS=dvh1.05.\(dvLevelStr)) "
+                    + "so AVPlayer composes the RPU on a display without Dolby Vision",
+                    category: .session
+                )
+                return CodecRoute(
+                    codecTagOverride: "dvh1",
+                    videoRange: .pq,
+                    primaryCodecs: "dvh1.05.\(dvLevelStr)",
+                    supplementalCodecs: nil,
+                    doviConfig: .rewriteToProfile5,
+                    convertP7ToProfile81: true,
+                    dvVariant: dvVariant
+                )
             }
             return CodecRoute(
                 codecTagOverride: "hvc1",
                 videoRange: .pq,
                 primaryCodecs: plainHEVCCodecs(codecpar: codecpar, fallbackLevel: hevcLevel),
-                supplementalCodecs: supplemental,
-                doviConfig: doviConfig,
-                convertP7ToProfile81: effectiveDvMode,
+                supplementalCodecs: "dvh1.08.\(dvLevelStr)/db1p",
+                doviConfig: .rewriteToProfile81,
+                convertP7ToProfile81: true,
                 dvVariant: dvVariant
             )
         case .unknown:
