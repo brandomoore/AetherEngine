@@ -10,7 +10,13 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- Correct accumulating AAC-LC audio drift on the native HLS path when an MP4
+  sample table runs on a different clock from the decoded samples. Only tracks
+  with demonstrated drift use timestamp-aware audio bridging; ordinary AAC and
+  rounding-only jitter keep stream-copy. Includes restart and EOF handling.
+  Reported in [brandomoore/Plozz#89](https://github.com/brandomoore/Plozz/issues/89).
 
 ## [7.34.1] - 2026-10-11
 

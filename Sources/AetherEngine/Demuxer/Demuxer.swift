@@ -1787,6 +1787,16 @@ public final class Demuxer: @unchecked Sendable {
         }
     }
 
+    func aacTimelineRequiresCorrection(streamIndex: Int32) -> Bool {
+        accessLock.lock()
+        defer { accessLock.unlock() }
+        guard let ctx = formatContext, let name = ctx.pointee.iformat?.pointee.name,
+              String(cString: name).split(separator: ",").contains("mov"),
+              streamIndex >= 0, streamIndex < Int32(ctx.pointee.nb_streams),
+              let stream = ctx.pointee.streams[Int(streamIndex)] else { return false }
+        return AACSampleTimeline.requiresCorrection(stream: stream)
+    }
+
     /// Keyframe timestamps in stream native timebase from libavformat's index.
     /// MKV populates from Cues lazily on first seek (cue-prewarm in
     /// HLSVideoEngine.start() ensures it's ready). MP4 stss / MPEG-TS populate

@@ -164,6 +164,7 @@ extension HLSVideoEngine {
     /// lacks the `dec3` extradata the mp4 muxer needs to write the audio sample-entry.
     func buildProducerWithAudioCascade(
         preferBridge: Bool,
+        correctAACTimeline: Bool = false,
         streamCopyAudio: HLSSegmentProducer.AudioConfig?,
         sourceAudioStreamIndex: Int32,
         sourceAudioStream: UnsafeMutablePointer<AVStream>?,
@@ -313,7 +314,8 @@ extension HLSVideoEngine {
                         mode: audioBridgeMode,
                         // The first attempt lets the bridge resolve, so a container that under-reports its
                         // channel count still gets the decoder-resolved answer; only the retry is forced.
-                        forcedEncoder: attemptIndex == 0 ? nil : encoderAttempt
+                        forcedEncoder: attemptIndex == 0 ? nil : encoderAttempt,
+                        correctSourceTimeline: correctAACTimeline
                     )
                 } catch AudioBridge.AudioBridgeError.encoderNotFound(let missing) where !isLastAttempt {
                     EngineLog.emit(
@@ -361,6 +363,7 @@ extension HLSVideoEngine {
                     let isEAC3Out = bridge.outputCodecID == AV_CODEC_ID_EAC3
                     let hlsCodec = isEAC3Out ? "ec-3" : "fLaC"
                     let pipelineLabel = "\(sourceCodecLabel) → \(isEAC3Out ? "EAC3" : "FLAC") bridge"
+                        + (correctAACTimeline ? " (timestamp correction)" : "")
                     audioHLSCodecs = hlsCodec
                     self.audioPipelineDescription = pipelineLabel
                     self.audioDelivery = .bridged

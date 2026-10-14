@@ -242,6 +242,18 @@ The label can also be taken back from the item itself, where the platform has no
 | Bridged (`AudioBridge`) | TrueHD, MLP, DTS, DTS-HD MA, MP3, MP2, Opus, Vorbis, PCM (raw shapes plus G.711 A-law / mu-law), WMA (Standard, Pro, Lossless, Voice), and the Flash tail Nellymoser Asao / ADPCM-SWF / Speex: decoded to PCM and re-encoded |
 | Surround | 5.1 / 7.1 with correct `AudioChannelLayout` preserved through the wrapper |
 
+AAC-LC in indexed MP4 VOD also bridges when the container timestamps demonstrably
+drift from its decoded sample clock. Detection reads the existing audio sample
+index, without fetching extra media, and excludes sparse indexes, discontinuities,
+unknown frame lengths, live inputs and non-MP4 containers. Ordinary AAC and
+nonaccumulating timestamp jitter still stream-copy. The corrected bridge resamples
+against decoded-frame timestamps, resets on seeks and drains its resampler at EOF;
+it does not change video timing or Match Frame Rate. Stereo uses FLAC, so the timing
+correction adds no lossy encoding generation; the resampling itself changes PCM.
+Surround retains the configured bridge mode below. Diagnostics identify this path
+as a bridge with `timestamp correction`. See
+[brandomoore/Plozz#89](https://github.com/brandomoore/Plozz/issues/89).
+
 Non-streamable codecs route through `AudioBridge` in one of two modes (`LoadOptions.audioBridgeMode`):
 
 - **`.surroundCompat`** (default): the encoder is chosen per source, not per mode. A source with more than two channels is re-encoded to lossy EAC3 at 128 kbps per channel (768 kbps 5.1). AVPlayer hands the encoded bitstream to HDMI and the sink decodes its own 5.1 mix, so surround works on essentially every modern AVR and soundbar (Sonos Arc, Samsung HW-Q, Bose). Two channels or fewer have no surround to carry and take the FLAC encoder instead, which is lossless where EAC3 would have been 256 kbps lossy, and LPCM the route decodes on the routes that can only pass a Dolby bitstream through (AE#395: an AirPlay 2 optical adapter played one MPEG-TS program's stream-copied AC3 5.1 and was silent on the bridged EAC3 stereo of the same program, so which track `av_find_best_stream` happened to pick decided whether the viewer heard anything).

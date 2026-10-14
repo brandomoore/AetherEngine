@@ -129,6 +129,8 @@ final class AudioBridge: @unchecked Sendable {
         case codecparAllocFailed
         case resamplerAllocFailed(code: Int32)
         case resamplerInitFailed(code: Int32)
+        case resamplerTimestampOverflow
+        case resamplerDrainFailed(reason: String)
         case sendPacketFailed(code: Int32)
         case sendFrameFailed(code: Int32)
 
@@ -146,6 +148,8 @@ final class AudioBridge: @unchecked Sendable {
             case .codecparAllocFailed:           return "AudioBridge: avcodec_parameters_alloc failed"
             case .resamplerAllocFailed(let c):   return "AudioBridge: swr_alloc_set_opts2 returned \(c)"
             case .resamplerInitFailed(let c):    return "AudioBridge: swr_init returned \(c)"
+            case .resamplerTimestampOverflow:    return "AudioBridge: source timestamp exceeds the resampler clock"
+            case .resamplerDrainFailed(let r):   return "AudioBridge: resampler EOF drain failed (\(r))"
             case .sendPacketFailed(let c):       return "AudioBridge: avcodec_send_packet (decoder) returned \(c)"
             case .sendFrameFailed(let c):        return "AudioBridge: avcodec_send_frame (encoder) returned \(c)"
             }
@@ -215,6 +219,7 @@ final class AudioBridge: @unchecked Sendable {
 
     private let srcTimeBase: AVRational
     private let mode: Mode
+    private let correctSourceTimeline: Bool
     private var resampledFrame: UnsafeMutablePointer<AVFrame>?
 
     /// Encoder PTS counter in encoder time base, incremented by nb_samples/frame. FLAC demands monotonically
@@ -257,10 +262,12 @@ final class AudioBridge: @unchecked Sendable {
         srcCodecpar: UnsafeMutablePointer<AVCodecParameters>,
         srcTimeBase: AVRational,
         mode: Mode = .surroundCompat,
-        forcedEncoder: AVCodecID? = nil
+        forcedEncoder: AVCodecID? = nil,
+        correctSourceTimeline: Bool = false
     ) throws {
         self.srcTimeBase = srcTimeBase
         self.mode = mode
+        self.correctSourceTimeline = correctSourceTimeline
 
         // 1. Source decoder
         let srcCodecID = srcCodecpar.pointee.codec_id
@@ -294,6 +301,7 @@ final class AudioBridge: @unchecked Sendable {
             cleanup()
             throw AudioBridgeError.decoderParametersFailed(code: copyRet)
         }
+        if correctSourceTimeline { dec.pointee.pkt_timebase = srcTimeBase }
         // DTS-HD MA / HRA carry a lossless XLL extension on top of the mandatory DTS core. Decode the FULL
         // stream: for DTS-HD MA the dca decoder reconstructs the lossless XLL (S32P), which .lossless mode
         // re-encodes bit-perfectly to FLAC; .surroundCompat re-encodes lossy EAC3 either way. An earlier #64
@@ -468,7 +476,7 @@ final class AudioBridge: @unchecked Sendable {
             cleanup()
             throw AudioBridgeError.resamplerAllocFailed(code: swrRet)
         }
-        let initRet = swr_init(swrCtx)
+        let initRet = initializeResampler(swrCtx, outputRate: sampleRate)
         guard initRet >= 0 else {
             cleanup()
             throw AudioBridgeError.resamplerInitFailed(code: initRet)
@@ -709,6 +717,15 @@ final class AudioBridge: @unchecked Sendable {
             }
         }
 
+        if correctSourceTimeline {
+            do {
+                try drainCorrectedResampler(enc: enc, fifo: fifoPtr)
+            } catch {
+                stats.decodeErrors += 1
+                EngineLog.emit("[AudioBridge] ERROR: \(error)", category: .session)
+            }
+        }
+
         // 2. Encode the FIFO remainder, including the final partial
         //    frame (requireFull: false pads/short-frames it).
         try? drainFIFOIntoEncoder(enc: enc, fifo: fifoPtr, requireFull: false, results: &results)
@@ -884,7 +901,9 @@ final class AudioBridge: @unchecked Sendable {
                     // unsignalled priming is worth and two orders below the lip-sync threshold. It is
                     // applied on every rebase, not only near zero, so a restart mid-file inherits the
                     // same relationship instead of stepping by a padding.
-                    nextEncoderPTS = av_rescale_q(packetPts, srcTimeBase, encoderTimeBase)
+                    let anchor = correctSourceTimeline && sf.pointee.pts != Self.avNoPTS
+                        ? sf.pointee.pts : packetPts
+                    nextEncoderPTS = av_rescale_q(anchor, srcTimeBase, encoderTimeBase)
                         &+ Int64(enc.pointee.initial_padding)
                     rebaseFromNextSourcePTS = false
                 }
@@ -1017,7 +1036,8 @@ final class AudioBridge: @unchecked Sendable {
             0,
             nil
         )
-        let initRet = setRet >= 0 && scratch != nil ? swr_init(scratch) : setRet
+        let initRet = setRet >= 0 && scratch != nil
+            ? initializeResampler(scratch, outputRate: enc.pointee.sample_rate) : setRet
         guard initRet >= 0 else {
             swr_free(&scratch)
             swrReconfigureFailures += 1
@@ -1057,6 +1077,51 @@ final class AudioBridge: @unchecked Sendable {
         return true
     }
 
+    private func initializeResampler(_ context: OpaquePointer?, outputRate: Int32) -> Int32 {
+        if correctSourceTimeline {
+            let result = av_opt_set_double(
+                context.map(UnsafeMutableRawPointer.init),
+                "async", Double(outputRate) * AACSampleTimeline.maximumRateCorrection, 0)
+            guard result >= 0 else { return result }
+        }
+        return swr_init(context)
+    }
+
+    private func drainCorrectedResampler(
+        enc: UnsafeMutablePointer<AVCodecContext>, fifo: OpaquePointer
+    ) throws {
+        guard let swr = swrCtx else { return }
+        var frame = av_frame_alloc()
+        defer { av_frame_free(&frame) }
+        guard let frame else {
+            throw AudioBridgeError.resamplerDrainFailed(reason: "frame allocation")
+        }
+        frame.pointee.format = pcmSampleFmt.rawValue
+        frame.pointee.sample_rate = enc.pointee.sample_rate
+        frame.pointee.nb_samples = 2048
+        let layoutResult = av_channel_layout_copy(&frame.pointee.ch_layout, &enc.pointee.ch_layout)
+        guard layoutResult >= 0, av_frame_get_buffer(frame, 0) >= 0 else {
+            throw AudioBridgeError.resamplerDrainFailed(reason: "sample buffer allocation")
+        }
+        let planes = av_sample_fmt_is_planar(pcmSampleFmt) != 0
+            ? Int(enc.pointee.ch_layout.nb_channels) : 1
+        while true {
+            let produced = swr_convert(swr, frame.pointee.extended_data, 2048, nil, 0)
+            guard produced >= 0 else {
+                throw AudioBridgeError.resamplerDrainFailed(reason: "conversion returned \(produced)")
+            }
+            if produced == 0 { break }
+            let written = frame.pointee.extended_data.withMemoryRebound(
+                to: UnsafeMutableRawPointer?.self, capacity: planes
+            ) { av_audio_fifo_write(fifo, $0, produced) }
+            guard written == produced else {
+                throw AudioBridgeError.resamplerDrainFailed(reason: "FIFO wrote \(written) of \(produced)")
+            }
+            stats.samplesEnqueued += Int64(written)
+            stats.packetsFedSinceLastEnqueue = 0
+        }
+    }
+
     /// Resample sf (decoded source frame) to encoder format and push into the FIFO (swr_convert may produce
     /// more/fewer samples; the FIFO smooths that). Buffer layout by pcmSampleFmt: interleaved (S16/S32, FLAC mode)
     /// is one contiguous buffer in out[0]; planar (FLTP, EAC3 mode) is N pointers, one per channel. Passing a
@@ -1083,6 +1148,14 @@ final class AudioBridge: @unchecked Sendable {
         guard reconfigureSwrInputIfNeeded(forFrame: sf, enc: enc), let swr = swrCtx else {
             stats.framesDroppedBeforeFIFO += 1
             return
+        }
+
+        if correctSourceTimeline, sf.pointee.pts != Self.avNoPTS {
+            let ticks = av_rescale_q(sf.pointee.pts, srcTimeBase, encoderTimeBase)
+            let (timestamp, overflow) = ticks.multipliedReportingOverflow(by: Int64(swrInRate))
+            guard !overflow else { throw AudioBridgeError.resamplerTimestampOverflow }
+            // swr_next_pts uses 1/(inputRate * outputRate), not the encoder's sample clock.
+            _ = swr_next_pts(swr, timestamp)
         }
 
         let outNbSamples = swr_get_out_samples(swr, sf.pointee.nb_samples)
@@ -1218,4 +1291,3 @@ final class AudioBridge: @unchecked Sendable {
         }
     }
 }
-

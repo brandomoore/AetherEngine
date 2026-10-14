@@ -1810,6 +1810,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         }
         var streamCopyAudio: HLSSegmentProducer.AudioConfig?
         var bridgePreferred = false
+        let correctAACTimeline = !isLiveSession
+            && audioDem.aacTimelineRequiresCorrection(streamIndex: audioStreamIndex)
         var audioHLSCodecs: String?
         // AE#458: resolved once here so the stream-copy config and the bridge cascade below label the
         // track identically; both end up in the same fMP4 mdhd.
@@ -1851,10 +1853,12 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     frameSize: acpForHE.frame_size,
                     hasASC: hasASC
                 )
-            if compat.requiresBridge || isHEAAC {
+            if compat.requiresBridge || isHEAAC || correctAACTimeline {
                 bridgePreferred = true
                 EngineLog.emit(
-                    isHEAAC
+                    correctAACTimeline
+                        ? "[HLSVideoEngine] audio: AAC sample clock differs from MP4 timestamps; enabling timestamp-corrected bridge"
+                        : isHEAAC
                         ? "[HLSVideoEngine] audio: HE-AAC (profile=\(acpForHE.profile) frameSize=\(acpForHE.frame_size)), ADTS stream-copy would mis-signal SBR, bridging instead"
                         : "[HLSVideoEngine] audio: codec=\(compat) (bridge required), decoding + "
                           + (Self.spatialRenderingLayout(
@@ -1982,6 +1986,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let prod: HLSSegmentProducer
         prod = try buildProducerWithAudioCascade(
             preferBridge: bridgePreferred,
+            correctAACTimeline: correctAACTimeline,
             streamCopyAudio: streamCopyAudio,
             sourceAudioStreamIndex: audioStreamIndex,
             sourceAudioStream: audioStreamIndex >= 0 ? audioDem.stream(at: audioStreamIndex) : nil,
