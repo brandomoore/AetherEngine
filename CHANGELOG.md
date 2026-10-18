@@ -17,6 +17,65 @@ the public-API contract.
   with demonstrated drift use timestamp-aware audio bridging; ordinary AAC and
   rounding-only jitter keep stream-copy. Includes restart and EOF handling.
   Reported in [brandomoore/Plozz#89](https://github.com/brandomoore/Plozz/issues/89).
+
+## [7.40.0] - 2026-10-18
+
+### Changed
+
+- **TrueHD Atmos is built from the stream's own channel presentation.** With `objectAudioRendering`
+  in a `TrueHDObjectAudio` build, every output is now a share of the 7.1 (or 5.1) bed Dolby renders
+  the same mix into, split per frequency bin between floor and heights by where the objects' energy
+  lies (`BedSplitter`). No object signal is mixed into an output; the objects are decoded without
+  their matrix interpolation (LibTrueHD 3.0 no longer compiles the interpolating decode at all) and
+  taken as points at their positions, without size, snap, zones, screen anchoring, the elevation
+  switch or metadata ramps. Measured against the previous exact render through Apple's APAC decode on
+  72 windows of six films, 0.35 % of the energy lands on another speaker (median of the windows with
+  heights), Dolby's Unfold demo 3.3 %, the heights within about a dB. A 5.1 bed now covers a 7.1
+  layout's rears as well as its sides, and the split's 2048-frame latency is drained at the end of
+  input and before every encoder restart. The exact render it is measured against is only built with
+  the measurement-only `TrueHDReferenceRender` trait (#731).
+- **DTS:X plays its standard presentation only, into 7.1.4 or 9.1.6.** With LibDTSX 3.0, the heights
+  are removed from the 7.1 bed by the standard's own constant (each at -3 dB in the speaker under it)
+  instead of the gains the stream's metadata states, which is no longer read; on twelve DTS:X tracks
+  every frame stated exactly that fold, so the output is bit-identical. The alternate presentations,
+  which carry objects (some IMAX-labelled streams), are refused and play as 7.1, and DTS:X is rendered
+  only into the two layouts that carry the bed and the four heights one to one; any other layout
+  keeps the channel bridge. The object position mapping and the fold renderer are gone (#744).
+- **The documentation no longer says TrueHD Atmos objects are always lost.** The Known limitations
+  entry in `docs/formats.md`, the `AudioDelivery.bridged` reference and the channel bridge's notes
+  predate `objectAudioRendering` (#731) and said objects and heights never survive. They now say the
+  channel bridge drops them and `objectAudioRendering = .apac(layout)` keeps them, in a build with the
+  `TrueHDObjectAudio` / `DTSXObjectAudio` traits (off by default since 7.39.0), rendered into a speaker
+  bed as lossy APAC that tvOS sends to an Atmos receiver as Dolby MAT. No behaviour change (#802,
+  thanks @aravindhsampath).
+
+### Added
+
+- **`LiveTelemetry.objectAudio`: how many Atmos objects play, and how many overhead.** While
+  `objectAudioRendering` plays TrueHD Atmos or DTS:X (a build with the `TrueHDObjectAudio` /
+  `DTSXObjectAudio` traits; without them it stays nil), the 1 Hz snapshot carries an
+  `ObjectAudioActivity`: the bed it renders into, the objects the presentation declares, how many of
+  them play and how many sit above ear level, and its bed channels on height speakers (DTS:X's standard
+  heights). These are the counts the `bed levels` log line has carried since #731, for a host's stats
+  panel without reading the log; they sit behind a lock of their own, so the sampler never waits for a
+  decode. `aetherctl play` takes `--atmos-bed` as `serve` does and prints them: on a TrueHD Atmos
+  remux, `obj=13/13 up=4 bed=7.1.4`.
+
+### Fixed
+
+- **The persistent HTTP/1.1 ingest holds the next segment request whenever the buffer is full.**
+  Backpressure applied only while a segment still had bytes left over, so a segment whose last chunk
+  was taken just under the 16 MB ceiling sent the next request at once, past the ceiling. The
+  producer now waits for room between segments either way (#732; a test pins the case, and the
+  timing test that caught it on CI no longer flakes).
+- **A slow origin no longer fails large HEVC-in-TS segments on the persistent HTTP/1.1 ingest.**
+  Segment bodies stream to the demuxer instead of downloading whole first, the 45 s ceiling covers
+  only the wait for a response head, and a body ends on its size or on 30 s without a byte (typed
+  `.stalled` rather than the socket's Code=60). One request per origin at a time, so a seek never
+  opens a second connection beside a response in flight (#732).
+- **The relay admits only http and https origins.** A playlist naming another scheme (`file://`
+  included) answers 404 instead of reaching URLSession.
+
 ## [7.39.0] - 2026-10-17
 
 **Not built by default any more: TrueHD Atmos and DTS:X object rendering, Profile 7 FEL dual-layer
@@ -66,6 +125,21 @@ third-party patent licensing; integrators who enable them are responsible for th
 ## [7.38.1] - 2026-10-16
 
 ### Fixed
+
+- **The HEVC-in-MPEG-TS HLS VOD ingest under `heldSourceConnection` no longer fails on a slow origin.**
+  A segment body now reaches the demuxer as it arrives instead of after its last byte, the carriage
+  probe reads the first segment's head and hands the still open response to the producer instead of
+  downloading it whole, and the 45 s ceiling on a whole exchange is gone: it now covers only the wait
+  for a response head, and a body is limited by its size and by 30 s without a byte, so a large
+  segment that keeps arriving is never cut off. That ceiling surfaced as `NSPOSIXErrorDomain Code=60`,
+  which named neither cause; a stall now says `body stalled, no bytes for 30 s after <received>/<expected>
+  bytes in <elapsed> s`. A seek that abandons a body with at most 2 MB left, at a rate that brings it in within 3 s,
+  drains it and keeps the connection, and the next request waits for that instead of opening a
+  second connection beside it; a larger or slower remainder closes it at once. With the FIFO full the current segment is read to its
+  end, so a paused session leaves the connection idle between two requests, not mid-body. Measured on a
+  loopback origin at 200 KB/s with 11.6 MB segments: before, the probe died at 45.1 s with `Code=60` and
+  the session left the ingest; after, the ingest held and played. The h2 path's 45 s resource timeout
+  is lifted the same way (#732, thanks @qoli for the paired device runs).
 
 - **The package compiles in Release with Xcode 26 again.** `FelResidualMeasure` (the
   `AETHER_FEL_MEASURE` diagnostic from 7.37.0) formatted its luma-band line inside the closure it

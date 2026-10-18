@@ -3,7 +3,8 @@
 import Accelerate
 import Foundation
 
-/// Per-channel levels of the rendered bed, for the session log.
+/// Per-channel levels of the rendered bed, for the session log, and the object counts behind them,
+/// which `LiveTelemetry.objectAudio` also publishes (`activity`).
 ///
 /// A report that the heights or the LFE are missing can only be placed if the log says what the
 /// engine handed AVPlayer. Level here means the encoder was given that channel's sound, so a height
@@ -38,6 +39,9 @@ struct BedLevelMeter {
     /// at all still reports what is playing.
     private var activeObjects = 0
     private var elevatedObjects = 0
+    /// What the current configuration declares, set when it arrives.
+    private var configuredObjects = 0
+    private var heightBedChannels = 0
     private var maxActiveObjects = 0
     private var maxElevatedObjects = 0
 
@@ -63,6 +67,8 @@ struct BedLevelMeter {
         if configurationChanged || elementStates.count != roles.count {
             elementStates = Array(repeating: nil, count: roles.count)
             lfeIndices = roles.indices.filter { roles[$0] == .lfe }
+            configuredObjects = roles.filter { $0 == .object }.count
+            heightBedChannels = roles.filter { if case .bed(let speaker) = $0 { speaker.isHeight } else { false } }.count
             // A configuration with no objects sends no object metadata; the old counts must not hold.
             activeObjects = 0
             elevatedObjects = 0
@@ -81,6 +87,13 @@ struct BedLevelMeter {
             maxActiveObjects = max(maxActiveObjects, activeObjects)
             maxElevatedObjects = max(maxElevatedObjects, elevatedObjects)
         }
+    }
+
+    /// The counts as of the latest update, for `LiveTelemetry.objectAudio`.
+    var activity: ObjectAudioActivity {
+        ObjectAudioActivity(
+            layout: layout, objects: configuredObjects, activeObjects: activeObjects, elevatedObjects: elevatedObjects,
+            heightChannels: heightBedChannels)
     }
 
     /// Measure the LFE elements' combined input for one decoded block (one plane per role).

@@ -193,10 +193,14 @@ final class HLSOriginRelay: @unchecked Sendable {
     }
 
     /// scheme://host:port for `url`, which is the granularity the allow list works at.
+    ///
+    /// Nil for anything but http and https. A playlist can name any scheme, and URLSession reads
+    /// `file://localhost/...` from the sandbox; the pump's HTTP-only head was the only thing that
+    /// kept such a URI from being served, so admission refuses it outright instead.
     static func originKey(for url: URL) -> String? {
-        guard let scheme = url.scheme?.lowercased(), let host = url.host?.lowercased() else {
-            return nil
-        }
+        guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https",
+            let host = url.host?.lowercased()
+        else { return nil }
         if let port = url.port { return "\(scheme)://\(host):\(port)" }
         return "\(scheme)://\(host)"
     }

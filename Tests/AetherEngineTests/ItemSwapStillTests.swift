@@ -61,10 +61,13 @@ struct ItemSwapStillTests {
         var audioDone = false
         // A stall deadline, not a total one: under load the writer can be slow and still moving
         // (`video 4/120 ready=true, audio 24/40 ready=true` after a fixed 20 s on CI), and only a
-        // writer that takes nothing for 20 s is the deadlock described above.
+        // writer that takes nothing for 20 s is the deadlock described above. Both tracks reading
+        // ready at the end of such a run says the loop itself had not run: a starved task sleeps
+        // through the deadline, so a stall also needs the polls to show it.
         var lastProgress = ContinuousClock.now
+        var idlePolls = 0
         while !(videoDone && audioDone), writer.status == .writing,
-              ContinuousClock.now - lastProgress < .seconds(20) {
+              ContinuousClock.now - lastProgress < .seconds(20) || idlePolls < 1_000 {
             var fed = false
             if !videoDone, video.isReadyForMoreMediaData {
                 // Our own buffer, not one from the adaptor's pool: that pool belongs to the
@@ -112,7 +115,13 @@ struct ItemSwapStillTests {
                     audioDone = true
                 }
             }
-            if fed { lastProgress = .now } else { try await Task.sleep(for: .milliseconds(5)) }
+            if fed {
+                lastProgress = .now
+                idlePolls = 0
+            } else {
+                idlePolls += 1
+                try await Task.sleep(for: .milliseconds(5))
+            }
         }
         guard videoDone, audioDone else {
             let state = "video \(frame)/120 ready=\(video.isReadyForMoreMediaData), "

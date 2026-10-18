@@ -28,6 +28,10 @@ public struct LiveTelemetry: Equatable, Sendable {
     /// AVPlayer-native path) or before the first delta. Measured from the bridge's cumulative output-byte
     /// counter, since the common FLAC bridge is lossless VBR and has no fixed configured rate.
     public let audioBridgeBitrateMbps: Double?
+    /// What the object renderer is doing while `objectAudioRendering` plays TrueHD Atmos or DTS:X:
+    /// the bed it renders into and the objects the track declares, plays and lifts. nil on every
+    /// other audio path, the channel bridge included.
+    public let objectAudio: ObjectAudioActivity?
     public let observedFps: Double?
     /// Frames the display dropped **for the session**: AVPlayer's access log on the native path, the
     /// render synchronizer's own metrics on the software one (#306). Software sessions predating that
@@ -97,6 +101,7 @@ public struct LiveTelemetry: Equatable, Sendable {
         instantBitrateMbps: Double?,
         averageBitrateMbps: Double?,
         audioBridgeBitrateMbps: Double?,
+        objectAudio: ObjectAudioActivity? = nil,
         observedFps: Double?,
         droppedFrameCount: Int?,
         forwardBufferSeconds: Double?,
@@ -121,6 +126,7 @@ public struct LiveTelemetry: Equatable, Sendable {
         self.instantBitrateMbps = instantBitrateMbps
         self.averageBitrateMbps = averageBitrateMbps
         self.audioBridgeBitrateMbps = audioBridgeBitrateMbps
+        self.objectAudio = objectAudio
         self.observedFps = observedFps
         self.droppedFrameCount = droppedFrameCount
         self.forwardBufferSeconds = forwardBufferSeconds

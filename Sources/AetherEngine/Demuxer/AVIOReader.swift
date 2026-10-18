@@ -774,9 +774,6 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     static let liveRefusalMaximumRetryWait: TimeInterval = 5
     /// How long a live stream keeps asking before the refusal is the session's answer.
     static let liveRefusalRetryBudget: TimeInterval = 60
-    /// Test seam: a shorter budget, so the give-up is exercised without a minute of wall clock.
-    /// Read once per reader, at init.
-    nonisolated(unsafe) static var liveRefusalRetryBudgetForTesting: TimeInterval?
 
     /// The wait before a live stream's refused request is made again: a second, or the origin's
     /// Retry-After (0 for none) when that is longer, never more than `liveRefusalMaximumRetryWait`.
@@ -1137,18 +1134,20 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
     /// TEST-ONLY slow-CDN throttle (kbit/s, 0 = unlimited), captured once from the static hook at init.
     private let throttleKbps: Int
-    /// TEST-ONLY reconnect-backoff scale (1.0 = real timing), captured once from the static hook at init.
+    /// Reconnect-backoff scale, 1 in the shipped app; tests shrink it so a give-up spanning a dozen
+    /// backoffs finishes in test time. An init parameter like `connStallTimeout` below, for the same
+    /// reason: a process-wide hook leaked into every suite running alongside.
     private let backoffScale: Double
     /// #392: the idle gap this reader takes a first refusal at face value after. Shipped value
-    /// unless a test shortens it, captured once at init like the two hooks above.
+    /// unless a test shortens it.
     private let pinIdleSeconds: TimeInterval
-    /// How long a live refusal streak is ridden out, captured once at init like the hooks above.
+    /// How long a live refusal streak is ridden out, `liveRefusalRetryBudget` unless a test shortens it.
     private let liveRefusalRetryBudgetSeconds: TimeInterval
     /// Stall threshold this reader runs with, `connStallTimeoutDefault` unless a caller overrides it.
     /// One value for both detectors, because they are one policy: a connection that has delivered
     /// nothing for this long is replaced, whether or not a read is waiting on it (#309).
     ///
-    /// An init parameter rather than a process-wide test hook on purpose. The hooks next to it are
+    /// An init parameter rather than a process-wide test hook on purpose. A hook is
     /// read at every reader's init, so a test that sets one changes the behaviour of every reader any
     /// CONCURRENTLY running suite happens to build, and swift-testing runs suites in parallel. A
     /// shortened stall threshold leaking that way would make other suites reconnect early under
@@ -1185,7 +1184,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private let probeDrainLock = NSLock()
     private var drainingProbeRequest = false
 
-    init(url: URL, extraHeaders: [String: String] = [:], label: String = "source", chunkSize: Int = 4 * 1024 * 1024, prefetchEnabled: Bool = true, isLive: Bool = false, chunkRequestTimeout: TimeInterval = 35, chunkMaxRetries: Int = 3, boundedInitialFetch: Int64? = nil, sequentialOnly: Bool = false, connStallTimeout: TimeInterval = AVIOReader.connStallTimeoutDefault, windowHighWater: Int? = nil, streamHighWater: Int? = nil, detourIdleSeconds: TimeInterval? = nil, detourFetchBudget: TimeInterval? = nil, heldConnection: Bool = false, probeControl: ProbeControl? = nil, probeRequestSession: URLSession? = nil, sourceOpenPolicy: SourceOpenPolicy = .init(), requestHeaderStore: RequestHeaderStore? = nil) {
+    init(url: URL, extraHeaders: [String: String] = [:], label: String = "source", chunkSize: Int = 4 * 1024 * 1024, prefetchEnabled: Bool = true, isLive: Bool = false, chunkRequestTimeout: TimeInterval = 35, chunkMaxRetries: Int = 3, boundedInitialFetch: Int64? = nil, sequentialOnly: Bool = false, connStallTimeout: TimeInterval = AVIOReader.connStallTimeoutDefault, windowHighWater: Int? = nil, streamHighWater: Int? = nil, detourIdleSeconds: TimeInterval? = nil, detourFetchBudget: TimeInterval? = nil, heldConnection: Bool = false, probeControl: ProbeControl? = nil, probeRequestSession: URLSession? = nil, sourceOpenPolicy: SourceOpenPolicy = .init(), requestHeaderStore: RequestHeaderStore? = nil, backoffScale: Double = 1, pinIdleSeconds: TimeInterval = AVIOReader.pinIdleRepinSecondsDefault, liveRefusalRetryBudget: TimeInterval = AVIOReader.liveRefusalRetryBudget) {
         self.sourceOpenPolicy = sourceOpenPolicy
         self.probeControl = probeControl
         self.probeRequestSession = probeControl == nil ? nil : probeRequestSession
@@ -1201,9 +1200,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         self.chunkMaxRetries = max(1, chunkMaxRetries)
         self.boundedInitialFetch = boundedInitialFetch.map { max(1, $0) }
         self.throttleKbps = AetherEngine.sourceThrottleKbpsForTesting
-        self.backoffScale = AetherEngine.reconnectBackoffScaleForTesting
-        self.pinIdleSeconds = AetherEngine.pinIdleSecondsForTesting ?? Self.pinIdleRepinSecondsDefault
-        self.liveRefusalRetryBudgetSeconds = Self.liveRefusalRetryBudgetForTesting ?? Self.liveRefusalRetryBudget
+        self.backoffScale = backoffScale
+        self.pinIdleSeconds = pinIdleSeconds
+        self.liveRefusalRetryBudgetSeconds = liveRefusalRetryBudget
         self.connStallTimeout = max(0.05, connStallTimeout)
         self.winHighWater = max(1, windowHighWater
             ?? (isLive ? Self.liveWinHighWaterDefault : Self.winHighWaterDefault))

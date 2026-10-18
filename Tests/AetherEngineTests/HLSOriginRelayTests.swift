@@ -86,6 +86,33 @@ struct HLSOriginRelayAddressingTests {
         #expect(HLSOriginRelay.originKey(for: URL(string: "https://a.example.com:8920/x")!) == "https://a.example.com:8920")
         #expect(HLSOriginRelay.originKey(for: URL(string: "http://a.example.com/x")!) == "http://a.example.com")
         #expect(HLSOriginRelay.originKey(for: URL(string: "file:///tmp/x")!) == nil)
+        #expect(HLSOriginRelay.originKey(for: URL(string: "file://localhost/tmp/x")!) == nil)
+        #expect(HLSOriginRelay.originKey(for: URL(string: "ftp://a.example.com/x")!) == nil)
+        #expect(HLSOriginRelay.originKey(for: URL(string: "HTTPS://a.example.com/x")!) == "https://a.example.com")
+    }
+
+    @Test("A playlist that names a local file gets no byte of it back")
+    func playlistNamedFileIsRefused() async throws {
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("relay-file-\(UUID().uuidString).ts")
+        try Data("sandbox bytes".utf8).write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+        let named = try #require(URL(string: "file://localhost\(file.path)"))
+
+        let relay = HLSOriginRelay()
+        let server = HLSLocalServer(relay: relay)
+        try server.start()
+        defer { server.stop(); relay.stop() }
+        let origin = URL(string: "https://127.0.0.1:9/hls/media.m3u8")!
+        relay.grantCredentials(to: origin)
+
+        _ = relay.rewritePlaylist(
+            "#EXTM3U\n#EXTINF:6.0,\n\(named.absoluteString)\n", relativeTo: origin,
+            port: server.port, token: server.pathToken)
+
+        let local = try #require(relay.localURL(
+            for: named, port: server.port, token: server.pathToken))
+        #expect(try await status(of: local) == 404)
     }
 
     @Test("Sub-resources follow the address the request arrived on")

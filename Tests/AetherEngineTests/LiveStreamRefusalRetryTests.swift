@@ -10,6 +10,8 @@ import Foundation
 ///
 /// The loopback cases run with the reconnect backoff scaled down, the way the other reader suites
 /// do, and are judged by what came through and how many requests it took, never by the wall clock.
+/// Scale and budget go to each reader at init: process-wide hooks raced between these tests, which
+/// run in parallel, and handed one test's one-second budget to its neighbour.
 /// The wait itself is a pure rule, tested as one.
 @Suite("Live stream reader rides out refusals", .offCooperativePool, .timeLimit(.minutes(2)))
 struct LiveStreamRefusalRetryTests {
@@ -101,8 +103,11 @@ struct LiveStreamRefusalRetryTests {
         return data
     }
 
-    private static func makeLiveReader(_ url: URL) -> AVIOReader {
-        AVIOReader(url: url, label: "live", prefetchEnabled: true, isLive: true)
+    private static func makeLiveReader(
+        _ url: URL, backoffScale: Double = 0.02, refusalBudget: TimeInterval = AVIOReader.liveRefusalRetryBudget
+    ) -> AVIOReader {
+        AVIOReader(url: url, label: "live", prefetchEnabled: true, isLive: true,
+                   backoffScale: backoffScale, liveRefusalRetryBudget: refusalBudget)
     }
 
     /// Reads until `expectedBytes` have come through or the reader fails; the bytes, and the code
@@ -134,8 +139,6 @@ struct LiveStreamRefusalRetryTests {
 
     @Test("a stream refused mid-session is asked for again until it is served, and arms no pacer")
     func refusedMidStreamIsRetriedUntilServed() throws {
-        AetherEngine.reconnectBackoffScaleForTesting = 0.02
-        defer { AetherEngine.reconnectBackoffScaleForTesting = 1.0 }
         let first = Self.streamBytes(count: 400)
         let second = Self.streamBytes(count: 400)
         let refusals = 3
@@ -168,16 +171,12 @@ struct LiveStreamRefusalRetryTests {
 
     @Test("a stream refused for longer than the budget ends as a read error")
     func refusedPastTheBudgetGivesUp() throws {
-        AetherEngine.reconnectBackoffScaleForTesting = 0.02
-        defer { AetherEngine.reconnectBackoffScaleForTesting = 1.0 }
-        AVIOReader.liveRefusalRetryBudgetForTesting = 1
-        defer { AVIOReader.liveRefusalRetryBudgetForTesting = nil }
         let first = Self.streamBytes(count: 400)
         let origin = try #require(ScriptedOrigin { index in
             index == 0 ? .init(status: 200, body: first) : .init(status: 509)
         })
         defer { origin.stop() }
-        let reader = Self.makeLiveReader(origin.url)
+        let reader = Self.makeLiveReader(origin.url, refusalBudget: 1)
         defer { reader.markClosed(); reader.close() }
         try reader.open()
 
@@ -207,8 +206,6 @@ struct LiveStreamRefusalRetryTests {
 
     @Test("a live open answered with a server error is asked once more and plays when served")
     func serverErrorAtOpenIsAskedOnceMore() throws {
-        AetherEngine.reconnectBackoffScaleForTesting = 0.02
-        defer { AetherEngine.reconnectBackoffScaleForTesting = 1.0 }
         let body = Self.streamBytes(count: 400)
         let origin = try #require(ScriptedOrigin { index in
             index == 0 ? .init(status: 502) : .init(status: 200, body: body)
@@ -225,8 +222,6 @@ struct LiveStreamRefusalRetryTests {
 
     @Test("a live open answered with a server error twice fails typed with its status")
     func serverErrorTwiceAtOpenFailsTyped() throws {
-        AetherEngine.reconnectBackoffScaleForTesting = 0.02
-        defer { AetherEngine.reconnectBackoffScaleForTesting = 1.0 }
         let origin = try #require(ScriptedOrigin { _ in .init(status: 500) })
         defer { origin.stop() }
         let reader = Self.makeLiveReader(origin.url)

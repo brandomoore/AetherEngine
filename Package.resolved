@@ -1,5 +1,5 @@
 {
-  "originHash" : "856dc654c740b018d3c4a31d0d78988b4c57927f83aa3d4d22ee9c48b424e1b6",
+  "originHash" : "7816b11b113ce741ab17b588aa7b4d9eb9f27d3c190e97a227916509bcc7ba8d",
   "pins" : [
     {
       "identity" : "ffmpegbuild",
@@ -24,8 +24,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/superuser404notfound/LibDTSX",
       "state" : {
-        "revision" : "1f0dd2daaaeb899b694e8502a5bb6f570046f4f3",
-        "version" : "2.0.0"
+        "revision" : "7d68c8bbda348a10e169b9bb9619c8b2b7a0c642",
+        "version" : "3.0.0"
       }
     },
     {
@@ -33,8 +33,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/superuser404notfound/LibTrueHD",
       "state" : {
-        "revision" : "3eab2e7c10ff1b3c2078afbab138471f2511859b",
-        "version" : "2.3.1"
+        "revision" : "aebd5ffe1046dadbea833ce87a75d00fd8b1edd1",
+        "version" : "3.0.0"
       }
     },
     {

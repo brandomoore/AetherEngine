@@ -433,6 +433,7 @@ final class LiveTelemetrySampler {
             instantBitrateMbps: instantBitrateMbps,
             averageBitrateMbps: averageBitrateMbps,
             audioBridgeBitrateMbps: audioBridgeBitrateMbps,
+            objectAudio: engine.objectAudioActivity,
             observedFps: observedFps,
             droppedFrameCount: droppedFrameCount,
             forwardBufferSeconds: forwardBufferSeconds,

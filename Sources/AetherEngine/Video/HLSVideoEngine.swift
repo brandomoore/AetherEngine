@@ -2639,6 +2639,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
     var audioBridgeLiveBytes: Int { subsystemSnapshot().audioBridge?.liveBytes.totalBytes ?? 0 }
     var audioBridgeOutputBytesLifetime: Int64 { subsystemSnapshot().audioBridge?.outputBytesLifetime ?? 0 }
+    var objectAudioActivity: ObjectAudioActivity? { subsystemSnapshot().audioBridge?.objectAudioActivity }
     var lastAVGapMs: Double { subsystemSnapshot().producer?.lastAVGapMs ?? 0 }
 
     public func diagnosticStats() -> DiagnosticStats {

@@ -45,6 +45,10 @@ protocol AudioTranscodingBridge: AnyObject, Sendable {
     var liveBytes: AudioBridge.LiveBytes { get }
     var fifoSampleCount: Int { get }
     var outputBytesLifetime: Int64 { get }
+
+    /// What the object renderer is doing, for `LiveTelemetry.objectAudio`; nil for a bridge without
+    /// one. Read off the pump thread, like `outputBytesLifetime`.
+    var objectAudioActivity: ObjectAudioActivity? { get }
 }
 
 extension AudioBridge: AudioTranscodingBridge {
@@ -66,4 +70,8 @@ extension AudioBridge: AudioTranscodingBridge {
         return Int64(max(0, channels)) * Int64(max(0, sampleRate)) * bits
     }
     func settle() -> [UnsafeMutablePointer<AVPacket>] { [] }
+}
+
+extension AudioTranscodingBridge {
+    var objectAudioActivity: ObjectAudioActivity? { nil }
 }

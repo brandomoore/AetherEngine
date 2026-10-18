@@ -9,7 +9,8 @@ import AetherLibavutil
 /// End to end on real DTS-HD elementary streams: verdict, decode, render, encode. The samples are
 /// not in the repository, so each test runs only when its variable names a `.dts` file:
 /// `AE_DTSX_SAMPLE` the "DTS:X Object Emulator" demo (standard 7.1.4, 95 s),
-/// `AE_DTSX_ALTERNATE_SAMPLE` Trinnov's "Experience" trailer (7.1.4 plus five moving objects, 44 s),
+/// `AE_DTSX_ALTERNATE_SAMPLE` Trinnov's "Experience" trailer (7.1.4 plus five moving objects, 44 s,
+/// refused),
 /// `AE_DTS_HD_MA_SAMPLE` a DTS-HD Master Audio stream without DTS:X (FFmpeg's FATE
 /// `dts/master_audio_7.1_24bit.dts`). LibDTSX's README says where to get them.
 @Suite("DTS:X samples, decode to APAC")
@@ -35,13 +36,18 @@ struct DTSXSampleTests {
         }
     }
 
-    @Test("DTS:X is recognised on its head and plain DTS-HD MA is refused")
+    @Test("DTS:X is recognised on its head; objects and plain DTS-HD MA are refused")
     func verdicts() throws {
         if let data = Self.sample("AE_DTSX_SAMPLE") {
             #expect(try Self.verdict(data.prefix(1 << 20)) == .renders("7.1.4"))
         }
         if let data = Self.sample("AE_DTSX_ALTERNATE_SAMPLE") {
-            #expect(try Self.verdict(data.prefix(1 << 20)) == .renders("7.1.4+5"))
+            let verdict = try Self.verdict(data.prefix(1 << 20))
+            guard case .refused(let reason) = verdict else {
+                Issue.record("the alternate presentation was not refused: \(String(describing: verdict))")
+                return
+            }
+            #expect(reason.contains("7.1.4+5"), "\(reason)")
         }
         if let data = Self.sample("AE_DTS_HD_MA_SAMPLE") {
             let verdict = try Self.verdict(data.prefix(1 << 20))
@@ -114,35 +120,6 @@ struct DTSXSampleTests {
         for (c, speaker) in layout.speakers.enumerated() where speaker.isHeight {
             #expect(rms[c] > 1e-3, "\(speaker.rawValue) carries its height channel")
         }
-    }
-
-    @Test("alternate-presentation objects move, and render where LibDTSX placed them")
-    func alternateObjectsMove() throws {
-        guard let data = Self.sample("AE_DTSX_ALTERNATE_SAMPLE") else { return }
-        let decoder = try DTSXObjectAudioDecoder()
-        var objects = 0, ramps = 0, positions = Set<SIMD3<Float>>()
-        try data.withUnsafeBytes { raw in
-            var offset = 0
-            while offset < raw.count {
-                let n = min(65536, raw.count - offset)
-                try decoder.push(UnsafeRawBufferPointer(rebasing: raw[offset..<offset + n]))
-                offset += n
-                while let block = try decoder.nextBlock() {
-                    objects = block.roles.filter { $0 == .object }.count
-                    for update in block.updates {
-                        if update.rampFrames == block.frameCount { ramps += 1 }
-                        for (i, state) in update.states.enumerated() where block.roles[i] == .object {
-                            if let state { positions.insert(state.position) }
-                        }
-                    }
-                }
-            }
-        }
-        print("[DTSXSample] alternate: \(objects) objects, \(ramps) ramped updates, \(positions.count) positions")
-        #expect(objects == 5)
-        #expect(ramps > 900, "moving objects ramp over the frame that moves them")
-        #expect(positions.count > 1000)
-        #expect(positions.allSatisfy { p in (0...1).contains(p.x) && (0...1).contains(p.y) && (0...1).contains(p.z) })
     }
 
     @Test("the bridge turns the whole standard sample into contiguous APAC packets")

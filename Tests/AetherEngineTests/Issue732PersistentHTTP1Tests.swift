@@ -1,3 +1,4 @@
+import CommonCrypto
 import Foundation
 import XCTest
 @testable import AetherEngine
@@ -59,7 +60,283 @@ final class Issue732PersistentHTTP1Tests: XCTestCase {
         let stream = Self.drain(reader)
         XCTAssertEqual(stream.count, 3 * 188 * 3)
         XCTAssertEqual(stream[Self.markerOffset], 3)
-        XCTAssertEqual(server.connectionCount, 2, "the cancelled body cost its connection, nothing more")
+        XCTAssertEqual(server.connectionCount, 1, "the short remainder was drained and the socket kept")
+        XCTAssertEqual(server.maxInFlight, 1, "the next request waited for the drain")
+        XCTAssertEqual(server.requests.map(\.path), ["/vod.m3u8", "/seg0.ts", "/seg1.ts", "/seg2.ts", "/seg3.ts", "/seg4.ts", "/seg5.ts"])
+    }
+
+    func testSlowSegmentReachesTheReaderBeforeItsDownloadEnds() async throws {
+        let server = try XCTUnwrap(KeepAliveOrigin())
+        defer { server.stop() }
+        let segments = ["seg0.ts", "seg1.ts"]
+        server.route = { path in
+            if path == "/vod.m3u8" { return .init(body: Self.mediaPlaylist(segments)) }
+            guard let index = segments.firstIndex(where: { "/" + $0 == path }) else { return .init(status: 404) }
+            return index == 0
+                ? .init(body: Self.transportStream(marker: 0))
+                : .init(body: Self.transportStream(marker: 1, packets: 600), trickleUs: 5_000)
+        }
+        let made = try await HLSVODIngestReader.makeIfHEVCMPEGTS(
+            playlistURL: server.url("/vod.m3u8"), httpHeaders: [:], persistentHTTP1: true)
+        let reader = try XCTUnwrap(made)
+        defer { reader.close() }
+
+        var buffer = [UInt8](repeating: 0, count: 188 * 4)
+        var got = 0
+        while got < buffer.count {
+            let n = buffer.withUnsafeMutableBufferPointer { reader.read($0.baseAddress! + got, size: Int32(188 * 4 - got)) }
+            XCTAssertGreaterThan(n, 0)
+            if n <= 0 { break }
+            got += Int(n)
+        }
+        XCTAssertEqual(buffer[188 * 3], 0x47, "the first packet of segment 1 is in the reader")
+        XCTAssertFalse(server.completed.contains("/seg1.ts"), "while segment 1 is still downloading")
+
+        let rest = Self.drain(reader)
+        XCTAssertEqual(got + rest.count, 3 * 188 + 600 * 188)
+        XCTAssertEqual(server.connectionCount, 1)
+    }
+
+    func testProbeLeavesTheFirstSegmentOpenInsteadOfDownloadingIt() async throws {
+        let server = try XCTUnwrap(KeepAliveOrigin())
+        defer { server.stop() }
+        let segments = ["seg0.ts", "seg1.ts"]
+        server.route = { path in
+            if path == "/vod.m3u8" { return .init(body: Self.mediaPlaylist(segments)) }
+            guard let index = segments.firstIndex(where: { "/" + $0 == path }) else { return .init(status: 404) }
+            return index == 0
+                ? .init(body: Self.transportStream(marker: 0, packets: 400), trickleUs: 5_000)
+                : .init(body: Self.transportStream(marker: 1))
+        }
+        let made = try await HLSVODIngestReader.makeIfHEVCMPEGTS(
+            playlistURL: server.url("/vod.m3u8"), httpHeaders: [:], persistentHTTP1: true)
+        let reader = try XCTUnwrap(made)
+        defer { reader.close() }
+        XCTAssertFalse(server.completed.contains("/seg0.ts"), "the verdict did not wait for the whole segment")
+
+        let stream = Self.drain(reader)
+        XCTAssertEqual(stream.count, 400 * 188 + 3 * 188)
+        XCTAssertEqual(stream[Self.markerOffset], 0)
+        XCTAssertEqual(stream[400 * 188 + Self.markerOffset], 1)
+        XCTAssertEqual(server.requests.map(\.path), ["/vod.m3u8", "/seg0.ts", "/seg1.ts"])
+        XCTAssertEqual(server.connectionCount, 1)
+    }
+
+    func testSeekOverALargeRemainderClosesTheConnection() async throws {
+        let server = try XCTUnwrap(KeepAliveOrigin())
+        defer { server.stop() }
+        let segments = (0..<5).map { "seg\($0).ts" }
+        // 12,000 packets is about 2.2 MB, over the drain budget.
+        server.route = { path in
+            if path == "/vod.m3u8" { return .init(body: Self.mediaPlaylist(segments)) }
+            guard let index = segments.firstIndex(where: { "/" + $0 == path }) else { return .init(status: 404) }
+            return index == 1
+                ? .init(body: Self.transportStream(marker: 1, packets: 12_000), trickleUs: 2_000)
+                : .init(body: Self.transportStream(marker: UInt8(index)))
+        }
+        let made = try await HLSVODIngestReader.makeIfHEVCMPEGTS(
+            playlistURL: server.url("/vod.m3u8"), httpHeaders: [:], persistentHTTP1: true)
+        let reader = try XCTUnwrap(made)
+        defer { reader.close() }
+
+        var head = [UInt8](repeating: 0, count: 188)
+        XCTAssertEqual(head.withUnsafeMutableBufferPointer { reader.read($0.baseAddress, size: 188) }, 188)
+        try await waitUntil { server.requests.contains { $0.path == "/seg1.ts" } }
+        let seekStarted = Date()
+        XCTAssertTrue(reader.seek(to: 20)) // segment 3 contains 20 s, the restart is one earlier
+        let stream = Self.drain(reader)
+        XCTAssertLessThan(Date().timeIntervalSince(seekStarted), 2, "the seek did not wait for a drain")
+        XCTAssertEqual(stream.count, 3 * 188 * 3)
+        XCTAssertEqual(stream[Self.markerOffset], 2)
+        XCTAssertEqual(server.connectionCount, 2)
+    }
+
+    func testSlowRemainderClosesAtOnceInsteadOfDraining() async throws {
+        let server = try XCTUnwrap(KeepAliveOrigin())
+        defer { server.stop() }
+        let segments = (0..<5).map { "seg\($0).ts" }
+        // Inside the drain budget by size, but at 10 ms a packet its rest needs seconds.
+        server.route = { path in
+            if path == "/vod.m3u8" { return .init(body: Self.mediaPlaylist(segments)) }
+            guard let index = segments.firstIndex(where: { "/" + $0 == path }) else { return .init(status: 404) }
+            return index == 1
+                ? .init(body: Self.transportStream(marker: 1, packets: 1_000), trickleUs: 10_000)
+                : .init(body: Self.transportStream(marker: UInt8(index)))
+        }
+        let made = try await HLSVODIngestReader.makeIfHEVCMPEGTS(
+            playlistURL: server.url("/vod.m3u8"), httpHeaders: [:], persistentHTTP1: true)
+        let reader = try XCTUnwrap(made)
+        defer { reader.close() }
+
+        var head = [UInt8](repeating: 0, count: 188)
+        XCTAssertEqual(head.withUnsafeMutableBufferPointer { reader.read($0.baseAddress, size: 188) }, 188)
+        try await waitUntil { server.requests.contains { $0.path == "/seg1.ts" } }
+        try await Task.sleep(nanoseconds: 500_000_000) // long enough for the body to show its rate
+        let seekStarted = Date()
+        XCTAssertTrue(reader.seek(to: 20))
+        let stream = Self.drain(reader)
+        XCTAssertLessThan(Date().timeIntervalSince(seekStarted), 1.5, "no drain that could not finish")
+        XCTAssertEqual(stream.count, 3 * 188 * 3)
+        XCTAssertEqual(stream[Self.markerOffset], 2)
+        XCTAssertEqual(server.connectionCount, 2)
+    }
+
+    func testDrainPastItsDeadlineClosesAndTheNextRequestGoesAhead() async throws {
+        let server = try XCTUnwrap(KeepAliveOrigin())
+        defer { server.stop() }
+        let segments = (0..<5).map { "seg\($0).ts" }
+        // Fast enough to look drainable, then silent: only the drain deadline ends it.
+        server.route = { path in
+            if path == "/vod.m3u8" { return .init(body: Self.mediaPlaylist(segments)) }
+            guard let index = segments.firstIndex(where: { "/" + $0 == path }) else { return .init(status: 404) }
+            return index == 1
+                ? .init(body: Self.transportStream(marker: 1, packets: 1_000), stallAfter: 188 * 100)
+                : .init(body: Self.transportStream(marker: UInt8(index)))
+        }
+        let made = try await HLSVODIngestReader.makeIfHEVCMPEGTS(
+            playlistURL: server.url("/vod.m3u8"), httpHeaders: [:], persistentHTTP1: true)
+        let reader = try XCTUnwrap(made)
+        defer { reader.close() }
+
+        var head = [UInt8](repeating: 0, count: 188)
+        XCTAssertEqual(head.withUnsafeMutableBufferPointer { reader.read($0.baseAddress, size: 188) }, 188)
+        try await waitUntil { server.requests.contains { $0.path == "/seg1.ts" } }
+        let seekStarted = Date()
+        XCTAssertTrue(reader.seek(to: 20))
+        let stream = Self.drain(reader)
+        let waited = Date().timeIntervalSince(seekStarted)
+        XCTAssertGreaterThanOrEqual(waited, PersistentHTTP1Transport.drainDeadline - 0.2)
+        XCTAssertLessThan(waited, PersistentHTTP1Transport.drainDeadline + 2)
+        XCTAssertEqual(stream.count, 3 * 188 * 3)
+        XCTAssertEqual(stream[Self.markerOffset], 2)
+        XCTAssertEqual(server.connectionCount, 2)
+    }
+
+    func testSeekOntoAnEncryptedSegmentLetsTheProbeResponseGo() async throws {
+        let server = try XCTUnwrap(KeepAliveOrigin())
+        defer { server.stop() }
+        let key = Data((0..<16).map { UInt8($0) })
+        let clear = (0..<5).map { Self.transportStream(marker: UInt8($0)) }
+        let encrypted = clear.map { Self.aes128CBC($0, key: key) }
+        var text = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n"
+        for index in 0..<5 {
+            if index == 2 {
+                text += "#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\",IV=0x00000000000000000000000000000000\n"
+            }
+            text += "#EXTINF:6,\nseg\(index).ts\n"
+        }
+        let playlist = Data((text + "#EXT-X-ENDLIST").utf8)
+        // Segment 0 is large and slow, so its probe response is still open when the seek lands.
+        let first = Self.transportStream(marker: 0, packets: 2_000)
+        server.route = { path in
+            switch path {
+            case "/vod.m3u8": return .init(body: playlist)
+            case "/key.bin": return .init(body: key)
+            case "/seg0.ts": return .init(body: first, trickleUs: 2_000)
+            default:
+                guard let index = Int(path.dropFirst(4).dropLast(3)), (1..<5).contains(index) else {
+                    return .init(status: 404)
+                }
+                return .init(body: index >= 2 ? encrypted[index] : clear[index])
+            }
+        }
+        let made = try await HLSVODIngestReader.makeIfHEVCMPEGTS(
+            playlistURL: server.url("/vod.m3u8"), httpHeaders: [:], persistentHTTP1: true)
+        let reader = try XCTUnwrap(made)
+        defer { reader.close() }
+
+        XCTAssertTrue(reader.seek(to: 20)) // segment 3 contains 20 s; the restart is 2, the first encrypted one
+        let done = expectation(description: "drained")
+        let box = StreamBox()
+        Thread.detachNewThread {
+            box.bytes = Self.drain(reader)
+            done.fulfill()
+        }
+        await fulfillment(of: [done], timeout: 10)
+        XCTAssertEqual(box.bytes.count, 3 * 188 * 3)
+        XCTAssertEqual(box.bytes.first.map { _ in box.bytes[Self.markerOffset] }, 2)
+    }
+
+    func testFullBufferLetsTheCurrentSegmentFinishAndHoldsTheNextRequest() async throws {
+        let server = try XCTUnwrap(KeepAliveOrigin())
+        defer { server.stop() }
+        let segments = (0..<3).map { "seg\($0).ts" }
+        // 12 MB of segment 0 plus 5.6 MB of segment 1: the 16 MB FIFO fills inside segment 1.
+        server.route = { path in
+            if path == "/vod.m3u8" { return .init(body: Self.mediaPlaylist(segments)) }
+            guard let index = segments.firstIndex(where: { "/" + $0 == path }) else { return .init(status: 404) }
+            return .init(body: Self.transportStream(marker: UInt8(index), packets: index == 0 ? 64_000 : 30_000))
+        }
+        let made = try await HLSVODIngestReader.makeIfHEVCMPEGTS(
+            playlistURL: server.url("/vod.m3u8"), httpHeaders: [:], persistentHTTP1: true)
+        let reader = try XCTUnwrap(made)
+        defer { reader.close() }
+
+        var head = [UInt8](repeating: 0, count: 188)
+        XCTAssertEqual(head.withUnsafeMutableBufferPointer { reader.read($0.baseAddress, size: 188) }, 188)
+        try await waitUntil { server.completed.contains("/seg1.ts") }
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertFalse(server.requests.contains { $0.path == "/seg2.ts" }, "the next request waits for the reader")
+
+        let rest = Self.drain(reader)
+        XCTAssertEqual(188 + rest.count, (64_000 + 30_000 + 30_000) * 188)
+        XCTAssertEqual(server.connectionCount, 1)
+    }
+
+    func testASegmentTakenWholeJustUnderTheCeilingStillHoldsTheNextRequest() async throws {
+        let server = try XCTUnwrap(KeepAliveOrigin())
+        defer { server.stop() }
+        let segments = (0..<3).map { "seg\($0).ts" }
+        // Segment 0 stops 45 KB short of the 16 MB ceiling, so segment 1 (56 KB, one chunk) is taken
+        // whole while the FIFO is under it and lands it over: full, with nothing left in flight.
+        server.route = { path in
+            if path == "/vod.m3u8" { return .init(body: Self.mediaPlaylist(segments)) }
+            guard let index = segments.firstIndex(where: { "/" + $0 == path }) else { return .init(status: 404) }
+            return .init(body: Self.transportStream(marker: UInt8(index), packets: index == 0 ? 89_000 : 300))
+        }
+        let made = try await HLSVODIngestReader.makeIfHEVCMPEGTS(
+            playlistURL: server.url("/vod.m3u8"), httpHeaders: [:], persistentHTTP1: true)
+        let reader = try XCTUnwrap(made)
+        defer { reader.close() }
+
+        var head = [UInt8](repeating: 0, count: 188)
+        XCTAssertEqual(head.withUnsafeMutableBufferPointer { reader.read($0.baseAddress, size: 188) }, 188)
+        try await waitUntil { server.completed.contains("/seg1.ts") }
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertFalse(server.requests.contains { $0.path == "/seg2.ts" }, "the next request waits for the reader")
+
+        let rest = Self.drain(reader)
+        XCTAssertEqual(188 + rest.count, (89_000 + 300 + 300) * 188)
+        XCTAssertEqual(server.connectionCount, 1)
+    }
+
+    func testStalledBodyFailsWithWhatHadArrived() async throws {
+        let server = try XCTUnwrap(KeepAliveOrigin())
+        defer { server.stop() }
+        server.route = { _ in .init(body: Data(count: 5000), stallAfter: 1000) }
+        let transport = PersistentHTTP1Transport(label: "test", readTimeout: 0.5)
+        defer { transport.close() }
+
+        do {
+            _ = try await transport.get(server.url("/stall"), headers: [:], limit: 1 << 20)
+            XCTFail("a stalled body completed")
+        } catch let error as PersistentHTTP1Connection.ConnectionError {
+            guard case .stalled = error else { return XCTFail("\(error)") }
+            XCTAssertTrue(error.localizedDescription.contains("1000/5000 bytes"), error.localizedDescription)
+        }
+    }
+
+    func testSteadySlowBodyIsNeverCutOff() async throws {
+        let server = try XCTUnwrap(KeepAliveOrigin())
+        defer { server.stop() }
+        // 40 packets 50 ms apart: two seconds in all, against a read timeout of 0.3 s.
+        let body = Self.transportStream(marker: 7, packets: 40)
+        server.route = { _ in .init(body: body, trickleUs: 50_000) }
+        let transport = PersistentHTTP1Transport(label: "test", readTimeout: 0.3)
+        defer { transport.close() }
+
+        let answer = try await transport.get(server.url("/slow"), headers: [:], limit: 1 << 20)
+        XCTAssertEqual(answer.body, body)
     }
 
     func testServerCloseOpensAFreshConnection() async throws {
@@ -182,10 +459,10 @@ final class Issue732PersistentHTTP1Tests: XCTestCase {
         return Data((text + "#EXT-X-ENDLIST").utf8)
     }
 
-    /// Three TS packets whose PMT declares HEVC (0x24); the marker sits in the PMT packet's filler.
-    private static func transportStream(marker: UInt8) -> Data {
-        var bytes = [UInt8](repeating: 0xFF, count: 188 * 3)
-        for packet in 0..<3 {
+    /// TS packets whose first PMT declares HEVC (0x24); the marker sits in the PMT packet's filler.
+    private static func transportStream(marker: UInt8, packets: Int = 3) -> Data {
+        var bytes = [UInt8](repeating: 0xFF, count: 188 * packets)
+        for packet in 0..<packets {
             bytes[packet * 188] = 0x47
             bytes[packet * 188 + 3] = 0x10
         }
@@ -194,6 +471,30 @@ final class Issue732PersistentHTTP1Tests: XCTestCase {
         bytes.replaceSubrange(1..<(1 + pmt.count), with: pmt)
         bytes[markerOffset] = marker
         return Data(bytes)
+    }
+
+    private final class StreamBox: @unchecked Sendable {
+        var bytes: [UInt8] = []
+    }
+
+    private static func aes128CBC(_ data: Data, key: Data) -> Data {
+        var out = Data(count: data.count + kCCBlockSizeAES128)
+        var written = 0
+        let iv = Data(count: kCCBlockSizeAES128)
+        let outCapacity = out.count
+        let status = out.withUnsafeMutableBytes { outBytes in
+            data.withUnsafeBytes { inBytes in
+                key.withUnsafeBytes { keyBytes in
+                    iv.withUnsafeBytes { ivBytes in
+                        CCCrypt(CCOperation(kCCEncrypt), CCAlgorithm(kCCAlgorithmAES), CCOptions(kCCOptionPKCS7Padding),
+                                keyBytes.baseAddress, key.count, ivBytes.baseAddress,
+                                inBytes.baseAddress, data.count, outBytes.baseAddress, outCapacity, &written)
+                    }
+                }
+            }
+        }
+        precondition(status == kCCSuccess)
+        return out.prefix(written)
     }
 
     private static func drain(_ reader: HLSVODIngestReader) -> [UInt8] {
@@ -229,10 +530,12 @@ final class KeepAliveOrigin: @unchecked Sendable {
         var silentClose = false
         /// Sends the body one 188-byte packet per interval.
         var trickleUs: useconds_t = 0
+        /// Sends this many body bytes, then nothing more until the origin stops.
+        var stallAfter: Int?
 
         init(status: Int = 200, headers: [String: String] = [:], body: Data = Data(),
              chunked: Bool = false, connectionClose: Bool = false, silentClose: Bool = false,
-             trickleUs: useconds_t = 0) {
+             trickleUs: useconds_t = 0, stallAfter: Int? = nil) {
             self.status = status
             self.headers = headers
             self.body = body
@@ -240,6 +543,7 @@ final class KeepAliveOrigin: @unchecked Sendable {
             self.connectionClose = connectionClose
             self.silentClose = silentClose
             self.trickleUs = trickleUs
+            self.stallAfter = stallAfter
         }
     }
 
@@ -255,6 +559,9 @@ final class KeepAliveOrigin: @unchecked Sendable {
     private var _route: @Sendable (String) -> Reply = { _ in Reply(status: 404) }
     private var _requests: [Request] = []
     private var _connections = 0
+    private var _completed: [String] = []
+    private var _inFlight = 0
+    private var _maxInFlight = 0
     private var _fds: [Int32] = []
     private var stopped = false
 
@@ -271,6 +578,10 @@ final class KeepAliveOrigin: @unchecked Sendable {
 
     var requests: [Request] { lock.withLock { _requests } }
     var connectionCount: Int { lock.withLock { _connections } }
+    /// Paths whose whole response went out.
+    var completed: [String] { lock.withLock { _completed } }
+    /// Most responses in progress at once, across connections.
+    var maxInFlight: Int { lock.withLock { _maxInFlight } }
 
     func url(_ path: String) -> URL {
         URL(string: "http://127.0.0.1:\(listener.port)\(path)")!
@@ -323,10 +634,17 @@ final class KeepAliveOrigin: @unchecked Sendable {
             }
             let route: @Sendable (String) -> Reply = lock.withLock {
                 _requests.append(Request(connection: id, path: path, requestLine: requestLine, headers: headers))
+                _inFlight += 1
+                _maxInFlight = max(_maxInFlight, _inFlight)
                 return _route
             }
             let reply = route(path)
-            if !respond(fd, reply) || reply.connectionClose || reply.silentClose { return }
+            let sent = respond(fd, reply)
+            lock.withLock {
+                _inFlight -= 1
+                if sent { _completed.append(path) }
+            }
+            if !sent || reply.connectionClose || reply.silentClose { return }
         }
     }
 
@@ -350,6 +668,11 @@ final class KeepAliveOrigin: @unchecked Sendable {
                 offset += piece.count
             }
             return send(fd, Data("0\r\n\r\n".utf8))
+        }
+        if let stallAfter = reply.stallAfter {
+            guard send(fd, reply.body.prefix(stallAfter)) else { return false }
+            while !lock.withLock({ stopped }) { usleep(20_000) }
+            return false
         }
         guard reply.trickleUs > 0 else { return send(fd, reply.body) }
         var offset = 0

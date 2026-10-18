@@ -5,7 +5,7 @@ import AetherLibavutil
 
 extension HLSVideoEngine {
 
-    /// Audio codec routing: stream-copy (fMP4-legal, preserves Atmos/DTS-HD) vs AudioBridge (decode->S16 PCM->FLAC for non-fMP4-legal codecs; TrueHD-MAT Atmos object metadata lost in PCM intermediate).
+    /// Audio codec routing: stream-copy (fMP4-legal, preserves Atmos/DTS-HD) vs AudioBridge (decode to PCM, then FLAC or EAC3, for non-fMP4-legal codecs; TrueHD-MAT Atmos object metadata lost in the PCM intermediate unless `objectAudioRendering`, in a build with the object-audio traits, sends it to `SpatialAudioBridge`).
     enum AudioCodecCompat {
         case aac, ac3, eac3, flac, alac, mp3, opus
         case truehd, dts

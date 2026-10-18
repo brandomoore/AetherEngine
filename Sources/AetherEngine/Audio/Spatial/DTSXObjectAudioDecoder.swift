@@ -4,12 +4,11 @@ import Foundation
 import DTSX
 
 /// DTS:X decoder over the LibDTSX library (the Rust `dca` crate behind a C API): lossless decode of
-/// the DTS-HD Master Audio stream DTS:X is carried on, returned the way `TrueHDObjectAudioDecoder`
-/// returns an Atmos presentation. The library does the DTS-specific work: it removes the heights
-/// and objects the encoder folded into the compatible 7.1 bed, so the bed, the four fixed heights
-/// and any objects play side by side, and it places DTS:X's angular object positions in the room
-/// coordinates this renderer and LibTrueHD use (x left→right and y front→back on 0...1, z 0 ear
-/// level to 1 ceiling). What is left here is naming the channels.
+/// the DTS-HD Master Audio stream DTS:X is carried on, in its standard presentation only. The
+/// library removes the four heights from the compatible 7.1 bed, where the encoder folded each at
+/// -3 dB into the speaker under it, and refuses the alternate presentations, which carry objects.
+/// What is left here is naming the twelve channels, each of which plays on its own speaker of a
+/// 7.1.4 or 9.1.6 layout.
 final class DTSXObjectAudioDecoder: ObjectAudioDecoding {
 
     struct DecoderError: Error, CustomStringConvertible {
@@ -98,8 +97,16 @@ final class DTSXObjectAudioDecoder: ObjectAudioDecoding {
 
         let channels = Int(block.channel_count)
         if rolesSerial != block.layout_serial {
+            var named: [ObjectAudioRole] = []
+            for c in 0..<channels {
+                guard let role = Self.role(forSpeaker: block.speakers[c]) else {
+                    throw DecoderError(status: DTSX_ERR_UNSUPPORTED,
+                                       message: "channel with speaker code \(block.speakers[c]) outside DTS:X's 7.1.4")
+                }
+                named.append(role)
+            }
+            roles = named
             rolesSerial = block.layout_serial
-            roles = (0..<channels).map { Self.role(forSpeaker: block.speakers[$0]) }
         }
         planes.removeAll(keepingCapacity: true)
         for c in 0..<channels { planes.append(UnsafePointer(block.channels[c]!)) }
@@ -144,14 +151,11 @@ final class DTSXObjectAudioDecoder: ObjectAudioDecoding {
 
     // MARK: - Mapping
 
-    /// The speaker codes are LibTrueHD's. A DTS:X bed is 7.1 (5.1 under one alternate presentation),
-    /// its four fixed heights are the top front and top back pairs, and the codes beyond those only
-    /// occur in beds no DTS:X stream tested had; each sits at its nominal position, as in
-    /// `TrueHDObjectAudioDecoder`. Objects, and a bed speaker the API has no code for, are
-    /// positioned by metadata.
-    static func role(forSpeaker code: UInt8) -> ObjectAudioRole {
+    /// The speaker codes are LibTrueHD's: the standard presentation's 7.1 bed and its top front and
+    /// top back pairs, each on its own speaker. LibDTSX outputs no other channel.
+    static func role(forSpeaker code: UInt8) -> ObjectAudioRole? {
         switch code {
-        case DTSX_SPEAKER_LFE, DTSX_SPEAKER_LFE2: return .lfe
+        case DTSX_SPEAKER_LFE: return .lfe
         case DTSX_SPEAKER_L: return .bed(.left)
         case DTSX_SPEAKER_R: return .bed(.right)
         case DTSX_SPEAKER_C: return .bed(.center)
@@ -159,27 +163,15 @@ final class DTSXObjectAudioDecoder: ObjectAudioDecoding {
         case DTSX_SPEAKER_RS: return .bed(.sideRight)
         case DTSX_SPEAKER_LB: return .bed(.rearLeft)
         case DTSX_SPEAKER_RB: return .bed(.rearRight)
-        case DTSX_SPEAKER_LW: return .bed(.wideLeft)
-        case DTSX_SPEAKER_RW: return .bed(.wideRight)
         case DTSX_SPEAKER_TFL: return .bed(.topFrontLeft)
         case DTSX_SPEAKER_TFR: return .bed(.topFrontRight)
-        case DTSX_SPEAKER_TSL: return .bed(.topMiddleLeft)
-        case DTSX_SPEAKER_TSR: return .bed(.topMiddleRight)
         case DTSX_SPEAKER_TBL: return .bed(.topRearLeft)
         case DTSX_SPEAKER_TBR: return .bed(.topRearRight)
-        case DTSX_SPEAKER_LSC: return .fixed(SIMD3(0.25, 0, 0))
-        case DTSX_SPEAKER_RSC: return .fixed(SIMD3(0.75, 0, 0))
-        case DTSX_SPEAKER_CB: return .fixed(SIMD3(0.5, 1, 0))
-        case DTSX_SPEAKER_LSD: return .fixed(SpatialSpeaker.sideLeft.position)
-        case DTSX_SPEAKER_RSD: return .fixed(SpatialSpeaker.sideRight.position)
-        case DTSX_SPEAKER_TC: return .fixed(SIMD3(0.5, 0.5, 1))
-        // On the front-top row, where LibTrueHD's TFC and the ceiling pair since #742 sit.
-        case DTSX_SPEAKER_TFC: return .fixed(SIMD3(0.5, 0.25, 1))
-        default: return .object
+        default: return nil
         }
     }
 
-    /// DTS:X states no object gain, size or zone: an element is its room position.
+    /// A channel's element: its speaker's position, playing at unity.
     static func state(for element: DTSXElement) -> ObjectAudioElementState {
         let p = element.position
         return ObjectAudioElementState(

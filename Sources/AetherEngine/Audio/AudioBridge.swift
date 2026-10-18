@@ -14,7 +14,9 @@ import AetherLibswresample
 ///
 /// Atmos object metadata survives neither mode (TrueHD-MAT objects interleaved in the source, FFmpeg's EAC3 encoder
 /// produces no JOC, FLAC has no object channel concept). EAC3+JOC sources stay lossless via the stream-copy path
-/// that bypasses this bridge; only non-stream-copyable sources enter here.
+/// that bypasses this bridge; only non-stream-copyable sources enter here. TrueHD Atmos and DTS:X keep their objects
+/// and heights only under `LoadOptions.objectAudioRendering`, in a build with the `TrueHDObjectAudio` /
+/// `DTSXObjectAudio` traits (off by default), which routes them to `SpatialAudioBridge` instead.
 ///
 /// Encoder choice. Public so LoadOptions / the host pass it through; default `.surroundCompat`, the one mode
 /// that keeps surround on every sink.

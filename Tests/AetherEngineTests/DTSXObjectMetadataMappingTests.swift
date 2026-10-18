@@ -5,13 +5,13 @@ import Foundation
 import DTSX
 @testable import AetherEngine
 
-/// LibDTSX places DTS:X in the renderer's room itself; `DTSXObjectAudioDecoder` only names the
+/// LibDTSX returns DTS:X's standard presentation only, and `DTSXObjectAudioDecoder` names its
 /// channels. These pin what a listener would hear wrong: a bed or height channel on the wrong
-/// speaker, or an object somewhere other than where the library put it.
-@Suite("DTS:X metadata maps onto the renderer's room")
+/// speaker, or a channel outside the twelve slipping through to be panned.
+@Suite("DTS:X channels map onto the renderer's speakers")
 struct DTSXObjectMetadataMappingTests {
 
-    @Test("bed and fixed-height speaker codes route to the matching speaker, LFE to LFE, objects are positioned")
+    @Test("bed and height speaker codes route to the matching speaker, LFE to LFE, nothing else is taken")
     func speakerRoles() {
         // The standard DTS:X presentation: a 7.1 bed and the top front and top back pairs.
         let standard: [(UInt8, ObjectAudioRole)] = [
@@ -24,47 +24,32 @@ struct DTSXObjectMetadataMappingTests {
         for (code, role) in standard {
             #expect(DTSXObjectAudioDecoder.role(forSpeaker: code) == role, "speaker \(code)")
         }
-        #expect(DTSXObjectAudioDecoder.role(forSpeaker: DTSX_SPEAKER_LW) == .bed(.wideLeft))
-        #expect(DTSXObjectAudioDecoder.role(forSpeaker: DTSX_SPEAKER_TSR) == .bed(.topMiddleRight))
-        #expect(DTSXObjectAudioDecoder.role(forSpeaker: DTSX_SPEAKER_TFC) == .fixed(SIMD3(0.5, 0.25, 1)))
-        #expect(DTSXObjectAudioDecoder.role(forSpeaker: DTSX_SPEAKER_LSD) == .fixed(SpatialSpeaker.sideLeft.position))
-        #expect(DTSXObjectAudioDecoder.role(forSpeaker: DTSX_SPEAKER_RSD) == .fixed(SpatialSpeaker.sideRight.position))
-        #expect(DTSXObjectAudioDecoder.role(forSpeaker: DTSX_SPEAKER_OBJECT) == .object)
-        #expect(DTSXObjectAudioDecoder.role(forSpeaker: DTSX_SPEAKER_UNKNOWN) == .object)
+        for code in [DTSX_SPEAKER_OBJECT, DTSX_SPEAKER_UNKNOWN, DTSX_SPEAKER_LW, DTSX_SPEAKER_TSR,
+                     DTSX_SPEAKER_TFC, DTSX_SPEAKER_CB, DTSX_SPEAKER_LFE2] {
+            #expect(DTSXObjectAudioDecoder.role(forSpeaker: code) == nil, "speaker \(code)")
+        }
     }
 
-    @Test("an object keeps the room position the library gave it, at its gain")
-    func object() {
+    @Test("the standard channels play one to one on 7.1.4 and 9.1.6, and only there")
+    func oneToOneLayouts() {
+        for layout in SpatialSpeakerLayout.allCases {
+            #expect(layout.carriesDTSXOneToOne == (layout == .l714 || layout == .l916), "\(layout.rawValue)")
+        }
+    }
+
+    @Test("a channel plays at unity while active")
+    func channelState() {
         var element = DTSXElement()
-        element.kind = DTSX_ELEMENT_OBJECT
-        element.speaker = DTSX_SPEAKER_OBJECT
+        element.kind = DTSX_ELEMENT_BED
+        element.speaker = DTSX_SPEAKER_TFL
         element.flags = DTSX_ELEMENT_ACTIVE
-        element.position = (1, 0.0375, 0.2667)
+        element.position = (0, 0, 1)
         element.gain = 1
         let state = DTSXObjectAudioDecoder.state(for: element)
-        #expect(state.position == SIMD3(1, 0.0375, 0.2667))
+        #expect(state.position == SIMD3(0, 0, 1))
         #expect(state.gain == 1)
-        #expect(state.size == 0 && !state.snap && state.excluded.isEmpty)
-
         element.flags = 0
         #expect(DTSXObjectAudioDecoder.state(for: element).gain == 0)
-    }
-
-    @Test("an IMAX front object at 34.5°, 12° up plays mostly from its front speaker, partly from the top front")
-    func imaxFrontObjectThroughThePanner() {
-        // Independence Day's DTS:X carries two static objects at azimuth ±34.5°, elevation 12°.
-        // LibDTSX places the right one on the right wall 0.0375 of the way back, 12/45 up; panned,
-        // the floor gets cos and the ceiling sin of 12/45 of a quarter turn, as by angle.
-        let layout = SpatialSpeakerLayout.l714
-        var gains: [Float] = []
-        AllocentricPanner(layout: layout).objectGains(
-            position: SIMD3(1, 0.0375, 12.0 / 45), size: 0, snap: false, into: &gains)
-        let gain = { (speaker: SpatialSpeaker) in gains[layout.speakers.firstIndex(of: speaker)!] }
-        let floor = cos(Float(12.0 / 45) * .pi / 2), ceiling = sin(Float(12.0 / 45) * .pi / 2)
-        #expect(abs(gain(.right) - floor * cos(0.075 * .pi / 2)) < 1e-4)
-        #expect(abs(gain(.sideRight) - floor * sin(0.075 * .pi / 2)) < 1e-4)
-        #expect(gain(.topFrontRight) > 0.95 * ceiling)
-        #expect(gain(.left) == 0 && gain(.topFrontLeft) == 0 && gain(.rearRight) == 0)
     }
 
     @Test("the decoder opens, takes input and asks for more")

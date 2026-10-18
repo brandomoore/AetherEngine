@@ -78,7 +78,7 @@ func printUsage() {
                  [--reload-applying <key>=<value>]... [--reload-applying-at <ms>]
                  [--drop-audio]
                  [--sequential-origin] [--declared-duration S]
-             [--max-concurrent-requests N]
+             [--max-concurrent-requests N] [--atmos-bed 7.1.4]
                      [--audio-stats] [--host-calls play,extractor,setrate,pausestart,reloadlive,seekback,seekfar,pauseseek,pausereload,playreload,extplayreload,reloadnext] <url>
                      (full load+play session smoke test; --fel opts into the Profile 7
                       FEL dual-layer route (off by default, as in the engine, and only in
@@ -308,6 +308,22 @@ func printUsage() {
                 disk bounded. --sliding is accepted but ignored (sliding is
                 now the unconditional behaviour for a live session).
     """)
+}
+
+// MARK: - Object audio
+
+/// `--atmos-bed 7.1.4`: TrueHD Atmos or DTS:X rendered into that bed and delivered as APAC
+/// (`LoadOptions.objectAudioRendering`, #731). Without it the channel bridge plays them.
+private func objectAudioRendering(_ flag: String?) -> ObjectAudioRendering {
+    guard let flag else { return .off }
+    guard let layout = SpatialSpeakerLayout(rawValue: flag) else {
+        print("ERROR: --atmos-bed expects one of \(SpatialSpeakerLayout.allCases.map(\.rawValue)), got '\(flag)'")
+        exit(64)
+    }
+    #if !(TrueHDObjectAudio || DTSXObjectAudio)
+    print("[aetherctl] note: --atmos-bed renders nothing without the TrueHDObjectAudio / DTSXObjectAudio traits")
+    #endif
+    return .apac(layout)
 }
 
 // MARK: - URL parsing
@@ -810,6 +826,8 @@ if first == "play" {
     // LoadOptions.progressiveSegmentDelivery: serve each VOD segment while it is written. Pair it
     // with a throttled origin to see the startup difference; on a fast source nothing changes.
     let progressiveSegments = takeFlag("--progressive-segments", from: &rest)
+    // #731: TrueHD Atmos or DTS:X rendered into a bed as APAC; the 1 Hz line then reports its objects.
+    let playObjectAudio = objectAudioRendering(takeStringFlag("--atmos-bed", from: &rest))
     let declaredDuration = takeDoubleFlag("--declared-duration", from: &rest)
     // #311: install the software frame-time observer and read the presentation timebase, so the
     // per-frame boundaries and the clock a host would pace an overlay against are both observable.
@@ -1016,6 +1034,7 @@ if first == "play" {
                  sequentialOrigin: sequentialOrigin, maxConcurrentRequests: maxConcurrentRequests,
                  heldConnection: heldConnection,
                  progressiveSegments: progressiveSegments,
+                 objectAudioRendering: playObjectAudio,
                  declaredDuration: declaredDuration,
                  httpHeaders: playHeaders,
                  deinterlaceFieldRate: playFieldRate,
@@ -1118,20 +1137,7 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     // being judged by ear.
     let serveAudioDelayMs = takeIntFlag("--audio-delay", from: &rest) ?? 0
     // #731: TrueHD Atmos or DTS:X rendered into a speaker bed and served as APAC (LoadOptions.objectAudioRendering).
-    let atmosBedFlag = takeStringFlag("--atmos-bed", from: &rest)
-    let serveObjectAudioRendering: ObjectAudioRendering
-    if let atmosBedFlag {
-        guard let layout = SpatialSpeakerLayout(rawValue: atmosBedFlag) else {
-            print("ERROR: --atmos-bed expects one of \(SpatialSpeakerLayout.allCases.map(\.rawValue)), got '\(atmosBedFlag)'")
-            exit(64)
-        }
-        serveObjectAudioRendering = .apac(layout)
-        #if !(TrueHDObjectAudio || DTSXObjectAudio)
-        print("[aetherctl] note: --atmos-bed renders nothing without the TrueHDObjectAudio / DTSXObjectAudio traits")
-        #endif
-    } else {
-        serveObjectAudioRendering = .off
-    }
+    let serveObjectAudioRendering = objectAudioRendering(takeStringFlag("--atmos-bed", from: &rest))
     rejectStrayFlags(rest, subcommand: first)
     guard let urlArg = rest.first else {
         print("ERROR: \(first) requires a <url> argument")
