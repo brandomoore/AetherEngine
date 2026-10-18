@@ -386,6 +386,35 @@ final class Issue732PersistentHTTP1Tests: XCTestCase {
         XCTAssertEqual(server.connectionCount, 1)
     }
 
+    func testChunkedReadsKeepFramingAcrossCancellationHandlers() async throws {
+        let server = try XCTUnwrap(KeepAliveOrigin())
+        defer { server.stop() }
+        let expected = Data((0..<5000).map { UInt8($0 & 0xFF) })
+        server.route = { _ in .init(body: expected, chunked: true) }
+        let url = server.url("/chunked")
+        let origin = try XCTUnwrap(PersistentHTTP1Transport.Origin(url))
+        let connection = PersistentHTTP1Connection(origin: origin, label: "isolation")
+        defer { connection.retire(reason: "test finished") }
+        let head = try await connection.sendRequest(target: url, headers: [:])
+        var framing = PersistentHTTP1Connection.framing(for: head)
+        var received = Data()
+
+        while true {
+            let current = framing
+            let (chunk, advanced) = try await withTaskCancellationHandler {
+                try await connection.readChunk(current, progress: { "test body" })
+            } onCancel: {
+                connection.retire(reason: "test cancelled")
+            }
+            framing = advanced
+            guard let chunk else { break }
+            received.append(chunk)
+        }
+
+        XCTAssertEqual(received, expected)
+        XCTAssertNil(PersistentHTTP1Connection.reuseRefusal(head, framing))
+    }
+
     func testRefusalKeepsTheConnectionAndReportsItsStatus() async throws {
         let server = try XCTUnwrap(KeepAliveOrigin())
         defer { server.stop() }

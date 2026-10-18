@@ -12,6 +12,10 @@ the public-API contract.
 
 ### Fixed
 
+- Keep persistent HTTP/1.1 body framing in the caller's isolation while reading
+  chunks. Swift 6.4 can otherwise reject the cancellation-handler read with
+  "sending 'current' risks causing data races"; the chunked decoder remains
+  single-consumer, without unchecked Sendable conformance or an executor hop.
 - Correct accumulating AAC-LC audio drift on the native HLS path when an MP4
   sample table runs on a different clock from the decoded samples. Only tracks
   with demonstrated drift use timestamp-aware audio bridging; ordinary AAC and

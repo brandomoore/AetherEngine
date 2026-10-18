@@ -574,7 +574,10 @@ final class PersistentHTTP1Connection: @unchecked Sendable {
 
     /// The next piece of a body under `framing`, nil at its end, plus the framing after it. No
     /// cancellation handler: the caller decides whether an abandoned body is drained or closed.
-    func readChunk(_ framing: Framing, progress: () -> String) async throws -> (Data?, Framing) {
+    func readChunk(
+        _ framing: Framing, progress: () -> String,
+        isolation: isolated (any Actor)? = #isolation
+    ) async throws -> (Data?, Framing) {
         guard let task = stateLock.withLock({ retired ? nil : task }) else { throw CancellationError() }
         while true {
             switch framing {

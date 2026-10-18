@@ -358,6 +358,12 @@ at a time, until a 120 s time limit fired at 151 s because its watchdog is a tas
 pool. `LIBDISPATCH_COOPERATIVE_POOL_STRICT=1` narrows the pool to one thread and reproduces that
 on any Mac; the full suite has to pass under it.
 
+Persistent HTTP/1.1 body reads inherit the caller's isolation through
+`PersistentHTTP1Connection.readChunk`'s isolated parameter. Its framing can own a
+mutable chunked-body decoder, so a cancellation-handler read must not send that
+single-consumer state to a different executor. Cancellation still abandons the
+body through its existing drain-or-close path.
+
 ## Subtitle recognition scheduling
 
 Bitmap subtitle OCR awaits each image's recognition on a dedicated utility thread.
