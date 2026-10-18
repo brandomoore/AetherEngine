@@ -61,7 +61,7 @@ struct LivePacketReplayGuard {
     }
 
     private struct Overlap {
-        let videoFrontier: Int64
+        var videoFrontier: Int64
         let admittedVideoFrontier: Int64
         let audioFrontier: Int64
         let requiresAudioMatch: Bool
@@ -79,6 +79,8 @@ struct LivePacketReplayGuard {
         var firstUnmatchedAudioSeconds: Double?
         var containsUnmatchedPackets = false
         var pendingVideoSignatures: Set<Signature> = []
+        var outgoingVideoTailSeconds: Double?
+        var outgoingVideoTailPackets = 0
     }
 
     private struct DamagedBoundary {
@@ -269,6 +271,24 @@ struct LivePacketReplayGuard {
             overlap = nil
             return Decision(drop: false, event: .mismatch(
                 videoPackets: current.videoPackets, audioPackets: current.audioPackets))
+        }
+        if signature.stream == .video, current.videoPackets == 0, signature.dts > current.videoFrontier {
+            // Returning audio can open the overlap while the outgoing connection's last
+            // pictures are still inside the PES parser. Retain them like a held boundary,
+            // so their returning copies land in the same verified batch instead of after it.
+            let start = current.outgoingVideoTailSeconds ?? sourceSeconds
+            if sourceSeconds >= start,
+               sourceSeconds - start <= Swift.max(Self.maximumUnmatchedSeconds, 2 * (videoCadence.cadence ?? 0))
+                + timeBaseSeconds,
+               current.outgoingVideoTailPackets < Self.maximumUnmatchedPackets {
+                current.outgoingVideoTailSeconds = start
+                current.outgoingVideoTailPackets += 1
+                current.videoFrontier = signature.dts
+                if isCorrupt { current.containsUnmatchedPackets = true }
+                else { current.pendingVideoSignatures.insert(signature) }
+                overlap = current
+                return Decision(drop: false, event: nil)
+            }
         }
         if signature.stream == .video, signature.dts > current.admittedVideoFrontier,
            signature.dts <= current.videoFrontier, !current.pendingVideoSignatures.contains(signature) {

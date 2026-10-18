@@ -681,7 +681,7 @@ extension AetherEngine {
     /// TrueHD that FFmpeg marked Atmos while probing (mlpdec sets the profile from the major sync), and
     /// not a commentary. `TrackInfo.isAtmos` stays the E-AC-3 JOC answer it is documented as.
     nonisolated static func isRenderableTrueHDAtmos(_ track: TrackInfo) -> Bool {
-        track.codec.lowercased() == "truehd" && !track.isCommentary && !track.isExternal
+        linksTrueHDObjectDecoder && track.codec.lowercased() == "truehd" && !track.isCommentary && !track.isExternal
             && track.profile == trueHDAtmosProfileName
     }
 
@@ -694,12 +694,18 @@ extension AetherEngine {
     /// `TrackInfo.codec` is the decoder's name, `dca` for libavcodec's DTS decoder; `dts` is the
     /// codec's own name, which a build without the decoder would report.
     nonisolated static func isRenderableDTSX(_ track: TrackInfo) -> Bool {
-        ["dca", "dts"].contains(track.codec.lowercased()) && !track.isCommentary && !track.isExternal
+        linksDTSXObjectDecoder && ["dca", "dts"].contains(track.codec.lowercased()) && !track.isCommentary && !track.isExternal
             && dtsxProfileNames.contains(track.profile ?? "")
     }
 
     nonisolated private static let dtsxProfileNames = Set([AV_PROFILE_DTS_HD_MA_X, AV_PROFILE_DTS_HD_MA_X_IMAX]
         .compactMap { VideoStreamFormat.profileName(codecID: AV_CODEC_ID_DTS, profile: $0) })
+
+    /// Whether the build links the codec's object decoder (#777: its package trait). Without it the codec
+    /// keeps the channel bridge, so the pick has no heights to prefer it for.
+    nonisolated static let linksTrueHDObjectDecoder = OptionalComponent.trueHDObjectAudio.isBuiltIn
+
+    nonisolated static let linksDTSXObjectDecoder = OptionalComponent.dtsxObjectAudio.isBuiltIn
 
     /// The tracks object rendering keeps the heights of.
     nonisolated static func isRenderableObjectAudio(_ track: TrackInfo) -> Bool {
@@ -804,7 +810,8 @@ extension AetherEngine {
 
     // MARK: - Decoder identity helpers
 
-    /// User-facing label for the active video decoder. nil when no video track (AV_CODEC_ID_NONE). Native = VideoToolbox HW; SW = dav1d (AV1) or libavcodec (VP9, MPEG-2, VC-1).
+    /// User-facing label for the active video decoder. nil when no video track (AV_CODEC_ID_NONE).
+    /// isSoftware describes the decoder, not the playback path: the software host can use VideoToolbox.
     static func videoDecoderLabel(codecID: AVCodecID, isSoftware: Bool) -> String? {
         guard codecID != AV_CODEC_ID_NONE else { return nil }
         let name: String = {

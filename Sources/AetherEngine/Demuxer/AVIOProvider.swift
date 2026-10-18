@@ -77,12 +77,17 @@ protocol AVIOProvider: AnyObject {
     /// AE#585: the index pass is over, so the next read that lands outside a resident span is
     /// playback's. Default no-op.
     func endIndexPass()
+
+    /// AE#782: the demuxer was just repositioned for playback (a producer restart), so the next read
+    /// that needs the network is where playback continues, not index work that returns. Default no-op.
+    func notePlaybackRepositioned()
 }
 
 extension AVIOProvider {
     func markOpenPhaseFinished() {}
     func beginIndexPass() {}
     func endIndexPass() {}
+    func notePlaybackRepositioned() {}
     var currentSourceOffset: Int64? { nil }
     var sourceSurvivesReopen: Bool { false }
 }

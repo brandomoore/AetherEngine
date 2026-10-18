@@ -160,7 +160,7 @@ struct Issue460ReloadWithOptionsTests {
 
         // Refused for the session, not for the fields: the tuning change rides along and must not
         // survive a reload that never happened.
-        try? await engine.reloadAtCurrentPosition {
+        _ = try? await engine.reloadAtCurrentPosition {
             $0.autoplay = false
             $0.teletextPage = 888
         }
@@ -178,7 +178,7 @@ struct Issue460ReloadWithOptionsTests {
 
         var seenHeader: String?
         var seenMatchContent: Bool?
-        try? await engine.reloadAtCurrentPosition {
+        _ = try? await engine.reloadAtCurrentPosition {
             seenHeader = $0.httpHeaders["Authorization"]
             seenMatchContent = $0.matchContentEnabled
         }

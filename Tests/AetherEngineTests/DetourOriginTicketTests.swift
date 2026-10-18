@@ -58,6 +58,56 @@ struct DetourOriginTicketTests {
         // exactly that range: the pump's refills are 32 MB and the tail prefetch is a suffix.
         #expect(server.requestedRanges.contains { $0.start == 4 * 1024 * 1024 && $0.end == 8 * 1024 * 1024 - 1 },
                 "no detour block went out, so this measured nothing: \(server.requestedRanges)")
+
+        // Arming a seek deadline must still reuse that resident block without network I/O.
+        let requestsBeforeHit = server.rangeRequestCount
+        reader.beginReadDeadline(secondsFromNow: 8)
+        #expect(reader.seek(offset: target, whence: Int32(SEEK_SET)) == target)
+        #expect(reader.read(into: buf, size: Int32(chunk)) == chunk)
+        #expect(server.rangeRequestCount == requestsBeforeHit)
+        reader.endReadDeadline()
+    }
+
+    @Test("bounded cold probing reanchors without a speculative block, then restores normal detours",
+          .timeLimit(.minutes(2)))
+    func boundedProbeSkipsColdDetour() throws {
+        let server = try #require(ThrottledOriginServer(totalSize: 64 * 1024 * 1024,
+                                                       throttleUs: 40_000, patternedBody: true))
+        defer { server.stop() }
+        let reader = AVIOReader(url: URL(string: "http://127.0.0.1:\(server.port)/bounded.bin")!)
+        defer { reader.markClosed(); reader.close() }
+        try reader.open()
+        let chunk = 256 * 1024
+        let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: chunk)
+        defer { buf.deallocate() }
+        func readToThirteenMB(from start: Int) throws {
+            var position = start
+            while position < 13 * 1024 * 1024 {
+                let n = Int(reader.read(into: buf, size: Int32(chunk)))
+                try #require(n > 0)
+                position += n
+            }
+        }
+        try readToThirteenMB(from: 0)
+        #expect(reader.hasLiveConnectionForTesting)
+        let target: Int64 = 5 * 1024 * 1024
+        reader.beginReadDeadline(secondsFromNow: 8)
+        #expect(reader.seek(offset: target, whence: Int32(SEEK_SET)) == target)
+        let n = Int(reader.read(into: buf, size: Int32(chunk)))
+        #expect(n == chunk)
+        #expect(!reader.readDeadlineFired)
+        #expect((0..<max(0, n)).allSatisfy {
+            buf[$0] == ThrottledOriginServer.patternByte(at: target + Int64($0))
+        })
+        #expect(server.requestedRanges.contains { $0.start == target })
+        #expect(!server.requestedRanges.contains { $0.start == 4 * 1024 * 1024 && $0.end == 8 * 1024 * 1024 - 1 })
+        reader.endReadDeadline()
+
+        // The policy is scoped to the bounded operation, not a sticky source-wide downgrade.
+        try readToThirteenMB(from: Int(target) + max(0, n))
+        #expect(reader.seek(offset: target, whence: Int32(SEEK_SET)) == target)
+        #expect(reader.read(into: buf, size: Int32(chunk)) == chunk)
+        #expect(server.requestedRanges.contains { $0.start == 4 * 1024 * 1024 && $0.end == 8 * 1024 * 1024 - 1 })
     }
 
     #if os(macOS)

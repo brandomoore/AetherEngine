@@ -150,7 +150,7 @@ struct HEVCCodecStringTests {
 
     @Test("the plain HEVC route declares the Annex-B source's own profile in the master")
     func plainRouteUsesAnnexBSPS() throws {
-        var codecpar: UnsafeMutablePointer<AVCodecParameters>? = try #require(avcodec_parameters_alloc())
+        var codecpar: UnsafeMutablePointer<AVCodecParameters>? = avcodec_parameters_alloc()
         defer { avcodec_parameters_free(&codecpar) }
         let cp = codecpar!
         cp.pointee.codec_type = AVMEDIA_TYPE_VIDEO

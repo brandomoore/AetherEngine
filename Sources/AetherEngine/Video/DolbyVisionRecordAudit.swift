@@ -31,7 +31,8 @@ public enum DolbyVisionRecordAudit {
         var result: Int?
         A53SEIParser.forEachNAL(data, size, framing) { nal, len in
             guard result == nil, (nal[0] >> 1) & 0x3F == nalTypeRPU else { return }
-            guard let rpu = dovi_parse_unspec62_nalu(nal, len) else { return }
+            // Behind the CRC and panic-path checks: libdovi aborts the process on some malformed RPUs.
+            guard let rpu = DoviRpuGuard.parse(nal, len) else { return }
             defer { dovi_rpu_free(rpu) }
             guard let hdr = dovi_rpu_get_header(rpu) else { return }
             defer { dovi_rpu_free_header(hdr) }
@@ -227,6 +228,45 @@ public enum DolbyVisionRecordAudit {
             guard packet.pointee.stream_index == videoIdx else { continue }
             walked += 1
             if let profile = rpuProfile(packet, framing: framing) { return profile }
+        }
+        return nil
+    }
+
+    /// Walks the first video packets of an open demuxer for the first RPU of a Profile 7 source and reads
+    /// its enhancement-layer type ("FEL" or "MEL"). nil when no packet in the budget carries one.
+    ///
+    /// Takes the session's own probe demuxer, so the packets read here are packets the caller must not
+    /// need afterwards: the caller seeks it back or opens another. The same packet and byte ceilings as
+    /// `rpuProfile(walking:)` apply, for the same reason (audit BIT-2, BIT-103).
+    static func probeEnhancementLayerType(
+        demuxer: Demuxer, streamIndex: Int32, packetBudget: Int = auditPacketBudget,
+        byteBudget: Int64 = Int64(walkByteBudget)
+    ) -> String? {
+        guard let stream = demuxer.stream(at: streamIndex) else { return nil }
+        let codecpar = stream.pointee.codecpar
+        let framing = A53SEIParser.nalFraming(
+            codec: .hevc, extradata: codecpar?.pointee.extradata,
+            size: Int(codecpar?.pointee.extradata_size ?? 0))
+
+        demuxer.beginInputByteBudget(byteBudget)
+        defer { demuxer.endInputByteBudget() }
+
+        var walked = 0
+        var packetsRead = 0
+        var bytesRead = 0
+        while walked < packetBudget {
+            guard !walkExhausted(packetsRead: packetsRead, bytesRead: bytesRead, packetBudget: packetBudget)
+            else { return nil }
+            guard let packet = (try? demuxer.readPacket()) ?? nil else { return nil }
+            defer {
+                av_packet_unref(packet)
+                av_packet_free_safe(packet)
+            }
+            packetsRead += 1
+            bytesRead += Int(max(packet.pointee.size, 0))
+            guard packet.pointee.stream_index == streamIndex else { continue }
+            walked += 1
+            if let type = DoviRpuConverter.enhancementLayerType(packet, framing: framing) { return type }
         }
         return nil
     }

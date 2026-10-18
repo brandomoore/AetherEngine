@@ -384,6 +384,27 @@ extension HLSVideoEngine {
         return plan
     }
 
+    /// AE#783: the highest source bitrate of any planned segment, from the byte positions the container
+    /// index records at the segment boundaries. Those bytes hold every interleaved track, including the
+    /// ones the session drops, so the figure errs high. Nil unless the positions rise across every
+    /// measurable boundary: two IRAPs in one Matroska Cluster share a position, a disc folds several
+    /// files onto one axis, and either one makes a byte span mean nothing. The final segment has no
+    /// indexed end and is not measured.
+    ///
+    /// Pure for offline testing.
+    static func peakSegmentBitrate(plan: [Segment], keyframeBytePositions: [Int64: Int64]) -> Int64? {
+        guard plan.count > 1 else { return nil }
+        var peak: Double = 0
+        for segment in plan.dropLast() {
+            guard let start = keyframeBytePositions[segment.startPts], start >= 0,
+                  let end = keyframeBytePositions[segment.endPts], end > start,
+                  segment.durationSeconds > 0
+            else { return nil }
+            peak = max(peak, Double(end - start) * 8 / segment.durationSeconds)
+        }
+        return peak > 0 && peak < Double(Int64.max) ? Int64(peak) : nil
+    }
+
     /// Segments shorter than this are folded into a neighbour by `collapseShortSegments`. A keyframe
     /// cluster (several IRAPs within a few frames) otherwise makes `buildKeyframeSegmentPlan` emit
     /// sub-frame segments whose narrow [start,end) window can miss every demuxed keyframe, so the producer
@@ -487,9 +508,7 @@ extension HLSVideoEngine {
         guard Self.configRecordNeedsInBandRebuild(extradata, size: extradataSize) else { return nil }
         let naluLengthSize = 4   // the predicate above already required it
 
-        var vps: [UInt8]?
-        var sps: [UInt8]?
-        var pps: [UInt8]?
+        var sets = VideoConfigRecord.HEVCParameterSets()
         // Counted in VIDEO packets: a film interleaves audio and dozens of subtitle tracks, which
         // would otherwise exhaust the budget before the first video packet.
         let packetBudget = 16
@@ -501,55 +520,19 @@ extension HLSVideoEngine {
             if pkt.pointee.stream_index != videoStreamIndex { return false }
             packetsScanned += 1
             guard let pktData = pkt.pointee.data else { return packetsScanned >= packetBudget }
-            let pktSize = Int(pkt.pointee.size)
-
-            var offset = 0
-            while offset + naluLengthSize <= pktSize {
-                var nalLen = 0
-                for i in 0..<naluLengthSize {
-                    nalLen = (nalLen << 8) | Int(pktData[offset + i])
-                }
-                offset += naluLengthSize
-                if nalLen == 0 || offset + nalLen > pktSize { break }
-                let nalType = (Int(pktData[offset]) >> 1) & 0x3F  // HEVC NAL type: bits 1..6 of byte 0
-                let nalBytes = Array(UnsafeBufferPointer(start: pktData + offset, count: nalLen))
-                switch nalType {
-                case 32: if vps == nil { vps = nalBytes }
-                case 33: if sps == nil { sps = nalBytes }
-                case 34: if pps == nil { pps = nalBytes }
-                default: break
-                }
-                offset += nalLen
-            }
-
-            return (vps != nil && sps != nil && pps != nil) || packetsScanned >= packetBudget
+            sets.collect(from: pktData, size: Int(pkt.pointee.size), naluLengthSize: naluLengthSize)
+            return sets.isComplete || packetsScanned >= packetBudget
         }
 
-        guard let vps, let sps, let pps else {
+        guard let vps = sets.vps, let sps = sets.sps, let pps = sets.pps else {
             EngineLog.emit(
                 "[HLSVideoEngine] in-band parameter-set scan found none: "
-                + "packets=\(packetsScanned) vps=\(vps != nil) sps=\(sps != nil) pps=\(pps != nil)",
+                + "packets=\(packetsScanned) vps=\(sets.vps != nil) sps=\(sets.sps != nil) pps=\(sets.pps != nil)",
                 category: .session
             )
             return nil
         }
-
-        // Assemble hvcC: keep source 22-byte header, set numOfArrays=3, append VPS/SPS/PPS arrays (1-byte type, 2-byte numNalus=1, 2-byte nalUnitLength, NAL bytes).
-        var hvcC: [UInt8] = []
-        hvcC.reserveCapacity(22 + 1 + 5 * 3 + vps.count + sps.count + pps.count)
-        for i in 0..<22 { hvcC.append(extradata[i]) }
-        hvcC.append(3)
-        func appendArray(nalUnitType: UInt8, nal: [UInt8]) {
-            hvcC.append(0x80 | (nalUnitType & 0x3F))
-            hvcC.append(0); hvcC.append(1)
-            let nl = UInt16(nal.count)
-            hvcC.append(UInt8(nl >> 8)); hvcC.append(UInt8(nl & 0xFF))
-            hvcC.append(contentsOf: nal)
-        }
-        appendArray(nalUnitType: 32, nal: vps)
-        appendArray(nalUnitType: 33, nal: sps)
-        appendArray(nalUnitType: 34, nal: pps)
-        return hvcC
+        return VideoConfigRecord.hevcRecord(header: extradata, vps: vps, sps: sps, pps: pps)
     }
 
     /// Shows the packets at the head of the source to `inspect`, which returns true once it has seen

@@ -56,6 +56,7 @@ final class LoopbackListener: @unchecked Sendable {
     /// to `SO_NOSIGPIPE`, and owns it from then on; it returns false to end the loop. It is never
     /// called once `stop()` has run.
     func start(_ onAccept: @escaping (Int32) -> Bool) {
+        nonisolated(unsafe) let onAccept = onAccept
         Thread.detachNewThread { [self] in acceptLoop(onAccept) }
     }
 

@@ -23,7 +23,7 @@ struct StaleSessionCallbackTests {
     @Test("An escalation raised before stop() and run after it does nothing")
     func escalationAfterStopIsDropped() async throws {
         let engine = try AetherEngine()
-        engine.loadedURL = try #require(URL(string: "http://127.0.0.1:9/source.mkv"))
+        engine.loadedURL = URL(string: "http://127.0.0.1:9/source.mkv")
         let raisedUnder = engine.loadGeneration
         var events: [SoftwarePathEscalationEvent] = []
         let sub = engine.softwarePathEscalations.sink { events.append($0) }

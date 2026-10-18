@@ -1,0 +1,11 @@
+# Everything the scripts generate: clips, RPU binaries and configs, logs, recordings.
+out/
+*.mp4
+*.mov
+*.MOV
+*.hevc
+*.bin
+*.log
+recordings/
+.dd/
+__pycache__/

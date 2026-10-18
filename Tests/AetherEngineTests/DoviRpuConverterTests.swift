@@ -7,6 +7,7 @@ import Dovi
 /// Successful real-RPU conversion and the FEL/MEL string value are validated against
 /// dovi_tool ground truth via `aetherctl dovitest` and on device; these guard the
 /// pure byte-walk branches (degrade-on-failure, EL drop, no-op) from regressing.
+@Suite(.serialized)
 struct DoviRpuConverterTests {
 
     /// 2-byte HEVC NAL header (type in bits 1..6 of byte 0, layer 0, temporal_id_plus1 = 1) + payload.
@@ -71,6 +72,73 @@ struct DoviRpuConverterTests {
         #expect(nalTypes(pkt) == [1])
     }
 
+    @Test("A packet of only a refused RPU and an EL is left untouched and reports the failure")
+    func refusedRPUWithoutBaseLayerReportsFailure() {
+        let nals = [hevcNAL(type: 62, payload: [0x00]), hevcNAL(type: 63, payload: [0xCC])]
+        let bytes = framed(nals, .lengthPrefixed(size: 4))
+        let pkt = packet(from: bytes)
+        defer { free(pkt) }
+
+        // Nothing is left to rebuild a packet from, so it stays as it was, but the dropped RPU still counts.
+        #expect(DoviRpuConverter.convertPacketToProfile81(pkt) == false)
+        #expect(packetBytes(pkt) == bytes)
+    }
+
+    /// CRC-valid RPUs that reach a panic or an unbounded allocation in libdovi, and one with a wrong CRC.
+    /// Handing any of them to libdovi aborts the test process, so passing is the point.
+    typealias Hostile = (name: String, rpu: [UInt8])
+    static let hostileRPUs: [Hostile] = {
+        typealias G = DoviRpuGuardTests
+        let poly: [[G.Piece]] = [[.polynomial], [.polynomial], [.polynomial]]
+        return [
+            ("linear interpolation", G.craft(linearOnComponent: 1)),
+            ("polynomial and MMR mix, no residual", G.craft(pieces: [[.polynomial, .mmr], [.polynomial], [.polynomial]])),
+            ("polynomial and MMR mix, MEL", G.craft(pieces: [[.mmr, .polynomial], [.polynomial], [.polynomial]], residual: .mel)),
+            ("polynomial and MMR mix, FEL", G.craft(pieces: [[.polynomial], [.polynomial], [.polynomial, .mmr]], residual: .fel)),
+            ("pivot count beyond the payload", G.craft(pieces: poly, pivotCount: (UInt64(1) << 32) - 2)),
+            ("mapping_idc with 64 leading zeros", G.craft(pieces: [[.linear], [.polynomial], [.polynomial]],
+                                                          firstMappingIdc: { $0.ueRaw(zeros: 64, rest: 0) })),
+            ("vdr_rpu_id with 40 leading zeros", G.craft(pieces: poly, vdrRpuId: { $0.ueRaw(zeros: 40, rest: G.maxRest(40)) })),
+            ("undefined level 8 block length", G.craftUsePrev(cmv40Block: (11, 8))),
+            ("bad CRC", G.withBadCRC(G.craft(linearOnComponent: nil), crcByte: 1)),
+        ]
+    }()
+
+    @Test("A hostile or corrupt RPU is refused on the real conversion paths: HDR10 fallback, no abort",
+          arguments: Array(DoviRpuConverterTests.hostileRPUs.indices), [VideoNALFraming.lengthPrefixed(size: 4), .annexB])
+    func hostileRPUDegradesOnEveryEntryPoint(index: Int, framing: VideoNALFraming) {
+        let (name, rpu) = Self.hostileRPUs[index]
+        let nals = [hevcNAL(type: 1, payload: [0xAA, 0xBB]), rpu, hevcNAL(type: 63, payload: [0xCC])]
+        let bytes = framed(nals, framing)
+
+        // The probes read the packet and must come back empty-handed.
+        let probe = packet(from: bytes)
+        defer { free(probe) }
+        #expect(DoviRpuConverter.enhancementLayerType(probe, framing: framing) == nil, Comment(rawValue: name))
+        #expect(DolbyVisionRecordAudit.rpuProfile(probe, framing: framing) == nil, Comment(rawValue: name))
+
+        // The conversion reports the failure and drops the RPU and the EL, keeping the base layer.
+        let pkt = packet(from: bytes)
+        defer { free(pkt) }
+        #expect(DoviRpuConverter.convertPacketToProfile81(pkt, framing: framing) == false, Comment(rawValue: name))
+        let expected = framed([nals[0]], framing)
+        #expect(packetBytes(pkt) == expected, Comment(rawValue: name))
+    }
+
+    @Test("A well-formed crafted RPU takes the same paths and converts, so the refusals above are the guard's")
+    func craftedRPUConvertsOnTheSamePaths() {
+        let rpu = DoviRpuGuardTests.craft(pieces: [[.polynomial], [.mmr], [.mmr]], residual: .fel)
+        let bytes = framed([hevcNAL(type: 1, payload: [0xAA, 0xBB]), rpu, hevcNAL(type: 63, payload: [0xCC])],
+                           .lengthPrefixed(size: 4))
+        let probe = packet(from: bytes)
+        defer { free(probe) }
+        #expect(DoviRpuConverter.enhancementLayerType(probe) == "FEL")
+        let pkt = packet(from: bytes)
+        defer { free(pkt) }
+        #expect(DoviRpuConverter.convertPacketToProfile81(pkt) == true)
+        #expect(nalTypes(pkt) == [1, 62])
+    }
+
     @Test("A non-DV packet is left untouched")
     func leavesNonDVUntouched() {
         let bl = hevcNAL(type: 1, payload: [0xAA, 0xBB])
@@ -106,6 +174,15 @@ struct DoviRpuConverterTests {
     @Test("enhancementLayerType returns nil for an unparseable RPU")
     func elTypeNilForMalformedRPU() {
         let pkt = avccPacket([hevcNAL(type: 1, payload: [0xAA]), hevcNAL(type: 62, payload: [0x00])])
+        defer { free(pkt) }
+        #expect(DoviRpuConverter.enhancementLayerType(pkt) == nil)
+    }
+
+    @Test("enhancementLayerType does not hand libdovi an RPU the guard rejects (it would abort the process)")
+    func elTypeSkipsAnRPUThatWouldAbortLibdovi() {
+        // CRC-valid, but a linear-interpolation polynomial piece, which libdovi panics on.
+        let rpu = DoviRpuGuardTests.craft(linearOnComponent: 0)
+        let pkt = avccPacket([hevcNAL(type: 1, payload: [0xAA]), rpu])
         defer { free(pkt) }
         #expect(DoviRpuConverter.enhancementLayerType(pkt) == nil)
     }
@@ -258,7 +335,7 @@ struct DoviRpuConverterTests {
             A53SEIParser.forEachNAL(buf.baseAddress!, buf.count, framing) { nal, len in
                 switch (nal[0] >> 1) & 0x3F {
                 case 62:
-                    guard let rpu = dovi_parse_unspec62_nalu(nal, len) else { degraded = true; return }
+                    guard let rpu = DoviRpuGuard.parse(nal, len) else { degraded = true; return }   // as production: the guard first, libdovi is panic=abort
                     if dovi_convert_rpu_with_mode(rpu, 2) != 0 { dovi_rpu_free(rpu); degraded = true; return }
                     guard let out = dovi_write_unspec62_nalu(rpu) else { dovi_rpu_free(rpu); degraded = true; return }
                     guard let data = out.pointee.data, out.pointee.len > 0 else {
@@ -380,5 +457,191 @@ struct DoviRpuConverterTests {
         // The EL is dropped, which would leave nothing: the degenerate guard keeps the packet.
         #expect(DoviRpuConverter.convertPacketToProfile81(pkt) == true)
         #expect(packetBytes(pkt) == input)
+    }
+
+    #if DualLayerDolbyVision
+    // MARK: - Single parse per RPU
+
+    /// Each RPU must be parsed exactly once. Before the fix, `separateDualLayers`
+    /// parsed via `DoviFelComposer.parseRpuParameters` (internally calling
+    /// `dovi_parse_unspec62_nalu`) and then again via a direct call, and
+    /// `DualLayerVideoDecoder` added a third. After the fix: one parse per RPU.
+    @Test("separateDualLayers parses each RPU exactly once")
+    func singleParsePerRPUPerformance() {
+        // Build a P7 packet from the real RPU fixture: BL + RPU + EL.
+        // clipARpuHex already includes the 2-byte HEVC NAL header (0x7C, 0x01 = type 62).
+        let bl = hevcNAL(type: 1, payload: [0xAA, 0xBB])
+        let rpu = hexToBytes(DoviFelMathTests.clipARpuHex)
+        let el = hevcNAL(type: 63, payload: [0xCC])
+        let pkt = avccPacket([bl, rpu, el])
+        defer { free(pkt) }
+
+        // Baseline: no prior parses.
+        DoviFelComposer.resetParseRpuCountForTesting()
+        #expect(DoviFelComposer.parseRpuCountForTesting == 0)
+
+        let result = DoviRpuConverter.separateDualLayers(pkt)
+
+        // Exactly one parse happened (via parseRpuParameters).
+        #expect(DoviFelComposer.parseRpuCountForTesting == 1,
+                "expected exactly 1 parse per RPU, got \(DoviFelComposer.parseRpuCountForTesting)")
+        #expect(result.rpuParams != nil)
+        #expect(result.convertedRpu != nil)
+        #expect(result.isFEL == true)
+        #expect(result.isMEL == false)
+        #expect(result.success == true)
+    }
+
+    // MARK: - Several RPUs in one packet
+
+    /// The raw bytes, the parameters and the converted RPU of a result must all come from one RPU.
+    /// Clip A and clip C differ in pivots and in size, so each output names its source.
+    @Test("with two valid RPUs in a packet, raw bytes, parameters and converted RPU all come from the last one")
+    func twoValidRpusComeFromOneRpu() throws {
+        let first = hexToBytes(DoviFelMathTests.clipARpuHex)
+        let second = hexToBytes(DoviFelMathTests.clipCRpuHex)
+        let pkt = avccPacket([hevcNAL(type: 1, payload: [0xAA]), first, second, hevcNAL(type: 63, payload: [0xCC])])
+        defer { free(pkt) }
+        let result = DoviRpuConverter.separateDualLayers(pkt)
+
+        #expect(result.success)
+        #expect(result.rpuData == second)
+        // Parameters of the second RPU: its luma curve is not the first's 9-pivot one.
+        let expected = try #require(Self.parameters(of: second))
+        let got = try #require(result.rpuParams)
+        #expect(got.polyY.numPivots == expected.polyY.numPivots)
+        #expect(got.polyY.pivots == expected.polyY.pivots)
+        #expect(got.polyCb.coef == expected.polyCb.coef)
+        #expect(got.mmrCb.coef == expected.mmrCb.coef)
+        let other = try #require(Self.parameters(of: first))
+        #expect(got.polyY.pivots != other.polyY.pivots || got.mmrCb.coef != other.mmrCb.coef, "fixture RPUs must differ")
+        #expect(result.convertedRpu == Self.converted(second))
+    }
+
+    @Test("a second RPU that fails the guard leaves the first RPU's bytes, parameters and conversion intact")
+    func failingSecondRpuKeepsFirstConsistent() throws {
+        let first = hexToBytes(DoviFelMathTests.clipARpuHex)
+        var bad = hexToBytes(DoviFelMathTests.clipCRpuHex)
+        bad[bad.count - 6] ^= 0xFF   // inside the CRC-covered payload: the guard refuses it
+        let pkt = avccPacket([hevcNAL(type: 1, payload: [0xAA]), first, bad, hevcNAL(type: 63, payload: [0xCC])])
+        defer { free(pkt) }
+        let result = DoviRpuConverter.separateDualLayers(pkt)
+
+        #expect(!result.success, "the dropped RPU is still reported")
+        #expect(result.rpuData == first)
+        let expected = try #require(Self.parameters(of: first))
+        let got = try #require(result.rpuParams)
+        #expect(got.polyY.pivots == expected.polyY.pivots)
+        #expect(got.mmrCb.coef == expected.mmrCb.coef)
+        #expect(result.convertedRpu == Self.converted(first))
+        #expect(result.isFEL)
+    }
+
+    private static func parameters(of nal: [UInt8]) -> DoviMetalParams? {
+        guard let rpu = dovi_parse_unspec62_nalu(nal, nal.count) else { return nil }
+        defer { dovi_rpu_free(rpu) }
+        return DoviFelComposer.parseRpuParameters(rpu: rpu)
+    }
+
+    private static func converted(_ nal: [UInt8]) -> [UInt8]? {
+        guard let rpu = dovi_parse_unspec62_nalu(nal, nal.count) else { return nil }
+        defer { dovi_rpu_free(rpu) }
+        guard let out = DoviRpuConverter.convertedUnspec62(rpu) else { return nil }
+        defer { dovi_data_free(out) }
+        return [UInt8](UnsafeBufferPointer(start: out.pointee.data, count: out.pointee.len))
+    }
+
+    @Test("separateDualLayers skips parameter extraction when extractParams is false")
+    func separateDualLayersSkipsParameterExtractionWhenRequested() {
+        let bl = hevcNAL(type: 1, payload: [0xAA, 0xBB])
+        let rpu = hexToBytes(DoviFelMathTests.clipARpuHex)
+        let el = hevcNAL(type: 63, payload: [0xCC])
+        let pkt = avccPacket([bl, rpu, el])
+        defer { free(pkt) }
+
+        DoviFelComposer.resetParseRpuCountForTesting()
+        #expect(DoviFelComposer.parseRpuCountForTesting == 0)
+
+        let result = DoviRpuConverter.separateDualLayers(pkt, extractParams: false)
+
+        #expect(DoviFelComposer.parseRpuCountForTesting == 0,
+                "expected 0 parses when extractParams is false, got \(DoviFelComposer.parseRpuCountForTesting)")
+        #expect(result.rpuParams == nil)
+        #expect(result.convertedRpu != nil)
+        #expect(result.isFEL == true)
+        #expect(result.isMEL == false)
+        #expect(result.success == true)
+    }
+
+    @Test("convertPacketToProfile81 skips parameter extraction")
+    func convertPacketToProfile81SkipsParameterExtraction() {
+        let bl = hevcNAL(type: 1, payload: [0xAA, 0xBB])
+        let rpu = hexToBytes(DoviFelMathTests.clipARpuHex)
+        let el = hevcNAL(type: 63, payload: [0xCC])
+        let pkt = avccPacket([bl, rpu, el])
+        defer { free(pkt) }
+
+        DoviFelComposer.resetParseRpuCountForTesting()
+        #expect(DoviFelComposer.parseRpuCountForTesting == 0)
+
+        let success = DoviRpuConverter.convertPacketToProfile81(pkt)
+
+        #expect(DoviFelComposer.parseRpuCountForTesting == 0,
+                "expected 0 parses in convertPacketToProfile81, got \(DoviFelComposer.parseRpuCountForTesting)")
+        #expect(success == true)
+    }
+
+    // MARK: - Untouched Base Layer with CustomBlockSource
+
+    @Test("separateDualLayers with useCustomBlockSource leaves packet untouched while extracting EL and RPU")
+    func separateDualLayersWithCustomBlockSourceLeavesPacketUntouched() {
+        let bl = hevcNAL(type: 1, payload: [0xAA, 0xBB, 0xCC, 0xDD])
+        let rpu = hexToBytes(DoviFelMathTests.clipARpuHex)
+        let el = hevcNAL(type: 63, payload: [0xEE, 0xFF])
+        let pkt = avccPacket([bl, rpu, el])
+        defer { free(pkt) }
+
+        let originalData = pkt.pointee.data
+        let originalSize = pkt.pointee.size
+        let originalBuf = pkt.pointee.buf
+
+        let result = DoviRpuConverter.separateDualLayers(
+            pkt,
+            extractEL: true,
+            useCustomBlockSource: true,
+            extractParams: true
+        )
+        defer {
+            var elOpt: UnsafeMutablePointer<AVPacket>? = result.elPacket
+            trackedPacketFree(&elOpt)
+        }
+
+        // Base-layer packet pointer, size, and AVBufferRef must be COMPLETELY UNTOUCHED
+        #expect(pkt.pointee.data == originalData)
+        #expect(pkt.pointee.size == originalSize)
+        #expect(pkt.pointee.buf == originalBuf)
+
+        // EL packet, RPU params, and converted RPU must still be correctly extracted
+        #expect(result.elPacket != nil)
+        #expect(result.rpuParams != nil)
+        #expect(result.convertedRpu != nil)
+        #expect(result.isFEL == true)
+        #expect(result.isMEL == false)
+        #expect(result.success == true)
+    }
+    #endif
+
+    /// Hex-string decoder for RPU fixtures.
+    private func hexToBytes(_ hex: String) -> [UInt8] {
+        var bytes: [UInt8] = []
+        var i = hex.startIndex
+        while i < hex.endIndex {
+            let next = hex.index(i, offsetBy: 2)
+            if let byte = UInt8(hex[i..<next], radix: 16) {
+                bytes.append(byte)
+            }
+            i = next
+        }
+        return bytes
     }
 }

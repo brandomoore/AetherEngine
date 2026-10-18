@@ -12,10 +12,11 @@ final class SoftwarePacketDiskFIFO: @unchecked Sendable {
     /// Clients can index keyframes by token without retaining packet payloads or forging offsets.
     struct Cursor: Hashable, Sendable {
         let chunkID: UInt64
-        fileprivate let generation: UUID
-        fileprivate let offset: UInt64
-        fileprivate let recordIndex: Int
-        fileprivate let payloadPrefix: Int
+        // Internal, not fileprivate: `SoftwarePacketMemoryFIFO` mints the same tokens.
+        let generation: UUID
+        let offset: UInt64
+        let recordIndex: Int
+        let payloadPrefix: Int
     }
 
     struct StaleSweepResult: Sendable {
@@ -57,6 +58,7 @@ final class SoftwarePacketDiskFIFO: @unchecked Sendable {
     let staleSweepResult: StaleSweepResult
     private let chunkTargetBytes: Int
     private let retainConsumed: Bool
+    var retainsConsumedPackets: Bool { retainConsumed }
     private let lock = NSLock()
     private var writer: FileHandle?
     private var reader: FileHandle?

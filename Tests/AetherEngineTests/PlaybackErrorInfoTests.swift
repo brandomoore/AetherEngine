@@ -30,6 +30,78 @@ struct PlaybackErrorInfoTests {
         }
     }
 
+    @MainActor
+    @Test("A live HLS join the origin refuses publishes its answer, not a probe failure",
+          .timeLimit(.minutes(1)),
+          arguments: [(509, PlaybackErrorKind.sourceRateLimited), (403, .sourceRefused)])
+    func refusedLiveJoinPublishesTheOriginsAnswer(status: Int, kind: PlaybackErrorKind) async throws {
+        let origin = try #require(RefusingOrigin(status: status))
+        defer { origin.stop() }
+        let observed = try await failedLiveIngestLoad(
+            try #require(URL(string: "http://127.0.0.1:\(origin.port)/live/1.m3u8")))
+        #expect(observed?.kind == kind)
+        #expect(observed?.underlyingCode == status)
+    }
+
+    @MainActor
+    @Test("A live HLS join that reaches nothing publishes an unavailable live source", .timeLimit(.minutes(1)))
+    func unreachableLiveJoinIsUnavailable() async throws {
+        let observed = try await failedLiveIngestLoad(try #require(URL(string: "http://127.0.0.1:1/live/1.m3u8")))
+        #expect(observed?.kind == .liveSourceUnavailable)
+    }
+
+    /// Loads `url` live through the engine's own HLS ingest, as a known HLS playlist on the live path
+    /// is, and returns the failure the load published.
+    @MainActor
+    private func failedLiveIngestLoad(_ url: URL) async throws -> PlaybackErrorInfo? {
+        let engine = try AetherEngine()
+        defer { engine.stop() }
+        var observed: PlaybackErrorInfo?
+        let token = engine.$state.sink { state in
+            if case .error = state { observed = engine.errorInfo }
+        }
+        defer { token.cancel() }
+        var options = LoadOptions()
+        options.isLive = true
+        do {
+            _ = try await engine.load(
+                source: .custom(HLSLiveIngestReader(playlistURL: url), formatHint: "mpegts"), options: options)
+            Issue.record("A refused live playlist must fail the load")
+        } catch {}
+        return observed
+    }
+
+    /// Answers every request with `status` and an empty body, one response per connection.
+    private final class RefusingOrigin: @unchecked Sendable {
+        let port: UInt16
+        private let listener: LoopbackListener
+
+        init?(status: Int) {
+            guard let listener = LoopbackListener(backlog: 8) else { return nil }
+            self.listener = listener
+            port = listener.port
+            listener.start { conn in
+                Thread.detachNewThread {
+                    defer { close(conn) }
+                    var request = Data()
+                    var buffer = [UInt8](repeating: 0, count: 4096)
+                    while request.range(of: Data("\r\n\r\n".utf8)) == nil {
+                        let n = read(conn, &buffer, buffer.count)
+                        guard n > 0 else { return }
+                        request.append(contentsOf: buffer[0..<n])
+                    }
+                    let response = "HTTP/1.1 \(status) Refused\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    _ = response.withCString { write(conn, $0, strlen($0)) }
+                }
+                return true
+            }
+        }
+
+        func stop() {
+            listener.stop()
+        }
+    }
+
     @Test("An underlying NSError contributes its domain and code")
     func capturesUnderlying() {
         let underlying = NSError(domain: "CoreMediaErrorDomain", code: -12939)

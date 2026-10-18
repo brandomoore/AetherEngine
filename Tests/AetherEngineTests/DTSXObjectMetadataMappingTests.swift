@@ -1,3 +1,5 @@
+// Only with the DTSXObjectAudio trait (off by default): the decoder and its library are not built without it.
+#if DTSXObjectAudio
 import Testing
 import Foundation
 import DTSX
@@ -88,3 +90,4 @@ struct DTSXObjectMetadataMappingTests {
         #expect(throws: DTSXObjectAudioDecoder.DecoderError.self) { try decoder.nextBlock() }
     }
 }
+#endif

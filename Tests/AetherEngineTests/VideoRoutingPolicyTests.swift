@@ -284,4 +284,253 @@ struct VideoRoutingPolicyTests {
                 codecID: codec, dvProfile: 10, dvBlCompatID: 0))
         }
     }
+
+    // MARK: - Profile 7 dual-layer routing & hardware capability gate
+
+    @Test("HEVC DV P7 routes to software for dual-layer Metal reconstruction when HW decode confirmed")
+    func dvProfile7RoutesToSoftwareWithHardwareDecode() {
+        #expect(VideoRoutingPolicy.requiresSoftwarePath(
+            codecID: AV_CODEC_ID_HEVC,
+            fieldOrder: AV_FIELD_PROGRESSIVE,
+            av1Available: true,
+            dvProfile: 7,
+            dolbyVisionHandling: .automatic,
+            preferDualLayerDolbyVision: true,
+            canHardwareDecode: { true },
+            elType: "FEL"
+        ) == DualLayerRouteDecision.isBuiltIn)
+    }
+
+    @Test("the el_type probe is only wanted when its answer can change the route")
+    func enhancementLayerProbeIsGated() {
+        func wanted(codec: AVCodecID = AV_CODEC_ID_HEVC, profile: Int? = 7,
+                    handling: DolbyVisionHandling = .automatic, prefer: Bool = true,
+                    hardware: (() -> Bool)? = { true }) -> Bool {
+            VideoRoutingPolicy.dualLayerRouteIsWanted(
+                codecID: codec, dvProfile: profile, dolbyVisionHandling: handling,
+                preferDualLayerDolbyVision: prefer, canHardwareDecode: hardware)
+        }
+        #expect(wanted() == DualLayerRouteDecision.isBuiltIn)
+        #expect(!wanted(prefer: false), "not opted in: no probe")
+        #expect(!wanted(handling: .baseLayerOnly))
+        #expect(!wanted(hardware: { false }), "no proven hardware session: the host would not compose")
+        #expect(!wanted(profile: 8))
+        #expect(!wanted(profile: nil))
+        #expect(!wanted(codec: AV_CODEC_ID_H264))
+        // The probe's gate and the routing decision share one predicate: FEL routes exactly when it holds.
+        for prefer in [true, false] {
+            let routes = VideoRoutingPolicy.requiresSoftwarePath(
+                codecID: AV_CODEC_ID_HEVC, fieldOrder: AV_FIELD_PROGRESSIVE, av1Available: true,
+                dvProfile: 7, preferDualLayerDolbyVision: prefer, canHardwareDecode: { true }, elType: "FEL")
+            #expect(routes == wanted(prefer: prefer))
+        }
+    }
+
+    @Test("HEVC DV P7 FEL stays native when the caller does not opt in")
+    func dvProfile7FelStaysNativeByDefault() {
+        #expect(!VideoRoutingPolicy.requiresSoftwarePath(
+            codecID: AV_CODEC_ID_HEVC,
+            fieldOrder: AV_FIELD_PROGRESSIVE,
+            av1Available: true,
+            dvProfile: 7,
+            canHardwareDecode: { true },
+            elType: "FEL"
+        ))
+    }
+
+    @Test("HEVC DV P7 stays native when preferDualLayerDolbyVision is disabled")
+    func dvProfile7StaysNativeWhenPreferDualLayerDisabled() {
+        #expect(!VideoRoutingPolicy.requiresSoftwarePath(
+            codecID: AV_CODEC_ID_HEVC,
+            fieldOrder: AV_FIELD_PROGRESSIVE,
+            av1Available: true,
+            dvProfile: 7,
+            dolbyVisionHandling: .automatic,
+            preferDualLayerDolbyVision: false,
+            canHardwareDecode: { true },
+            elType: "FEL"
+        ))
+    }
+
+    @Test("HEVC DV P7 stays native when hardware decode is unsupported")
+    func dvProfile7StaysNativeWhenHardwareUnsupported() {
+        #expect(!VideoRoutingPolicy.requiresSoftwarePath(
+            codecID: AV_CODEC_ID_HEVC,
+            fieldOrder: AV_FIELD_PROGRESSIVE,
+            av1Available: true,
+            dvProfile: 7,
+            dolbyVisionHandling: .automatic,
+            preferDualLayerDolbyVision: true,
+            canHardwareDecode: { false },
+            elType: "FEL"
+        ))
+    }
+
+    @Test("HEVC DV P7 FEL stays native when the hardware probe is unclassifiable")
+    func dvProfile7StaysNativeWhenProbeUnclassifiable() throws {
+        // No extradata: the probe has nothing to judge, so the verdict is .unclassifiable. The
+        // permissive gate keeps native for that; the strict one the FEL route uses must say no,
+        // because SoftwarePlaybackHost would give such a stream to libavcodec.
+        let par = try #require(avcodec_parameters_alloc())
+        defer { var p: UnsafeMutablePointer<AVCodecParameters>? = par; avcodec_parameters_free(&p) }
+        par.pointee.codec_id = AV_CODEC_ID_HEVC
+        par.pointee.width = 3840
+        par.pointee.height = 2160
+        guard case .unclassifiable = VTCapabilityProbe.hardwareDecodeVerdict(codecpar: par) else {
+            Issue.record("expected an unclassifiable verdict for a config record without extradata")
+            return
+        }
+        #expect(VTCapabilityProbe.canHardwareDecode(codecpar: par))
+        #expect(!VTCapabilityProbe.opensHardwareDecoder(codecpar: par))
+        #expect(!VideoRoutingPolicy.requiresSoftwarePath(
+            codecID: AV_CODEC_ID_HEVC,
+            fieldOrder: AV_FIELD_PROGRESSIVE,
+            av1Available: true,
+            dvProfile: 7,
+            dolbyVisionHandling: .automatic,
+            preferDualLayerDolbyVision: true,
+            canHardwareDecode: { VTCapabilityProbe.opensHardwareDecoder(codecpar: par) },
+            elType: "FEL"
+        ))
+    }
+
+    @Test("HEVC DV P7 stays native when dolbyVisionHandling is baseLayerOnly")
+    func dvProfile7StaysNativeWhenBaseLayerOnly() {
+        #expect(!VideoRoutingPolicy.requiresSoftwarePath(
+            codecID: AV_CODEC_ID_HEVC,
+            fieldOrder: AV_FIELD_PROGRESSIVE,
+            av1Available: true,
+            dvProfile: 7,
+            dolbyVisionHandling: .baseLayerOnly,
+            preferDualLayerDolbyVision: true,
+            canHardwareDecode: { true },
+            elType: "FEL"
+        ))
+    }
+
+    // MARK: - Profile 7 FEL vs MEL routing
+
+    @Test("Profile 7 FEL / MEL table-driven routing matrix (dolby-vision-fel.md §5.2)")
+    func profile7RoutingMatrix() {
+        struct TestCase {
+            let elType: String?
+            let handling: DolbyVisionHandling
+            let preferDualLayer: Bool
+            let canHardwareDecode: Bool
+            let expectedSoftware: Bool
+        }
+
+        let elTypes: [String?] = ["FEL", "MEL", nil]
+        let handlings: [DolbyVisionHandling] = [.automatic, .baseLayerOnly]
+        let preferOptions = [true, false]
+        let hwOptions = [true, false]
+
+        var cases: [TestCase] = []
+        for el in elTypes {
+            for handling in handlings {
+                for prefer in preferOptions {
+                    for hw in hwOptions {
+                        // Section 5.2 table:
+                        // P7 FEL + .automatic + preferDualLayerDolbyVision (true) + HW decode -> software host,
+                        // in a build with the DualLayerDolbyVision trait. All other combinations -> native (false)
+                        let expected = DualLayerRouteDecision.isBuiltIn
+                            && el == "FEL"
+                            && handling == .automatic
+                            && prefer
+                            && hw
+                        cases.append(TestCase(
+                            elType: el,
+                            handling: handling,
+                            preferDualLayer: prefer,
+                            canHardwareDecode: hw,
+                            expectedSoftware: expected
+                        ))
+                    }
+                }
+            }
+        }
+
+        #expect(cases.count == 24)
+
+        for c in cases {
+            let actual = VideoRoutingPolicy.requiresSoftwarePath(
+                codecID: AV_CODEC_ID_HEVC,
+                fieldOrder: AV_FIELD_PROGRESSIVE,
+                av1Available: true,
+                dvProfile: 7,
+                dolbyVisionHandling: c.handling,
+                preferDualLayerDolbyVision: c.preferDualLayer,
+                canHardwareDecode: { c.canHardwareDecode },
+                elType: c.elType
+            )
+            #expect(
+                actual == c.expectedSoftware,
+                "Failed for elType=\(String(describing: c.elType)), handling=\(c.handling), prefer=\(c.preferDualLayer), hw=\(c.canHardwareDecode): expected \(c.expectedSoftware), got \(actual)"
+            )
+        }
+    }
+
+    @Test("Profile 7 FEL routes to software when HW decode and dual-layer preferred")
+    func felRoutesToSoftware() {
+        #expect(VideoRoutingPolicy.requiresSoftwarePath(
+            codecID: AV_CODEC_ID_HEVC,
+            fieldOrder: AV_FIELD_PROGRESSIVE,
+            av1Available: true,
+            dvProfile: 7,
+            dolbyVisionHandling: .automatic,
+            preferDualLayerDolbyVision: true,
+            canHardwareDecode: { true },
+            elType: "FEL"
+        ) == DualLayerRouteDecision.isBuiltIn)
+    }
+
+    @Test("Profile 7 MEL stays native regardless of preferences")
+    func melStaysNativeAlways() {
+        // All combinations: each dolbyVisionHandling, preferDualLayerDolbyVision, hardware avail
+        for handling in [DolbyVisionHandling.automatic, .baseLayerOnly] {
+            for prefer in [true, false] {
+                for hardware in [true, false] {
+                    #expect(!VideoRoutingPolicy.requiresSoftwarePath(
+                        codecID: AV_CODEC_ID_HEVC,
+                        fieldOrder: AV_FIELD_PROGRESSIVE,
+                        av1Available: true,
+                        dvProfile: 7,
+                        dolbyVisionHandling: handling,
+                        preferDualLayerDolbyVision: prefer,
+                        canHardwareDecode: { hardware },
+                        elType: "MEL"
+                    ),
+                    "MEL should stay native with handling=\(handling), prefer=\(prefer), hw=\(hardware)")
+                }
+            }
+        }
+    }
+
+    @Test("Profile 7 MEL ignores dolbyVisionHandling and prefer settings")
+    func melIgnoresOptions() {
+        #expect(!VideoRoutingPolicy.requiresSoftwarePath(
+            codecID: AV_CODEC_ID_HEVC,
+            fieldOrder: AV_FIELD_PROGRESSIVE,
+            av1Available: true,
+            dvProfile: 7,
+            dolbyVisionHandling: .automatic,
+            preferDualLayerDolbyVision: true,
+            canHardwareDecode: { true },
+            elType: "MEL"
+        ))
+    }
+
+    @Test("Profile 7 no el_type stays native (docs §5.2: only explicit FEL routes software)")
+    func noElTypeStaysNative() {
+        #expect(!VideoRoutingPolicy.requiresSoftwarePath(
+            codecID: AV_CODEC_ID_HEVC,
+            fieldOrder: AV_FIELD_PROGRESSIVE,
+            av1Available: true,
+            dvProfile: 7,
+            dolbyVisionHandling: .automatic,
+            preferDualLayerDolbyVision: true,
+            canHardwareDecode: { true },
+            elType: nil
+        ))
+    }
 }

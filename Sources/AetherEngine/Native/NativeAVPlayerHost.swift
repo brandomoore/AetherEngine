@@ -47,6 +47,9 @@ final class NativeAVPlayerHost {
     /// AE#495: what the AE#495 relay knows about the origin's certificate, when the item this host
     /// plays is served by one. Set by the engine at mount, read only while classifying a failure.
     var upstreamTrustRefusal: (@Sendable () -> Int?)?
+    /// AE#682: whether the session's server withheld its I-frame playlist from this item (see
+    /// `MasterFallbackDecision.isMasterRejection(_:mediaErrorCodes:iFramePlaylistWithheld:)`).
+    var iFramePlaylistWithheld: (@Sendable () -> Bool)?
     /// AE#561: what the session can still offer when AVPlayer refuses the media, answered by the
     /// engine because the host owns none of it. Set at mount, read only while classifying a failure.
     var softwarePathAvailability: (@Sendable () -> SoftwarePathEscalation.Availability?)?
@@ -1074,7 +1077,11 @@ final class NativeAVPlayerHost {
                 remoteHLSOriginRefused = true
                 return
             }
-            if let code, MasterFallbackDecision.isMasterRejectionCode(code) {
+            if let error = item.error as NSError?, MasterFallbackDecision.isMasterRejection(error,
+                mediaErrorCodes: item.errorLog()?.events.map(\.errorStatusCode) ?? [],
+                iFramePlaylistWithheld: iFramePlaylistWithheld?() ?? false) {
+                let code = MasterFallbackDecision.rejectionCode(for: error,
+                    iFramePlaylistWithheld: iFramePlaylistWithheld?() ?? false)
                 EngineLog.emit(
                     "[NativeAVPlayerHost] #\(sessionID) startup .failed is a master rejection "
                     + "(code=\(code)); signalling engine for media fallback instead of surfacing",
@@ -2884,7 +2891,7 @@ final class NativeAVPlayerHost {
         return parts.joined(separator: " ")
     }
 
-    /// Warn when the FLAC bridge produced N-channel LPCM but the route carries fewer channels. FLAC bridge decodes to LPCM (unlike stream-copy EAC3/AC3 which tunnels encoded); Sonos Arc reports ch=2 LPCM even with eARC. Not a bridge bug -- a route capability mismatch.
+    /// Warn when the FLAC bridge produced N-channel LPCM but the route carries fewer channels. FLAC bridge decodes to LPCM (unlike stream-copy EAC3/AC3 which tunnels encoded). Not a bridge bug, a route capability mismatch. Silent with tvOS's Continuous Audio Connection on: every HDMI route then reports 32 channels whatever the sink takes (AE#794), so the route cannot show a mismatch.
     private static func warnIfFLACSurroundExceedsRoute(_ item: AVPlayerItem, sid: Int) async {
         #if os(iOS) || os(tvOS)
         var trackChannels: Int = 0
@@ -2912,11 +2919,11 @@ final class NativeAVPlayerHost {
         EngineLog.emit(
             "[NativeAVPlayerHost] #\(sid) WARNING: FLAC bridge produced \(trackChannels)-channel "
             + "LPCM but active audio route carries only \(routeChannels) LPCM channels, tvOS "
-            + "will downmix. Common cause: soundbars (Sonos Arc, etc.) accept multichannel only "
-            + "via bitstream codecs (EAC3, Atmos, DD+), not LPCM. Stream-copy paths bypass this; "
-            + "TrueHD / DTS-HD MA sources route through the FLAC bridge and hit the LPCM limit. "
-            + "AVRs with 7.1 LPCM-over-HDMI support play these sources at full source channel "
-            + "count without downmix.",
+            + "will downmix. A 6-channel route is a 5.1 sink (an eARC soundbar such as a Sonos "
+            + "Arc takes 6-channel LPCM), which still gets lossless 5.1; a 2-channel route is a "
+            + "sink behind legacy ARC or one that renegotiated to stereo after idling, where "
+            + "audioBridgeMode .surroundCompat (EAC3 5.1) keeps the surround. An AVR with 7.1 "
+            + "LPCM over HDMI plays the full source channel count.",
             category: .session
         )
         #endif

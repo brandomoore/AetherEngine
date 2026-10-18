@@ -1,4 +1,4 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 6.1
 
 import PackageDescription
 
@@ -27,6 +27,32 @@ let package = Package(
         // exposing it would force SPM consumers to compile it on those
         // platforms. The target is preserved below so `swift build` on
         // macOS still produces the CLI for upstream development.
+    ],
+    // Four optional components, all off by default. A host that wants one enables its trait
+    // (`.package(url:..., traits: [...])`, or the package's traits in Xcode); without it the code is not
+    // compiled and the library behind it is not linked. These components may be subject to third-party
+    // patent licensing; an integrator that enables one is responsible for its own licensing. Off, the
+    // matching LoadOptions are accepted and change nothing: object audio keeps the channel bridge, a
+    // Profile 7 source keeps the native route, and a Dolby Vision Profile 5 / 10.0 source yields no
+    // scrub still or held picture. LibDovi, FFmpeg and everything else are unaffected.
+    traits: [
+        .trait(
+            name: "TrueHDObjectAudio",
+            description: "Link LibTrueHD and the object renderer, so objectAudioRendering can render TrueHD Atmos objects to APAC."
+        ),
+        .trait(
+            name: "DTSXObjectAudio",
+            description: "Link LibDTSX and the object renderer, so objectAudioRendering can render DTS:X heights and objects to APAC."
+        ),
+        .trait(
+            name: "DualLayerDolbyVision",
+            description: "Compile the Dolby Vision Profile 7 FEL dual-layer composer, so preferDualLayerDolbyVision can take that route."
+        ),
+        .trait(
+            name: "DolbyVisionStillReshaping",
+            description: "Compile the CPU reshaping that turns a Dolby Vision Profile 5 / 10.0 frame into a still (scrub thumbnails, I-frame stills, held pictures)."
+        ),
+        .default(enabledTraits: []),
     ],
     dependencies: [
         // Minimal FFmpeg build (avcodec, avformat, avutil, swresample only).
@@ -58,12 +84,13 @@ let package = Package(
         // TrueHD decoder that also decodes the Atmos object presentation (beds, objects, OAMD) for
         // `objectAudioRendering` (#731). The Rust `truehd` crate (Apache-2.0) behind a C API, prebuilt
         // as an xcframework like LibDovi so consumers need no Rust. Pinned to the minor for the same reason.
-        .package(url: "https://github.com/superuser404notfound/LibTrueHD", .upToNextMinor(from: "2.3.0")),  // 2.3.0: decodes about a third faster again (harletty's truehd speed work: blocks decoded in place, table-driven Huffman, vectorised prediction filters, whole-block matrices; truehdd#42 included), byte-identical output; 2.2.1: rust_eh_personality exported weak, so it coalesces with LibDovi's copy and a host with its own Objective-C and C++ stays within compact unwind's three personality routines (#752); same decoder; 2.2.0: decodes about 30% faster (the truehd crate with its block and PCM buffers sized to the samples they hold, truehdd#42, from a fork of upstream main until that is merged), byte-identical output; 2.1.0: x86_64 in the iOS simulator slice, so a generic iOS Simulator build of a host links; same decoder; 2.0.0: transferred from Silo-Server/SiloObjectAudio and renamed (product TrueHD), rebuilt from source; same decoder as SiloObjectAudio 1.0.0
+        .package(url: "https://github.com/superuser404notfound/LibTrueHD", .upToNextMinor(from: "2.3.1")),  // 2.3.1: truehd_atmos_version_string() names the truehd commit actually built in (read from Cargo.lock, LibTrueHD#2), same decoder; 2.3.0: decodes about a third faster again (harletty's truehd speed work: blocks decoded in place, table-driven Huffman, vectorised prediction filters, whole-block matrices; truehdd#42 included), byte-identical output; 2.2.1: rust_eh_personality exported weak, so it coalesces with LibDovi's copy and a host with its own Objective-C and C++ stays within compact unwind's three personality routines (#752); same decoder; 2.2.0: decodes about 30% faster (the truehd crate with its block and PCM buffers sized to the samples they hold, truehdd#42, from a fork of upstream main until that is merged), byte-identical output; 2.1.0: x86_64 in the iOS simulator slice, so a generic iOS Simulator build of a host links; same decoder; 2.0.0: transferred from Silo-Server/SiloObjectAudio and renamed (product TrueHD), rebuilt from source; same decoder as SiloObjectAudio 1.0.0
         // DTS:X decoder for `objectAudioRendering`: lossless DTS-HD MA with the encoder's height and object
         // folds removed from the bed, the fixed heights, and the alternate presentations' objects placed in
-        // the same room coordinates as LibTrueHD's. The Rust `dca` crate (Apache-2.0) behind a C API,
-        // prebuilt as an xcframework like LibTrueHD. Pinned to the minor for the same reason.
-        .package(url: "https://github.com/superuser404notfound/LibDTSX", .upToNextMinor(from: "1.0.1")),  // 1.0.1: rust_eh_personality weak (#752); dca 0.8.0 (harletty-bridge a717bae); the first two frames after a start or seek only prime the decoder
+        // the same room coordinates as LibTrueHD's. The Rust `dca` crate behind a C API, a port of FFmpeg's
+        // LGPL-2.1-or-later dca decoder, so the built library is LGPL-3.0-or-later and ships as a dynamic
+        // framework the app embeds, like FFmpegBuild's (#798). Pinned to the minor for the same reason.
+        .package(url: "https://github.com/superuser404notfound/LibDTSX", .upToNextMinor(from: "2.0.0")),  // 2.0.0: DTSX.framework, dynamic, exporting only the C API, with dSYMs; NOTICE states the LGPL; same decoder, bit-identical output (#798); 1.0.1: rust_eh_personality weak (#752); dca 0.8.0 (harletty-bridge a717bae); the first two frames after a start or seek only prime the decoder
     ],
     targets: [
         .target(
@@ -71,8 +98,8 @@ let package = Package(
             dependencies: [
                 .product(name: "AetherFFmpegBuild", package: "FFmpegBuild"),
                 .product(name: "Dovi", package: "LibDovi"),
-                .product(name: "TrueHD", package: "LibTrueHD"),
-                .product(name: "DTSX", package: "LibDTSX"),
+                .product(name: "TrueHD", package: "LibTrueHD", condition: .when(traits: ["TrueHDObjectAudio"])),
+                .product(name: "DTSX", package: "LibDTSX", condition: .when(traits: ["DTSXObjectAudio"])),
             ],
             // Silent E-AC-3 Atmos that `AtmosOutputActivator` loops beside an APAC track on tvOS.
             resources: [.copy("Resources/silent-atmos.mp4")],

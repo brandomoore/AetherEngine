@@ -15,6 +15,27 @@ import Foundation
 /// whether the software path can serve this source at all, so a source it cannot serve costs a
 /// refusal here rather than a second dead session.
 extension AetherEngine {
+    @MainActor
+    func handleVODVideoConfigurationChange(session: HLSVideoEngine, epoch: UInt64,
+                                           summary: String, generation: UInt64,
+                                           reportRefusal: Bool = true) async {
+        guard loadGeneration == generation, nativeVideoSession === session,
+              session.pendingVODVideoConfigurationMismatch?.epoch == epoch else { return }
+        let request = SoftwarePathEscalation.Request(
+            domain: SoftwarePathEscalation.videoConfigurationErrorDomain, code: 0,
+            message: summary, positionSeconds: positionForSessionRebuild)
+        let allowed = SoftwarePathEscalation.shouldEscalate(errorDomain: request.domain,
+            availability: .init(alreadyEscalated: softwarePathEscalationBudget.isSpent,
+                preferredDecodePath: loadedOptions.preferredDecodePath,
+                nativeRemoteHLS: loadedOptions.nativeRemoteHLS,
+                hostAllowsEscalation: loadedOptions.escalatesToSoftwarePath))
+        guard allowed else {
+            if reportRefusal, !softwarePathEscalationBudget.isSpent { publishError(Self.absorbedFailure(request)) }
+            return
+        }
+        await escalateToSoftwarePath(request, expectedGeneration: generation)
+    }
+
 
     /// Rebuild this session on the software path, once, because the native one refused the media.
     /// `expectedGeneration` is the session the failure was raised under (audit LIF-103).

@@ -89,7 +89,7 @@ struct SoftwarePathEscalationTests {
         let origin = try ProbeHTTPTestOrigin(data: ProbeTestFixtures.hdr10Plus(), stage: .headers)
         defer { origin.stop() }
         let engine = try AetherEngine()
-        engine.loadedURL = try #require(URL(string: "http://127.0.0.1:\(origin.port)/source.mkv"))
+        engine.loadedURL = URL(string: "http://127.0.0.1:\(origin.port)/source.mkv")
 
         let escalation = Task { @MainActor in
             await engine.escalateToSoftwarePath(SoftwarePathEscalation.Request(
@@ -150,7 +150,7 @@ struct SoftwarePathEscalationTests {
         let origin = try ProbeHTTPTestOrigin(data: ProbeTestFixtures.hdr10Plus(), stage: .headers)
         defer { origin.stop() }
         let engine = try AetherEngine()
-        engine.loadedURL = try #require(URL(string: "http://127.0.0.1:\(origin.port)/source.mkv"))
+        engine.loadedURL = URL(string: "http://127.0.0.1:\(origin.port)/source.mkv")
         // AE#629 round 3, measured by the reporter: a mount raised by a load() of the host's own was
         // refused while AVPlayer's clock read 12.00 s, the start of the segment under the 15.90 s the
         // load was handed. The rebuild resumed at 15.90 s and the event said 12.00 s.
@@ -182,7 +182,7 @@ struct SoftwarePathEscalationTests {
     func failedRebuildSurfacesOnce() async throws {
         let engine = try AetherEngine()
         // A port nothing listens on: the rebuild tears the session down and its open is refused.
-        engine.loadedURL = try #require(URL(string: "http://127.0.0.1:9/source.mkv"))
+        engine.loadedURL = URL(string: "http://127.0.0.1:9/source.mkv")
         var errors: [PlaybackErrorInfo?] = []
         let sub = engine.$state.sink { state in
             if case .error = state { errors.append(engine.errorInfo) }

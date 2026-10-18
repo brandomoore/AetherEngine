@@ -68,6 +68,13 @@ enum VTCapabilityProbe {
         return hardwareDecodeVerdict(codecpar: codecpar).keepsNativeRoute
     }
 
+    /// Strict form of the gate for routes that need a PROVEN hardware session, such as the dual-layer path:
+    /// `.unclassifiable` is false here, unlike `canHardwareDecode`, because `SoftwarePlaybackHost` would
+    /// hand an unclassifiable stream to libavcodec.
+    static func opensHardwareDecoder(codecpar: UnsafePointer<AVCodecParameters>) -> Bool {
+        hardwareDecodeVerdict(codecpar: codecpar).opensHardwareDecoder
+    }
+
     /// The throwaway session is invalidated immediately; the whole probe costs well under a millisecond and
     /// runs once per consult.
     static func hardwareDecodeVerdict(codecpar: UnsafePointer<AVCodecParameters>) -> HardwareDecodeVerdict {

@@ -116,7 +116,7 @@ enum A53SEIParser {
 
     /// Strip emulation-prevention bytes (00 00 03 -> 00 00). In a valid stream, a 0x03 after two
     /// zeros is always an EPB, so the unconditional drop matches FFmpeg's h2645 unescape.
-    private static func unescapeRBSP(_ p: UnsafePointer<UInt8>, _ n: Int) -> [UInt8] {
+    static func unescapeRBSP(_ p: UnsafePointer<UInt8>, _ n: Int) -> [UInt8] {
         var out = [UInt8]()
         out.reserveCapacity(n)
         var zeros = 0

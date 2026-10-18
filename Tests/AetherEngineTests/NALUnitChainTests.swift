@@ -169,7 +169,7 @@ struct NALUnitChainTests {
                 audio: nil, onInitCaptured: { _ in })
         }
         func write(_ bytes: [UInt8], to muxer: MP4SegmentMuxer) throws {
-            var packet: UnsafeMutablePointer<AVPacket>? = try #require(trackedPacketAlloc())
+            var packet: UnsafeMutablePointer<AVPacket>? = trackedPacketAlloc()
             defer { trackedPacketFree(&packet) }
             let pkt = packet!
             #expect(av_new_packet(pkt, Int32(bytes.count)) >= 0)

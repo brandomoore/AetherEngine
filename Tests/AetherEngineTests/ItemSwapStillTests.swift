@@ -52,15 +52,19 @@ struct ItemSwapStillTests {
         // then takes nothing more until audio catches up. With a `requestMediaDataWhenReady` block
         // per track that catching up depends on AVFoundation calling the audio block again, and on
         // a loaded CI runner it did not: `video 88/120 ready=false, audio 21/40 ready=true`, the
-        // audio block called once in total, until the deadline below. A loop that waits on one
+        // audio block called once in total, until the deadline. A loop that waits on one
         // track at a time deadlocks the same way from the other side.
         let chunk = 4800
         var frame = 0
         var chunks = 0
         var videoDone = false
         var audioDone = false
-        let deadline = ContinuousClock.now + .seconds(20)
-        while !(videoDone && audioDone), writer.status == .writing, ContinuousClock.now < deadline {
+        // A stall deadline, not a total one: under load the writer can be slow and still moving
+        // (`video 4/120 ready=true, audio 24/40 ready=true` after a fixed 20 s on CI), and only a
+        // writer that takes nothing for 20 s is the deadlock described above.
+        var lastProgress = ContinuousClock.now
+        while !(videoDone && audioDone), writer.status == .writing,
+              ContinuousClock.now - lastProgress < .seconds(20) {
             var fed = false
             if !videoDone, video.isReadyForMoreMediaData {
                 // Our own buffer, not one from the adaptor's pool: that pool belongs to the
@@ -108,7 +112,7 @@ struct ItemSwapStillTests {
                     audioDone = true
                 }
             }
-            if !fed { try await Task.sleep(for: .milliseconds(5)) }
+            if fed { lastProgress = .now } else { try await Task.sleep(for: .milliseconds(5)) }
         }
         guard videoDone, audioDone else {
             let state = "video \(frame)/120 ready=\(video.isReadyForMoreMediaData), "
@@ -356,6 +360,7 @@ struct ItemSwapStillTests {
     nonisolated static let profile81URL = userFixtures
         .appendingPathComponent("Patterns_Of_Nature_HDR10-P8.1_UHD_24_H265-10Mbps_DD+JOC-768Kbps.mp4")
 
+    #if DolbyVisionStillReshaping
     /// Dolby's own Profile 5 signal, which cannot be committed: the base layer is IPTPQc2 and only
     /// the RPU makes it a picture, so the hold must come from the reshaping path.
     @Test("a Profile 5 title holds a reshaped still",
@@ -377,6 +382,35 @@ struct ItemSwapStillTests {
         #expect(engine.heldPictureLastRoute == "Dolby Vision reshaped")
         #expect(view.isHoldingStill)
     }
+    #else
+    /// Without the reshaping a Profile 5 picture cannot be made from the segment, so where the hold
+    /// would need it (the output presents Dolby Vision) it is skipped with its reason rather than
+    /// showing the planes read as YCbCr. Where AVPlayer presents the source as HDR10 (a Mac without a
+    /// Dolby Vision display), the output's own picture is correct and is held as before.
+    @Test("without the reshaping trait a Profile 5 title never holds a reshaped still",
+          .enabled(if: FileManager.default.fileExists(atPath: ItemSwapStillTests.profile5URL.path)))
+    func profile5WithoutReshapingHoldsNothingReshaped() async throws {
+        let engine = try AetherEngine()
+        defer { engine.stop() }
+        let view = AetherPlayerView(frame: CGRect(x: 0, y: 0, width: 320, height: 180))
+        engine.bind(view: view)
+        _ = try await engine.load(url: Self.profile5URL)
+        let host = try #require(engine.nativeHost)
+        try await waitFor { host.isVideoReadyForDisplay }
+        engine.pause()
+        // No scrub still either, and the capability says so up front so a host hides the preview.
+        #expect(!engine.supportsCacheBackedStills)
+        #expect(await engine.scrubThumbnail(atSeconds: 0.5, maxWidth: 160) == nil)
+        await engine.holdPictureAcrossItemSwap()
+        if AetherEngine.heldPictureNeedsReshaping(videoFormat: engine.videoFormat, dolbyVisionProfile: engine.sourceDVProfile) {
+            #expect(engine.heldPictureLastSkip == "Dolby Vision still reshaping not built in")
+            #expect(!view.isHoldingStill)
+        } else {
+            #expect(engine.heldPictureLastRoute == "native output")
+        }
+        #expect(engine.heldPictureLastRoute != "Dolby Vision reshaped")
+    }
+    #endif
 
     @Test("a Profile 8.1 title holds its HDR10 base layer from the output",
           .enabled(if: FileManager.default.fileExists(atPath: ItemSwapStillTests.profile81URL.path)))

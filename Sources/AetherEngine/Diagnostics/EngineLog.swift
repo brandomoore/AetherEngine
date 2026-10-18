@@ -63,6 +63,14 @@ public enum EngineLog {
         return map
     }()
 
+    private static let osLogs: [Category: OSLog] = {
+        var map: [Category: OSLog] = [:]
+        for cat in Category.allCases {
+            map[cat] = OSLog(subsystem: subsystem, category: cat.rawValue)
+        }
+        return map
+    }()
+
     public enum Level: Sendable {
         /// Default: OSLog default level + host handler (in-app overlay, aetherctl stdout).
         case info
@@ -91,12 +99,14 @@ public enum EngineLog {
     /// `.public` privacy means a Console.app capture or a sysdiagnose would otherwise carry the token
     /// in clear text even for a host that scrubs its own log.
     private static func deliver(_ line: String, category: Category, level: Level) {
-        let line = LogRedaction.redact(line)
         switch level {
         case .info:
+            let line = LogRedaction.redact(line)
             loggers[category]?.log("\(line, privacy: .public)")
             handler?(line)
         case .verbose:
+            guard let osLog = osLogs[category], osLog.isEnabled(type: .debug) else { return }
+            let line = LogRedaction.redact(line)
             loggers[category]?.debug("\(line, privacy: .public)")
         }
     }

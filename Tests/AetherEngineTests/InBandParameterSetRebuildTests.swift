@@ -60,4 +60,60 @@ struct InBandParameterSetRebuildTests {
         #expect(record.count > 23)
         #expect(record[22] == 3, "numOfArrays must cover VPS, SPS and PPS")
     }
+
+    /// The Profile 7 FEL route needs a proven hardware session, which the strict verdict cannot give
+    /// an empty hvcC; the load completes the demuxer's own record so the route and the decoders see
+    /// what AVPlayer would have rebuilt.
+    @Test("Completing the record in place makes the strict verdict classifiable and rewinds",
+          .enabled(if: fixtureExists("hev1-inband-xps.mp4"),
+                   "run Scripts/fetch-fixtures.sh to generate the in-band xPS clip"),
+          .timeLimit(.minutes(1)))
+    func completionInPlace() throws {
+        let demuxer = Demuxer()
+        try demuxer.open(url: fixtureURL("hev1-inband-xps.mp4"), profile: .playback)
+        defer { demuxer.close() }
+        let videoIdx = demuxer.videoStreamIndex
+        let codecpar = try #require(demuxer.stream(at: videoIdx)?.pointee.codecpar)
+        #expect(VTCapabilityProbe.hardwareDecodeVerdict(codecpar: codecpar)
+                == .unclassifiable(reason: "in-band parameter sets"))
+
+        #expect(VideoConfigRecord.completeHEVCRecordFromInBandParameterSets(demuxer: demuxer, streamIndex: videoIdx))
+        #expect(codecpar.pointee.extradata_size > 23)
+        #expect(codecpar.pointee.extradata?[22] == 3)
+        #expect(VTCapabilityProbe.hardwareDecodeVerdict(codecpar: codecpar) != .unclassifiable(reason: "in-band parameter sets"))
+
+        // Back at the head: the next video packet is the opening keyframe.
+        var first: (key: Bool, pts: Int64)?
+        while first == nil, let pkt = try demuxer.readPacket() {
+            var toFree: UnsafeMutablePointer<AVPacket>? = pkt
+            defer { trackedPacketFree(&toFree) }
+            if pkt.pointee.stream_index == videoIdx {
+                first = ((pkt.pointee.flags & AV_PKT_FLAG_KEY) != 0, pkt.pointee.pts)
+            }
+        }
+        #expect(first?.key == true)
+        #expect(first?.pts == 0)
+
+        // A complete record is left alone.
+        #expect(!VideoConfigRecord.completeHEVCRecordFromInBandParameterSets(demuxer: demuxer, streamIndex: videoIdx))
+    }
+
+    /// A Profile 7 enhancement layer carries its own VPS / SPS / PPS inside `unspec63` NAL units;
+    /// only the base layer's top-level parameter sets may seed the base layer's record.
+    @Test("The collector keeps top-level parameter sets and skips enhancement-layer ones")
+    func collectorSkipsWrappedEnhancementLayerSets() {
+        func nal(_ bytes: [UInt8]) -> [UInt8] {
+            let n = bytes.count
+            return [UInt8(n >> 24), UInt8((n >> 16) & 0xFF), UInt8((n >> 8) & 0xFF), UInt8(n & 0xFF)] + bytes
+        }
+        // unspec63 header (0x7E 0x01) wrapping an EL SPS (0x42 0x01), then the BL's VPS, SPS, PPS.
+        let packet = nal([0x7E, 0x01, 0x42, 0x01, 0xEE])
+            + nal([0x40, 0x01, 0xA1]) + nal([0x42, 0x01, 0xB2]) + nal([0x44, 0x01, 0xC3])
+        var sets = VideoConfigRecord.HEVCParameterSets()
+        packet.withUnsafeBufferPointer { sets.collect(from: $0.baseAddress!, size: $0.count) }
+        #expect(sets.isComplete)
+        #expect(sets.vps == [0x40, 0x01, 0xA1])
+        #expect(sets.sps == [0x42, 0x01, 0xB2])
+        #expect(sets.pps == [0x44, 0x01, 0xC3])
+    }
 }

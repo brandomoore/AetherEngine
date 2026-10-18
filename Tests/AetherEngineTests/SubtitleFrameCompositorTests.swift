@@ -203,6 +203,41 @@ struct SubtitleFrameCompositorTests {
         }
     }
 
+    #if DualLayerDolbyVision
+    /// The Profile 7 FEL route hands the renderer composed P010 frames carrying the Dolby Vision RPU
+    /// and compatibility ID. In PiP with a cue up, the frame the layer receives is the compositor's
+    /// copy: it has to carry the source frame's attachments (the CFString "1" among them, which the
+    /// render server parses with `CFStringGetIntValue`) and must not inherit a previous frame's RPU
+    /// from the recycled pool buffer, which is the stale-trims failure the design doc describes.
+    @Test("a composited Dolby Vision frame carries its own RPU attachments and a recycled buffer drops stale ones")
+    func compositedFrameCarriesDolbyVisionAttachments() throws {
+        let compositor = SubtitleFrameCompositor()
+        compositor.update(cues: [SubtitleCue(id: 1, startTime: 0, endTime: 10, body: .text("HELLO"))], enabled: true, delaySeconds: 0)
+        let format = kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+
+        let rpuNAL: [UInt8] = [0x7C, 0x01, 0x19, 0x08, 0x42, 0xA5, 0x80]
+        let dv = try blackFrame(format)
+        DoviDisplayMetadata.attach(rpuNAL: rpuNAL, to: dv)
+        let sourcePayload = try #require(attachment(dv, DoviDisplayMetadata.rpuDataKey as CFString) as? Data)
+
+        // Several rounds, so the pool hands out a buffer that already held an RPU.
+        for _ in 0..<4 {
+            let out = compositor.composite(dv, ptsSeconds: 5)
+            #expect(out !== dv)
+            #expect(attachment(out, DoviDisplayMetadata.rpuDataKey as CFString) as? Data == sourcePayload)
+            #expect(attachment(out, DoviDisplayMetadata.compatibilityIDKey as CFString) as? String == "1")
+        }
+
+        // A frame with no RPU (a bypass without display metadata) must not pick one up.
+        let plain = try blackFrame(format)
+        for _ in 0..<4 {
+            let out = compositor.composite(plain, ptsSeconds: 5)
+            #expect(attachment(out, DoviDisplayMetadata.rpuDataKey as CFString) == nil)
+            #expect(attachment(out, DoviDisplayMetadata.compatibilityIDKey as CFString) == nil)
+        }
+    }
+    #endif
+
     @Test("an untagged source renders through BT.709")
     func untaggedSourceFallsBackTo709() throws {
         let space = SubtitleFrameCompositor.renderColorSpace(for: try blackFrame(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange))

@@ -17,7 +17,392 @@ the public-API contract.
   with demonstrated drift use timestamp-aware audio bridging; ordinary AAC and
   rounding-only jitter keep stream-copy. Includes restart and EOF handling.
   Reported in [brandomoore/Plozz#89](https://github.com/brandomoore/Plozz/issues/89).
+## [7.39.0] - 2026-10-17
 
+**Not built by default any more: TrueHD Atmos and DTS:X object rendering, Profile 7 FEL dual-layer
+composition, and Dolby Vision Profile 5 / 10.0 stills.** Each is now an optional component behind a
+package trait that is off by default (`TrueHDObjectAudio`, `DTSXObjectAudio`, `DualLayerDolbyVision`,
+`DolbyVisionStillReshaping`). A host that used any of them re-enables it on its package dependency:
+
+```swift
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.39.0",
+         traits: ["TrueHDObjectAudio", "DTSXObjectAudio", "DualLayerDolbyVision", "DolbyVisionStillReshaping"])
+```
+
+or in Xcode's package dependency editor (XcodeGen cannot set traits; see
+[README › Optional components](README.md#optional-components)). These components may be subject to
+third-party patent licensing; integrators who enable them are responsible for their own licensing.
+
+### Changed
+
+- **Optional components, off by default.** Without its trait a component is not compiled, and a library
+  behind it is neither linked nor resolved. The public API is unchanged and the options become no-ops:
+  `objectAudioRendering` keeps the codec on the channel bridge, and `preferDualLayerDolbyVision` keeps a
+  Profile 7 source on the native route (the route line reads `not taken (built without the
+  DualLayerDolbyVision trait)`, and `reloadAtCurrentPosition(applying:)` no longer refuses flipping it on a
+  custom-reader session, since nothing would move). The two audio traits used to be on by default; the
+  dual-layer path (`DualLayerVideoDecoder`, the Metal composer, `OrderedDelivery`, the per-frame display
+  metadata and the FEL diagnostics) and the still reshaping (`DolbyVisionStillConverter`) were always
+  compiled.
+- **A Dolby Vision Profile 5 / 10.0 source has no stills without `DolbyVisionStillReshaping`.** Its planes
+  are IPT, which the standard still path would read as YCbCr (the green / magenta picture of #103), so it
+  yields none: `scrubThumbnail` and `scrubPreviewFrame` return nil without decoding anything,
+  `supportsCacheBackedStills` is false, the I-frame rendition is absent (`dolbyVisionStillsNotBuiltIn`),
+  an audio switch holds no picture, and the session log says so once. Playback is unaffected, as are
+  Profile 8.x, HDR10, HLG and SDR stills.
+
+### Added
+
+- **`AetherEngine.OptionalComponent`**, with `isBuiltIn` and `traitName` per component, so a host can
+  hide a setting its build would ignore.
+- **`Probes/AllTraits`**, a consumer package that enables every trait; CI builds it for tvOS and iOS, runs
+  the suite with all traits (including on a one-thread cooperative pool) and builds a release `aetherctl`
+  with them. The Dolby Vision pulse probe links the engine through `PulseEngine/` with
+  `DualLayerDolbyVision` and refuses to run its FEL arms without it.
+- `aetherctl feltest`, `play --cycle-el` and `play --dv-pin` need `DualLayerDolbyVision` and exit 64
+  without it; the `@_spi(Diagnostics)` FEL tooling (`felDecodeProbe`, `FelProbeResult`,
+  `felResidualEnabled`, `armDolbyVisionPinTest` and the pin queries) exists only with it.
+
+## [7.38.1] - 2026-10-16
+
+### Fixed
+
+- **The package compiles in Release with Xcode 26 again.** `FelResidualMeasure` (the
+  `AETHER_FEL_MEASURE` diagnostic from 7.37.0) formatted its luma-band line inside the closure it
+  hands its queue, as one `+` chain of three `map`/`joined` expressions, and Xcode 26.3's type checker
+  gave up on that closure ("unable to type-check this expression in reasonable time", x86_64 Release
+  archive), so a host archiving a universal macOS app on Xcode 26 could not build 7.37.0 or 7.38.0.
+  Xcode 27 checked it in time, which is what this repository's CI runs. The closure now calls a
+  function, and the three parts are bound to typed constants first. No behaviour change.
+
+## [7.38.0] - 2026-10-16
+
+### Changed
+
+- **A live stream on the software path starts near the newest media.** A continuous live stream over
+  HTTP opens with a burst of what the origin holds of the channel (8 to 18 s on one IPTV panel, at
+  link speed), and the software host armed its clock on that burst's first packet. Nothing on the
+  software path catches up, so the picture then ran the whole burst behind the broadcast for as long
+  as the channel played: measured 17 s behind on a channel whose native-path session ran 6 s behind.
+  The live feeder now waits for the burst to land (the ring growing no faster than real time over a
+  quarter second, from 0.3 s on, or 1.5 s at most) and starts 4 s behind the newest media, on a
+  keyframe; a source that delivers in real time, or a ring too shallow to be worth a later keyframe,
+  still starts from its first packet. The media behind the start stays in the rewind ring.
+  `SoftwareLiveJoinPolicy`, `SoftwareLiveJoinPlacementTests`.
+
+- **LibDTSX 2.0.0: `DTSX.framework` is a dynamic framework the app embeds, under the LGPL.** The
+  `dca` crate it compiles in is labelled Apache-2.0 but is a port of FFmpeg's LGPL-2.1-or-later
+  `dca` decoder, so the built library is LGPL-3.0-or-later and now ships, like the FFmpeg
+  frameworks, as a replaceable framework in `YourApp.app/Frameworks/`, exporting only the C API.
+  Same decoder, bit-identical output. A host with the `DTSXObjectAudio` trait on ships LibDTSX's
+  `NOTICE` and `LICENSES/` with the app (#798, thanks @tweakapps and @cmcpherson274).
+- **LibTrueHD 2.3.1:** `truehd_atmos_version_string()` names the `truehd` commit actually built in;
+  it still named an older one. Same decoder (LibTrueHD#2, thanks @cmcpherson274).
+
+### Fixed
+
+- **A software start or seek no longer runs the clock while the decoder works up to the target
+  (#800).** The software host started its clock the moment the first packet went in (video-only) or
+  the first audio decoded, while the video decoder was still working from the keyframe before the
+  target up to it, so the first frames reached the layer late and were dropped: a 4K HEVC title
+  with no audio and 10 s GOPs ran its clock 0.9 s ahead of the first frame after a switch onto the
+  software path and dropped 5 to 7 frames on an Apple TV 4K, a 1080p H.264 title with audio 0.3 s
+  and 3. Before 7.32.2 the #724 re-anchor hid this by starting the clock a whole GOP behind. The
+  video preroll #774 added for the Profile 7 FEL route now holds every VOD software route: the
+  clock waits at rate 0 until frames from its position on are in the layer
+  (`SampleBufferRenderer.videoPrerollSeconds`, 0.125 s) and then starts `prerollStartLead` from
+  now. A live stream off the FEL route still starts at once. Measured with `aetherctl play --sw` on
+  a 4K 10 s GOP fixture: `preroll ready after 889 ms; starting at t=36.600`, where the clock used to
+  start at once. Reported with measurements by @cmcpherson274. `VideoPrerollTests`.
+
+- **A live reconnect whose audio returns first no longer publishes a picture twice.** When the
+  returning connection's audio opened the replay check before the outgoing connection's last pictures
+  left the PES parser (a flagged picture and its unflagged, truncated successor), those pictures were
+  not part of the held boundary. The returning copy of the first one committed the batch, the
+  returning copy of the truncated one arrived after it, and the producer published both and bumped the
+  second DTS, which poisons Apple's reference chain until the next IDR. Measured on one reconnect in
+  three on an Apple TV (AE#747, `superseded=0`). Such a tail now raises the retained video frontier,
+  bounded like a held damaged boundary, so the returning copies land in the verified batch and replace
+  the outgoing ones. `LivePacketReplayGuardTests`.
+
+- **A live stream read off its URL and refused for a while keeps its session.** The continuous
+  MPEG-TS form of an IPTV channel is one connection for as long as it plays, and a connection-limited
+  panel answers its reconnects with 509 while another device on the account holds the last slot, for
+  seconds to tens of seconds. The reader climbed its 0.5, 1, 2, 4, 8 s ladder, gave up after six
+  refusals, and each refusal armed the origin's request pacer (a quiet of up to 15 s, with each
+  request waiting up to 10 s on it), which the reload after it then waited out. A live stream's
+  429/503/509 is now asked again every second, or after the origin's Retry-After up to 5 s, for up to
+  60 s, the way the live HLS ingest asks for its playlist (#778); its refusals arm no pacer and lower
+  no budget, and the books still say the origin refused, so the revive arm tells metered from lost. A
+  live open the origin answers with a status fails typed with that status at once
+  (`AVIOReaderError.httpStatus`, `sourceRateLimited` or `sourceRefused` at the host), where the read
+  loop used to spend the open budget on the same request and hand back an untyped read failure.
+  A server error that is not a refusal (a 500 or 502 while a tuner spins up) is asked once more
+  first, as the read loop did. `LiveStreamRefusalRetryTests`.
+- **Profile 7 FEL chroma residual is sampled where the base chroma sits.** With a quarter-resolution
+  enhancement layer (1080p under 4K), the chroma kernel read the enhancement chroma at texel centres,
+  a quarter of an EL chroma texel up and to the left of the co-sited (top-left) chroma location HDR
+  streams use. Base chroma sample n now reads EL texel n / 2, DoViBaker's phase. Same-resolution
+  enhancement layers and luma are unchanged.
+
+## [7.37.0] - 2026-10-15
+
+### Added
+
+- **`TrackInfo.isDTSX`.** Set from libavcodec's DTS:X profiles ("DTS-HD MA + DTS:X", "... IMAX") at
+  probe time, and once LibDTSX confirms, while `objectAudioRendering` plays it, a track FFmpeg labelled
+  plain DTS-HD MA (FFmpeg reads only two of DTS:X's markers). The confirmation is kept per source like a
+  confirmed JOC flag, survives a track or title switch, and republishes `audioTracks`. Hosts can name a
+  DTS:X track the way they name TrueHD Atmos without parsing the profile string.
+
+- **A live session's request headers can be replaced without a rebuild (#792).**
+  `updateRequestHeaders(_:)` hands the session a new header set, and the next request each of its
+  source readers makes carries it: one store per load now feeds the playback demuxer, the producer's
+  reopens and revives, the I-frame and embedded-subtitle side readers, and the still extractor
+  `makeFrameExtractor()` returns for the session's source, which used to freeze a copy at their open. A media server whose bearer tokens expire under a long title no longer costs a
+  `reloadAtCurrentPosition(applying:)` teardown per rotation, and a reconnect already backing off over
+  a lapsed token heals on its next attempt once the host renews. The returned
+  `RequestHeaderUpdateOutcome` says `.installedForNextRebuild` where the requests are not the
+  engine's to change (`.remoteBypass`, an AVPlayer-hosted audio item, a custom `IOReader`, a remote
+  disc image). See [Rotating a credential without a rebuild](docs/api.md#rotating-a-credential-without-a-rebuild).
+
+- **A DVD-Video ripped as a `VIDEO_TS` folder plays over HTTP, as a `BDMV` folder does.** A
+  `DiscDirectoryReader` (or `HTTPDiscDirectoryReader`) whose listing holds `VIDEO_TS/` files is now read
+  as DVD-Video: the title sets, VMGI filtering, durations, chapters and languages come from the same code
+  as an image's (`DiscReader.dvdTitleSet`, now shared), the selected title's VOBs play back to back in
+  part order, and the cell timeline and VTS time map apply as on an image, since the VOBs in order are
+  the same run of bytes as their sectors. A listing without `VIDEO_TS/` is read as Blu-ray, as before,
+  and one with both trees plays its Blu-ray title, the order an image is recognized in.
+- **Dolby Vision Profile 7 FEL plays as Dolby Vision on the software path.** Opt-in: with `LoadOptions.preferDualLayerDolbyVision` set to `true` (default `false`) and `dolbyVisionHandling` `.automatic`, `SoftwarePlaybackHost` routes a Profile 7 file whose enhancement layer is FEL through `DualLayerVideoDecoder`: the base layer and the enhancement layer (typically 4K and 1080p) decode on VideoToolbox, `DoviFelComposer` rebuilds the 12-bit picture on Metal, and each frame carries its RPU converted to Profile 8.1 (`DolbyVisionRPUData`, `DolbyCompatibilityID`, the latter a `CFString` `"1"`: tvOS parses it with `CFStringGetIntValue` and a `CFNumber` aborts the render server). A MEL enhancement layer keeps the native route. An `hev1` source whose `hvcC` carries no VPS / SPS / PPS (the usual Dolby Vision MP4 recipes) is classified from the parameter sets at the head of the stream, the rebuild the native path already does for its init.mp4 (#19). What the route gives up against the native one (system Picture in Picture, the I-frame playlist's scrub thumbnails, WebVTT renditions, AirPlay picture) is listed in the document. Details in [docs/dolby-vision-fel.md](docs/dolby-vision-fel.md).
+- **The Profile 7 dual-layer route is FEL only and capability gated, and says why.**
+  `DualLayerRouteDecision` adds a real-time budget to the route: the base and enhancement layers
+  together may need at most UHD 3840x2160 at 30 fps plus a 1920x1080 enhancement layer at 30 fps (a 24p
+  UHD master uses 80%), otherwise the file keeps the native route, as MEL does and as does a box without
+  hardware HEVC decode (8.1 where the display takes Dolby Vision, the HDR10 base layer where it does
+  not). Every Profile 7 load logs one `DV P7 dual-layer route: taken (...)` or `not taken (<reason>)`
+  line; the line is new, and with the preference off it is the only change.
+
+- **`aetherctl play --fel`, `--surface`, `--cycle-el`; `aetherctl dvsurvey`, `feltest`.** Flip the residual on a timer over a visible surface, report a title's L1 display-metadata distribution, and check the FEL decode against real files. The probes behind them are `@_spi(Diagnostics)`, outside the SemVer contract. `play` runs the dual-layer route only with `--fel` (off by default, like the engine option); `--no-fel` is accepted and does nothing.
+- **`AETHER_FEL_MEASURE` reports the signed FEL-minus-MEL mean per plane and luma band.** The diagnostic composes every Nth frame a second time with the residual off and compares the two; the signed mean says whether the residual brightens or darkens, which the absolute difference could not. It runs one sample at a time and skips a frame that arrives while one is in flight. Off by default; it is an environment-variable diagnostic, not API.
+- **The dual-layer decoder pairs the two layers by picture order.** `DualLayerPictureAlignment` derives each layer's display slot from its POC (`HEVCPictureOrderCount`, no decoding) and stamps each enhancement-layer packet with the time of the base-layer picture in the same slot, so a stream whose enhancement layer is coded with B-frames over a base layer without them pairs the right pictures. A stream whose layers share one GOP keeps every packet's own time. After a seek a layer pairs by access unit until its next sequence-opening IRAP.
+- **`Probes/DolbyVisionPulse`, a reproducible Dolby Vision pulse test.** Clips whose pixels are constant while only the RPU (or, for the enhancement-layer clip, only the residual) switches every 72 frames, counter clips whose base and enhancement layers each carry their own frame number (so a dropped or mispaired residual shows on screen), a tvOS host app that plays them through AVPlayer, VideoToolbox, and the FEL route, and scripts that build the clips, cut a phone recording per arm and read back whether the panel followed the metadata. It is the measurement behind [the FEL consumption evidence](docs/dolby-vision-fel.md#45-consumption-test-assets); the host builds in CI, the rest needs a television and a phone.
+
+### Changed
+
+- **The lossless bridge's documentation and route warning name the sinks it is for (#794).** An eARC
+  soundbar takes multichannel LPCM (measured: a Sonos Arc takes 6 channels, so `.lossless` reaches it as
+  lossless 5.1 where `.surroundCompat` gives lossy 5.1); only a sink behind legacy ARC needs E-AC-3. The
+  FLAC route warning no longer says soundbars take multichannel only as a bitstream. The engine still
+  does not pick the mode from the route: with tvOS's Continuous Audio Connection on, every HDMI route
+  reports 32 unlabelled channels whatever the sink takes.
+
+- **Dolby Vision Profile 7: a packet whose only NALs are a refused RPU and its EL now reports the
+  conversion as failed** (#767, thanks @pkajaba). The packet is left as it was, as before; the result used
+  to say success, which hid the dropped RPU from the one-shot conversion log and from `aetherctl dovitest`.
+  The same PR adds the Metal FEL composer and the Dolby Vision display metadata, which nothing selects yet.
+- **`.verbose` engine log lines cost nothing unless the category's debug level is enabled.** `EngineLog` redacted and handed every `.verbose` line to OSLog even when nobody was reading debug output; it now checks `OSLog.isEnabled(type: .debug)` for the category first and returns early. `.info` lines and the host `handler` are unchanged (verbose lines never reached the handler).
+- **`reloadAtCurrentPosition(applying:)` refuses a `preferDualLayerDolbyVision` change, or a `dolbyVisionHandling` change while the preference is on, on a custom `IOReader` source playing Profile 7**, with the new public case `SessionReloadRefusal.dualLayerRouteNeedsFreshLoad`, before any teardown. A host that switches over `SessionReloadRefusal` exhaustively has to handle the new case. The in-place rebuild of a custom source keeps the route the session was loaded with, so the change would have been logged as applied and ignored; `load()` again with the new option. URL sources re-run `load()` and are unaffected.
+
+- **LibTrueHD and LibDTSX can be left out.** Each object-audio decoder library is now behind a package
+  trait, `TrueHDObjectAudio` and `DTSXObjectAudio`, both on by default, so a host that does nothing
+  keeps today's build. A host that cannot ship one of them turns its trait off
+  (`.package(url:..., traits: [])`, or the package's traits in Xcode): the library is neither linked
+  nor resolved, and its codec keeps the channel bridge whatever `objectAudioRendering` asks, with the
+  reason in the session log, and the automatic audio pick no longer prefers it. The manifest moves to
+  swift-tools-version 6.1, which traits need. CI also builds the engine and its tests with both traits
+  off. See README › Package traits.
+
+### Fixed
+
+- **A credential refused mid-session is reported as one, in seconds, and heals when the host renews it
+  (#792).** A 401 or 403 after the session started was handled as a dropped connection: twelve
+  unproductive reconnects with the same refused header (about 80 s of `.stalled(reconnecting: true)`),
+  two revives that reopened with it again, and then `vodSourceFailed` / "Source read failed". The reader
+  now gives a credential refusal a short ladder of its own (about 3 s, the first retry re-resolving an
+  expired signed redirect through the source) and stamps it on the session's header store with the
+  header revision it was sent with. The first refusal of a header set is published on the new
+  `sourceAuthorizationRefused` (the status), so a host can renew and call `updateRequestHeaders(_:)`
+  while the reader is still retrying, which gives it a fresh ladder. Once the reader has given up, the
+  loopback session waits up to 10 s for new headers and rebuilds the producer at the playhead when they
+  arrive (up to three times); otherwise, and on the software path, the session ends with
+  `sourceRefused` and the status as `underlyingCode`. A revive is never spent on the header that was
+  just refused.
+
+- **A TrueHD track started or switched to mid-stream is no longer reported as a dead decoder** (#786,
+  thanks @ijuniorfu). TrueHD and MLP decode only from a major sync, so after a start, seek or track
+  switch past the opening the decoder skips up to about a hundred 40-frame access units before its
+  first frame. The channel bridge judged its decoder dead after 64 silent packets, about 53 ms of
+  TrueHD, so `AudioBridge` raised AE#396 / AE#641 and the session went to `.error`
+  (`.audioBridgeProducedNoOutput`) while it played, ignoring seeks after it. For these two codecs the
+  bound is now 1200 packets (one second of source), the bound `SpatialAudioBridge` already used for
+  the same wait; every other source keeps 64.
+
+- **Software VOD exposes retained cache ranges to host timelines.** `residentRanges` now covers
+  compressed video packets together with the selected audio stream, including retained history,
+  gaps and disk eviction. Cached seeks keep the same spans; cold seeks and teardown clear them.
+  Sampling continues while paused and runs off the main actor, with stale seek/stop results
+  discarded. Hosts no longer need to infer a cache band's start from the moving playhead.
+  VC-1 uses verified successor timestamps rather than rounded packet-duration islands. Valid
+  committed packets remain seekable after a source read error, which is still reported after drain;
+  storage failures remain unusable. Failed resume/seek positioning can no longer publish a false
+  successful landing. Bounded cold probes avoid speculative detour fetches, and foreground software
+  positioning has a finite 30 s budget for slow multi-probe remote keyframe searches. On tvOS's
+  in-memory packet store, history the system reclaims under memory pressure leaves the published
+  ranges at the next sample instead of only when a seek walks into it.
+
+- **A remuxed title declares a `BANDWIDTH` its densest segment fits under** (#783, thanks @hp561). The
+  master declared twice the container's average, and a VBR ending in an HEVC Matroska file with three
+  Opus tracks bridged to FLAC ran past it: AVPlayer logged -12318 "Segment exceeds specified bandwidth
+  for variant". When the plan's boundaries are container index entries, the byte positions the index
+  records at them now give each segment's source bitrate, and the highest of them (with 20% headroom,
+  plus the bridged track's ceiling: FLAC at its PCM rate, E-AC-3 and APAC at their configured rate)
+  raises the declaration, up to four times the average and never past 160 Mbit/s, so an implausible
+  measurement cannot leave a variant AVPlayer refuses to pick. Twice the average stays the floor, so no
+  declaration goes down. On a 60 s HEVC file averaging 20.1 Mbit/s whose densest served segment carried
+  55.6 Mbit/s, the declaration went from 40.2 to 68.2 Mbit/s. The I-frame variant keeps reusing the
+  main figure, which bounds any keyframe of it.
+
+- **The package builds again on toolchains before Swift 6.4** (#787). `H264MatroskaSlotPermutation.CFRRewriter` (from #762) relied on Swift 6.4 leaving private stored properties with a default out of the memberwise initializer; earlier compilers make that initializer private, so `swift build` failed on Xcode 26. The initializer is now written out. No behavior change.
+
+- **A jump back opens one connection at the landing instead of three serial detour fetches** (#782,
+  thanks @tweakapps). On the native path a producer restart behind the reader's window was served the
+  way a parse read is: one 4 MB detour block per request, serially, until 8 MB had gone by, while the old
+  connection kept streaming ahead. A restart now tells the reader it repositioned playback, so the first
+  read it cannot serve from memory anchors the streaming connection there (a resident detour block still
+  serves first). Against a 400 ms, 40 Mbit/s origin a 64 s jump back landed in 3.3 s instead of 6.7 s,
+  with its first segment in 1.8 s instead of 4.2 s, the same cost as a long jump forward.
+
+- **H.264 VOD with in-band parameter changes recovers through compatible decoding** (#785, thanks @orut34iop). When an IDR
+  references SPS/PPS that differ from the AVC initialization, the producer stops before writing that
+  sample into the stale native segment. Automatic routing uses the existing software-path takeover,
+  preserving a pending seek or cold-resume position and the session transport. Repeated or unused
+  parameter sets keep the native route, and so does a change confined to the PPS, the VUI or the
+  level, which the native decoder takes in band (a TS recording remuxed to MKV or MP4 carries those);
+  only the fields a decoder session is built from, profile through cropping, take the software path.
+  An explicitly selected route or disabled escalation is honored.
+
+- **A live HLS source refused for a while keeps its session.** An IPTV panel that limits an account's
+  connections answers a live playlist refresh with 509 while another device holds the last slot, and
+  goes on refusing a session it evicted, while a fresh session from the loaded URL is admitted at
+  once. The ingest retried 1, 2 and 4 s apart and went terminal at 12 s, which on the software path
+  ended the session, and each refusal armed the origin's request pacer, so the host's reload then
+  waited up to 10 s for its first request. A refused refresh (429, 503, 509) is now asked again every
+  second, or after the origin's Retry-After up to 5 s, for up to 60 s, and so is a refused segment; an
+  unreachable origin or any other 5xx keeps the 12 s budget, so a dead channel or a lost network still
+  reaches the host's reopen or fallback as soon as before. A
+  session URL the loaded URL led to through redirects is asked for afresh through the loaded URL once
+  it has been refused twice, or at once when it answers as gone (a 4xx other than 429 and 408); the
+  playlist tracker follows MEDIA-SEQUENCE, so the segments continue where they left off. The live
+  ingest's refusals no longer arm the pacer or lower the origin's request budget; its own steady retry
+  is its pacing, and a ceiling the host declares or another path learns still binds it.
+- **The Profile 7 dual-layer route recovers from a system session loss (#739).** A screen lock or sleep
+  invalidates both VideoToolbox sessions; the host's recovery reached only `HardwareVideoDecoder`, so on
+  the route audio played on over a frozen picture. `DualLayerVideoDecoder` now reports one loss per
+  event, rebuilds both sessions and re-adopts its feed epoch; the host reaches it through the new
+  internal `VideoSessionRebuilding` protocol.
+
+- **The Profile 7 dual-layer route shows the last frames at end of stream.** The end-of-source flush
+  dropped what VideoToolbox still owed, the base frames waiting for an enhancement layer and the
+  compositions in flight. `VideoDecodingPipeline.drainForEndOfStream()` (a no-op where `flush()` already
+  delivers) drains both sessions with pairing live, sends a waiting base frame out alone, and waits for
+  the composer; the host calls it before that flush. Seeks still discard.
+
+- **A failed `CMBlockBuffer` creation around a packet's payload no longer releases the packet reference
+  twice** when CoreMedia has already freed the block source from inside the failing call.
+
+- **The software path no longer drops frames on tvOS while it downloads.** Its compressed packet
+  cache was a temporary disk file; on an Apple TV 4K appends to it took 100 to 600 ms while a download
+  ran, the demux thread waited behind them, and video it had already parked reached the decoder late.
+  On tvOS the cache now lives in purgeable memory (96 MB forward, up to 128 MB of reclaimable played
+  history), as AVPlayer's own cache does there: a 4K title's 150 s soak went from 22 to 42 drops to
+  0 to 3. macOS, iOS and visionOS keep the disk cache.
+
+- **Seeks on Matroska TrueHD titles hit the software packet cache again.** TrueHD packets carry no
+  duration and repeat their millisecond timestamps, so the cache never counted the audio as stored,
+  and every seek on the software path, even back to a spot just played, refetched from the source.
+  A duration-less audio packet now covers up to the next one's timestamp (gaps up to 0.5 s).
+
+- **FLAC with blocks under 192 samples plays instead of failing to open** (#764). An MKV whose FLAC used
+  small fixed blocks (`STREAMINFO` min = max = 144, 48 kHz stereo) died on the native path with
+  `-11829 "Cannot Open"` (underlying `-12848`), and the same stream in a plain `.flac` file failed the
+  audio-only route. CoreMedia's floor for `min_blocksize` is 192, not the specification's 16: measured on
+  macOS 26, a field of 191 drops the audio track even over real 4608-sample frames, and a field of 192 over
+  real 144-sample frames gets past that check and then hangs the decoder, so the field cannot simply be
+  raised. Such a stream is now decoded by libavcodec: the video route bridges it (bit-perfect for FLAC),
+  the audio-only route takes the FFmpeg host. A zeroed `min_blocksize` over a legal `max_blocksize` keeps
+  the AE#221 clamp and stays a stream copy. The stream-copy fallback packet duration for FLAC also uses
+  the block size `STREAMINFO` declares when min = max, instead of assuming 4096 samples. Covered by
+  `Issue764FLACSmallBlockTests`.
+
+- **`serveIFramePlaylist` shows scrub thumbnails for HDR10, HLG and Dolby Vision titles** (#682). The
+  stock tvOS scrubber fetched the first keyframe of a PQ rendition and then left the thumbnail box empty,
+  for Dolby Vision profile 5 and 8.1 as much as for plain HDR10, at 4K and at 1080p (measured on an Apple
+  TV 4K, tvOS 27). An HDR or Dolby Vision session now lists a Motion JPEG rendition instead
+  (`CODECS="mjpg"`, `VIDEO-RANGE=SDR`, 640 pixels wide), whose stills come from the engine's own still
+  pipeline: the tone map for PQ and HLG, the RPU reshaping for profile 5. SDR sessions keep serving their
+  own keyframes. The session log names the format: `i-frame rendition: served segments=<n>
+  format=keyframes|jpeg`. Because an SDR rendition is the one thing AVPlayer can still play when it
+  refuses the HDR variant (an SDR panel without dynamic range matching), `iframe.m3u8` is answered only
+  once a media segment has been requested; otherwise it is withheld after 3 s, and the item's 404 counts
+  as the refusal it stands for, so the session still falls back to the media playlist instead of
+  playing the stills as its video.
+
+- **A 25 fps H.264 Matroska file with forward-clamped B-picture timestamps plays at a steady
+  cadence.** Its packet timestamps repeated display slots and left the preceding slots empty, so
+  decoded output alternated 0 ms and 80 ms frame intervals instead of 40 ms. The demuxer now
+  recognizes that shape only from an exact CFR lattice, complete picture-order ranks and two
+  corroborating clamps, then reconstructs PTS and DTS from the IDR anchor, picture order and decode
+  order. A seek starts from a new IDR, and overflow or any later timestamp outside the proven shape
+  disables the repair and leaves that packet untouched, as does a reconstruction that would present a
+  picture before its decode time.
+- **H.264 MP4s with missing composition offsets keep display order across cadence changes and
+  hierarchical B pictures.** A corroborated missing-offset head with a changing decode cadence now
+  reuses the existing timestamp slots. Later zero-offset regions can prove a forward-coded anchor
+  farther ahead than the declared backward reorder delay, using a bounded complete-prefix check.
+  Original DTS, audio, payload and index remain unchanged; unsupported sequences still pass through.
+- **`activeVideoDecoder` names the decoder used by the software host (#753).** HEVC decoded by
+  VideoToolbox now reports `VideoToolbox HEVC (HW)` on initial load and reload, instead of
+  `libavcodec HEVC (SW)`. Decoder selection and playback routing are unchanged.
+
+- **A live GOP longer than the sealed target duration no longer breaks the playlist.** RFC 8216 keeps
+  `TARGETDURATION` fixed for a playlist's life, so a later segment above it made the playlist invalid
+  for AVPlayer (-12642). The engine now retires that playlist URL with its original target and an
+  end index before the long segment, and serves the same cache under a new `live-N/` namespace with
+  a fresh seal; the consumer item swaps to it in place, keeping source, cache, position (also behind
+  live) and play/pause intent. A media playlist failure no longer counts as evidence against the HDR
+  master (#748, thanks @yucelokan).
+- **A CRC-valid but hostile Dolby Vision RPU no longer aborts the process on any path found so far,
+  in parse, convert or write (#765, thanks @pkajaba).** libdovi is built panic=abort, so one panic ends
+  the process. `DoviRpuGuard` checks the CRC and pre-scans each RPU for the inputs that make libdovi 3.4
+  panic or allocate unbounded: a polynomial piece with linear interpolation (`unimplemented!` in the
+  parser and the writer), a reshaping curve that mixes polynomial and MMR pieces (it parses, and a MEL
+  or residual-free RPU keeps its mapping through the mode 2 conversion, so `dovi_write_unspec62_nalu`
+  then indexes out of bounds), pivot and block counts the payload cannot hold, and display-management
+  block lengths the spec does not define (`unreachable!`). It also refuses an Exp-Golomb value of
+  2^32 - 1 or more anywhere it reads one (libdovi reads 64 leading zeros differently from a plain shift,
+  so a crafted `mapping_idc` could slip past, and its writer allocates about 0.5 GB to write such an id
+  back). The guard knows these paths; it does not prove there are no others. Every RPU in dovi_tool's
+  test corpus (2333, Profile 5, 7 MEL and FEL, 8, CM v2.9 and v4.0) passes it and converts as before.
+- **A refused live join says so, instead of reading as an unreadable source.** When the live HLS
+  ingest's playlist was refused at the join, the probe saw no bytes and the load published
+  `customSourceProbeFailed`, which a host reads as a stream it cannot play: one that falls back to
+  another route on it moved the channel there for the rest of its session over a 509 an IPTV panel
+  gives while another device holds the account's last slot. The load now publishes the origin's
+  answer, as an HTTP reader's failed open does: `sourceRateLimited` (429/503/509) or `sourceRefused`
+  with the status in `underlyingCode`, or `liveSourceUnavailable` when the playlist could not be
+  reached.
+
+- **A live channel on the HLS ingest follows a wireless AirPlay route change.** The ingest hands the
+  pipeline a forward-only custom source, and the route change rebuilt the session to serve it on the
+  device's LAN address. That rebuild is refused for such a source (#526) and the refusal was dropped,
+  so the receiver stayed on 127.0.0.1, which it cannot reach, and played nothing while the sender
+  reported external playback. The route change now swaps the player's item onto the receiver's
+  address (and back onto the loopback when the receiver lets go), as it already did for a sequential
+  origin. The session, its ingest and its segment cache carry on, so the source is asked for nothing
+  again; the swapped item rejoins its live playlist at the player's join point, as a live reload does
+  (`AirPlayPlaylistDecision.routeChangeHop`, #780, thanks @jpsts). The fallback for a receiver that
+  refuses the master (#227) rejoins a live playlist the same way, instead of seeking the media playlist
+  to the start of its window.
 ## [7.36.0] - 2026-10-13
 
 ### Added

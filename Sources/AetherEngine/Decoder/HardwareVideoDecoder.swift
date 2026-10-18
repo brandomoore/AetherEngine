@@ -79,10 +79,38 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// Protects `session` across the demux thread (decode), main thread (close/flush), and VT callback (delivery).
     private let lock = NSLock()
 
-    /// AE#492: guarded by `lock`, the same one `flush()` and `decode(packet:epoch:)` take.
+    /// When true, wrap the packet's AVBuffer with a CMBlockBuffer that holds
+    /// an `av_buffer_ref` and unrefs it on disposal (dolby-vision-fel.md §5.4).
+    var useCustomBlockSource: Bool = false
+
+    #if DEBUG
+    /// Called after a packet has been handed to VideoToolbox (whatever the status it returned), and
+    /// not for one the epoch gate or a missing session refused.
+    var onSubmittedToVideoToolboxForTesting: (() -> Void)?
+    var onBlockBufferAllocatedForTesting: ((CMBlockBuffer) -> Void)?
+    #endif
+
+    /// AE#492: the epoch a fed packet must carry. Guarded by `epochLock`, a leaf lock held only for a
+    /// read or a write of this integer (nothing is taken, awaited or called while it is held), so
+    /// `DualLayerVideoDecoder` can move this decoder's epoch from inside its own critical section
+    /// without nesting into `lock`, which `decode` may hold across a blocking VideoToolbox call whose
+    /// output callbacks need the owner's lock. `decode` and `flush()` still read and bump it while
+    /// holding `lock`, so a flush and a feed cannot interleave; `adoptFeedEpoch` alone moves it
+    /// without `lock`, and only ever to the owner's current epoch.
     private var _feedEpoch: UInt64 = 0
-    var feedEpoch: UInt64 {
-        lock.lock(); defer { lock.unlock() }; return _feedEpoch
+    private let epochLock = NSLock()
+    private var currentEpoch: UInt64 {
+        epochLock.lock(); defer { epochLock.unlock() }; return _feedEpoch
+    }
+    var feedEpoch: UInt64 { currentEpoch }
+
+    /// Moves this decoder onto the feed epoch its owner is already in. `DualLayerVideoDecoder` calls it
+    /// (a) when it opens the enhancement decoder lazily, after a `flush()` may have moved its own
+    /// epoch, and (b) from inside its `flush()` critical section, so that a post-seek packet fed with
+    /// the new epoch while the owner is still draining this decoder is accepted, instead of being
+    /// dropped as stale by a decoder that has not yet been flushed. Takes only `epochLock`.
+    func adoptFeedEpoch(_ epoch: UInt64) {
+        epochLock.lock(); _feedEpoch = epoch; epochLock.unlock()
     }
 
     /// AE#739: the system invalidates the session behind our back (iOS screen lock, media services
@@ -102,6 +130,9 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     private var awaitingKeyframe = false
     private var droppedAwaitingKeyframe = 0
     private var decoderSpecification: NSDictionary?
+    /// Guarded by `lock`. False for a session opened from parameter sets, which `makeSession` and a
+    /// rebuild then create without `PropagatePerFrameHDRDisplayMetadata`.
+    private var propagatesHDRDisplayMetadata = true
     private var pixelBufferAttributes: NSDictionary?
 
     /// Heap-allocated box carrying a weak self reference for the C decompression callback's refCon.
@@ -112,6 +143,79 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     fileprivate final class RefConBox {
         weak var decoder: HardwareVideoDecoder?
         init(_ decoder: HardwareVideoDecoder) { self.decoder = decoder }
+    }
+
+    /// Keeps `packet.buf` alive for the lifetime of a CMBlockBuffer that wraps
+    /// the packet's data without copying it (dolby-vision-fel.md §5.4).
+    final class CustomBlockSource {
+        var avBuf: UnsafeMutablePointer<AVBufferRef>?
+        let dataPtr: UnsafeMutableRawPointer
+        /// Set by the block source's `FreeBlock`, which releases the retain the refCon carries. CoreMedia
+        /// may call it from inside a failed `CMBlockBufferCreateWithMemoryBlock` (after `AllocateBlock`),
+        /// and `makeBlockBuffer` must then not release that retain a second time.
+        var freeBlockRan = false
+
+        /// `data` is the packet's own payload pointer. It is not always `buf->data`: the Matroska
+        /// demuxer hands out packets whose `data` sits inside a larger buffer (observed at +4 on P7
+        /// MKV remuxes), so block memory taken from `buf->data` starts early and VideoToolbox sees
+        /// a corrupt sample (-12909). Defaults to `buf->data` for callers that own the whole buffer.
+        init?(buf: UnsafeMutablePointer<AVBufferRef>, data: UnsafeMutablePointer<UInt8>? = nil) {
+            guard let data = data ?? buf.pointee.data, let ref = av_buffer_ref(buf) else { return nil }
+            self.avBuf = ref
+            self.dataPtr = UnsafeMutableRawPointer(data)
+        }
+
+        func releaseBuffer() {
+            if avBuf != nil {
+                av_buffer_unref(&avBuf)
+            }
+        }
+
+        deinit {
+            releaseBuffer()
+        }
+    }
+
+    /// Wraps a packet's payload in a CMBlockBuffer without copying it. The block buffer owns
+    /// `blockSource` (and with it the `av_buffer_ref` of `packet.buf`) until CoreMedia frees the
+    /// block; if the buffer cannot be created the reference is released here, so the caller has
+    /// nothing to clean up. `dataLength` is the size of the payload when it differs from the block
+    /// (only a test needs that, to make the creation fail).
+    static func makeBlockBuffer(wrapping blockSource: CustomBlockSource, size: Int, dataLength: Int? = nil) -> (buffer: CMBlockBuffer?, status: OSStatus) {
+        var source = CMBlockBufferCustomBlockSource(
+            version: kCMBlockBufferCustomBlockSourceVersion,
+            AllocateBlock: { refCon, _ in
+                guard let refCon else { return nil }
+                let holder = Unmanaged<CustomBlockSource>.fromOpaque(refCon).takeUnretainedValue()
+                return holder.dataPtr
+            },
+            FreeBlock: { refCon, _memoryBlock, _size in
+                guard let refCon else { return }
+                let holder = Unmanaged<CustomBlockSource>.fromOpaque(refCon).takeRetainedValue()
+                holder.freeBlockRan = true
+                holder.releaseBuffer()
+            },
+            refCon: Unmanaged.passRetained(blockSource).toOpaque()
+        )
+        var blockBuffer: CMBlockBuffer?
+        let status = CMBlockBufferCreateWithMemoryBlock(
+            allocator: kCFAllocatorDefault,
+            memoryBlock: nil,
+            blockLength: size,
+            blockAllocator: kCFAllocatorNull,
+            customBlockSource: &source,
+            offsetToData: 0,
+            dataLength: dataLength ?? size,
+            flags: kCMBlockBufferAssureMemoryNowFlag,
+            blockBufferOut: &blockBuffer
+        )
+        // `blockSource` is still held by this frame, so reading the flag is safe even after FreeBlock
+        // dropped the refCon's retain. On a failure CoreMedia calls FreeBlock synchronously or not at
+        // all; release here only in the second case.
+        if status != kCMBlockBufferNoErr, !blockSource.freeBlockRan, let refCon = source.refCon {
+            Unmanaged<CustomBlockSource>.fromOpaque(refCon).takeRetainedValue().releaseBuffer()
+        }
+        return (blockBuffer, status)
     }
 
     // MARK: - Lifecycle
@@ -245,11 +349,14 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         )
         guard status == noErr, let created = sessionOut else { return (nil, status) }
         // Pass through per-frame HDR metadata for correct tone mapping; unknown-key set returns -12911 on older OSes (swallowed).
-        VTSessionSetProperty(
-            created,
-            key: kVTDecompressionPropertyKey_PropagatePerFrameHDRDisplayMetadata,
-            value: kCFBooleanTrue
-        )
+        // Not on a session opened from parameter sets: see `open(parameterSets:timeBase:onFrame:)`.
+        if propagatesHDRDisplayMetadata {
+            VTSessionSetProperty(
+                created,
+                key: kVTDecompressionPropertyKey_PropagatePerFrameHDRDisplayMetadata,
+                value: kCFBooleanTrue
+            )
+        }
         return (created, noErr)
     }
 
@@ -267,7 +374,7 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             VTDecompressionSessionInvalidate(old)
             session = nil
         }
-        _feedEpoch &+= 1
+        epochLock.lock(); _feedEpoch &+= 1; epochLock.unlock()
         let created = makeSession(formatDescription: formatDescription, refCon: refConBox)
         guard let fresh = created.session else {
             sessionLost = true
@@ -295,12 +402,111 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     }
     #endif
 
+    /// Opens a decoder session from raw HEVC parameter sets (VPS, SPS, PPS), used for the Enhancement Layer (EL)
+    /// in Dolby Vision Profile 7 dual-layer decoding.
+    func open(
+        parameterSets: [[UInt8]],
+        timeBase: AVRational,
+        onFrame: @escaping DecodedFrameHandler
+    ) throws {
+        self.onFrame = onFrame
+        self.timeBase = timeBase
+
+        guard parameterSets.count >= 3 else {
+            throw VideoDecoderError.noExtradata
+        }
+
+        var ptrs: [UnsafePointer<UInt8>] = []
+        var sizes: [Int] = []
+        var allocations: [UnsafeMutablePointer<UInt8>] = []
+        defer {
+            for a in allocations { a.deallocate() }
+        }
+        for ps in parameterSets {
+            let p = UnsafeMutablePointer<UInt8>.allocate(capacity: ps.count)
+            ps.withUnsafeBufferPointer { src in
+                if let base = src.baseAddress {
+                    p.initialize(from: base, count: ps.count)
+                }
+            }
+            allocations.append(p)
+            ptrs.append(UnsafePointer(p))
+            sizes.append(ps.count)
+        }
+
+        var fd: CMVideoFormatDescription?
+        let fdStatus = CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+            allocator: kCFAllocatorDefault,
+            parameterSetCount: parameterSets.count,
+            parameterSetPointers: ptrs,
+            parameterSetSizes: sizes,
+            nalUnitHeaderLength: 4,
+            extensions: nil,
+            formatDescriptionOut: &fd
+        )
+        guard fdStatus == noErr, let formatDesc = fd else {
+            throw VideoDecoderError.formatDescriptionFailed(status: fdStatus)
+        }
+
+        let dims = CMVideoFormatDescriptionGetDimensions(formatDesc)
+        self.width = dims.width
+        self.height = dims.height
+
+        var decoderSpec: NSDictionary?
+        if #available(tvOS 17.0, iOS 17.0, *) {
+            decoderSpec = [
+                kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder: true,
+            ]
+        }
+
+        self.colorPrimaries = kCVImageBufferColorPrimaries_ITU_R_2020
+        self.colorTransfer = kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ
+        self.colorMatrix = kCVImageBufferYCbCrMatrix_ITU_R_2020
+
+        let pixelBufferAttrs: NSDictionary = [
+            kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+            kCVPixelBufferIOSurfacePropertiesKey: NSDictionary(),
+            kCVPixelBufferMetalCompatibilityKey: true,
+        ]
+
+        let box = RefConBox(self)
+        let unmanaged = Unmanaged.passRetained(box)
+
+        // `session` is read by `decode`/`flush`/`close` on other threads: install it under `lock`.
+        lock.lock()
+        propagatesHDRDisplayMetadata = false
+        decoderSpecification = decoderSpec
+        pixelBufferAttributes = pixelBufferAttrs
+        let created = makeSession(formatDescription: formatDesc, refCon: unmanaged)
+        guard let createdSession = created.session else {
+            lock.unlock()
+            unmanaged.release()
+            throw VideoDecoderError.sessionCreationFailed(status: created.status)
+        }
+        formatDescription = formatDesc
+        session = createdSession
+        refConBox = unmanaged
+        lock.unlock()
+
+        // Deliberately no `kVTDecompressionPropertyKey_PropagatePerFrameHDRDisplayMetadata` here,
+        // unlike `open(stream:)`. This path builds the base layer's session when its parameter sets
+        // arrive in band, and the enhancement layer's session always. The dual-layer decoder
+        // attaches its own Dolby Vision RPU to every frame it delivers (composed or bypassed) from
+        // the RPU it extracted; letting VideoToolbox propagate HDR display metadata as well would put a
+        // second, possibly different, attachment on the base-layer buffer a bypassed frame goes out as.
+
+        EngineLog.emit(
+            "[HardwareVideoDecoder] opened secondary HEVC \(width)x\(height) 10-bit from parameter sets",
+            category: .swPlayback
+        )
+    }
+
     // MARK: - Decode
 
     func decode(packet: UnsafeMutablePointer<AVPacket>, epoch: UInt64? = nil) {
         lock.lock()
         // AE#492: see `SoftwareVideoDecoder.decode`. Same rule, same lock as `flush()`.
-        if let epoch, epoch != _feedEpoch { lock.unlock(); return }
+        if let epoch, epoch != currentEpoch { lock.unlock(); return }
         guard session != nil, !sessionLost, let formatDesc = formatDescription else {
             lock.unlock()
             return
@@ -312,24 +518,43 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         // and AVPacket storage is reused for the next packet.
         guard let data = packet.pointee.data, packet.pointee.size > 0 else { return }
         let size = Int(packet.pointee.size)
-        let copied = UnsafeMutableRawPointer.allocate(byteCount: size, alignment: 1)
-        copied.copyMemory(from: data, byteCount: size)
 
         var blockBuffer: CMBlockBuffer?
-        let blockStatus = CMBlockBufferCreateWithMemoryBlock(
-            allocator: kCFAllocatorDefault,
-            memoryBlock: copied,
-            blockLength: size,
-            blockAllocator: kCFAllocatorDefault,  // ← matching dealloc allocator
-            customBlockSource: nil,
-            offsetToData: 0,
-            dataLength: size,
-            flags: 0,
-            blockBufferOut: &blockBuffer
-        )
+        var blockStatus: OSStatus = noErr
+        var copied: UnsafeMutableRawPointer?
+
+        if useCustomBlockSource,
+           let buf = packet.pointee.buf,
+           let blockSource = CustomBlockSource(buf: buf, data: data) {
+            // Design §5.4: no copy. The CMBlockBuffer holds an `av_buffer_ref` of
+            // `packet.buf` and unrefs it in FreeBlock, so VT can retain the data past
+            // the call without a copy.
+            (blockBuffer, blockStatus) = Self.makeBlockBuffer(wrapping: blockSource, size: size)
+            #if DEBUG
+            if let bb = blockBuffer {
+                onBlockBufferAllocatedForTesting?(bb)
+            }
+            #endif
+        } else {
+            // Fallback: copy into newly allocated memory when custom block source is disabled,
+            // packet has no AVBufferRef (e.g. synthetic test packet), or av_buffer_ref failed.
+            copied = UnsafeMutableRawPointer.allocate(byteCount: size, alignment: 1)
+            copied?.copyMemory(from: data, byteCount: size)
+            blockStatus = CMBlockBufferCreateWithMemoryBlock(
+                allocator: kCFAllocatorDefault,
+                memoryBlock: copied,
+                blockLength: size,
+                blockAllocator: kCFAllocatorDefault,
+                customBlockSource: nil,
+                offsetToData: 0,
+                dataLength: size,
+                flags: 0,
+                blockBufferOut: &blockBuffer
+            )
+        }
         guard blockStatus == kCMBlockBufferNoErr, let bb = blockBuffer else {
             // CMBlockBuffer takes ownership only on success; we own the allocation on failure.
-            copied.deallocate()
+            copied?.deallocate()
             return
         }
         let pts = SourceTimestampBounds.cmTime(ticks: packet.pointee.pts, timeBase: timeBase)
@@ -378,7 +603,7 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         // while the sample buffer is built lets a pre-seek packet into VT after it. Safe to hold:
         // the output callback never takes `lock`, and `close()` already holds it across the VT wait.
         lock.lock()
-        if let epoch, epoch != _feedEpoch { lock.unlock(); return }
+        if let epoch, epoch != currentEpoch { lock.unlock(); return }
         guard let session = self.session, !sessionLost else { lock.unlock(); return }
         var recoveredAfterDropping: Int?
         if awaitingKeyframe {
@@ -404,6 +629,9 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         let lostNow = decodeStatus == kVTInvalidSessionErr && !sessionLost
         if lostNow { sessionLost = true }
         lock.unlock()
+        #if DEBUG
+        onSubmittedToVideoToolboxForTesting?()
+        #endif
         if let recoveredAfterDropping {
             EngineLog.emit(
                 "[HardwareVideoDecoder] AE#739 recovered at keyframe pts=\(packet.pointee.pts) "
@@ -426,9 +654,18 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         }
     }
 
-    func flush() {
+    func flush() { flush(bumpingEpoch: true) }
+
+    /// The flush a `DualLayerVideoDecoder` makes: its owner has already moved this decoder's epoch with
+    /// `adoptFeedEpoch` (inside its own critical section), so bumping it again here would retire the
+    /// post-seek packets the owner has been feeding since.
+    func flushKeepingEpoch() { flush(bumpingEpoch: false) }
+
+    private func flush(bumpingEpoch: Bool) {
         lock.lock()
-        _feedEpoch &+= 1   // AE#492
+        if bumpingEpoch {   // AE#492
+            epochLock.lock(); _feedEpoch &+= 1; epochLock.unlock()
+        }
         let session = self.session
         lock.unlock()
         guard let session else { return }
@@ -553,3 +790,12 @@ private func hwDecoderOutputCallback(
         pts: presentationTimeStamp
     )
 }
+
+/// AE#739: a decoder whose VideoToolbox sessions the system can invalidate behind its back, and that
+/// can build them again. The host recovers through this rather than through one decoder type.
+protocol VideoSessionRebuilding: AnyObject {
+    var onSessionLost: (@Sendable () -> Void)? { get set }
+    @discardableResult func rebuildSession() -> Bool
+}
+
+extension HardwareVideoDecoder: VideoSessionRebuilding {}

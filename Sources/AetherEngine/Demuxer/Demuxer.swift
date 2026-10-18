@@ -82,10 +82,20 @@ struct DemuxerOpenProfile: Sendable {
     /// distinguished them. Defaults to the pump, since every other path builds its profile explicitly.
     var readerLabel: String = "pump"
     var sourceOpenPolicy: SourceOpenPolicy = .init()
+    /// AE#792: the session's live header set. A reader opened with one reads its headers from it per
+    /// request instead of keeping the `extraHeaders` it was opened with, so a session-scoped open (the
+    /// playback demuxer, the producer's reopens) follows `updateRequestHeaders(_:)`. Nil everywhere else.
+    var requestHeaders: RequestHeaderStore? = nil
 
     func withSourceOpenPolicy(_ policy: SourceOpenPolicy) -> DemuxerOpenProfile {
         var copy = self
         copy.sourceOpenPolicy = policy
+        return copy
+    }
+
+    func withRequestHeaders(_ store: RequestHeaderStore?) -> DemuxerOpenProfile {
+        var copy = self
+        copy.requestHeaders = store
         return copy
     }
 
@@ -782,7 +792,8 @@ public final class Demuxer: @unchecked Sendable {
             boundedInitialFetch: openProfile.boundedInitialFetch,
             sequentialOnly: openProfile.avioSequentialOnly,
             heldConnection: openProfile.avioHeldConnection,
-            sourceOpenPolicy: openProfile.sourceOpenPolicy
+            sourceOpenPolicy: openProfile.sourceOpenPolicy,
+            requestHeaderStore: openProfile.requestHeaders
         )
         reader.onNetworkPhaseChanged = onNetworkPhaseChanged
         reader.playIntentProvider = playIntentProvider
@@ -921,6 +932,10 @@ public final class Demuxer: @unchecked Sendable {
 
     /// AE#585: ends the bracket above. Safe to call without a matching `beginIndexPass`.
     func endIndexPass() { avioProvider?.endIndexPass() }
+
+    /// AE#782: a producer restart just seeked here, so the reader anchors its connection at the next
+    /// read it cannot serve from memory instead of detouring.
+    func notePlaybackRepositioned() { avioProvider?.notePlaybackRepositioned() }
 
     /// Default 5 MB/5s budgets miss sparse PGS/DVB tracks on 10-20 GB Blu-ray rips.
     /// 50 MB/60 s ensures codec params are populated without noticeably slowing open.
@@ -1649,7 +1664,7 @@ public final class Demuxer: @unchecked Sendable {
         guard layout.pointee.nb_channels > 0 else { return nil }
         var buffer = [CChar](repeating: 0, count: 64)
         guard av_channel_layout_describe(layout, &buffer, buffer.count) > 0 else { return nil }
-        return String(cString: buffer)
+        return String(decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
     }
 
     /// The language to publish for a stream. A disc keeps its track languages in its navigation data
@@ -1837,6 +1852,12 @@ public final class Demuxer: @unchecked Sendable {
     /// during avformat_find_stream_info. Empty = no usable index, fall back to
     /// uniform-stride plan. AVINDEX_KEYFRAME checked defensively.
     func indexedKeyframes(streamIndex: Int32) -> [Int64] {
+        indexedKeyframeEntries(streamIndex: streamIndex).map(\.pts)
+    }
+
+    /// `indexedKeyframes` with each entry's byte position in the source (AE#783), -1 where the index
+    /// has none. Matroska stores the position of the Cluster that holds the keyframe.
+    func indexedKeyframeEntries(streamIndex: Int32) -> [(pts: Int64, pos: Int64)] {
         accessLock.lock()
         defer { accessLock.unlock() }
         let compositionOffset = compositionRepair?.decodeTimestampOffset
@@ -1849,7 +1870,7 @@ public final class Demuxer: @unchecked Sendable {
         let count = avformat_index_get_entries_count(stream)
         guard count > 0 else { return [] }
         let tb = stream.pointee.time_base
-        var result: [Int64] = []
+        var result: [(pts: Int64, pos: Int64)] = []
         for i in 0..<count {
             // AVINDEX_KEYFRAME = 0x0001. Fold each entry onto the contiguous timeline (multi-clip disc)
             // so the segment plan built from these IRAP positions matches the normalized packets
@@ -1860,7 +1881,7 @@ public final class Demuxer: @unchecked Sendable {
                   let folded = normalizedTimestamp(entry.pointee.timestamp, pos: entry.pointee.pos, timeBase: tb),
                   let placed = Self.offsetIndexTimestamp(folded, by: compositionOffset)
             else { continue }
-            result.append(placed)
+            result.append((pts: placed, pos: entry.pointee.pos))
         }
         return result
     }
@@ -2419,7 +2440,11 @@ public final class Demuxer: @unchecked Sendable {
         // matroska may return success with a partial index after abort; deadline flag
         // is authoritative, not ret.
         let capped = avioProvider?.readDeadlineFired ?? false
-        return ret >= 0 && !capped && probeControl?.isStopped != true
+        let stopped = probeControl?.isStopped == true
+        // Fixed result flags only: FFmpeg refusal, read deadline, cancellation. No source identity.
+        let flags = (ret < 0 ? 1 : 0) | (capped ? 2 : 0) | (stopped ? 4 : 0)
+        EngineLog.emit("[DemuxReposition] flags=\(flags)", category: .swPlayback)
+        return ret >= 0 && !capped && !stopped
     }
 
     /// How an off-actor reposition ended (#254). Named to mirror `SeekEvent.Outcome` so the engine's

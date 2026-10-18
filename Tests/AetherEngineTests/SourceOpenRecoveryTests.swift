@@ -47,21 +47,27 @@ struct SourceOpenRecoveryTests {
 
     @Test("A silent initial request reaches the alternate request shape within the host budget")
     func coldRequestRecovery() async throws {
-        let origin = try ProbeHTTPTestOrigin(data: bytes, stage: .headers)
+        // Silence is keyed on the request shape, not on arrival order: on a loaded runner the first
+        // request can be cancelled at its first-byte deadline before it ever reaches the wire, and
+        // then the alternate request is the first one the origin sees.
+        let silence = ProbeTestGate()
+        let origin = try ProbeHTTPTestOrigin(data: bytes, response: { request, _ in
+            if request.range != "bytes=0-" { silence.wait() }
+            return nil
+        })
         let source = url(origin)
         OriginRequestBudget.shared.setHostLimit(1, for: source)
         let reader = AVIOReader(url: source, boundedInitialFetch: 4096,
             sourceOpenPolicy: .init(firstByteTimeout: 0.2, sizeProbeTimeout: 2))
-        defer { reader.markClosed(); reader.close(); origin.stop() }
-        let job = ProbeTestJob { try reader.open() }
-        try await waitFor { origin.blocked.entered }
-        try await job.outcome().get()
+        defer { reader.markClosed(); reader.close(); silence.open(); origin.stop() }
+        try await ProbeTestJob { try reader.open() }.outcome().get()
         #expect(reader.isSeekable)
         #expect(try await readPrefix(reader) == bytes.prefix(16))
         #expect(OriginRequestBudget.shared.snapshot(for: source)?.peakInflight == 1)
         #expect(origin.requests.map(\.method).allSatisfy { $0 == "GET" })
-        #expect(origin.requests.contains { $0.range == "bytes=0-" })
-        #expect(origin.requests.count == 2, "the recovered data connection must be retained, not reprobed")
+        #expect(origin.requests.filter { $0.range == "bytes=0-" }.count == 1,
+                "the recovered data connection must be retained, not reprobed")
+        #expect(origin.requests.count <= 2)
         #expect(origin.failure == nil)
     }
 
@@ -200,7 +206,9 @@ struct SourceOpenRecoveryTests {
         if case .failure(let error) = result {
             #expect(error as? AVIOReaderError == .requestTimeout)
         } else { Issue.record("no response is not a successful sequential open") }
-        #expect(origin.requests.count == 2)
+        // Either request can be cancelled at its deadline before it reaches the wire on a loaded
+        // runner, so the count is a ceiling: two ranged GETs at most, never an unranged one.
+        #expect(origin.requests.count <= 2)
         #expect(origin.requests.allSatisfy { $0.method == "GET" && $0.range != nil })
         #expect(OriginRequestBudget.shared.snapshot(for: source)?.inflight == 0)
     }
@@ -215,7 +223,11 @@ struct SourceOpenRecoveryTests {
             sourceOpenPolicy: .init(firstByteTimeout: 0.15, sizeProbeTimeout: 30))
         defer { reader.close(); gate.open(); origin.stop() }
         let job = ProbeTestJob { try reader.open() }
-        let teardown = ProbeTestTrigger(when: { origin.requests.count == 2 || job.isFinished }) {
+        // Keyed on the alternate request's shape: the first request can be cancelled before it
+        // reaches the wire on a loaded runner, so counting arrivals can wait for one that never comes.
+        let teardown = ProbeTestTrigger(when: {
+            origin.requests.contains { $0.range == "bytes=0-" } || job.isFinished
+        }) {
             reader.markClosed()
         }
         let result = try await job.outcome()

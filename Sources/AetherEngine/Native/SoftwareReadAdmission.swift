@@ -9,6 +9,11 @@ enum SoftwareReadAdmission {
         !stopRequested && readGeneration == requestedGeneration
             && requestedGeneration == settledGeneration
     }
+
+    /// A failure that belongs to the session rather than to one seek (the dual-layer decoder's primary
+    /// open, reported once and not retried by a seek). A seek in flight must not drop it, because
+    /// nothing reports it a second time; only a stopped host does.
+    static func admitsSessionFailure(stopRequested: Bool) -> Bool { !stopRequested }
 }
 
 /// The combined VOD loop stays alive after one EOF/error publication. MainActor may reject that

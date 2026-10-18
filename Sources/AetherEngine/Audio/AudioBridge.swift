@@ -16,13 +16,15 @@ import AetherLibswresample
 /// produces no JOC, FLAC has no object channel concept). EAC3+JOC sources stay lossless via the stream-copy path
 /// that bypasses this bridge; only non-stream-copyable sources enter here.
 ///
-/// Encoder choice. Public so LoadOptions / the host pass it through; default `.surroundCompat` (soundbar /
-/// LPCM-stereo-only install base is the consumer majority).
+/// Encoder choice. Public so LoadOptions / the host pass it through; default `.surroundCompat`, the one mode
+/// that keeps surround on every sink.
 ///   - `.surroundCompat`: EAC3 128 kbps/channel (256 stereo, 768 5.1), AVPlayer -> HDMI bitstream tunnel. Lossy,
-///     caps at 5.1 (7.1 loses SL/SR), but surround works on essentially every AVR + soundbar including LPCM-stereo-
-///     only routes (Sonos Arc, Samsung HW-Q, Bose) where FLAC falls down.
-///   - `.lossless`: FLAC up to 7.1, AVPlayer -> LPCM HDMI route. Needs a multichannel-LPCM sink (Denon/Marantz/NAD);
-///     a stereo-LPCM route downmixes to stereo.
+///     caps at 5.1 (a 7.1 source is downmixed, its back surrounds folded into the sides), but surround works on
+///     every AVR and soundbar, including one behind legacy ARC (stereo LPCM or a Dolby bitstream only).
+///   - `.lossless`: FLAC up to 7.1, AVPlayer -> LPCM HDMI route. Needs a multichannel-LPCM sink: an AVR over
+///     HDMI, or an AVR or soundbar on eARC (a Sonos Arc there takes 6 channels, so lossless 5.1). A legacy-ARC
+///     route downmixes to stereo. Not picked from the route: with Continuous Audio Connection on, tvOS reports
+///     32 channels for every HDMI sink (AE#794).
 public enum AudioBridgeMode: String, Sendable, CaseIterable {
     case surroundCompat
     case lossless
@@ -271,6 +273,7 @@ final class AudioBridge: @unchecked Sendable {
 
         // 1. Source decoder
         let srcCodecID = srcCodecpar.pointee.codec_id
+        decoderPacketThreshold = Self.decoderSilencePacketThreshold(for: srcCodecID)
 
         // PCM intermediate format follows the ENCODER (resolved below, after the channel count): EAC3 needs
         // FLTP; FLAC takes S16 (lossy src) or S32@24 (lossless src).
@@ -600,6 +603,26 @@ final class AudioBridge: @unchecked Sendable {
     /// AE#474: the DECODER arm's unit, and only its unit. Source went in and the FIFO got nothing
     /// back, so there is no sample count to bound anything with and packets are all there is.
     private static let silentFeedPacketThreshold = 64
+
+    /// AE#786: a packet is not the same length of source on every codec, and the decoder arm has to
+    /// outlast the longest a healthy decoder stays quiet. TrueHD and MLP decode only from a major
+    /// sync, and a TrueHD packet is one 40-frame access unit (1/1200 s), so after a start or seek
+    /// mid-stream the decoder skips up to ~100 of them ("Stream parameters not seen") before its
+    /// first frame. At 64 that wait was reported as a dead decoder and the session went to `.error`
+    /// while it played. `SpatialAudioBridge` met the same wait first and shares this bound: a second
+    /// of source.
+    static let trueHDSilentFeedPacketThreshold = 1200
+
+    static func decoderSilencePacketThreshold(for codecID: AVCodecID) -> Int {
+        switch codecID {
+        case AV_CODEC_ID_TRUEHD, AV_CODEC_ID_MLP:
+            return trueHDSilentFeedPacketThreshold
+        default:
+            return silentFeedPacketThreshold
+        }
+    }
+
+    private let decoderPacketThreshold: Int
 
     /// AE#474: the ENCODER arm's unit. `drainFIFOIntoEncoder(requireFull: true)` cannot encode below
     /// `frame_size`, so nothing can be emitted until that many samples have been enqueued, and the
@@ -966,13 +989,17 @@ final class AudioBridge: @unchecked Sendable {
     ///
     /// Pure and static so the boundary can be pinned against the frame sizes this bridge really
     /// opens instead of against whichever one the fixtures happen to reach.
-    static func silenceIsStructural(stats: FeedStats, encoderFrameSize: Int32) -> Bool {
+    static func silenceIsStructural(
+        stats: FeedStats,
+        encoderFrameSize: Int32,
+        decoderPacketThreshold: Int = silentFeedPacketThreshold
+    ) -> Bool {
         guard stats.isSilent else { return false }
         let frame = Int64(encoderFrameSize > 0 ? encoderFrameSize : assumedEncoderFrameSize)
         // The encoder arm: enough PCM to build several frames went in and none came back.
         if stats.samplesEnqueued >= frame * silentFeedEncoderFrameMultiple { return true }
         // The decoder arm: the FIFO has stood still for longer than any source explains.
-        return stats.packetsFedSinceLastEnqueue >= silentFeedPacketThreshold
+        return stats.packetsFedSinceLastEnqueue >= decoderPacketThreshold
     }
 
     /// AE#396: say it once, the moment the silence is structural. Without this the only downstream
@@ -981,7 +1008,8 @@ final class AudioBridge: @unchecked Sendable {
     /// the #165 cascade line.
     private func noteSilentFeedIfNeeded(encoderFrameSize: Int32) {
         guard !silentFeedReported,
-              Self.silenceIsStructural(stats: stats, encoderFrameSize: encoderFrameSize)
+              Self.silenceIsStructural(stats: stats, encoderFrameSize: encoderFrameSize,
+                                       decoderPacketThreshold: decoderPacketThreshold)
         else { return }
         silentFeedReported = true
         let encoder = avcodec_get_name(outputCodecID).map { String(cString: $0) } ?? "the encoder"

@@ -124,12 +124,13 @@ struct Issue220BoundedRangeTests {
         // speculative tail fetch is issued concurrently and would otherwise arrive afterwards and
         // read as a connection this EOF read opened.
         try await waitForOriginToSettle(server)
-        let requestsBefore = server.rangeRequestCount
 
         #expect(reader.seek(offset: size, whence: SEEK_SET) == size)
         #expect(reader.read(into: buf, size: 4096) == FFmpegErr.eof)
         try await waitForOriginToSettle(server)
-        #expect(server.rangeRequestCount == requestsBefore,
+        // On the ranges, not the count: under load the open's speculative tail fetch can land after
+        // the settle window, and it is not a connection for the EOF read. That one asks for `size-`.
+        #expect(server.requestedRanges.allSatisfy { $0.start < size },
                 "a read at EOF opened a connection: \(server.requestedRanges)")
     }
 

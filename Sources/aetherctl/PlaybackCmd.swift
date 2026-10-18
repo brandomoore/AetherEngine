@@ -6,6 +6,9 @@ import AVFoundation
 import ImageIO
 import UniformTypeIdentifiers
 import AetherEngine
+#if canImport(AppKit)
+import AppKit
+#endif
 
 /// #544: the still drill writes what it decoded, because a hit count says the call returned an image
 /// and only the file says it is the right picture.
@@ -65,6 +68,7 @@ enum LoadOptionChange {
     case preferredAudioLanguages([String])
     case decodePath(DecodePath)
     case dolbyVisionHandling(DolbyVisionHandling)
+    case preferDualLayerDolbyVision(Bool)
     case isLive(Bool)
     case autoplay(Bool)
 
@@ -75,6 +79,7 @@ enum LoadOptionChange {
         case .preferredAudioLanguages(let langs): return "preferredAudioLanguages=\(langs.joined(separator: ","))"
         case .decodePath(let path): return "preferredDecodePath=\(path.rawValue)"
         case .dolbyVisionHandling(let handling): return "dolbyVisionHandling=\(handling.rawValue)"
+        case .preferDualLayerDolbyVision(let flag): return "preferDualLayerDolbyVision=\(flag)"
         case .isLive(let value): return "isLive=\(value)"
         case .autoplay(let value): return "autoplay=\(value)"
         }
@@ -87,6 +92,7 @@ enum LoadOptionChange {
         case .preferredAudioLanguages(let langs): options.preferredAudioLanguages = langs
         case .decodePath(let path): options.preferredDecodePath = path
         case .dolbyVisionHandling(let handling): options.dolbyVisionHandling = handling
+        case .preferDualLayerDolbyVision(let flag): options.preferDualLayerDolbyVision = flag
         case .isLive(let value): options.isLive = value
         case .autoplay(let value): options.autoplay = value
         }
@@ -110,7 +116,8 @@ func runPlay(url: URL, seconds: Double, live: Bool, nativeHLS: Bool = false, liv
                     deinterlaceFieldRate: DeinterlaceFieldRate = .field,
                     assertDolbyVision: Bool = false,
                     preserveASSMarkup: Bool = false,
-                    dolbyVisionHandling: DolbyVisionHandling = .automatic, record: URL? = nil) -> Int32 {
+                    dolbyVisionHandling: DolbyVisionHandling = .automatic, preferDualLayerDolbyVision: Bool = false,
+                    attachSurface: Bool = false, record: URL? = nil) -> Int32 {
     EngineLog.handler = { print($0) }
     if mallocCensus {
         AetherEngine.setLargeAllocationCensusEnabled(
@@ -132,7 +139,7 @@ func runPlay(url: URL, seconds: Double, live: Bool, nativeHLS: Bool = false, liv
     // CFRunLoopRun, not a blocking semaphore: AetherEngine is @MainActor, so parking the main thread would deadlock the executor.
     let box = UncheckedBox<Int32?>(nil)
     Task { @MainActor in
-        box.value = await playSmokeTest(url: url, seconds: seconds, live: live, forceSoftware: forceSoftware, softwareEscalation: softwareEscalation, nativeHLS: nativeHLS, liveIngest: liveIngest, fastZap: fastZap, liveStartImmediately: liveStartImmediately, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats, seekEvery: seekEvery, seekPattern: seekPattern, seekCount: seekCount, startPosition: startPosition, frameTimes: frameTimes, presentTimes: presentTimes, servedURL: servedURL, pictureProbe: pictureProbe, pictureOrigin: pictureOrigin, nativeVideoFrameDiagnostics: nativeVideoFrameDiagnostics, nativeVideoFrameRecovery: nativeVideoFrameRecovery, sidecars: sidecars, audioSwitch: audioSwitch, teletextPage: teletextPage, teletextSwitch: teletextSwitch, audioDelayMs: audioDelayMs, audioDelaySwitches: audioDelaySwitches, pausedMount: pausedMount, optionCorrection: optionCorrection, sequentialOrigin: sequentialOrigin, maxConcurrentRequests: maxConcurrentRequests, heldConnection: heldConnection, progressiveSegments: progressiveSegments, declaredDuration: declaredDuration, httpHeaders: httpHeaders, deinterlaceFieldRate: deinterlaceFieldRate, assertDolbyVision: assertDolbyVision, preserveASSMarkup: preserveASSMarkup, dolbyVisionHandling: dolbyVisionHandling, record: record)
+        box.value = await playSmokeTest(url: url, seconds: seconds, live: live, forceSoftware: forceSoftware, softwareEscalation: softwareEscalation, nativeHLS: nativeHLS, liveIngest: liveIngest, fastZap: fastZap, liveStartImmediately: liveStartImmediately, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats, seekEvery: seekEvery, seekPattern: seekPattern, seekCount: seekCount, startPosition: startPosition, frameTimes: frameTimes, presentTimes: presentTimes, servedURL: servedURL, pictureProbe: pictureProbe, pictureOrigin: pictureOrigin, nativeVideoFrameDiagnostics: nativeVideoFrameDiagnostics, nativeVideoFrameRecovery: nativeVideoFrameRecovery, sidecars: sidecars, audioSwitch: audioSwitch, teletextPage: teletextPage, teletextSwitch: teletextSwitch, audioDelayMs: audioDelayMs, audioDelaySwitches: audioDelaySwitches, pausedMount: pausedMount, optionCorrection: optionCorrection, sequentialOrigin: sequentialOrigin, maxConcurrentRequests: maxConcurrentRequests, heldConnection: heldConnection, progressiveSegments: progressiveSegments, preferDualLayerDolbyVision: preferDualLayerDolbyVision, attachSurface: attachSurface, declaredDuration: declaredDuration, httpHeaders: httpHeaders, deinterlaceFieldRate: deinterlaceFieldRate, assertDolbyVision: assertDolbyVision, preserveASSMarkup: preserveASSMarkup, dolbyVisionHandling: dolbyVisionHandling, record: record)
         CFRunLoopStop(CFRunLoopGetMain())
     }
     CFRunLoopRun()
@@ -453,7 +460,7 @@ private func seekIntentDrill(
 }
 
 @MainActor
-private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware: Bool = false, softwareEscalation: Bool = true, nativeHLS: Bool = false, liveIngest: Bool = false, fastZap: Bool = false, liveStartImmediately: Bool = true, dvrWindow: Double?, subsPick: String?, hostCalls: [String], audioStats: Bool, seekEvery: Double? = nil, seekPattern: [Double] = [], seekCount: Int? = nil, startPosition: Double? = nil, frameTimes: Bool = false, presentTimes: Bool = false, servedURL: Bool = false, pictureProbe: Bool = false, pictureOrigin: Double = 0, nativeVideoFrameDiagnostics: Bool = false, nativeVideoFrameRecovery: Bool = false, sidecars: [ExternalSubtitleTrack] = [], audioSwitch: AudioSwitchRequest? = nil, teletextPage: Int? = nil, teletextSwitch: TeletextPageSwitchRequest? = nil, audioDelayMs: Int = 0, audioDelaySwitches: [AudioDelaySwitchRequest] = [], pausedMount: Bool = false, optionCorrection: LoadOptionCorrectionRequest? = nil, sequentialOrigin: Bool = false, maxConcurrentRequests: Int? = nil, heldConnection: Bool = false, progressiveSegments: Bool = false, declaredDuration: Double? = nil, httpHeaders: [String: String] = [:], deinterlaceFieldRate: DeinterlaceFieldRate = .field, assertDolbyVision: Bool = false, preserveASSMarkup: Bool = false, dolbyVisionHandling: DolbyVisionHandling = .automatic, record: URL? = nil) async -> Int32 {
+private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware: Bool = false, softwareEscalation: Bool = true, nativeHLS: Bool = false, liveIngest: Bool = false, fastZap: Bool = false, liveStartImmediately: Bool = true, dvrWindow: Double?, subsPick: String?, hostCalls: [String], audioStats: Bool, seekEvery: Double? = nil, seekPattern: [Double] = [], seekCount: Int? = nil, startPosition: Double? = nil, frameTimes: Bool = false, presentTimes: Bool = false, servedURL: Bool = false, pictureProbe: Bool = false, pictureOrigin: Double = 0, nativeVideoFrameDiagnostics: Bool = false, nativeVideoFrameRecovery: Bool = false, sidecars: [ExternalSubtitleTrack] = [], audioSwitch: AudioSwitchRequest? = nil, teletextPage: Int? = nil, teletextSwitch: TeletextPageSwitchRequest? = nil, audioDelayMs: Int = 0, audioDelaySwitches: [AudioDelaySwitchRequest] = [], pausedMount: Bool = false, optionCorrection: LoadOptionCorrectionRequest? = nil, sequentialOrigin: Bool = false, maxConcurrentRequests: Int? = nil, heldConnection: Bool = false, progressiveSegments: Bool = false, preferDualLayerDolbyVision: Bool = false, attachSurface: Bool = false, declaredDuration: Double? = nil, httpHeaders: [String: String] = [:], deinterlaceFieldRate: DeinterlaceFieldRate = .field, assertDolbyVision: Bool = false, preserveASSMarkup: Bool = false, dolbyVisionHandling: DolbyVisionHandling = .automatic, record: URL? = nil) async -> Int32 {
     let engine: AetherEngine
     do {
         engine = try AetherEngine()
@@ -549,6 +556,7 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
         // The base layer of a Dolby Vision source, the Dolby Vision left out of the container: the
         // harness for a record the bitstream contradicts.
         dolbyVisionHandling: dolbyVisionHandling,
+        preferDualLayerDolbyVision: preferDualLayerDolbyVision,
         panelPresentsDolbyVision: assertDolbyVision,
         isLive: live,
         dvrWindowSeconds: dvrWindow,
@@ -615,6 +623,46 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
             frameProbe?.record(frame)
         }
     }
+
+    #if canImport(AppKit)
+    var surfaceWindow: NSWindow?
+    var surfaceView: AetherPlayerView?
+    if attachSurface {
+        _ = NSApplication.shared
+        let pv = AetherPlayerView(frame: NSRect(x: 0, y: 0, width: 1280, height: 720))
+        let win = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 1280, height: 720),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        win.title = "AetherEngine Dolby Vision FEL Playback"
+        win.contentView = pv
+        // `--cycle-el` posts the current mode here; shown as a large label over the picture and in the title.
+        let label = NSTextField(labelWithString: "")
+        label.font = .systemFont(ofSize: 44, weight: .heavy)
+        label.textColor = .white
+        label.drawsBackground = true
+        label.backgroundColor = NSColor.black.withAlphaComponent(0.7)
+        label.isHidden = true
+        label.frame = NSRect(x: 24, y: 24, width: 640, height: 64)
+        label.autoresizingMask = [.maxXMargin, .maxYMargin]
+        pv.addSubview(label)
+        NotificationCenter.default.addObserver(forName: Notification.Name("aetherctl.elmode"), object: nil, queue: .main) { note in
+            let text = (note.object as? String) ?? ""
+            MainActor.assumeIsolated {
+                label.stringValue = " " + text + " "
+                label.isHidden = false
+                win.title = "AetherEngine: " + text
+            }
+        }
+        win.orderFront(nil)
+        engine.bind(view: pv)
+        surfaceView = pv
+        surfaceWindow = win
+        print("  SURFACE attached: 1280x720 window active for display layer")
+    }
+    #endif
 
     do {
         let probe: SourceProbe?
@@ -1541,6 +1589,10 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
             print("recording: \(bytes) B at \(record.path)")
         }
     }
+    #if canImport(AppKit)
+    _ = surfaceWindow
+    _ = surfaceView
+    #endif
     print("VERDICT: OK")
     return 0
 }

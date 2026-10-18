@@ -1220,20 +1220,18 @@ final class MP4SegmentMuxer {
     /// target; when it is illegal too there is nothing to copy from and inventing a value would be a guess.
     /// Bisected on the reporter's asset: `min_blocksize` alone decides whether the session opens, and
     /// `total_samples` (equally wrong there, describing the pre-cut source) does not, so nothing else moves.
+    /// A field this repair leaves below CoreMedia's real floor of 192 never gets here: the audio route
+    /// bridges that stream instead (AE#764, `FLACStreamInfo`).
     static func sanitizedFLACExtradata(
         _ codecpar: UnsafePointer<AVCodecParameters>
     ) -> [UInt8]? {
-        guard codecpar.pointee.codec_id == AV_CODEC_ID_FLAC,
-              let extradata = codecpar.pointee.extradata,
-              codecpar.pointee.extradata_size >= Int32(flacStreamInfoSize) else { return nil }
+        guard let (minBlockSize, maxBlockSize) = FLACStreamInfo.blockSizes(codecpar),
+              let repaired = FLACStreamInfo.repairedMinBlockSize(min: minBlockSize, max: maxBlockSize),
+              let extradata = codecpar.pointee.extradata else { return nil }
 
         var bytes = [UInt8](UnsafeBufferPointer(start: extradata, count: Int(codecpar.pointee.extradata_size)))
-        let minBlockSize = UInt16(bytes[0]) << 8 | UInt16(bytes[1])
-        let maxBlockSize = UInt16(bytes[2]) << 8 | UInt16(bytes[3])
-        guard minBlockSize < flacMinimumBlockSize, maxBlockSize >= flacMinimumBlockSize else { return nil }
-
-        bytes[0] = UInt8(maxBlockSize >> 8)
-        bytes[1] = UInt8(maxBlockSize & 0xFF)
+        bytes[0] = UInt8(repaired >> 8)
+        bytes[1] = UInt8(repaired & 0xFF)
         EngineLog.emit(
             "[MP4SegmentMuxer] FLAC STREAMINFO min_blocksize=\(minBlockSize) is illegal, "
             + "clamped to max_blocksize=\(maxBlockSize) so dfLa passes CoreMedia validation",
@@ -1241,10 +1239,6 @@ final class MP4SegmentMuxer {
         )
         return bytes
     }
-
-    /// FLAC `STREAMINFO` payload length, and the spec's floor for both blocksize fields.
-    private static let flacStreamInfoSize = 34
-    private static let flacMinimumBlockSize: UInt16 = 16
 
     /// Replace codecpar.extradata using av_malloc + AV_INPUT_BUFFER_PADDING_SIZE pad.
     private static func replaceExtradata(

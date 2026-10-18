@@ -71,13 +71,15 @@ struct Issue613PacketCoverageTests {
 
     /// The bound that lets HEVC in: FFmpeg rejects more than 15 reorder pictures, inside the
     /// 32-timestamp queue. Codecs without an established bound keep the strict model.
-    @Test("H.264 and HEVC take the successor model, other codecs keep the duration model")
+    @Test("H.264, HEVC and VC-1 take the successor model, other codecs keep the duration model")
     func reorderDepthByCodec() {
         #expect(SoftwarePlaybackHost.presentationReorderDepth(
             codecID: AV_CODEC_ID_H264.rawValue) == 32)
         #expect(SoftwarePlaybackHost.presentationReorderDepth(
             codecID: AV_CODEC_ID_HEVC.rawValue) == 32)
-        for other in [AV_CODEC_ID_AV1, AV_CODEC_ID_VP9, AV_CODEC_ID_MPEG2VIDEO, AV_CODEC_ID_VC1] {
+        #expect(SoftwarePlaybackHost.presentationReorderDepth(
+            codecID: AV_CODEC_ID_VC1.rawValue) == 32)
+        for other in [AV_CODEC_ID_AV1, AV_CODEC_ID_VP9, AV_CODEC_ID_MPEG2VIDEO, AV_CODEC_ID_WMV3] {
             #expect(SoftwarePlaybackHost.presentationReorderDepth(codecID: other.rawValue) == nil)
         }
     }
@@ -105,6 +107,108 @@ struct Issue613PacketCoverageTests {
             // Ten seconds stored, less the 32 timestamps the reorder queue holds back (1.33 s).
             #expect((successorFrontier ?? 0) > 8, "the frontier must reach the store, not the first hole")
         }
+    }
+
+    private func withAsyncRoot<T>(_ body: (URL) async throws -> T) async throws -> T {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vc1-coverage-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        return try await body(root)
+    }
+
+    /// Synthetic VC-1 timing only: one reference followed by up to seven B pictures,
+    /// 30 fps rounded to milliseconds, and presentation-ordered audio with explicit duration.
+    /// Missing audio duration is covered separately by upstream #775, not this VC-1 regression.
+    /// No private media, packet payloads or source identifiers are needed to reproduce it.
+    private func vc1ReadAhead(root: URL, count: Int, strict: Bool = false,
+                              discontinuity: Bool = false) async throws -> SoftwarePacketReadAhead {
+        var order = [0]
+        for first in stride(from: 1, to: count, by: 8) {
+            let reference = min(first + 7, count - 1)
+            order.append(reference)
+            order.append(contentsOf: first..<reference)
+        }
+        var packets: [SoftwareStoredPacket] = []
+        func timestamp(_ index: Int) -> Int64 {
+            Int64(index) * 100 / 3 + (discontinuity && index >= 150 ? 2000 : 0)
+        }
+        for (decodeIndex, picture) in order.enumerated() {
+            packets.append(SoftwareStoredPacket(pts: timestamp(picture), dts: timestamp(decodeIndex),
+                duration: 33, position: 0, streamIndex: 0, flags: picture % 240 == 0 ? 1 : 0,
+                timeBaseNumerator: 1, timeBaseDenominator: 1000,
+                bytes: Data(repeating: 7, count: 100), sideData: []))
+            if decodeIndex % 5 == 0 {
+                packets.append(SoftwareStoredPacket(pts: timestamp(decodeIndex), dts: timestamp(decodeIndex),
+                    duration: Int64(decodeIndex + 5) * 100 / 3 - Int64(decodeIndex) * 100 / 3,
+                    position: 0, streamIndex: 1, flags: 1,
+                    timeBaseNumerator: 1, timeBaseDenominator: 1000,
+                    bytes: Data(repeating: 3, count: 16), sideData: []))
+            }
+        }
+        let all = packets
+        let counter = Counter()
+        let fifo = try SoftwarePacketDiskFIFO(chunkTargetBytes: 64 * 1024, retainConsumed: true,
+                                              parentDirectory: root)
+        let source = SoftwarePacketReadAhead(video: .init(index: 0, numerator: 1, denominator: 1000),
+            audio: .init(index: 1, numerator: 1, denominator: 1000), byteBudget: 50_000_000,
+            forwardSeconds: 10_000, initialSourceClock: 0, fifo: fifo,
+            videoReorderDepth: strict ? nil : SoftwarePlaybackHost.presentationReorderDepth(
+                codecID: AV_CODEC_ID_VC1.rawValue)) { _ in
+                    let index = counter.next() - 1
+                    return index < all.count ? all[index] : nil
+                }
+        source.start()
+        do { try await waitFor { source.snapshot.sourceEnded } }
+        catch { source.close(); throw error }
+        return source
+    }
+
+    @Test("VC-1 rounded durations and seven-picture reorder retain one long A/V range", .timeLimit(.minutes(2)))
+    func vc1RoundedDurationsAndCacheSeek() async throws {
+        try await withAsyncRoot { root in
+            let old = try await vc1ReadAhead(root: root, count: 15_000, strict: true)
+            #expect(old.residentRanges.count == 4096, "old codec selection saturates coverage")
+            #expect((old.residentRanges.last?.upperBound ?? 0) < 420)
+            old.close()
+
+            let source = try await vc1ReadAhead(root: root, count: 15_000)
+            defer { source.close() }
+            #expect(source.residentRanges.count == 1)
+            #expect((source.residentRanges.last?.upperBound ?? 0) > 499)
+            // A former one-millisecond hole, then a retained position beyond the old cap.
+            for target in [0.0995, 450.0] {
+                let token = source.beginSeek(to: target)
+                #expect(try source.prepareSeek(token, to: target))
+            }
+            source.close()
+            #expect(source.residentRanges.isEmpty, "discard must clear the published cache")
+        }
+    }
+
+    @Test("VC-1 successor coverage preserves a genuine two-second A/V discontinuity", .timeLimit(.minutes(2)))
+    func vc1DiscontinuityRemainsUncached() async throws {
+        try await withAsyncRoot { root in
+            let source = try await vc1ReadAhead(root: root, count: 600, discontinuity: true)
+            defer { source.close() }
+            #expect(source.residentRanges.count == 2)
+            #expect(!source.residentRanges.contains { $0.contains(6) })
+            let token = source.beginSeek(to: 6)
+            #expect(try source.prepareSeek(token, to: 6) == false)
+        }
+    }
+
+    @Test("VC-1 admission retains the existing fail-closed late-timestamp guard")
+    func vc1LateTimestampInvalidates() throws {
+        let depth = try #require(SoftwarePlaybackHost.presentationReorderDepth(codecID: AV_CODEC_ID_VC1.rawValue))
+        var model = SoftwareVideoPacketCoverage(timeBaseNumerator: 1, timeBaseDenominator: 1000,
+                                                reorderDepth: depth)
+        for index: Int64 in 0..<100 { model.insert(pts: index * 100 / 3) }
+        #expect(!model.rangesSeconds.isEmpty)
+        let admitted = model.insert(pts: 1)
+        #expect(!admitted)
+        #expect(model.isInvalidated)
+        #expect(model.rangesSeconds.isEmpty)
     }
 
     // MARK: - 2. A full coverage forgets history instead of freezing

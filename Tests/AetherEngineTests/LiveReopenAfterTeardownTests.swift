@@ -10,7 +10,7 @@ struct LiveReopenAfterTeardownTests {
 
     @Test("a reopen demuxer is only registered while the failed producer is still the session's")
     func registrationRequiresCurrentProducer() throws {
-        var codecpar: UnsafeMutablePointer<AVCodecParameters>? = try #require(avcodec_parameters_alloc())
+        var codecpar: UnsafeMutablePointer<AVCodecParameters>? = avcodec_parameters_alloc()
         defer { avcodec_parameters_free(&codecpar) }
         codecpar!.pointee.codec_id = AV_CODEC_ID_H264
         codecpar!.pointee.codec_type = AVMEDIA_TYPE_VIDEO

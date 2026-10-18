@@ -22,6 +22,32 @@ struct SoftwarePacketCoverage: Sendable {
     var rangeCount: Int { ranges.count }
     var isFull: Bool { ranges.count >= maximumRangeCount }
 
+    /// Immutable presentation spans for a background residency snapshot. Never round over a gap.
+    func rangesSeconds(timeBaseNumerator: Int32, timeBaseDenominator: Int32) -> [ClosedRange<Double>] {
+        guard timeBaseNumerator > 0, timeBaseDenominator > 0 else { return [] }
+        return ranges.compactMap { range in
+            guard Int64(exactly: Double(range.lowerBound)) == range.lowerBound,
+                  Int64(exactly: Double(range.upperBound)) == range.upperBound else { return nil }
+            let start = Double(range.lowerBound) * Double(timeBaseNumerator) / Double(timeBaseDenominator)
+            let end = Double(range.upperBound) * Double(timeBaseNumerator) / Double(timeBaseDenominator)
+            guard start.isFinite, end.isFinite, start < end else { return nil }
+            return start...end
+        }
+    }
+
+    /// Linear intersection of sorted, disjoint spans; selected audio is required even when muted.
+    static func intersection(_ video: [ClosedRange<Double>], _ audio: [ClosedRange<Double>]) -> [ClosedRange<Double>] {
+        var result: [ClosedRange<Double>] = []
+        var v = 0, a = 0
+        while v < video.count, a < audio.count {
+            let start = max(video[v].lowerBound, audio[a].lowerBound)
+            let end = min(video[v].upperBound, audio[a].upperBound)
+            if start < end { result.append(start...end) }
+            if video[v].upperBound < audio[a].upperBound { v += 1 } else { a += 1 }
+        }
+        return result
+    }
+
     /// Adds [pts, pts + duration). Invalid or capacity-exceeding input leaves existing coverage
     /// unchanged. Rejecting a sparse extension is conservative: it never claims a missing packet.
     @discardableResult

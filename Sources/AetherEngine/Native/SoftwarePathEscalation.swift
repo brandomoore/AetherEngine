@@ -98,6 +98,7 @@ enum SoftwarePathEscalation {
 
     /// The domain of a media failure, i.e. AVFoundation could not make sense of what it was served.
     static let mediaErrorDomain = "CoreMediaErrorDomain"
+    static let videoConfigurationErrorDomain = "AetherEngine.VideoConfiguration"
 
     /// AE#627: a live join that read video for the whole keyframe wait and found no picture the native
     /// route can open a segment on (a feed without IDRs or recovery points, or with gradual refresh
@@ -121,5 +122,6 @@ enum SoftwarePathEscalation {
         // The bypass has no local muxer and decodes nothing here, so #461 ignores the option anyway.
         guard !availability.nativeRemoteHLS else { return false }
         return errorDomain == mediaErrorDomain || errorDomain == liveJoinErrorDomain
+            || errorDomain == videoConfigurationErrorDomain
     }
 }

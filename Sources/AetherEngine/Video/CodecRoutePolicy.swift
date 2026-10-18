@@ -651,7 +651,11 @@ extension HLSVideoEngine {
                 dvVariant: dvVariant
             )
         case .profile7:
-            // P7 dual-layer (UHD-BD): convert the RPU P7 -> P8.1 per packet (DoviRpuConverter, libdovi
+            // P7 dual-layer (UHD-BD). With preferDualLayerDolbyVision on and the box able to afford it,
+            // VideoRoutingPolicy sends a FEL to the software dual-layer route instead (SoftwarePlaybackHost +
+            // DualLayerVideoDecoder), which keeps the enhancement layer; every other P7 load lands here.
+            //
+            // Native route: convert the RPU P7 -> P8.1 per packet (DoviRpuConverter, libdovi
             // mode 2), drop the EL, rewrite the container dvcC to P8.1, and from there on serve exactly
             // what a P8.1 source is served, on every display. The way mpv treats Profile 7 without an EL
             // decoder: base layer plus RPU, never the bare base layer.

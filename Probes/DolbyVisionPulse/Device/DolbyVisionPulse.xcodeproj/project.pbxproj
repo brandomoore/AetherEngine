@@ -1,0 +1,342 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		1CC1EA98D9C5F77AAC72F7CC /* PulseVideoToolbox.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9672B7938DDC09AAB435BC6 /* PulseVideoToolbox.swift */; };
+		77CB08AE958747D4126970C6 /* DolbyVisionPulseHostApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7BCA97A8853B09B4E7B4B99A /* DolbyVisionPulseHostApp.swift */; };
+		C3F88D052478C6D03F65C74C /* PulseEngine in Frameworks */ = {isa = PBXBuildFile; productRef = 5DDCF6DD2D95C3E73D4B2B5C /* PulseEngine */; };
+		FB3139445F0E0031753BB397 /* PulseLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCACA2DF252349E564F73EAC /* PulseLog.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		6EC0C4402B0A4CFAB2376CAB /* PulseEngine */ = {isa = PBXFileReference; lastKnownFileType = folder; path = PulseEngine; sourceTree = SOURCE_ROOT; };
+		7BCA97A8853B09B4E7B4B99A /* DolbyVisionPulseHostApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DolbyVisionPulseHostApp.swift; sourceTree = "<group>"; };
+		81B68F565101F4AD4C23902A /* DolbyVisionPulseHost.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = DolbyVisionPulseHost.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		B9672B7938DDC09AAB435BC6 /* PulseVideoToolbox.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PulseVideoToolbox.swift; sourceTree = "<group>"; };
+		DCACA2DF252349E564F73EAC /* PulseLog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PulseLog.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		2BC4135493426C6DF7CC3B11 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				C3F88D052478C6D03F65C74C /* PulseEngine in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		877A8AC0E76ED624DD6E3BF6 /* Packages */ = {
+			isa = PBXGroup;
+			children = (
+				6EC0C4402B0A4CFAB2376CAB /* PulseEngine */,
+			);
+			name = Packages;
+			sourceTree = "<group>";
+		};
+		91F1FECFC9FBC63638DFB9F0 = {
+			isa = PBXGroup;
+			children = (
+				A0F3EC54F7CC8065A3A7DFAC /* Host */,
+				877A8AC0E76ED624DD6E3BF6 /* Packages */,
+				A0369D737D33D357FE77916A /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		A0369D737D33D357FE77916A /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				81B68F565101F4AD4C23902A /* DolbyVisionPulseHost.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		A0F3EC54F7CC8065A3A7DFAC /* Host */ = {
+			isa = PBXGroup;
+			children = (
+				7BCA97A8853B09B4E7B4B99A /* DolbyVisionPulseHostApp.swift */,
+				DCACA2DF252349E564F73EAC /* PulseLog.swift */,
+				B9672B7938DDC09AAB435BC6 /* PulseVideoToolbox.swift */,
+			);
+			path = Host;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		1DDB0EFB1D0FFFD6D891F260 /* DolbyVisionPulseHost */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = AF89BEB4939AE144202F15AF /* Build configuration list for PBXNativeTarget "DolbyVisionPulseHost" */;
+			buildPhases = (
+				3DBDD39040B8692C0BA1124E /* Sources */,
+				2BC4135493426C6DF7CC3B11 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = DolbyVisionPulseHost;
+			packageProductDependencies = (
+				5DDCF6DD2D95C3E73D4B2B5C /* PulseEngine */,
+			);
+			productName = DolbyVisionPulseHost;
+			productReference = 81B68F565101F4AD4C23902A /* DolbyVisionPulseHost.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		3E6283C4018EFBF976379C00 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+					1DDB0EFB1D0FFFD6D891F260 = {
+						ProvisioningStyle = Automatic;
+					};
+				};
+			};
+			buildConfigurationList = 7345ED8B0955685E060F8EA6 /* Build configuration list for PBXProject "DolbyVisionPulse" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = 91F1FECFC9FBC63638DFB9F0;
+			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				A1D5E5D261EA7A828134329D /* XCLocalSwiftPackageReference "PulseEngine" */,
+			);
+			preferredProjectObjectVersion = 77;
+			productRefGroup = A0369D737D33D357FE77916A /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				1DDB0EFB1D0FFFD6D891F260 /* DolbyVisionPulseHost */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXSourcesBuildPhase section */
+		3DBDD39040B8692C0BA1124E /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				77CB08AE958747D4126970C6 /* DolbyVisionPulseHostApp.swift in Sources */,
+				FB3139445F0E0031753BB397 /* PulseLog.swift in Sources */,
+				1CC1EA98D9C5F77AAC72F7CC /* PulseVideoToolbox.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		058CE76FD1067ADB93FFA4B8 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = "App Icon & Top Shelf Image";
+				ASSETCATALOG_COMPILER_LAUNCHIMAGE_NAME = LaunchImage;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Host/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "$(PULSE_BUNDLE_PREFIX).host";
+				SDKROOT = appletvos;
+				TARGETED_DEVICE_FAMILY = 3;
+			};
+			name = Release;
+		};
+		42160C4F45DACBA011092C36 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				PULSE_BUNDLE_PREFIX = de.superuser404.dolbyvisionpulse;
+				SDKROOT = appletvos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = 3;
+				TVOS_DEPLOYMENT_TARGET = 18.0;
+			};
+			name = Debug;
+		};
+		58026C6AF77395FFB0ED71C2 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = "App Icon & Top Shelf Image";
+				ASSETCATALOG_COMPILER_LAUNCHIMAGE_NAME = LaunchImage;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Host/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "$(PULSE_BUNDLE_PREFIX).host";
+				SDKROOT = appletvos;
+				TARGETED_DEVICE_FAMILY = 3;
+			};
+			name = Debug;
+		};
+		6CACE8A95F8A6D578B4F7D53 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				PULSE_BUNDLE_PREFIX = de.superuser404.dolbyvisionpulse;
+				SDKROOT = appletvos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = 3;
+				TVOS_DEPLOYMENT_TARGET = 18.0;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		7345ED8B0955685E060F8EA6 /* Build configuration list for PBXProject "DolbyVisionPulse" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				42160C4F45DACBA011092C36 /* Debug */,
+				6CACE8A95F8A6D578B4F7D53 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		AF89BEB4939AE144202F15AF /* Build configuration list for PBXNativeTarget "DolbyVisionPulseHost" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				58026C6AF77395FFB0ED71C2 /* Debug */,
+				058CE76FD1067ADB93FFA4B8 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		A1D5E5D261EA7A828134329D /* XCLocalSwiftPackageReference "PulseEngine" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = PulseEngine;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		5DDCF6DD2D95C3E73D4B2B5C /* PulseEngine */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = PulseEngine;
+		};
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = 3E6283C4018EFBF976379C00 /* Project object */;
+}

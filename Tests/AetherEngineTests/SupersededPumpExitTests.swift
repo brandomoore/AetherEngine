@@ -72,7 +72,7 @@ struct SupersededPumpExitTests {
 
     @Test("a read error from a replaced producer spends nothing and signals nothing")
     func supersededReadErrorIsIgnored() throws {
-        var codecpar: UnsafeMutablePointer<AVCodecParameters>? = try #require(avcodec_parameters_alloc())
+        var codecpar: UnsafeMutablePointer<AVCodecParameters>? = avcodec_parameters_alloc()
         defer { avcodec_parameters_free(&codecpar) }
         codecpar!.pointee.codec_id = AV_CODEC_ID_H264
         codecpar!.pointee.codec_type = AVMEDIA_TYPE_VIDEO
@@ -95,7 +95,7 @@ struct SupersededPumpExitTests {
 
     @Test("a replay exit retunes only the current producer, never a superseded channel")
     func replayExitRequiresCurrentProducer() throws {
-        var codecpar: UnsafeMutablePointer<AVCodecParameters>? = try #require(avcodec_parameters_alloc())
+        var codecpar: UnsafeMutablePointer<AVCodecParameters>? = avcodec_parameters_alloc()
         defer { avcodec_parameters_free(&codecpar) }
         codecpar!.pointee.codec_id = AV_CODEC_ID_H264
         codecpar!.pointee.codec_type = AVMEDIA_TYPE_VIDEO
@@ -117,7 +117,7 @@ struct SupersededPumpExitTests {
 
     @Test("verified replay exhaustion cannot silently request a reload that loses its history")
     func replayExhaustionHasSeparateHostEvidence() throws {
-        var codecpar: UnsafeMutablePointer<AVCodecParameters>? = try #require(avcodec_parameters_alloc())
+        var codecpar: UnsafeMutablePointer<AVCodecParameters>? = avcodec_parameters_alloc()
         defer { avcodec_parameters_free(&codecpar) }
         codecpar!.pointee.codec_id = AV_CODEC_ID_H264
         codecpar!.pointee.codec_type = AVMEDIA_TYPE_VIDEO
@@ -145,7 +145,7 @@ struct SupersededPumpExitTests {
 
     @Test("without a host that owns the retry, exhausted replay is a source reset")
     func replayExhaustionFallsBackToSourceReset() throws {
-        var codecpar: UnsafeMutablePointer<AVCodecParameters>? = try #require(avcodec_parameters_alloc())
+        var codecpar: UnsafeMutablePointer<AVCodecParameters>? = avcodec_parameters_alloc()
         defer { avcodec_parameters_free(&codecpar) }
         codecpar!.pointee.codec_id = AV_CODEC_ID_H264
         codecpar!.pointee.codec_type = AVMEDIA_TYPE_VIDEO
@@ -164,7 +164,7 @@ struct SupersededPumpExitTests {
 
     @Test("the same read error from the session's own producer still reaches the recovery arms")
     func currentReadErrorIsHandled() throws {
-        var codecpar: UnsafeMutablePointer<AVCodecParameters>? = try #require(avcodec_parameters_alloc())
+        var codecpar: UnsafeMutablePointer<AVCodecParameters>? = avcodec_parameters_alloc()
         defer { avcodec_parameters_free(&codecpar) }
         codecpar!.pointee.codec_id = AV_CODEC_ID_H264
         codecpar!.pointee.codec_type = AVMEDIA_TYPE_VIDEO

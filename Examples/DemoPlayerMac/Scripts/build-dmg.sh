@@ -66,7 +66,8 @@ mkdir -p "$BUILD_DIR"
 echo "==> [1/6] Building universal release..."
 swift build -c release --arch arm64 --arch x86_64
 
-BINARY=".build/apple/Products/Release/DemoPlayerMac"
+# Swift 6.4 moved the multi-arch output from .build/apple to .build/out; ask SwiftPM instead of guessing.
+BINARY="$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)/DemoPlayerMac"
 [ -f "$BINARY" ] || { echo "FAIL: $BINARY not produced"; exit 1; }
 
 echo "    binary: $(file "$BINARY" | head -1 | sed 's/.*: //')"

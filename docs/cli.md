@@ -1,6 +1,6 @@
 # aetherctl
 
-A standalone macOS CLI shipped alongside the library for repro work without going through TestFlight + Apple TV. Most subcommands operate on a media source URL (`file://` or `http(s)://`); `live`, `dvr`, `hlsfixture`, and `hlslive` run against built-in synthetic fixtures.
+A standalone macOS CLI shipped alongside the library for repro work without going through TestFlight + Apple TV. It builds with the package's traits, so the optional components ([README › Optional components](../README.md#optional-components)) are in it only when it is built with them: `swift run --traits TrueHDObjectAudio,DTSXObjectAudio,DualLayerDolbyVision,DolbyVisionStillReshaping aetherctl …` for `--atmos-bed`, `play --fel`, `--cycle-el`, `--dv-pin` and `feltest`, and for Profile 5 / 10.0 stills in `extract` and `play --host-calls` (`DolbyVisionStillReshaping`; without it those stills print as nil). Most subcommands operate on a media source URL (`file://` or `http(s)://`); `live`, `dvr`, `hlsfixture`, and `hlslive` run against built-in synthetic fixtures.
 
 ```bash
 swift run aetherctl probe <url>          # dump container + streams + duration, exit
@@ -10,6 +10,8 @@ swift run aetherctl segverify <url>      # SW-decode each loopback segment in is
 swift run aetherctl swdecode <url>       # open SoftwareVideoDecoder, decode N packets, report
 swift run aetherctl play <url>           # full load+play session smoke test: 1 Hz telemetry, cue log, host-call mimicry
 swift run aetherctl dovitest <url>       # convert a DV Profile 7 stream to 8.1, dump for dovi_tool
+swift run aetherctl feltest <url>        # test Dolby Vision Profile 7 FEL dual-layer Metal reconstruction
+swift run aetherctl dvsurvey <url>       # survey per-frame Dolby Vision L1 / L2 metadata, pick a --dv-pin frame
 swift run aetherctl pktdump <url>        # dump raw demuxer packet timing (dts/pts/keyframe) per open profile
 swift run aetherctl dualsubs <file> ...  # dual subtitle-track render probe (--primary / --secondary stream index)
 swift run aetherctl extract <url>        # FrameExtractor still-image extraction + leak testing
@@ -27,7 +29,7 @@ swift run aetherctl smbtest <smb-url>    # play a file off an SMB2/3 share via t
 swift run aetherctl <url>                # alias for serve (backwards compat)
 ```
 
-Twenty-one subcommands plus the bare-URL `serve` alias.
+Twenty-three subcommands plus the bare-URL `serve` alias.
 
 ## probe
 
@@ -65,7 +67,7 @@ open 'http://127.0.0.1:<port>/<token>/master.m3u8'   # macOS QuickTime
 
 `--native-subs <index>` turns on the native WebVTT subtitle renditions (the `LoadOptions.prepareNativeSubtitles` path a full session uses): the engine calls `requestNativeSubtitleTrack()` before `start()`, then `attachAllNativeSubtitleStores()` after start. Every non-bitmap text track is served as a language-tagged `EXT-X-MEDIA:TYPE=SUBTITLES` rendition (`DEFAULT=NO,AUTOSELECT=NO`) in the master playlist, backed by a per-track `subs_N.m3u8` WebVTT media playlist. (An earlier design muxed `mov_text`/tx3g traks into the fMP4; in-band timed text is not HLS-conformant and AVPlayer rejected it, so the WebVTT rendition replaced it, see [formats.md › Native subtitle renditions](formats.md#native-subtitle-renditions-webvtt-for-pip-airplay-and-external-display).) The `<index>` value is legacy and now ignored, kept only for CLI compatibility: every non-bitmap track is always declared, and actual track selection happens via the host API in a full session, not from this flag. `curl` the `master.m3u8` (or open it in QuickTime) to verify the `SUBTITLES` group + `subs_N.m3u8` endpoints enumerate every language as a legible `AVMediaSelection` group. Omit the flag to reproduce the default behavior (no renditions, output identical to before).
 
-`--iframes` lists an I-frame rendition in the master (the `LoadOptions.serveIFramePlaylist` path a full session uses, AE#682): the engine calls `requestIFramePlaylist()` before `start()`. The master then carries `#EXT-X-I-FRAME-STREAM-INF` and the server answers `iframe.m3u8`, `iframe_init.mp4` and `iframe<N>.mp4`, one keyframe per segment. The log line `[HLSVideoEngine] i-frame rendition: served segments=<n>` or `absent reason=<reason>` says which it was. `curl` the playlist and a fragment next to the printed playback URL to look at them.
+`--iframes` lists an I-frame rendition in the master (the `LoadOptions.serveIFramePlaylist` path a full session uses, AE#682): the engine calls `requestIFramePlaylist()` before `start()`. The master then carries `#EXT-X-I-FRAME-STREAM-INF` and the server answers `iframe.m3u8`, `iframe_init.mp4` and `iframe<N>.mp4`, one still per segment: the source's keyframe for SDR, a tone-mapped Motion JPEG (`CODECS="mjpg"`) for HDR and Dolby Vision. The log line `[HLSVideoEngine] i-frame rendition: served segments=<n> format=keyframes|jpeg` or `absent reason=<reason>` says which it was. `curl` the playlist and a fragment next to the printed playback URL to look at them.
 
 `--prewarm` / `--prewarm-bytes N` (AE#551, `play` only) warm the source before the load, the way a host warms the next episode, and print what was retained and how long it took. The load that follows adopts those bytes: its reads inside the warm head cost no request, and its data connection starts at the warm frontier instead of byte zero. Measure it against a REAL origin. On loopback the round trip it removes costs nothing to begin with, which is exactly the trap the #281 tail prefetch was built out of.
 
@@ -73,7 +75,7 @@ open 'http://127.0.0.1:<port>/<token>/master.m3u8'   # macOS QuickTime
 
 `--start-position S` starts the session at S seconds, the resume anchor a host passes to `load(url:startPosition:)`. Also available on `play`.
 
-`--atmos-bed <layout>` is `LoadOptions.objectAudioRendering = .apac(layout)` (`5.1.2`, `5.1.4`, `7.1.2`, `7.1.4` or `9.1.6`, #731, #744): a TrueHD Atmos or DTS:X track is rendered into that bed and served as APAC, so a master reads `CODECS="…,apac.31.03"` (up to 12 channels) or `apac.31.04` (16), and the log carries `TrueHD Atmos: objects rendered into …` (or `DTS:X: bed, heights and objects rendered into …`) and the `[SpatialAudioBridge] bed levels` lines. A DTS-HD MA track that LibDTSX does not confirm as DTS:X logs `DTS-HD MA track is not DTS:X LibDTSX renders (…); keeping the channel bridge` instead. `--audio-index <n>` serves source stream `n`, as a host's audio picker would. Dolby's Unfold demo, whose TrueHD Atmos track is stream 1: `serve --no-dv --atmos-bed 7.1.4 --audio-index 1 unfold.m2ts`.
+`--atmos-bed <layout>` is `LoadOptions.objectAudioRendering = .apac(layout)` (`5.1.2`, `5.1.4`, `7.1.2`, `7.1.4` or `9.1.6`, #731, #744), rendered only by a build with the `TrueHDObjectAudio` / `DTSXObjectAudio` traits: a TrueHD Atmos or DTS:X track is rendered into that bed and served as APAC, so a master reads `CODECS="…,apac.31.03"` (up to 12 channels) or `apac.31.04` (16), and the log carries `TrueHD Atmos: objects rendered into …` (or `DTS:X: bed, heights and objects rendered into …`) and the `[SpatialAudioBridge] bed levels` lines. A DTS-HD MA track that LibDTSX does not confirm as DTS:X logs `DTS-HD MA track is not DTS:X LibDTSX renders (…); keeping the channel bridge` instead. `--audio-index <n>` serves source stream `n`, as a host's audio picker would. Dolby's Unfold demo, whose TrueHD Atmos track is stream 1: `serve --no-dv --atmos-bed 7.1.4 --audio-index 1 unfold.m2ts`.
 
 `--audio-delay <ms>` parks the server with the AE#464 audio offset already in its muxer, which is how the DELIVERED offset is measured rather than argued about: fetch the media playlist and walk its segments, then read the first audio and video packet timestamps out of `init.mp4` + a segment with `ffprobe -show_entries packet=stream_index,pts_time`. On a 30 fps H.264 + AAC fixture the source's own alignment is +21.8 ms, `--audio-delay 200` reads +221.8 ms and `--audio-delay -150` reads -128.2 ms, i.e. exactly the offset asked for, with the video timestamp unchanged in every arm.
 
@@ -105,6 +107,9 @@ swift run aetherctl play --live --dvr-window 1800 --audio-stats <url>           
 swift run aetherctl play --live --native-hls <master.m3u8>      # nativeRemoteHLS bypass (carriage watchdog + #293 probe)
 swift run aetherctl play --sidecar de=/tmp/de.srt --subs de <master.m3u8>   # declare a sidecar at load (#316)
 swift run aetherctl play --native-hls --trust-any-certificate <https master.m3u8>  # the AE#495 origin relay
+swift run aetherctl play --fel <p7-file.mkv>                    # opt in to the Profile 7 FEL dual-layer route (off by default, like LoadOptions.preferDualLayerDolbyVision; --no-fel / --no-dual-layer are accepted and do nothing)
+swift run aetherctl play --fel --surface --cycle-el 10 <p7-file.mkv>   # flip the residual off and on every 10 s over a visible window (--window is the same flag)
+swift run aetherctl play --fel --surface --dv-pin 'darkest:240,period:2' <url>   # DEBUG: pulse a pinned frame's DV metadata (from dvsurvey)
 ```
 
 `--host-calls nativesubs,nativerender@N,subsoff@N,subson@N` drives the NATIVE SUBTITLE RENDITION path
@@ -249,11 +254,13 @@ gate: `AE#464: audio delay = +150 ms stands, but this session cannot re-anchor a
 re-anchor and re-cuts. Before round 2 the gate read `liveWindow != nil`, which is true for both, so the
 live-only session took a rebuild that rejoins at the edge.
 
-`--reload-applying <key>=<value>` (repeatable, with one shared `--reload-applying-at <ms>`, default +20 s) corrects a `LoadOption` on the playing session through `reloadAtCurrentPosition(applying:)` (#460). Keys: `header.<Name>`, `audio-bridge`, `preferred-audio`, `decode-path`, `is-live`, which is there to drive the refusal, since a field that names the session has to be observably refused rather than observably ignored, and `autoplay`, which drives the third answer: a field the session owns, neither refused nor applied. Both outcomes print, which is the pair a host's recovery ladder has to tell apart. Pair it with a header-logging origin to read the correction from the other end: with `--header "X-Auth: stale"` at load and `--reload-applying header.X-Auth=fresh`, the origin log shows three requests carrying the stale value, then three carrying the fresh one, and the transport telemetry carries straight through the rebuild (`resumed at 10.90s from 9.90s`).
+`--reload-applying <key>=<value>` (repeatable, with one shared `--reload-applying-at <ms>`, default +20 s) corrects a `LoadOption` on the playing session through `reloadAtCurrentPosition(applying:)` (#460). Keys: `header.<Name>`, `audio-bridge`, `preferred-audio`, `decode-path`, `prefer-dual-layer-dv` (alias `fel-mode`, `true|false`: `LoadOptions.preferDualLayerDolbyVision`, so a running session can be moved on or off the Profile 7 FEL route), `is-live`, which is there to drive the refusal, since a field that names the session has to be observably refused rather than observably ignored, and `autoplay`, which drives the third answer: a field the session owns, neither refused nor applied. Both outcomes print, which is the pair a host's recovery ladder has to tell apart. Pair it with a header-logging origin to read the correction from the other end: with `--header "X-Auth: stale"` at load and `--reload-applying header.X-Auth=fresh`, the origin log shows three requests carrying the stale value, then three carrying the fresh one, and the transport telemetry carries straight through the rebuild (`resumed at 10.90s from 9.90s`).
 
 `play --sw` sets `LoadOptions.preferredDecodePath = .software` (#461), the shipping per-session lever, rather than the process-global `setForceSoftwarePathForTesting` it drove before; that hook is still what `live --sw` and `dvr` use, since those harnesses run several sessions and want every one of them on the software host. `--reload-applying decode-path=software` is the same lever applied to a session that is already playing: on the 300 s H.264 fixture the run dispatches `codec=27 → native`, takes the correction at t=9.90 s and comes back `codec=27 → software` at 10.81 s, playing. On a live load the override reaches the same routing decision, which is the case with no alternative, since the #2 capability gate is VOD-only for H.264 / HEVC and such a live session is never classified at all.
 
 `play --no-sw-escalation` sets `LoadOptions.escalatesToSoftwarePath = false` (AE#629), and every `play` run prints an `ESCALATION at <s> duringStartup=<bool> absorbed=<domain>/<code> <kind>` line when the AE#561 rebuild is taken. The pair is the A/B for a host's own fallback ladder. On a 40 s HEVC fixture from `Scripts/nal-overrun-fixture.py --after 20`, played with `AETHER_DISABLE_NAL_SANITIZER=1`, the default arm prints `ESCALATION at 12.00s duringStartup=false absorbed=CoreMediaErrorDomain/-19602 nativeItemFailed`, rebuilds on the software path and plays to the end (`VERDICT: OK`). The declining arm prints no escalation, goes to `.error` with `-19602` at 12.00 s and exits 2.
+
+`play --fel` sets `LoadOptions.preferDualLayerDolbyVision = true`, the opt-in to the Profile 7 FEL dual-layer route, which a build without the `DualLayerDolbyVision` trait accepts and ignores (`--cycle-el` exits 64 there). It is off by default, as it is in the engine, so a plain `play` runs the route a host gets; `--no-fel` and `--no-dual-layer` are accepted as no-ops. `--surface` (or `--window`, the same flag) presents into a 1280x720 window, macOS only, so the picture can be looked at. `--cycle-el <seconds>` (at least 0.1) flips the FEL residual off and on every period, starting with the full result, and posts the current mode as a label over the picture and in the window title: the off phase is what a minimal enhancement layer decodes to, so the window is an A/B of the residual on the same frames. It changes only a session on the dual-layer route, so it wants `--fel` (without it `play` prints a note) and a surface to be seen on. `--dv-pin <spec>` arms the on-device consumption test in a DEBUG build of `aetherctl` with the `DualLayerDolbyVision` trait (a release build, or one without the trait, refuses the flag with exit 64): after composition it substitutes a captured frame's Dolby Vision metadata on a duty cycle, leaving the pixels untouched, so a visible pulse can only come from the metadata. The spec is the grammar `dvsurvey` prints, such as `darkest:240,period:2`; a spec with no capture rule is refused with exit 64. See [dolby-vision-fel.md](dolby-vision-fel.md).
 
 `--drop-audio` forces every audio pipeline to fail, so the AE#462 video-only drop is observable without a source this build has no decoder for: the loopback cascade skips both the stream-copy probe and the bridge, and `SoftwarePlaybackHost` refuses its decoder open. The run then prints `audio delivery=droppedNoPipeline pipeline=none`, which is the pair a host reads (the typed fact plus the human label), against `delivery=streamCopy` / `bridged` / `decoded` on the same source without the flag. It is loud in the log on purpose, in both the CLI line and the engine's own, because a forced classification read as a real one would be worse than no harness.
 
@@ -475,6 +482,22 @@ Runs the Dolby Vision Profile 7 to 8.1 converter over every video packet of the 
 swift run aetherctl dovitest [--out PATH.hevc] <p7-source>
 dovi_tool extract-rpu -i <printed output path> -o out.rpu
 dovi_tool info -i out.rpu -f 0   # expect dovi_profile 8, disable_residual_flag true
+```
+
+## feltest
+
+Needs the `DualLayerDolbyVision` trait; without it the subcommand exits 64 and says so. Runs the Dolby Vision Profile 7 FEL dual-layer pipeline over a real clip: demuxes, splits each packet into the base layer, the enhancement layer (typically 1080p) and the RPU, decodes both layers in hardware `VTDecompressionSession`s, composes each frame with `DoviFelComposer` on Metal, and audits the output twice. The pixel audit reports mean and standard deviation of Y / Cb / Cr, so a black picture or collapsed chroma fails. The metadata audit checks that every delivered frame carries a `DolbyVisionRPUData` attachment, and warns (without failing) when the payload never changes, since a static-metadata clip is valid. The verdict also requires at least one frame the composer actually reconstructed: a bypassed frame comes out as its base layer and counts as output but not as composed. Exit codes: `0` verified, `1` probe error, `2` no frames output, `3` chroma collapsed to a flat 64, `4` frames emitted without per-frame Dolby Vision metadata, `5` no frame was composed. See [dolby-vision-fel.md](dolby-vision-fel.md).
+
+```bash
+swift run aetherctl feltest [--frames N] <p7-source>
+```
+
+## dvsurvey
+
+Walks a title's RPUs with no decoders and no GPU, converts each to Profile 8.1 exactly as the FEL path attaches it, and reports the L1 distribution (`min_pq`, `max_pq`, `avg_pq`), the scene cuts, and the frame whose L1 sits furthest from the title's median, together with the `aetherctl play --dv-pin` spec that pins it (a host app passes the same spec to `armDolbyVisionPinTest`) for the on-device consumption test. Candidates rank on distance from the median across all three L1 fields, not `max_pq` alone. `--frames N` bounds the scan (default 2000) and `--list K` also dumps the first K frames. Exit codes: `0` ok, `1` probe error, `2` no RPUs, `3` no pin candidate, `4` the title's L1 range is too flat for a pinned frame to be visible on a panel.
+
+```bash
+swift run aetherctl dvsurvey --frames 6000 <p7-source>
 ```
 
 ## pktdump

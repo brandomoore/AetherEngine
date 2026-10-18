@@ -734,6 +734,7 @@ extension AetherEngine {
         let isCustom = isCustomSource
         if isCustom, customReader == nil { return }
         let headers = loadedOptions.httpHeaders
+        let headerStore = sessionRequestHeaders
         let formatHint = customFormatHint
         let probesize = loadedOptions.probesize
         let maxAnalyzeDuration = loadedOptions.maxAnalyzeDuration
@@ -785,7 +786,7 @@ extension AetherEngine {
                 guard let self else { return }
                 let outcome = await self.runSubtitleForwardPrefetchSession(
                     url: url, reader: attemptReader, formatHint: formatHint, headers: headers,
-                    startAt: resumeAt, callerProbesize: probesize,
+                    headerStore: headerStore, startAt: resumeAt, callerProbesize: probesize,
                     callerMaxAnalyzeDuration: maxAnalyzeDuration,
                     selectTitleID: titleID, store: store, leadSeconds: lead, link: link)
                 guard outcome.exit.isRestartable, !Task.isCancelled else { return }
@@ -837,6 +838,7 @@ extension AetherEngine {
     /// packets to the SubtitlePacketStore instead of decoded cues to native stores.
     nonisolated private func runSubtitleForwardPrefetchSession(
         url: URL, reader: IOReader?, formatHint: String?, headers: [String: String],
+        headerStore: RequestHeaderStore?,
         startAt: Double, callerProbesize: Int64?, callerMaxAnalyzeDuration: Int64?,
         selectTitleID: Int?, store: SubtitlePacketStore, leadSeconds: Double,
         link: SideReaderLinkArbiter?
@@ -844,6 +846,7 @@ extension AetherEngine {
         let demuxer = Demuxer()
         let openProfile = DemuxerOpenProfile.subtitleSideDemuxer(
             callerProbesize: callerProbesize, callerMaxAnalyzeDuration: callerMaxAnalyzeDuration).withReaderLabel("prefetch")
+            .withRequestHeaders(headerStore)
         let registered = await MainActor.run { [weak self] () -> Bool in
             guard !Task.isCancelled, let self else { return false }
             self.subtitleForwardPrefetchDemuxer = demuxer
@@ -1742,6 +1745,7 @@ extension AetherEngine {
             customClone = clone
         }
         let headers = loadedOptions.httpHeaders
+        let headerStore = sessionRequestHeaders
         let formatHint = customFormatHint
         let w = sourceVideoWidth > 0 ? sourceVideoWidth : 1920
         let h = sourceVideoHeight > 0 ? sourceVideoHeight : 1080
@@ -1767,7 +1771,7 @@ extension AetherEngine {
         nativeSubtitleReadersTask = BlockingWork.detached(priority: .utility) { [weak self] in
             await self?.runNativeSubtitleReaders(
                 url: url, reader: reader, formatHint: formatHint, headers: headers,
-                pairs: pairs, startAt: startAt, videoWidth: w, videoHeight: h,
+                headerStore: headerStore, pairs: pairs, startAt: startAt, videoWidth: w, videoHeight: h,
                 callerProbesize: probesize, callerMaxAnalyzeDuration: maxAnalyzeDuration,
                 selectTitleID: titleID, readToEOF: readToEOF, link: link
             )
@@ -1825,6 +1829,7 @@ extension AetherEngine {
     nonisolated private func runNativeSubtitleReaders(
         url: URL, reader: IOReader?, formatHint: String?,
         headers: [String: String],
+        headerStore: RequestHeaderStore?,
         pairs: [(streamIndex: Int32, store: NativeSubtitleCueStore)],
         startAt: Double, videoWidth: Int32, videoHeight: Int32,
         callerProbesize: Int64? = nil, callerMaxAnalyzeDuration: Int64? = nil,
@@ -1834,6 +1839,7 @@ extension AetherEngine {
         let demuxer = Demuxer()
         let openProfile = DemuxerOpenProfile.subtitleSideDemuxer(
             callerProbesize: callerProbesize, callerMaxAnalyzeDuration: callerMaxAnalyzeDuration).withReaderLabel("nativesubs")
+            .withRequestHeaders(headerStore)
         let registered = await MainActor.run { [weak self] () -> Bool in
             guard !Task.isCancelled, let self else { return false }
             self.nativeSubtitleReadersDemuxer = demuxer

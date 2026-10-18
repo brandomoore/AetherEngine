@@ -92,6 +92,29 @@ enum AirPlayPlaylistDecision {
         return bypassServesLoopbackOrigin
     }
 
+    /// How a session crosses a wireless-AirPlay route change onto its new playback URL.
+    enum RouteChangeHop: Equatable {
+        /// `reloadAtCurrentPosition`: the session is rebuilt at the playhead, which reopens the source.
+        case rebuild
+        /// The player's item is swapped onto the new address while the session goes on serving.
+        case swapItem
+    }
+
+    /// A rebuild reopens the source, and two kinds of session cannot be reopened where they are. A
+    /// sequential origin can only be read again from byte 0. A forward-only custom source, which is what
+    /// the live HLS ingest hands the pipeline, cannot be rebuilt at all: `reloadAtCurrentPosition`
+    /// refuses it (#526), so the route change did nothing and the receiver was left on 127.0.0.1, which
+    /// it cannot reach, and played nothing. Neither needs a rebuild. The loopback server listens on every
+    /// interface and keeps the segments it cut, so only the address the player is handed has to change.
+    static func routeChangeHop(sequentialOrigin: Bool,
+                               isLive: Bool,
+                               isCustomSource: Bool,
+                               customSourceIsSeekable: Bool) -> RouteChangeHop {
+        if sequentialOrigin && !isLive { return .swapItem }
+        if isCustomSource && !customSourceIsSeekable { return .swapItem }
+        return .rebuild
+    }
+
     /// The loopback URL rewritten for the receiver: same port and query, the device's LAN IP for the host
     /// (the receiver cannot reach 127.0.0.1), and the path of the chosen playlist. `.master` keeps whatever
     /// the session resolved. The playlists' `EXT-X-MEDIA` and segment URIs are relative, so everything

@@ -114,6 +114,16 @@ public actor FrameExtractor {
                   yieldWhile: yieldWhile)
     }
 
+    /// AE#792: an extractor over the session's own source, whose requests follow
+    /// `updateRequestHeaders(_:)` like the session's other readers.
+    init(url: URL, requestHeaderStore: RequestHeaderStore, selectTitleID: Int?,
+         yieldWhile: (@Sendable () -> Bool)?) {
+        self.init(context: FrameDecodeContext(url: url, httpHeaders: requestHeaderStore.current,
+                                              selectTitleID: selectTitleID,
+                                              requestHeaderStore: requestHeaderStore),
+                  yieldWhile: yieldWhile)
+    }
+
     /// Construct over a custom `IOReader` source (a clone with its own cursor).
     /// The extractor owns the reader and closes it on teardown.
     public init(reader: IOReader, formatHint: String? = nil,

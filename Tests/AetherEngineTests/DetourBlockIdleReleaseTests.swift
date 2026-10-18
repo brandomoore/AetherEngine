@@ -14,7 +14,7 @@ struct DetourBlockIdleReleaseTests {
         let server = try #require(maybe)
         defer { server.stop() }
         let url = URL(string: "http://127.0.0.1:\(server.port)/movie.bin")!
-        let reader = AVIOReader(url: url, detourIdleSeconds: 0.2)
+        let reader = AVIOReader(url: url, detourIdleSeconds: 0.2, detourFetchBudget: 30)
         defer { reader.markClosed(); reader.close() }
         try reader.open()
 

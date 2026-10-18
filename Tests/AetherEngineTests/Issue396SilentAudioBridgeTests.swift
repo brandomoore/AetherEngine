@@ -378,4 +378,78 @@ struct Issue396SilentAudioBridgeTests {
         #expect(!AudioBridge.silenceIsStructural(stats: stillFilling, encoderFrameSize: 4608),
                 "a FIFO that is still accepting samples is a bridge that has not been asked yet")
     }
+
+    // MARK: - AE#786: a decoder waiting for its sync is not a dead one
+
+    private func makeTrueHDCodecpar() -> UnsafeMutablePointer<AVCodecParameters> {
+        let par = avcodec_parameters_alloc()!
+        par.pointee.codec_type = AVMEDIA_TYPE_AUDIO
+        par.pointee.codec_id = AV_CODEC_ID_TRUEHD
+        par.pointee.sample_rate = 48_000
+        av_channel_layout_default(&par.pointee.ch_layout, 8)
+        return par
+    }
+
+    private final class DecoderVerdict: @unchecked Sendable {
+        private let lock = NSLock()
+        private var stats: AudioBridge.FeedStats?
+        var reported: AudioBridge.FeedStats? {
+            lock.lock(); defer { lock.unlock() }
+            return stats
+        }
+        func set(_ s: AudioBridge.FeedStats) { lock.lock(); stats = s; lock.unlock() }
+    }
+
+    @Test("TrueHD and MLP are judged on a second of access units, every other source on 64 packets")
+    func decoderPacketThresholdFollowsTheSource() {
+        #expect(AudioBridge.trueHDSilentFeedPacketThreshold == 1200)
+        #expect(AudioBridge.decoderSilencePacketThreshold(for: AV_CODEC_ID_TRUEHD)
+                == AudioBridge.trueHDSilentFeedPacketThreshold)
+        #expect(AudioBridge.decoderSilencePacketThreshold(for: AV_CODEC_ID_MLP)
+                == AudioBridge.trueHDSilentFeedPacketThreshold)
+        #expect(AudioBridge.decoderSilencePacketThreshold(for: AV_CODEC_ID_MP3) == 64)
+        #expect(AudioBridge.decoderSilencePacketThreshold(for: AV_CODEC_ID_DTS) == 64)
+        #expect(AudioBridge.decoderSilencePacketThreshold(for: AV_CODEC_ID_EAC3) == 64)
+
+        var waiting = AudioBridge.FeedStats()
+        waiting.packetsFed = 102
+        waiting.packetsFedSinceLastEnqueue = 102
+        #expect(!AudioBridge.silenceIsStructural(stats: waiting, encoderFrameSize: 1536,
+                                                 decoderPacketThreshold: 1200),
+                "102 access units is the longest major-sync wait measured, 85 ms of TrueHD")
+        #expect(AudioBridge.silenceIsStructural(stats: waiting, encoderFrameSize: 1536),
+                "the same count is past the default bound, which is why TrueHD needs its own")
+    }
+
+    @Test("a TrueHD bridge started between major syncs is not reported dead before a second of source")
+    func trueHDWaitingForMajorSyncIsNotADeadDecoder() throws {
+        let codecpar = makeTrueHDCodecpar()
+        defer {
+            var p: UnsafeMutablePointer<AVCodecParameters>? = codecpar
+            avcodec_parameters_free(&p)
+        }
+        let bridge = try AudioBridge(srcCodecpar: codecpar,
+                                     srcTimeBase: AVRational(num: 1, den: 1000),
+                                     mode: .surroundCompat)
+        defer { bridge.close() }
+        let verdict = DecoderVerdict()
+        bridge.onDecoderProducedNothing = { verdict.set($0) }
+
+        var outputs: [UnsafeMutablePointer<AVPacket>] = []
+        defer { freeAll(&outputs) }
+        var early = makeUndecodablePackets(count: 200)
+        defer { freeAll(&early) }
+        for p in early { outputs.append(contentsOf: (try? bridge.feed(packet: p)) ?? []) }
+
+        #expect(bridge.feedStats.decodedNothing)
+        #expect(verdict.reported == nil,
+                "AE#786: 200 access units is 167 ms, longer than any wait for a major sync and far short of a dead decoder")
+
+        var late = makeUndecodablePackets(count: AudioBridge.trueHDSilentFeedPacketThreshold)
+        defer { freeAll(&late) }
+        for p in late { outputs.append(contentsOf: (try? bridge.feed(packet: p)) ?? []) }
+
+        #expect(verdict.reported?.decodedNothing == true,
+                "a TrueHD decoder that never answers is still caught, a second of source later")
+    }
 }

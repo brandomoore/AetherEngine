@@ -24,6 +24,11 @@ final class DocumentedConstantsTests: XCTestCase {
         assertDocumented("Quarantine is bounded to 96 MiB and 10,000 packets", try documentation())
     }
 
+    func testSoftwarePositioningBudgetMatchesDocumentation() throws {
+        XCTAssertEqual(SoftwarePlaybackHost.seekBudgetSeconds, 30)
+        assertDocumented("**30 s positioning\nbudget**", try documentation())
+    }
+
     func testItemDiagnosticBoundsMatchDocumentation() throws {
         let docs = try documentation()
         XCTAssertEqual(ItemDiagnosticReadPool.maximumConcurrentReads, 2)
@@ -43,6 +48,74 @@ final class DocumentedConstantsTests: XCTestCase {
         assertDocumented("to **16 pictures**", docs)
         assertDocumented("**1024 interleaved packets and\n32 MiB**", docs)
         assertDocumented("within **64 pictures**", docs)
+    }
+
+    func testDualLayerRouteBudgetMatchesDocumentation() throws {
+        let fel = try felDocument()
+        XCTAssertEqual(DualLayerRouteDecision.maximumPixelsPerSecond, 311_040_000)
+        XCTAssertEqual(DualLayerRouteDecision.assumedFrameRate, 24)
+        XCTAssertEqual(DualLayerRouteDecision.assumedEnhancementLayerAreaFraction, 0.25)
+        assertDocumented("311.04 Mpx/s", fel)
+        assertDocumented("UHD\n3840x2160 at 30 fps plus a 1920x1080 enhancement layer at 30 fps", fel)
+        assertDocumented("an unknown frame rate is budgeted as 24", fel)
+        assertDocumented("A 24p UHD FEL master needs 80% of the budget", fel)
+    }
+
+    #if DualLayerDolbyVision
+    func testDualLayerPipelineBoundsMatchDocumentation() throws {
+        let docs = try documentation()
+        let fel = try felDocument()
+        XCTAssertEqual(DualLayerVideoDecoder.maxLayerSkewFrames, 3)
+        XCTAssertEqual(DualLayerVideoDecoder.maxEnhancementLayerQueueFrames, 10)
+        XCTAssertEqual(FrameSideDataRing.capacity, 32)
+        XCTAssertEqual(FrameSideDataRing.jitterToleranceTicks, 300)
+        XCTAssertEqual(DoviFelComposer.maxFramesInFlight, 3)
+        XCTAssertEqual(SampleBufferRenderer.felVideoLookaheadFrames, 9)
+        XCTAssertEqual(DoviFelComposer.outputPoolAllocationThreshold, 15)
+        XCTAssertEqual(DoviFelComposer.outputPoolReserve, 3)
+        XCTAssertEqual(DualLayerVideoDecoder.maxBorrowedParamsRun, 3)
+        XCTAssertEqual(SampleBufferRenderer.hardwareDecoderReorderDepth, 4)
+        XCTAssertEqual(DualLayerVideoDecoder.settledKeyMemory, 64)
+        XCTAssertEqual(DualLayerVideoDecoder.summaryIntervalSeconds, 1.0)
+        // About 36 ms: ten attempts with a sleep between each pair.
+        XCTAssertEqual(Double(DoviFelComposer.outputPoolAttempts - 1) * DoviFelComposer.outputPoolRetryInterval,
+                       0.036, accuracy: 1e-9)
+
+        assertDocumented("once K = 3 newer base-layer", fel)
+        assertDocumented("is the maximum layer skew, 3;", fel)
+        assertDocumented("waiting enhancement frames capped at 10", fel)
+        assertDocumented("At most 10 enhancement frames wait", fel)
+        assertDocumented("fixed capacity 32", fel)
+        assertDocumented("within ±300 ticks", fel)
+        assertDocumented("wait for one of 3 in-flight slots", fel)
+        assertDocumented("look-ahead (9)", fel)
+        assertDocumented("the in-flight slots (3) + 1, so 15", fel)
+        assertDocumented("a reserve of 3 more", fel)
+        assertDocumented("allocation threshold 15 + reserve 3", fel)
+        assertDocumented("`maxBorrowedParamsRun` (3)", fel)
+        assertDocumented("the renderer's 4-frame reorder buffer", fel)
+        assertDocumented("last 64\n  settled base-layer keys", fel)
+        assertDocumented("for at most about 36 ms", fel)
+        assertDocumented("Counters feed a 1 Hz summary", fel)
+        _ = docs
+    }
+    #endif
+
+    private func felDocument() throws -> String {
+        let url = Self.repoRoot.appendingPathComponent("docs/dolby-vision-fel.md")
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else {
+            throw XCTSkip("running outside a source checkout; no docs to check against")
+        }
+        return text
+    }
+
+    /// docs/formats.md quotes the lead a software-path live join keeps behind the newest media.
+    func testSoftwareLiveJoinLeadMatchesDocumentation() throws {
+        XCTAssertEqual(SoftwareLiveJoinPolicy.leadSeconds, 4)
+        XCTAssertEqual(SoftwareLiveJoinPolicy.minimumSettleSeconds, 0.3)
+        XCTAssertEqual(SoftwareLiveJoinPolicy.maximumSettleSeconds, 1.5)
+        XCTAssertEqual(SoftwareLiveJoinPolicy.calmWindowSeconds, 0.25)
+        assertDocumented("`SoftwareLiveJoinPolicy.leadSeconds` (4 s) behind the newest media", try documentation())
     }
 
     // MARK: - Documentation corpus
@@ -241,12 +314,9 @@ final class DocumentedConstantsTests: XCTestCase {
     func testTrueHDAtmosNumbersAreWhatTheDocsSay() throws {
         guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
         let docs = try documentation()
+        #if TrueHDObjectAudio || DTSXObjectAudio
         XCTAssertEqual(SpatialAudioBridge.bitRatePerChannel, 320_000)
         assertDocumented("320 kbps per bed channel", docs)
-        XCTAssertEqual(PeakLimiter.threshold, 0.98)
-        assertDocumented("nothing leaves above −0.18 dBFS", docs)
-        XCTAssertEqual(PeakLimiter.releaseSeconds, 0.25)
-        assertDocumented("a 250 ms release", docs)
         XCTAssertEqual(BedLevelMeter.firstWindowSeconds, 5)
         XCTAssertEqual(BedLevelMeter.windowSeconds, 30)
         assertDocumented("after the first 5 s of audio (and again after every seek), then every 30 s", docs)
@@ -254,6 +324,11 @@ final class DocumentedConstantsTests: XCTestCase {
         assertDocumented("returns nothing for 1200 packets in a row, a second of TrueHD", docs)
         XCTAssertEqual(ObjectMetadataHold.maxHeldFrames, 4_800)
         assertDocumented("(it waits at most 100 ms)", docs)
+        #endif
+        XCTAssertEqual(PeakLimiter.threshold, 0.98)
+        assertDocumented("nothing leaves above −0.18 dBFS", docs)
+        XCTAssertEqual(PeakLimiter.releaseSeconds, 0.25)
+        assertDocumented("a 250 ms release", docs)
         XCTAssertEqual(APACSampleEntry.codecsString(channelCount: 12), "apac.31.03")
         XCTAssertEqual(APACSampleEntry.codecsString(channelCount: 16), "apac.31.04")
     }
@@ -345,4 +420,13 @@ final class DocumentedConstantsTests: XCTestCase {
         else { throw XCTSkip("running outside a source checkout; no sources to check against") }
         return text
     }
+
+    // MARK: - Picture-order pairing (docs/dolby-vision-fel.md §5.3)
+
+    #if DualLayerDolbyVision
+    func testPictureOrderPairingBoundMatchesDocumentation() throws {
+        XCTAssertEqual(DualLayerPictureAlignment.maxSlotDistance, 16)
+        assertDocumented("more than 16 slots off its unit", try felDocument())
+    }
+    #endif
 }

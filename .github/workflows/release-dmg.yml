@@ -46,7 +46,9 @@ concurrency:
 jobs:
   build-and-upload:
     name: Build + notarize + upload .dmg
-    runs-on: macos-15
+    # Same image as ci.yml: macos-15's latest-stable is Xcode 26.3, whose Swift 6.2 timed out
+    # type-checking FelResidualMeasure and failed the 7.37.0 DMG while CI on Xcode 27 was green.
+    runs-on: xcode-27
     timeout-minutes: 30
     steps:
       # workflow_dispatch checks out the ref picked in "Use workflow from"
@@ -56,9 +58,16 @@ jobs:
         with:
           ref: refs/tags/${{ github.event.release.tag_name || inputs.tag }}
 
-      - uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1.7.0
-        with:
-          xcode-version: latest-stable
+      # The packaging script follows the workflow, not the tag: the sources it builds are the tag's,
+      # but a re-run for an older tag needs today's script on today's runner (7.37.0's still looked
+      # for the binary where Swift 6.2 put it).
+      - name: Packaging script from the workflow's commit
+        run: |
+          git fetch --no-tags --depth=1 origin ${{ github.sha }}
+          git checkout FETCH_HEAD -- Examples/DemoPlayerMac/Scripts/build-dmg.sh
+
+      - name: Show toolchain
+        run: xcodebuild -version
 
       - name: Resolve tag
         id: tag

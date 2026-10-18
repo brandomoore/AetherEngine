@@ -1,3 +1,5 @@
+// Only with the TrueHDObjectAudio trait (off by default): the decoder and its library are not built without it.
+#if TrueHDObjectAudio
 import Testing
 import Foundation
 import TrueHD
@@ -149,3 +151,4 @@ struct TrueHDObjectMetadataMappingTests {
         #expect(try decoder.nextBlock() == nil)
     }
 }
+#endif

@@ -20,7 +20,7 @@ struct SupersededProducerReportTests {
         init() throws {
             engine = HLSVideoEngine(url: URL(fileURLWithPath: "/nonexistent/superseded.mkv"),
                                     dvModeAvailable: false)
-            codecpar = try #require(avcodec_parameters_alloc())
+            codecpar = avcodec_parameters_alloc()
             codecpar!.pointee.codec_id = AV_CODEC_ID_H264
             codecpar!.pointee.codec_type = AVMEDIA_TYPE_VIDEO
             let plan = (0..<10).map { i in

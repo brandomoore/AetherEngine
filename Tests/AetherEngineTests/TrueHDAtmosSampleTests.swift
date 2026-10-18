@@ -1,3 +1,5 @@
+// Only with the TrueHDObjectAudio trait (off by default): the decoder and its library are not built without it.
+#if TrueHDObjectAudio
 import Testing
 import Foundation
 import AetherLibavcodec
@@ -105,3 +107,4 @@ struct TrueHDAtmosSampleTests {
         #expect(pts.count == 2 + Int((1_298_000.0 / 1024).rounded(.up)))
     }
 }
+#endif

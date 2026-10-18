@@ -90,4 +90,29 @@ struct AirPlayPlaylistDecisionTests {
         #expect(!AirPlayPlaylistDecision.routeChangeNeedsReload(
             isRemoteHLSBypass: true, bypassServesLoopbackOrigin: false))
     }
+
+    @Test("#526: a live session on a forward-only source swaps its item, as its rebuild is refused")
+    func forwardOnlyLiveSessionSwapsItsItem() {
+        #expect(AirPlayPlaylistDecision.routeChangeHop(
+            sequentialOrigin: false, isLive: true,
+            isCustomSource: true, customSourceIsSeekable: false) == .swapItem)
+    }
+
+    @Test("A sequential origin swaps its item; every session that can be reopened where it is is rebuilt")
+    func otherSessionsKeepTheirHop() {
+        #expect(AirPlayPlaylistDecision.routeChangeHop(
+            sequentialOrigin: true, isLive: false,
+            isCustomSource: false, customSourceIsSeekable: false) == .swapItem)
+        #expect(AirPlayPlaylistDecision.routeChangeHop(
+            sequentialOrigin: false, isLive: false,
+            isCustomSource: false, customSourceIsSeekable: false) == .rebuild)
+        // A seekable custom source rebuilds on its retained reader.
+        #expect(AirPlayPlaylistDecision.routeChangeHop(
+            sequentialOrigin: false, isLive: true,
+            isCustomSource: true, customSourceIsSeekable: true) == .rebuild)
+        // A live URL source rebuilds and rejoins at the edge.
+        #expect(AirPlayPlaylistDecision.routeChangeHop(
+            sequentialOrigin: false, isLive: true,
+            isCustomSource: false, customSourceIsSeekable: false) == .rebuild)
+    }
 }

@@ -1,3 +1,5 @@
+// Only with the TrueHDObjectAudio trait (off by default), which links LibTrueHD.
+#if TrueHDObjectAudio
 import Foundation
 import TrueHD
 
@@ -219,3 +221,4 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
         }
     }
 }
+#endif

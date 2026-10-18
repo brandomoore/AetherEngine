@@ -37,7 +37,15 @@ protocol VideoDecodingPipeline: AnyObject, Sendable {
     /// `nil` from a caller with no seek of its own to be invalidated by.
     func decode(packet: UnsafeMutablePointer<AVPacket>, epoch: UInt64?)
     func flush()
+    /// End of source or a live seam: delivers what the decoder still owes before the `flush()` the host
+    /// makes next. `flush()` of a decoder that delivers what it drains is enough, so the default does
+    /// nothing; a decoder whose `flush()` discards (the dual-layer one) overrides it. Seeks never call it.
+    func drainForEndOfStream()
     func close()
+}
+
+extension VideoDecodingPipeline {
+    func drainForEndOfStream() {}
 }
 
 enum VideoDecoderError: Error, LocalizedError {
@@ -46,6 +54,15 @@ enum VideoDecoderError: Error, LocalizedError {
     case noExtradata
     case formatDescriptionFailed(status: OSStatus)
     case sessionCreationFailed(status: OSStatus)
+    /// `DualLayerVideoDecoder` is single use (dolby-vision-fel.md §5.8): `open` after `close` refuses
+    /// with this instead of inheriting the previous stream's state. Thrown rather than a
+    /// trapping precondition so host misuse surfaces as an error and tests can assert it.
+    case decoderClosed
+    /// No Metal device or shader compilation failed; FEL composition cannot run.
+    /// Thrown from `open()` for a decoder built without a composer. The software host does not get
+    /// there in production: it builds the composer first and decodes the base layer alone when that
+    /// fails.
+    case composerUnavailable
 
     var errorDescription: String? {
         switch self {
@@ -54,6 +71,8 @@ enum VideoDecoderError: Error, LocalizedError {
         case .noExtradata: "Missing codec extradata"
         case .formatDescriptionFailed(let s): "Format description failed (\(s))"
         case .sessionCreationFailed(let s): "Decoder session failed (\(s))"
+        case .decoderClosed: "Decoder is closed (single use)"
+        case .composerUnavailable: "Dolby Vision FEL composer unavailable (no Metal device or shader compilation failed)"
         }
     }
 }

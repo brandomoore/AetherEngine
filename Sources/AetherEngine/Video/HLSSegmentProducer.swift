@@ -343,6 +343,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// keyframe's in-band sets against this triggers a versioned-init muxer rotation (the same EXT-X-MAP path SSAI
     /// uses), independent of whether the demuxer emits AV_PKT_DATA_NEW_EXTRADATA. Set at gate-open and each rotation.
     private var activeMuxerVideoExtradata: [UInt8]?
+    private var vodH264Configuration: H264ConfigurationTracker?
 
     /// #133 follow-up diag: count of same-PID in-band parameter-set changes rotated in place, surfaced in the log.
     private var samePIDReinitCount = 0
@@ -1283,6 +1284,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         case stopRequested
         case readError(code: Int32)
         case muxerFailed
+        case videoConfigurationChanged(summary: String)
         /// AE#222: the first cut could not write moov because the audio sample entry is packet-derived
         /// (E-AC-3/AC-3/TrueHD) and the source's first segment carries no audio packet. The pump captured a
         /// real audio frame on its way out (`capturedAudioMoovPrimeFrame`); the host rebuilds with it as the
@@ -1305,6 +1307,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             case .stopRequested: return "stopRequested"
             case .readError(let code): return "readError(\(code))"
             case .muxerFailed: return "muxerFailed"
+            case .videoConfigurationChanged: return "videoConfigurationChanged"
             case .needsAudioSampleEntryPrime: return "needsAudioSampleEntryPrime"
             case .keyframeStarvation: return "keyframeStarvation"
             case .sourceReplay: return "sourceReplay"
@@ -1556,6 +1559,12 @@ final class HLSSegmentProducer: @unchecked Sendable {
             isLive: isLive,
             codecIsH264: a53CodecKind == .h264,
             framingIsAnnexB: a53NALFraming == .annexB)
+        if !isLive, a53CodecKind == .h264, case .lengthPrefixed = a53NALFraming {
+            let extra = video.extradataOverride ?? video.codecpar.pointee.extradata.map {
+                Array(UnsafeBufferPointer(start: $0, count: Int(video.codecpar.pointee.extradata_size)))
+            }
+            if let extra { vodH264Configuration = H264ConfigurationTracker(avcC: extra) }
+        }
         self.convertP7Active = video.convertP7ToProfile81
         self.audioConfig = audio
         self.cache = cache
@@ -3480,6 +3489,19 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             )
                         }
                     }
+                }
+                // AVC VOD can carry new SPS/PPS even while its file header stays unchanged.
+                // Inspect on the producer queue, before the first stale-init sample is written.
+                // An active IDR reference is required; unused/repeated sets do not change routing.
+                if packet.pointee.stream_index == videoStreamIndex,
+                   case .lengthPrefixed(let size) = a53NALFraming,
+                   let data = packet.pointee.data, packet.pointee.size > 0,
+                   let mismatch = vodH264Configuration?.observe(
+                    UnsafeBufferPointer(start: data, count: Int(packet.pointee.size)), lengthSize: size) {
+                    EngineLog.emit("[HLSSegmentProducer] \(mismatch.summary); stopping stale-init VOD epoch=\(epoch)",
+                                   category: .session)
+                    exitReason = .videoConfigurationChanged(summary: mismatch.summary)
+                    break readLoop
                 }
                 av_packet_free_side_data(packet)
 

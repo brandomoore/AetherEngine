@@ -115,6 +115,26 @@ extension AetherEngine {
             throw AetherEngineError.sessionNotReloadable(refusal)
         }
 
+        // The dual-layer route is chosen by `load`'s probe (el_type, geometry, budget, handling) and a custom
+        // source's rebuild never re-runs it: it keeps the backend and the el_type the session came
+        // up with. Decided here for the same reason as the decode-path escape above, before any
+        // teardown, so the flip is refused instead of being logged as applied and ignored.
+        if let refusal = SessionOptionCorrection.dualLayerRouteRefusal(
+            isCustomSource: isCustomSource,
+            current: loadedOptions,
+            proposed: proposed,
+            dvProfile: DolbyVisionRecordAudit.correctedProfile(
+                record: sourceDVProfile, rpu: sourceDolbyVisionRPUProfile) ?? sourceDVProfile
+        ) {
+            EngineLog.emit(
+                "[AetherEngine] DV P7 dual-layer: preferDualLayerDolbyVision / dolbyVisionHandling correction refused, "
+                + "\(refusal.rawValue): a custom source keeps the route it was loaded with; load() it "
+                + "again with the new option",
+                category: .engine
+            )
+            throw AetherEngineError.sessionNotReloadable(refusal)
+        }
+
         // Stating the no-op matters for the same reason #364's teletext switch states it: a host
         // that corrected an option and saw a plain reload cannot otherwise tell "the correction was
         // already in force" from "the correction did not arrive".
@@ -246,6 +266,11 @@ public enum SessionReloadRefusal: String, Sendable, Equatable, CustomStringConve
     /// side-audio merge lives in the native path's segment producer, so the session would play
     /// silent. Same reachability as `softwarePathCannotRepresentSource`.
     case demuxedAudioLiveIsNativeOnly
+    /// A correction of `preferDualLayerDolbyVision`, or of `dolbyVisionHandling` while the preference is on, on a Profile 7 session that plays from a custom
+    /// `IOReader` source. The route is decided by `load()`'s probe, which a custom source's in-place
+    /// rebuild does not re-run, so the change could not take effect. Call `load()` again with the
+    /// new option. URL sources are not affected: their correction re-runs `load()`.
+    case dualLayerRouteNeedsFreshLoad
 
     public var description: String {
         switch self {
@@ -255,6 +280,8 @@ public enum SessionReloadRefusal: String, Sendable, Equatable, CustomStringConve
             return "the software path cannot represent this source's Dolby Vision signal"
         case .demuxedAudioLiveIsNativeOnly:
             return "this live source's audio is delivered separately and merged on the native path only"
+        case .dualLayerRouteNeedsFreshLoad:
+            return "the dual-layer Dolby Vision route of a custom source is decided by load(), not by a rebuild"
         }
     }
 }
@@ -360,6 +387,33 @@ enum SessionOptionCorrection {
         return nil
     }
 
+    /// Why a `preferDualLayerDolbyVision` or `dolbyVisionHandling` correction cannot be honoured, or nil
+    /// when it can.
+    ///
+    /// A URL source re-runs `load()` on a correction, which re-probes and re-decides the route. A
+    /// custom `IOReader` source rebuilds through `reloadWithAudioOverride`, which keeps the backend
+    /// and the el_type the session was loaded with, so the change would be logged as applied and move
+    /// nothing. The route needs the preference on and `dolbyVisionHandling` `.automatic`
+    /// (`DualLayerRouteDecision`), so a change of the preference always refuses, and a change of the
+    /// handling refuses when the preference is on, where it can turn the route on or off. With the
+    /// preference off the handling cannot move the route. Only a Profile 7 source can route
+    /// differently, so any other source is not refused: the change there moves nothing, which is also
+    /// what the rebuild does. A build without the `DualLayerDolbyVision` trait has no such route, so
+    /// nothing is refused there.
+    static func dualLayerRouteRefusal(
+        isCustomSource: Bool,
+        current: LoadOptions,
+        proposed: LoadOptions,
+        dvProfile: Int?
+    ) -> SessionReloadRefusal? {
+        guard DualLayerRouteDecision.isBuiltIn, isCustomSource, dvProfile == 7 else { return nil }
+        let preferenceChanged = proposed.preferDualLayerDolbyVision != current.preferDualLayerDolbyVision
+        let handlingMovesRoute = proposed.dolbyVisionHandling != current.dolbyVisionHandling
+            && proposed.preferDualLayerDolbyVision
+        guard preferenceChanged || handlingMovesRoute else { return nil }
+        return .dualLayerRouteNeedsFreshLoad
+    }
+
     /// Every field the proposal changed, for the log line. Reflection is right here and wrong
     /// above: a diagnostic that names a new field the day it is added is worth more than one that
     /// cannot be wrong, and being wrong here costs a log line.
@@ -390,7 +444,7 @@ enum SessionOptionCorrection {
     /// deliberately. Update this list and, if the field names the session, `loadIdentityFields`.
     static let knownFields: [String] = [
         "omitCriteriaColorExtensions", "suppressDisplayCriteria", "httpHeaders", "nativeVideoFrameDiagnostics", "nativeVideoFrameRecovery", "hostRetriesExhaustedLiveReplay",
-        "keepDvh1TagWithoutDV", "forceDolbyVisionOnNonDVDisplay", "dolbyVisionHandling", "matchContentEnabled",
+        "keepDvh1TagWithoutDV", "forceDolbyVisionOnNonDVDisplay", "dolbyVisionHandling", "preferDualLayerDolbyVision", "matchContentEnabled",
         "panelIsInHDRMode", "attemptsHDRMasterOnUnprovenPanel", "panelPresentsDolbyVision",
         "audioBridgeMode", "objectAudioRendering", "isLive", "audioOnly",
         "dvrWindowSeconds",

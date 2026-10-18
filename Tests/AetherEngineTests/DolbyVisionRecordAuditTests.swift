@@ -101,6 +101,14 @@ struct DolbyVisionRecordAuditTests {
         #expect(DolbyVisionRecordAudit.rpuProfile(pkt) == nil)
     }
 
+    @Test("an RPU the guard rejects is never handed to libdovi, which would abort the process")
+    func rpuThatWouldAbortLibdoviSaysNothing() {
+        let rpu = DoviRpuGuardTests.craft(linearOnComponent: 1)
+        let pkt = Self.avccPacket([Self.hevcNAL(type: 1, payload: [0xAA]), rpu])
+        defer { Self.free(pkt) }
+        #expect(DolbyVisionRecordAudit.rpuProfile(pkt) == nil)
+    }
+
     // MARK: - When the RPU is worth reading
 
     @Test("a Profile 5 record over a BT.2020 YCbCr PQ VUI is worth auditing")

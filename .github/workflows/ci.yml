@@ -25,7 +25,7 @@ jobs:
   test-macos:
     name: swift test (macOS)
     runs-on: xcode-27
-    timeout-minutes: 30
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -55,6 +55,21 @@ jobs:
           LIBDISPATCH_COOPERATIVE_POOL_STRICT: "1"
         run: swift test --skip-build --disable-xctest
 
+      # The optional components (TrueHDObjectAudio, DTSXObjectAudio, DualLayerDolbyVision) are off by
+      # default, so every step above builds and tests without them. This build and run keep the opt-in
+      # code compiling and its tests running. Steps in this job rather than a job of their own, to stay
+      # within the account's concurrent macOS runners.
+      - name: swift build (all traits)
+        run: swift build --enable-all-traits --build-tests --scratch-path .build-alltraits
+
+      - name: swift test (all traits)
+        run: swift test --enable-all-traits --skip-build --scratch-path .build-alltraits
+
+      - name: swift test (all traits, one-thread cooperative pool)
+        env:
+          LIBDISPATCH_COOPERATIVE_POOL_STRICT: "1"
+        run: swift test --enable-all-traits --skip-build --disable-xctest --scratch-path .build-alltraits
+
       - name: Software VOD packet-cache regressions
         run: |
           bash Scripts/test-software-packet-coverage.sh
@@ -74,10 +89,19 @@ jobs:
       - name: build the transport probe (AE#377)
         run: swift build --build-tests --package-path Probes/TransportProbe
 
+      # The pulse test's scripts are Python, shell and Swift nobody runs in CI; a syntax error in one is found
+      # at the television. Compiling them is all that can be checked without a phone recording.
+      - name: Compile the Dolby Vision pulse scripts
+        run: |
+          python3 -m py_compile Probes/DolbyVisionPulse/Scripts/*.py
+          zsh -n Probes/DolbyVisionPulse/Scripts/build.sh
+          zsh -n Probes/DolbyVisionPulse/Scripts/run_tv.sh
+          swiftc -typecheck Probes/DolbyVisionPulse/Scripts/dump_attachments.swift
+
   build-tvos:
     name: xcodebuild (tvOS + visionOS Simulator)
     runs-on: xcode-27
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -115,6 +139,33 @@ jobs:
             -derivedDataPath .build/xcode-probe \
             CODE_SIGNING_ALLOWED=NO
 
+      # The Dolby Vision pulse host is the other device harness, and the one that links the engine
+      # itself, so it is also the one that breaks when a public API it uses moves. It plays clips on an
+      # Apple TV that someone films, runs nowhere in CI, and would otherwise be found out by the person
+      # who needed a measurement that evening. It links the engine through PulseEngine/, which enables the
+      # DualLayerDolbyVision trait the host measures. EXCLUDED_ARCHS for the reason given above: an app cannot
+      # link the x86_64 slice.
+      - name: Build the Dolby Vision pulse host (Probes/DolbyVisionPulse)
+        run: |
+          xcodebuild build \
+            -project Probes/DolbyVisionPulse/Device/DolbyVisionPulse.xcodeproj \
+            -scheme DolbyVisionPulse \
+            -destination 'generic/platform=tvOS Simulator' \
+            -derivedDataPath .build/xcode-pulse \
+            EXCLUDED_ARCHS=x86_64 \
+            CODE_SIGNING_ALLOWED=NO
+
+      # xcodebuild has no flag for a package's traits, so the opt-in components reach the device SDKs
+      # through Probes/AllTraits, a consumer package that enables all of them the way a host does.
+      - name: Build with every optional component for tvOS
+        working-directory: Probes/AllTraits
+        run: |
+          xcodebuild build \
+            -scheme AetherEngineAllTraits \
+            -destination 'generic/platform=tvOS' \
+            -derivedDataPath ../../.build/xcode-alltraits-tvos \
+            CODE_SIGNING_ALLOWED=NO
+
       # #344: the package has declared visionOS since 6.0.0 and nothing here compiled for it, so an
       # availability list that named tvOS/iOS/macOS and then fell through to `*` broke the visionOS
       # build silently. `*` resolves to the declared visionOS floor (1.0), so any API newer than that
@@ -132,7 +183,7 @@ jobs:
   build-ios:
     name: xcodebuild (iOS Simulator) + release aetherctl
     runs-on: xcode-27
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -152,6 +203,19 @@ jobs:
       # 7.14.0 without anything noticing (AE#610). Off the `swift test` job's critical path.
       - name: swift build -c release (aetherctl)
         run: swift build -c release --product aetherctl
+
+      - name: swift build -c release (aetherctl, all traits)
+        run: swift build -c release --enable-all-traits --product aetherctl --scratch-path .build-release-alltraits
+
+      # See the tvOS job: the opt-in components for the iOS device SDK, through a consumer package.
+      - name: Build with every optional component for iOS
+        working-directory: Probes/AllTraits
+        run: |
+          xcodebuild build \
+            -scheme AetherEngineAllTraits \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath ../../.build/xcode-alltraits-ios \
+            CODE_SIGNING_ALLOWED=NO
 
   # The docs site (aetherengine-website) validates every heading anchor at build time, but it
   # lives in another repo and only builds AFTER a push to main, so a broken anchor ships first

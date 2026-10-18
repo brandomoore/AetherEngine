@@ -1,0 +1,60 @@
+# Device harness for the Dolby Vision pulse test (Probes/DolbyVisionPulse/README.md): a tvOS app
+# that plays the clips from Scripts/build.sh, arm by arm, so a camera pointed at the television can
+# see whether the Dolby Vision metadata reaches the panel. It depends on the engine as a local Swift
+# package (the repository root, three levels up), through `PulseEngine/`, a local package that enables
+# the engine's DualLayerDolbyVision trait: XcodeGen cannot set a package's traits, and without that
+# trait the `engine` and `soak` arms would measure the native route (the app refuses to run them).
+#
+# Regenerate with `xcodegen generate --spec project.yml` from this directory. The generated project
+# is committed so that running the probe needs Xcode and nothing else.
+name: DolbyVisionPulse
+options:
+  bundleIdPrefix: de.superuser404.dolbyvisionpulse
+  createIntermediateGroups: true
+  deploymentTarget:
+    tvOS: "18.0"
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    TARGETED_DEVICE_FAMILY: "3"
+    CODE_SIGN_STYLE: Automatic
+    # If a team cannot register this id, override it on the command line
+    # (PULSE_BUNDLE_PREFIX=com.example.pulse); the app's id is $(PULSE_BUNDLE_PREFIX).host.
+    PULSE_BUNDLE_PREFIX: de.superuser404.dolbyvisionpulse
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+
+packages:
+  PulseEngine:
+    path: PulseEngine
+
+targets:
+  DolbyVisionPulseHost:
+    type: application
+    platform: tvOS
+    sources:
+      - path: Host
+        excludes:
+          - Info.plist
+    dependencies:
+      - package: PulseEngine
+        product: PulseEngine
+    info:
+      path: Host/Info.plist
+      properties:
+        CFBundleDisplayName: Dolby Vision pulse
+        # The clips are served over plain http by Scripts/serve.py on the Mac next door.
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(PULSE_BUNDLE_PREFIX).host
+        GENERATE_INFOPLIST_FILE: NO
+
+schemes:
+  DolbyVisionPulse:
+    build:
+      targets:
+        DolbyVisionPulseHost: all
+    run:
+      config: Debug

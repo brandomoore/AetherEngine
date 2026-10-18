@@ -1,6 +1,6 @@
 import Foundation
 
-/// H.264 and HEVC compressed-packet presentation coverage matching the renderer's successor-PTS
+/// H.264, HEVC and VC-1 compressed-packet presentation coverage matching the renderer's successor-PTS
 /// duration.
 ///
 /// AVPacket.duration may describe decode cadence rather than how long a variable-rate picture is
@@ -8,14 +8,17 @@ import Foundation
 /// up to one second). This model publishes only those successor intervals, without rewriting any
 /// packet timestamp or duration. A larger gap remains a discontinuity, not a tolerance to bridge.
 ///
-/// H.264/HEVC caller contract: complete selected-stream packets, with valid presentation timestamps,
+/// H.264/HEVC/VC-1 caller contract: complete selected-stream packets, with valid presentation timestamps,
 /// enter in demux/decode order after they are retained in the packet store. FFmpeg n8.1.2 h264_ps.c
 /// rejects num_reorder_frames > 16 and hevc/ps.c rejects sps_max_num_reorder_pics > 15; the default
-/// holds 32 distinct timestamps as a conservative field-picture margin. That codec picture bound
+/// holds 32 distinct timestamps as a conservative field-picture margin. VC-1's max_b_frames is
+/// either read from three bits or set to 7, also within that queue. That codec picture bound
 /// does NOT prove arbitrary container PTS obey the bound. A timestamp behind the emitted watermark
 /// therefore invalidates all coverage until reset.
 /// Sources: https://github.com/FFmpeg/FFmpeg/blob/n8.1.2/libavcodec/h264_ps.c#L174-L180
 /// https://github.com/FFmpeg/FFmpeg/blob/n8.1.2/libavcodec/hevc/ps.c#L1397-L1403
+/// https://github.com/FFmpeg/FFmpeg/blob/n8.1.2/libavcodec/vc1.c#L346
+/// https://github.com/FFmpeg/FFmpeg/blob/n8.1.2/libavcodec/vc1.c#L426
 ///
 /// This metadata-only value neither owns packets nor synchronizes access. The owner must reset it
 /// together with its packet store on seek/flush/discard. Other codecs must keep their strict packet
@@ -47,6 +50,12 @@ struct SoftwareVideoPacketCoverage: Sendable {
     var pendingCount: Int { pending.count }
     var rangeCount: Int { coverage.rangeCount }
     var isFull: Bool { coverage.isFull }
+
+    var rangesSeconds: [ClosedRange<Double>] {
+        guard !isInvalidated else { return [] }
+        return coverage.rangesSeconds(timeBaseNumerator: timeBaseNumerator,
+                                      timeBaseDenominator: timeBaseDenominator)
+    }
 
     /// Duration/DTS are deliberately not inputs. Duplicate pending PTS do not advance the reorder
     /// watermark. At most depth + 1 timestamps are held transiently, then the minimum is emitted.

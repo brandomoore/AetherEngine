@@ -51,8 +51,9 @@ public struct SeekEvent: Sendable, Equatable {
         /// The picture is at the target: AVPlayer reported the landing, or the rendered frame reached the
         /// scrub target. This is the only outcome that means "safe to read the clock".
         case landed(renderedTime: Double)
-        /// The engine spent its recovery budget without the source serving the target. The clock is held
-        /// AT the target and the seek stays alive, so a `.landed` under this `id` can still follow.
+        /// Positioning did not complete within its budget. Native AVPlayer recovery may keep the
+        /// target pending and later emit `.landed` under this `id`. A software positioning failure
+        /// instead reports a terminal pipeline error without finalizing the requested clock.
         case stalled
         /// A newer seek took over before this one settled; the newer one's `.began` carries its target.
         case superseded

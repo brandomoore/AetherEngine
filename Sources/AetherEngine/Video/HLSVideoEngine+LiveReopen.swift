@@ -87,7 +87,7 @@ extension HLSVideoEngine {
             return true
         case .sourceReplay, .eof, .readError, .keyframeStarvation:
             return !sourceReopenable
-        case .stopRequested, .muxerFailed, .backpressureWedge, .needsAudioSampleEntryPrime:
+        case .stopRequested, .muxerFailed, .backpressureWedge, .needsAudioSampleEntryPrime, .videoConfigurationChanged:
             // muxerFailed / needsAudioSampleEntryPrime: handleLiveMuxerFailure and the AE#222 arm rebuild
             // the producer into the SAME provider, so an eager halt here would 503 the very provider the
             // rebuild is about to serve; both arms halt themselves once their budget is exhausted.
@@ -256,6 +256,10 @@ extension HLSVideoEngine {
             return
         }
         guard !alreadyRecovering else { return }
+        if case .videoConfigurationChanged(let summary) = reason {
+            recordVODVideoConfigurationMismatch(prod, summary: summary)
+            return
+        }
         // #65 (VOD only): a broken backpressure wedge means AVPlayer is stuck behind a parked producer.
         // Re-anchor the producer on AVPlayer's real position so the segments it is starved for get produced.
         if case .backpressureWedge = reason {
@@ -329,7 +333,7 @@ extension HLSVideoEngine {
                     + "revive cannot resume at an offset, surfacing source failure",
                     category: .session
                 )
-                surfaceVODSourceFailure(code, "Source read failed")
+                surfaceReadFailure(code)
             } else if Self.shouldReviveVODAfterReadError(
                 isLive: isLiveSession,
                 packetsWritten: prod.packetsWrittenCount,
@@ -342,7 +346,7 @@ extension HLSVideoEngine {
                     + "(readError \(code)); surfacing fatal source failure",
                     category: .session
                 )
-                surfaceVODSourceFailure(code, "Source read failed")
+                surfaceReadFailure(code)
             }
             return
         }
@@ -390,7 +394,7 @@ extension HLSVideoEngine {
             provider?.markLiveProductionHalted()
         }
         switch reason {
-        case .stopRequested, .muxerFailed, .backpressureWedge, .needsAudioSampleEntryPrime:
+        case .stopRequested, .muxerFailed, .backpressureWedge, .needsAudioSampleEntryPrime, .videoConfigurationChanged:
             // muxerFailed and needsAudioSampleEntryPrime never reach here (their arms above return first).
             return
         case .sourceReplay:
@@ -504,6 +508,12 @@ extension HLSVideoEngine {
         // reopening from byte 0 against an origin that is refusing precisely that, and then
         // declares the source "not readable in this session" while the same stream plays instantly
         // if the user backs out and presses play. That verdict is not just unhelpful, it is false.
+        // AE#792 part 2: a refused credential is neither metering nor a lost source. Reviving with the
+        // header that was just refused cannot succeed; reviving after the host renewed it is the heal.
+        if let refusal = requestHeaders.recentCredentialRefusal(within: Self.rateLimitVerdictWindowSeconds) {
+            handleCredentialRefusedReadError(code, refusal: refusal, deadProducer: deadProducer)
+            return
+        }
         let metered = OriginRequestBudget.shared.refusedRecently(
             sourceURL, within: Self.rateLimitVerdictWindowSeconds)
 
@@ -588,6 +598,99 @@ extension HLSVideoEngine {
             guard let self else { return }
             self.fireMeteredRevive(at: idx, deadProducer: deadProducer, sessionEpoch: sessionEpoch)
         }
+    }
+
+    /// AE#792 part 2: what a read error over a refused credential calls for. The store's revision says
+    /// whether the host replaced the headers since the refused request was built.
+    enum CredentialRefusalPlan: Equatable { case revive, awaitRenewal }
+
+    static func credentialRefusalPlan(refusedRevision: UInt64, currentRevision: UInt64) -> CredentialRefusalPlan {
+        currentRevision != refusedRevision ? .revive : .awaitRenewal
+    }
+
+    /// How long a session stalled on a refused credential waits for the host to renew it before the
+    /// refusal is published. The host learns of the refusal from `sourceAuthorizationRefused` at the
+    /// first 401/403, so this only has to cover a token refresh, not a user.
+    static let credentialRenewalGraceSeconds: TimeInterval = 10
+
+    func handleCredentialRefusedReadError(_ code: Int32, refusal: RequestHeaderStore.CredentialRefusal,
+                                          deadProducer: HLSSegmentProducer?) {
+        let store = requestHeaders
+        guard Self.credentialRefusalPlan(refusedRevision: refusal.revision,
+                                         currentRevision: store.revision) == .awaitRenewal else {
+            reviveAfterCredentialRenewal(refusal: refusal)
+            return
+        }
+        onNetworkPhaseChanged?(.reconnecting)
+        EngineLog.emit(
+            "[HLSVideoEngine] #792 VOD pump died on a refused credential (HTTP \(refusal.status), readError "
+            + "\(code)); waiting up to \(Int(Self.credentialRenewalGraceSeconds))s for new request headers",
+            category: .session)
+        let sessionEpoch = sessionEpochSnapshot()
+        BlockingWork.detached(priority: .userInitiated) { [weak self, weak deadProducer] in
+            let deadline = Date().addingTimeInterval(Self.credentialRenewalGraceSeconds)
+            while Date() < deadline, store.revision == refusal.revision {
+                try? await Task.sleep(nanoseconds: 250_000_000)
+            }
+            guard let self else { return }
+            guard Self.meteredReviveStillOwed(sessionUnchanged: self.isSessionEpochCurrent(sessionEpoch),
+                                              deadProducerInstalled: self.currentProducerIs(deadProducer)) else {
+                EngineLog.emit(
+                    "[HLSVideoEngine] #792 credential wait ended: the dead producer was already replaced "
+                    + "or the session stopped", category: .session)
+                return
+            }
+            if store.revision != refusal.revision {
+                self.reviveAfterCredentialRenewal(refusal: refusal)
+            } else {
+                EngineLog.emit(
+                    "[HLSVideoEngine] #792 no new request headers within "
+                    + "\(Int(Self.credentialRenewalGraceSeconds))s; publishing the refusal",
+                    category: .session)
+                self.surfaceCredentialRefusal(refusal)
+            }
+        }
+    }
+
+    private func reviveAfterCredentialRenewal(refusal: RequestHeaderStore.CredentialRefusal) {
+        restartLock.lock()
+        let admitted = credentialReviveGate.admit()
+        let attempts = credentialReviveGate.attempts
+        if admitted { mainDemuxerSuspectDead = true }
+        restartLock.unlock()
+        guard admitted else {
+            EngineLog.emit(
+                "[HLSVideoEngine] #792 renewed credentials refused again after \(attempts - 1) revives; "
+                + "publishing the refusal", category: .session)
+            surfaceCredentialRefusal(refusal)
+            return
+        }
+        let frozen = currentPlaybackPositionProvider?() ?? 0
+        let anchor = AetherEngine.recoveryAnchorPosition(
+            frozenPosition: frozen, pendingSeekTarget: recoverySeekTargetProvider?(),
+            currentRendered: frozen)
+        let idx = segmentIndexForPlaylistTime(anchor)
+        EngineLog.emit(
+            "[HLSVideoEngine] #792 request headers renewed after HTTP \(refusal.status); rebuilding the "
+            + "producer at \(String(format: "%.2f", anchor))s -> seg\(idx) "
+            + "(attempt \(attempts)/\(credentialReviveGate.maxAttempts))", category: .session)
+        requestRestart(at: idx, authoritative: true)
+    }
+
+    func surfaceCredentialRefusal(_ refusal: RequestHeaderStore.CredentialRefusal) {
+        surfaceVODSourceFailure(Int32(refusal.status),
+                                "Source refused the session's credentials (HTTP \(refusal.status))",
+                                kind: .sourceRefused)
+    }
+
+    /// The read-error surfaces that have no revive left: typed as a refusal when the reader's last
+    /// answer was one, the generic source failure otherwise.
+    func surfaceReadFailure(_ code: Int32) {
+        if let refusal = requestHeaders.recentCredentialRefusal(within: Self.rateLimitVerdictWindowSeconds) {
+            surfaceCredentialRefusal(refusal)
+            return
+        }
+        surfaceVODSourceFailure(code, "Source read failed")
     }
 
     /// Audit HLS-104: the backoff runs 3 to 45 s, and in that time a segment-driven restart, a seek or
@@ -1065,7 +1168,8 @@ extension HLSVideoEngine {
             do {
                 switch transport {
                 case .url:
-                    try dem.open(url: sourceURL, extraHeaders: sourceHTTPHeaders, profile: openProfile, isLive: true)
+                    try dem.open(url: sourceURL, extraHeaders: sourceHTTPHeaders,
+                                 profile: openProfile.withRequestHeaders(requestHeaders), isLive: true)
                 case .customFactory:
                     // #199: fresh engine-created ingest reader over the same channel; the dead
                     // reader's construction inputs are immutable, so this rejoins at the live edge.

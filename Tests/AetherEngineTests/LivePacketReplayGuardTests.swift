@@ -170,6 +170,44 @@ final class LivePacketReplayGuardTests: XCTestCase {
         }
         XCTAssertFalse(guard_.isDroppingReplay)
     }
+    /// AE#747, cut 2 on an Apple TV: returning audio opened the overlap before the outgoing
+    /// connection's flagged picture and its unflagged truncated successor left the parser.
+    func testAudioOpenedOverlapRetainsTheOutgoingVideoTailUntilItsReturningCopies() {
+        var guard_ = LivePacketReplayGuard()
+        for tick in 0..<600 {
+            if tick < 598 { guard_.record(packet(.video, Int64(tick)), sourceSeconds: Double(tick) / 25) }
+            guard_.record(packet(.audio, Int64(tick)), sourceSeconds: Double(tick) / 25)
+        }
+        func inspect(_ value: LivePacketReplayGuard.Signature, corrupt: Bool = false) -> LivePacketReplayGuard.Decision {
+            guard_.inspect(value, sourceSeconds: Double(value.dts) / 25, timeBaseSeconds: 0.04,
+                videoFrontier: 597, audioFrontier: 599, hasAudio: true, isCorrupt: corrupt)
+        }
+        XCTAssertEqual(inspect(packet(.audio, 300)).event, .began)
+        let flagged = inspect(packet(.video, 598), corrupt: true)
+        let truncated = inspect(packet(.video, 599, payload: 0xFF))
+        XCTAssertFalse(flagged.drop)
+        XCTAssertFalse(truncated.drop)
+        for tick in 300..<598 {
+            XCTAssertTrue(inspect(packet(.video, Int64(tick))).drop)
+            XCTAssertTrue(inspect(packet(.audio, Int64(tick + 1))).drop)
+        }
+        XCTAssertTrue(inspect(packet(.audio, 598)).drop)
+        XCTAssertTrue(inspect(packet(.audio, 599)).drop)
+        XCTAssertNil(inspect(packet(.audio, 600)).event)
+        let returning598 = inspect(packet(.video, 598))
+        let returning599 = inspect(packet(.video, 599))
+        XCTAssertNil(returning598.event, "the outgoing tail's returning copy must not commit the batch")
+        XCTAssertFalse(returning598.drop)
+        XCTAssertNil(returning599.event, "a returning copy committed after the batch is bumped downstream")
+        XCTAssertFalse(returning599.drop)
+        guard case .finished = inspect(packet(.video, 600)).event else { return XCTFail("must reach new media") }
+
+        // The producer discards the flagged copy and keeps the returning picture over the truncated one.
+        let batch = [packet(.video, 599, payload: 0xFF), packet(.video, 598), packet(.video, 599), packet(.video, 600)]
+        XCTAssertEqual(LivePacketReplayGuard.verifiedPacketOrder(batch).map { batch[$0] },
+                       [packet(.video, 598), packet(.video, 599), packet(.video, 600)])
+    }
+
     func testFreshProducerContinuationRecognizesShortCachedOverlap() {
         var original = LivePacketReplayGuard()
         for tick in 0..<40 {

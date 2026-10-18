@@ -14,6 +14,14 @@ enum H264SPS {
         parse(fromNAL: nal)?.frameMbsOnly
     }
 
+    /// The part of an SPS a decoder session is built from: profile_idc and every field from
+    /// chroma_format_idc through the cropping window, packed bit for bit. Constraint flags, level_idc,
+    /// the set's ID and the VUI are left out, since a change confined to them plays on the native
+    /// route with the original sample description (#785 follow-up, measured on macOS).
+    static func decoderSignature(fromNAL nal: [UInt8]) -> [UInt8]? {
+        parse(fromNAL: nal)?.signature
+    }
+
     /// First SPS NAL (incl. 1-byte header) from codecpar extradata, accepting both layouts: Annex-B
     /// (MPEG-TS, start-code delimited) and avcC (MP4/MKV, configurationVersion byte 0x01 then
     /// length-prefixed parameter sets). Returns nil when neither layout yields an SPS.
@@ -31,7 +39,7 @@ enum H264SPS {
         return extradata.withUnsafeBufferPointer { extractSPSandPPS(fromAnnexB: $0)?.sps }
     }
 
-    private static func parse(fromNAL nal: [UInt8]) -> (width: Int, height: Int, frameMbsOnly: Bool)? {
+    private static func parse(fromNAL nal: [UInt8]) -> (width: Int, height: Int, frameMbsOnly: Bool, signature: [UInt8])? {
         guard nal.count > 1, (nal[0] & 0x1f) == 7 else { return nil }
         let rbsp = unescape(Array(nal[1...]))  // strip NAL header + emulation-prevention (00 00 03 -> 00 00)
         var r = BitReader(rbsp)
@@ -40,6 +48,7 @@ enum H264SPS {
         _ = r.u(8)                  // constraint flags + reserved
         _ = r.u(8)                  // level_idc
         guard r.ue() != nil else { return nil } // seq_parameter_set_id
+        let coreStart = r.position
 
         var chromaFormatIdc = 1
         let highProfiles: Set<Int> = [100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135]
@@ -102,7 +111,15 @@ enum H264SPS {
         }
 
         guard width > 0, height > 0 else { return nil }
-        return (width, height, frameMbsOnly)
+        var core = BitReader(rbsp), signature = [UInt8(profileIdc)], packed = 0, count = 0
+        _ = core.u(coreStart)
+        for _ in coreStart..<r.position {
+            guard let b = core.u(1) else { return nil }
+            packed = (packed << 1) | b; count += 1
+            if count == 8 { signature.append(UInt8(packed)); packed = 0; count = 0 }
+        }
+        if count > 0 { signature.append(UInt8(packed << (8 - count))) }
+        return (width, height, frameMbsOnly, signature)
     }
 
     /// Scan Annex-B for the first SPS (NAL type 7) and PPS (NAL type 8), returned with their 1-byte NAL header.
@@ -237,6 +254,7 @@ enum H264SPS {
         private let bytes: [UInt8]
         private var bit = 0
         init(_ b: [UInt8]) { bytes = b }
+        var position: Int { bit }
 
         mutating func u(_ n: Int) -> Int? {
             var v = 0

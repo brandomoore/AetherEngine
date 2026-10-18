@@ -21,7 +21,9 @@ public struct PlaybackErrorKind: RawRepresentable, Sendable, Equatable, Hashable
     /// a 404, a 5xx. `underlyingCode` is that status; `underlyingDomain` is nil, the sentence is the
     /// engine's. Before this kind existed both this and a corrupt file arrived as `sourceOpenFailed`
     /// carrying FFmpeg's "Invalid data found when processing input". A 429/503/509 arrives as
-    /// `sourceRateLimited` instead: same shape, different recovery.
+    /// `sourceRateLimited` instead: same shape, different recovery. Mid-session, a 401/403 that the
+    /// host did not answer with new headers in time arrives as this kind too (AE#792), where it used to
+    /// arrive as `vodSourceFailed`.
     public static let sourceRefused = PlaybackErrorKind(rawValue: "sourceRefused")
     /// The transport was refused over certificate trust before any media arrived: a self-signed or
     /// private-CA origin, an expired certificate, a client certificate the process cannot present.
