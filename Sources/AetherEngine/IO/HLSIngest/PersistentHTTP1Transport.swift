@@ -734,7 +734,10 @@ final class PersistentHTTP1Connection: @unchecked Sendable {
     }
 
     /// Bytes left over from the head read first, then the socket. nil is EOF.
-    private func nextBytes(_ task: URLSessionStreamTask, upTo limit: Int, progress: () -> String) async throws -> Data? {
+    private func nextBytes(
+        _ task: URLSessionStreamTask, upTo limit: Int, progress: () -> String,
+        isolation: isolated (any Actor)? = #isolation
+    ) async throws -> Data? {
         let buffered = stateLock.withLock { () -> Data in
             let slice = pending.prefix(limit)
             pending.removeFirst(slice.count)

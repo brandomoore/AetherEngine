@@ -402,7 +402,7 @@ final class Issue732PersistentHTTP1Tests: XCTestCase {
         while true {
             let current = framing
             let (chunk, advanced) = try await withTaskCancellationHandler {
-                try await connection.readChunk(current, progress: { "test body" })
+                try await connection.readChunk(current, progress: { "\(received.count) bytes" })
             } onCancel: {
                 connection.retire(reason: "test cancelled")
             }
