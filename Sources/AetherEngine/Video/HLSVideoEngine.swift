@@ -257,6 +257,26 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// False for a Dolby Vision Profile 5 / 10.0 source in a build without the
     /// `DolbyVisionStillReshaping` trait: none of its frames can become a correct still.
     private(set) var yieldsStills = true
+    /// Dolby Vision without a displayable base layer (Profile 5, AV1 Profile 10.0): only the system
+    /// compositor shows it in colour, so scrub previews go through `compositorPreviewFile`.
+    private(set) var previewNeedsCompositor = false
+    private let compositorPreviewLock = NSLock()
+    private var compositorPreviewFiles: [(identity: String, file: CompositorPreviewFile)] = []
+    private var compositorPreviewSerial = 0
+    private var compositorHoldURL: URL?
+    /// Bumped by every `compositorPreviewFile` call, so a source read queued behind newer requests
+    /// is skipped instead of making the latest one wait for it.
+    private var compositorPreviewRequest = 0
+    /// Keyframes for previews outside the resident window: the served I-frame rendition when there
+    /// is one, else a side reader of this session's own, built on the first request that needs it.
+    /// Guarded by `restartLock`.
+    private var previewKeyframes: IFrameRendition?
+    private var previewKeyframeBuilder: PreviewKeyframeBuilder?
+    /// Whether this session may read preview keyframes off the source: the I-frame rendition's own
+    /// rule (keyframe-aligned plan, a reopenable URL, no serial or held origin, no disc), decided at
+    /// start. A Profile 5 / 10.0 session never serves that rendition, so this is asked separately.
+    private var previewReadsSource = false
+    nonisolated static let compositorPreviewFileLimit = 12
     /// AE#682: the server withheld the JPEG I-frame playlist because AVPlayer never asked for a media
     /// segment, which is how a refused HDR variant looks next to an SDR I-frame rendition.
     var iFrameRenditionWithheld: Bool { server?.iFrameRenditionWithheld ?? false }
@@ -1907,6 +1927,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     category: .session
                 )
             }
+            resolveUnlabelledTrueHDAtmos(
+                audioStream: audioStream, audioDemuxer: audioDem, streamIndex: audioStreamIndex)
             let compat = AudioCodecCompat.from(codecID)
             // HE-AAC needs bridging only when there is no ASC (live ADTS/MPEG-TS): synthesized ASC
             // would declare LC at the SBR output rate, decoded as garbage by AudioToolbox (-11821).
@@ -2244,10 +2266,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let stillsAvailable = FrameDecodeContext.yieldsStill(
             dolbyVisionNoBaseLayer: FrameDecodeContext.isDVNoBaseLayer(codecpar: codecpar))
         yieldsStills = stillsAvailable
+        previewNeedsCompositor = FrameDecodeContext.isDVNoBaseLayer(codecpar: codecpar)
         if !stillsAvailable {
             EngineLog.emit("[HLSVideoEngine] Dolby Vision Profile 5 / 10.0 stills are not built in "
-                           + "(DolbyVisionStillReshaping trait off): no scrub thumbnails, I-frame stills "
-                           + "or held pictures for this source", category: .session)
+                           + "(DolbyVisionStillReshaping trait off): no scrub thumbnails or I-frame stills; "
+                           + "scrub previews and the held picture go through the system compositor", category: .session)
         }
         // AE#682: decided before the routing below, because an I-frame rendition is one of the
         // reasons to serve a master at all.
@@ -2262,6 +2285,17 @@ public final class HLSVideoEngine: @unchecked Sendable {
             isDiscSource: dem.isDiscSource,
             secondReaderAvailable: sourceReopenableByURL || customIFrameReader != nil,
             stillsUnavailable: !stillsAvailable))
+        // The compositor preview reads by URL only: a custom reader's clone belongs to the rendition.
+        previewReadsSource = previewNeedsCompositor && IFrameRenditionEligibility.candidate(.init(
+            requested: true,
+            isLive: isLiveSession,
+            planBoundariesClaimRandomAccess: planBoundariesClaimRandomAccess,
+            sequentialOrigin: sequentialOrigin,
+            heldSourceConnection: openProfile.avioHeldConnection,
+            originIsSerial: sourceReopenableByURL
+                && OriginRequestBudget.shared.requiresSerialRequests(sourceURL),
+            isDiscSource: dem.isDiscSource,
+            secondReaderAvailable: sourceReopenableByURL)) == .served
         let hasNativeSubs = enableNativeSubtitleTrackForSession && !nativeSubtitleCueStoresForSession.isEmpty
         // AE#187: tvOS HW HEVC needs the codec advertised in a master's CODECS attribute; a bare media
         // playlist (H.264 is fine media-direct) fails the item with tracks count=0 / -12848. Scope to
@@ -2738,6 +2772,199 @@ public final class HLSVideoEngine: @unchecked Sendable {
                                     initData: initData, segmentURL: seg.fileURL)
     }
 
+    struct CompositorPreviewFile: Sendable {
+        let url: URL
+        /// Output-axis seconds of the keyframe the file shows.
+        let startSeconds: Double
+        let durationSeconds: Double
+    }
+
+    /// A single-keyframe fMP4 for the resident segment holding `seconds` (playlist/output axis), built
+    /// once per segment identity and kept for the last `compositorPreviewFileLimit` segments. Nil
+    /// for sources a still covers and live sessions. A segment that is not resident falls through to
+    /// `sourceKeyframePreviewFile`.
+    func compositorPreviewFile(atSeconds seconds: Double) -> CompositorPreviewFile? {
+        guard previewNeedsCompositor, !isLiveSession else { return nil }
+        compositorPreviewLock.lock()
+        compositorPreviewRequest &+= 1
+        let request = compositorPreviewRequest
+        compositorPreviewLock.unlock()
+        guard let source = scrubThumbnailSource(atSeconds: seconds) else {
+            return sourceKeyframePreviewFile(atSeconds: seconds, request: request)
+        }
+        compositorPreviewLock.lock()
+        if let hit = compositorPreviewFiles.firstIndex(where: { $0.identity == source.identity }) {
+            let entry = compositorPreviewFiles.remove(at: hit)
+            compositorPreviewFiles.append(entry)
+            compositorPreviewLock.unlock()
+            return entry.file
+        }
+        compositorPreviewSerial += 1
+        let serial = compositorPreviewSerial
+        compositorPreviewLock.unlock()
+
+        restartLock.lock()
+        let directory = cache?.sessionDir.appendingPathComponent("preview", isDirectory: true)
+        let tag = savedVideoConfig?.codecTagOverride
+        let color = savedVideoConfig?.colorOverride
+        restartLock.unlock()
+        guard let directory else { return nil }
+        let staging = directory.appendingPathComponent("staging", isDirectory: true)
+        guard (try? FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)) != nil,
+              let built = CompositorPreviewBuilder.build(
+                initData: source.initData, segmentURL: source.segmentURL,
+                durationSeconds: source.durationSeconds, codecTagOverride: tag, colorOverride: color,
+                stagingDir: staging) else { return nil }
+        let url = directory.appendingPathComponent("seg\(source.segmentIndex)-\(serial).mp4")
+        guard (try? built.file.write(to: url)) != nil else { return nil }
+        let file = CompositorPreviewFile(url: url, startSeconds: source.startSeconds,
+                                         durationSeconds: source.durationSeconds)
+        compositorPreviewLock.lock()
+        compositorPreviewFiles.append((source.identity, file))
+        var evicted: [URL] = []
+        while compositorPreviewFiles.count > Self.compositorPreviewFileLimit {
+            evicted.append(compositorPreviewFiles.removeFirst().file.url)
+        }
+        compositorPreviewLock.unlock()
+        for old in evicted { try? FileManager.default.removeItem(at: old) }
+        return file
+    }
+
+    /// The plan entry holding `seconds`: the last one starting at or before it. Seconds before the
+    /// first entry belong to it, a gap past the last one's end to nothing.
+    nonisolated static func planIndex(containing seconds: Double, in plan: [Segment]) -> Int? {
+        guard seconds.isFinite, let first = plan.first else { return nil }
+        if seconds < first.startSeconds { return 0 }
+        var low = 0, high = plan.count - 1
+        while low < high {
+            let mid = (low + high + 1) / 2
+            if plan[mid].startSeconds <= seconds { low = mid } else { high = mid - 1 }
+        }
+        let entry = plan[low]
+        return seconds < entry.startSeconds + max(entry.durationSeconds, 0) || low < plan.count - 1 ? low : nil
+    }
+
+    /// The preview for a position outside the resident window: the keyframe that opens its plan
+    /// segment, read off the source by a side demuxer as the I-frame rendition reads it, wrapped
+    /// with the session's own sample entry, `dvcC` and `colr`. Nothing is decoded; the compositor
+    /// colours it like the resident preview. Skipped when a newer request arrived meanwhile.
+    private func sourceKeyframePreviewFile(atSeconds seconds: Double, request: Int) -> CompositorPreviewFile? {
+        restartLock.lock()
+        let plan = segmentPlan
+        let directory = cache?.sessionDir.appendingPathComponent("preview", isDirectory: true)
+        let allowed = previewReadsSource
+        restartLock.unlock()
+        guard allowed, let directory, let index = Self.planIndex(containing: seconds, in: plan) else { return nil }
+        let identity = "plan:\(index)"
+        compositorPreviewLock.lock()
+        if let hit = compositorPreviewFiles.firstIndex(where: { $0.identity == identity }) {
+            let entry = compositorPreviewFiles.remove(at: hit)
+            compositorPreviewFiles.append(entry)
+            compositorPreviewLock.unlock()
+            return entry.file
+        }
+        compositorPreviewLock.unlock()
+
+        guard let (keyframes, builder) = previewKeyframeSource(plan: plan, directory: directory) else { return nil }
+        let isStale: () -> Bool = { [weak self] in
+            guard let self else { return true }
+            self.compositorPreviewLock.lock()
+            defer { self.compositorPreviewLock.unlock() }
+            return self.compositorPreviewRequest != request
+        }
+        guard let payload = keyframes.keyframePayload(at: index, isStale: isStale) else { return nil }
+        let segment = plan[index]
+        guard let built = builder.build(payload: payload, durationSeconds: segment.durationSeconds) else {
+            return nil
+        }
+
+        compositorPreviewLock.lock()
+        compositorPreviewSerial += 1
+        let serial = compositorPreviewSerial
+        compositorPreviewLock.unlock()
+        let url = directory.appendingPathComponent("plan\(index)-\(serial).mp4")
+        guard (try? (built.initSegment + built.fragment).write(to: url)) != nil else { return nil }
+        let file = CompositorPreviewFile(url: url, startSeconds: segment.startSeconds,
+                                         durationSeconds: segment.durationSeconds)
+        compositorPreviewLock.lock()
+        compositorPreviewFiles.append((identity, file))
+        var evicted: [URL] = []
+        while compositorPreviewFiles.count > Self.compositorPreviewFileLimit {
+            evicted.append(compositorPreviewFiles.removeFirst().file.url)
+        }
+        compositorPreviewLock.unlock()
+        for old in evicted { try? FileManager.default.removeItem(at: old) }
+        return file
+    }
+
+    /// The side reader and builder behind `sourceKeyframePreviewFile`, made on the first request
+    /// that needs them and torn down by `stop()`, which drains a read in flight before it frees the
+    /// codec parameters the builder reads.
+    private func previewKeyframeSource(plan: [Segment], directory: URL)
+        -> (IFrameRendition, PreviewKeyframeBuilder)? {
+        restartLock.lock()
+        defer { restartLock.unlock() }
+        if let previewKeyframes, let previewKeyframeBuilder { return (previewKeyframes, previewKeyframeBuilder) }
+        guard previewReadsSource, let cfg = savedVideoConfig, !plan.isEmpty else { return nil }
+        let staging = directory.appendingPathComponent("source-staging", isDirectory: true)
+        guard (try? FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)) != nil
+        else { return nil }
+        let builder = PreviewKeyframeBuilder(IFrameFragmentBuilder(
+            video: MP4SegmentMuxer.VideoConfig(
+                codecpar: cfg.codecpar, timeBase: cfg.timeBase,
+                codecTagOverride: cfg.codecTagOverride, doviConfig: cfg.doviConfig,
+                colorOverride: cfg.colorOverride, extradataOverride: cfg.extradataOverride,
+                convertsAnnexBSamples: cfg.convertsAnnexBSamples,
+                nalFramingLatch: cfg.nalFramingLatch),
+            stagingDir: staging))
+        let entries = plan.map {
+            IFrameRendition.Entry(startPts: $0.startPts, startSeconds: $0.startSeconds,
+                                  durationSeconds: $0.durationSeconds)
+        }
+        let keyframes = makeKeyframeRendition(
+            config: cfg, entries: entries,
+            cache: IFramePayloadCache(directory: directory.appendingPathComponent("payloads", isDirectory: true)),
+            format: .keyframes, buildFragment: { _, _, _ in nil }, custom: nil)
+        previewKeyframes = keyframes
+        previewKeyframeBuilder = builder
+        EngineLog.emit("[HLSVideoEngine] compositor preview: source keyframe reader ready "
+                       + "(segments=\(plan.count))", category: .session)
+        return (keyframes, builder)
+    }
+
+    /// The whole resident segment holding `seconds` as a video-only fMP4, and how far past the
+    /// segment's first frame `seconds` lies: what the held picture of an audio switch shows for a
+    /// source only the compositor colours. One file at a time; building the next removes the previous.
+    func compositorHoldFile(atSeconds seconds: Double) -> (url: URL, offsetSeconds: Double)? {
+        guard previewNeedsCompositor, !isLiveSession, seconds.isFinite,
+              let source = scrubThumbnailSource(atSeconds: seconds) else { return nil }
+        restartLock.lock()
+        let directory = cache?.sessionDir.appendingPathComponent("preview", isDirectory: true)
+        let tag = savedVideoConfig?.codecTagOverride
+        let color = savedVideoConfig?.colorOverride
+        restartLock.unlock()
+        guard let directory else { return nil }
+        let staging = directory.appendingPathComponent("hold-staging", isDirectory: true)
+        guard (try? FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)) != nil,
+              let built = CompositorPreviewBuilder.build(
+                initData: source.initData, segmentURL: source.segmentURL,
+                durationSeconds: source.durationSeconds, codecTagOverride: tag, colorOverride: color,
+                stagingDir: staging, content: .wholeSegment) else { return nil }
+        compositorPreviewLock.lock()
+        compositorPreviewSerial += 1
+        let serial = compositorPreviewSerial
+        let previous = compositorHoldURL
+        compositorPreviewLock.unlock()
+        let url = directory.appendingPathComponent("hold\(source.segmentIndex)-\(serial).mp4")
+        guard (try? built.file.write(to: url)) != nil else { return nil }
+        compositorPreviewLock.lock()
+        compositorHoldURL = url
+        compositorPreviewLock.unlock()
+        if let previous { try? FileManager.default.removeItem(at: previous) }
+        let offset = min(max(0, seconds - source.startSeconds + built.compositionDelaySeconds), source.durationSeconds)
+        return (url, offset)
+    }
+
     public func stop() {
         cancelResidentRangesPublish()
         // Sodalite#32: drop the tap routes first so a pump still draining its last packets no-ops
@@ -2759,6 +2986,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
         server = nil
         let c = cache
         cache = nil
+        compositorPreviewLock.lock()
+        compositorPreviewFiles.removeAll()
+        compositorHoldURL = nil
+        compositorPreviewLock.unlock()
         let ab = audioBridge
         audioBridge = nil
         let d = demuxer
@@ -2772,6 +3003,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
         provider = nil
         let iFrames = iFrameRendition
         iFrameRendition = nil
+        let previewFrames = previewKeyframes
+        previewKeyframes = nil
+        let previewBuilder = previewKeyframeBuilder
+        previewKeyframeBuilder = nil
         closeUnusedCustomIFrameReader()
         savedVideoConfig = nil
         savedAudioConfig = nil
@@ -2810,6 +3045,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // (pump accesses them during unwind). ownedParams released last (pump read them).
         BlockingWork.detached {
             iFrames?.shutdown()
+            previewFrames?.shutdown()
+            previewBuilder?.close()
             _ = p?.waitForFinish(timeout: 3.0)
             s?.stop()
             c?.close()
@@ -2870,13 +3107,34 @@ public final class HLSVideoEngine: @unchecked Sendable {
                                       startSeconds: entry.startSeconds, durationSeconds: entry.durationSeconds)
             }
         }
+        // The side reader owns the clone from here; `stop()` must not close it a second time.
+        let custom = customIFrameReader
+        customIFrameReader = nil
+        let entries = plan.map {
+            IFrameRendition.Entry(startPts: $0.startPts, startSeconds: $0.startSeconds,
+                                  durationSeconds: $0.durationSeconds)
+        }
+        return makeKeyframeRendition(
+            config: cfg, entries: entries,
+            cache: IFramePayloadCache(directory: directory.appendingPathComponent("payloads", isDirectory: true)),
+            format: format, buildFragment: buildFragment, custom: custom)
+    }
+
+    /// The side-read half every keyframe consumer shares: a demuxer of its own on the source, the
+    /// P7 conversion the playing samples get, and the gates that keep it off a busy or serial origin.
+    private func makeKeyframeRendition(
+        config cfg: HLSSegmentProducer.StreamConfig,
+        entries: [IFrameRendition.Entry],
+        cache: IFramePayloadCache,
+        format: IFrameRenditionFormat,
+        buildFragment: @escaping (Data, Int, IFrameRendition.Entry) -> IFrameFragmentBuilder.Output?,
+        custom: (reader: IOReader, formatHint: String?)?
+    ) -> IFrameRendition {
         let framing = cfg.nalFramingOverride ?? A53SEIParser.nalFraming(
             codec: cfg.codecpar.pointee.codec_id == AV_CODEC_ID_HEVC ? .hevc : .h264,
             extradata: cfg.codecpar.pointee.extradata.map { UnsafePointer($0) },
             size: Int(cfg.codecpar.pointee.extradata_size))
-        let url = sourceURL, headers = sourceHTTPHeaders, headerStore = requestHeaders, custom = customIFrameReader
-        // The side reader owns the clone from here; `stop()` must not close it a second time.
-        customIFrameReader = nil
+        let url = sourceURL, headers = sourceHTTPHeaders, headerStore = requestHeaders
         let reader = IFrameSideReader(
             open: { dem in
                 if let custom {
@@ -2891,13 +3149,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
             cleanup: { custom?.reader.close() },
             convertP7ToProfile81: cfg.convertP7ToProfile81,
             nalFraming: framing)
-        let entries = plan.map {
-            IFrameRendition.Entry(startPts: $0.startPts, startSeconds: $0.startSeconds,
-                                  durationSeconds: $0.durationSeconds)
-        }
         return IFrameRendition(
             entries: entries,
-            cache: IFramePayloadCache(directory: directory.appendingPathComponent("payloads", isDirectory: true)),
+            cache: cache,
             format: format,
             readPayload: { reader.payload(startPts: $0.startPts) },
             buildFragment: buildFragment,
@@ -4570,5 +4824,34 @@ extension HLSVideoEngine {
             let tb = savedVideoConfig?.timeBase ?? AVRational(num: 1, den: 1000)
             dem.seek(to: Double(targetPts) * Double(tb.num) / Double(tb.den))
         }
+    }
+}
+
+/// The fragment builder of the source-keyframe preview, behind a lock: its muxer stages each build
+/// under a name taken from the index and every preview builds index 0, and it reads the session's
+/// codec parameters, which `stop()` frees once `close()` has returned.
+final class PreviewKeyframeBuilder: @unchecked Sendable {
+    private let builder: IFrameFragmentBuilder
+    private let lock = NSLock()
+    private var closed = false
+
+    init(_ builder: IFrameFragmentBuilder) {
+        self.builder = builder
+    }
+
+    /// One keyframe at file time 0, as a standalone fMP4's init and fragment.
+    func build(payload: Data, durationSeconds: Double) -> IFrameFragmentBuilder.Output? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !closed else { return nil }
+        return builder.build(payload: payload, index: 0, startSeconds: 0,
+                             durationSeconds: max(durationSeconds, 0.04))
+    }
+
+    /// Waits for a build in flight; every later call answers nil.
+    func close() {
+        lock.lock()
+        closed = true
+        lock.unlock()
     }
 }

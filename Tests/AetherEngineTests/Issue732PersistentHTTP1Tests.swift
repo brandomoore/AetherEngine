@@ -1,6 +1,7 @@
 import CommonCrypto
 import Foundation
 import XCTest
+import Testing
 @testable import AetherEngine
 
 /// AE#732: under `heldSourceConnection` the HLS VOD ingest carries its playlist, probe and segment
@@ -482,14 +483,14 @@ final class Issue732PersistentHTTP1Tests: XCTestCase {
 
     static let markerOffset = 100
 
-    private static func mediaPlaylist(_ segments: [String]) -> Data {
+    fileprivate static func mediaPlaylist(_ segments: [String]) -> Data {
         var text = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n"
         for segment in segments { text += "#EXTINF:6,\n\(segment)\n" }
         return Data((text + "#EXT-X-ENDLIST").utf8)
     }
 
     /// TS packets whose first PMT declares HEVC (0x24); the marker sits in the PMT packet's filler.
-    private static func transportStream(marker: UInt8, packets: Int = 3) -> Data {
+    fileprivate static func transportStream(marker: UInt8, packets: Int = 3) -> Data {
         var bytes = [UInt8](repeating: 0xFF, count: 188 * packets)
         for packet in 0..<packets {
             bytes[packet * 188] = 0x47
@@ -506,7 +507,7 @@ final class Issue732PersistentHTTP1Tests: XCTestCase {
         var bytes: [UInt8] = []
     }
 
-    private static func aes128CBC(_ data: Data, key: Data) -> Data {
+    fileprivate static func aes128CBC(_ data: Data, key: Data) -> Data {
         var out = Data(count: data.count + kCCBlockSizeAES128)
         var written = 0
         let iv = Data(count: kCCBlockSizeAES128)
@@ -737,6 +738,103 @@ final class KeepAliveOrigin: @unchecked Sendable {
                 sent += n
             }
             return true
+        }
+    }
+}
+
+@Suite("Persistent HLS segment-boundary admission", .serialized, .timeLimit(.minutes(1)))
+struct PersistentHLSSegmentAdmissionTests {
+    enum Exit: String, CaseIterable, Sendable { case consume, seek, close, cancel }
+
+    @Test("a final chunk filling the FIFO holds the next request until consumption or retirement",
+          arguments: Exit.allCases, [nil, 1, 2])
+    func finalChunkAdmission(exit: Exit, encryptedFrom: Int?) async throws {
+        let server = try #require(KeepAliveOrigin())
+        defer { server.stop() }
+        let segments = (0..<4).map { "seg\($0).ts" }
+        // After the one 188-byte read below, these two segments leave 16,777,308 bytes:
+        // just above the 16 MiB ceiling. The final offered chunk can empty `pending` while
+        // filling the FIFO, which used to skip append() and start the next request. Encrypted from
+        // segment 1, the filling segment arrives whole through append() instead of stream().
+        let packetCounts = [64_000, 25_242, 3, 3]
+        let key = Data(repeating: 0x43, count: 16)
+        var playlist = String(decoding: Issue732PersistentHTTP1Tests.mediaPlaylist(segments), as: UTF8.self)
+        if let encryptedFrom {
+            playlist = playlist.replacingOccurrences(of: "#EXTINF:6,\nseg\(encryptedFrom).ts",
+                with: "#EXT-X-KEY:METHOD=AES-128,URI=\"/key\",IV=0x00000000000000000000000000000000\n#EXTINF:6,\nseg\(encryptedFrom).ts")
+        }
+        // The key is fetched before its first segment, so it only marks an escape when that is seg2.
+        let nextRequest: @Sendable (KeepAliveOrigin.Request) -> Bool = { request in
+            request.path == "/seg2.ts" || (encryptedFrom == 2 && request.path == "/key")
+        }
+        let playlistBody = Data(playlist.utf8)
+        server.route = { path in
+            if path == "/vod.m3u8" {
+                return .init(body: playlistBody)
+            }
+            if path == "/key" { return .init(body: key) }
+            guard let index = segments.firstIndex(where: { "/" + $0 == path }) else {
+                return .init(status: 404)
+            }
+            let clear = Issue732PersistentHTTP1Tests.transportStream(
+                marker: UInt8(index), packets: packetCounts[index])
+            return .init(body: encryptedFrom.map { index >= $0 } == true
+                ? Issue732PersistentHTTP1Tests.aes128CBC(clear, key: key) : clear)
+        }
+        let reader = try #require(try await HLSVODIngestReader.makeIfHEVCMPEGTS(
+            playlistURL: server.url("/vod.m3u8"), httpHeaders: [:], persistentHTTP1: true))
+        defer { reader.close() }
+        let firstRead = ProbeTestJob { () -> Int32 in
+            var bytes = [UInt8](repeating: 0, count: 188)
+            return bytes.withUnsafeMutableBufferPointer { reader.read($0.baseAddress, size: 188) }
+        }
+        #expect(try await firstRead.outcome().get() == 188)
+        try await waitFor { server.completed.contains("/seg1.ts") }
+        let escaped = try await waitFor(upTo: .milliseconds(500)) {
+            server.requests.contains(where: nextRequest)
+        }
+        #expect(!escaped, "the final chunk must not bypass the next request's admission")
+
+        switch exit {
+        case .consume: break
+        case .seek: #expect(reader.seek(to: 20)) // starts at segment 2, before the containing segment 3
+        case .close: reader.close()
+        case .cancel: reader.cancel()
+        }
+        let drain = ProbeTestJob { () -> (bytes: Int, marker: UInt8?, terminal: Int32) in
+            var bytes = [UInt8](repeating: 0, count: 4096)
+            var total = 0
+            var marker: UInt8?
+            while true {
+                let n = bytes.withUnsafeMutableBufferPointer { reader.read($0.baseAddress, size: 4096) }
+                if n <= 0 { return (total, marker, n) }
+                if marker == nil, n > Issue732PersistentHTTP1Tests.markerOffset {
+                    marker = bytes[Issue732PersistentHTTP1Tests.markerOffset]
+                }
+                total += Int(n)
+            }
+        }
+        let result = try await drain.outcome().get()
+        switch exit {
+        case .consume:
+            #expect(result.bytes + 188 == packetCounts.reduce(0, +) * 188)
+            #expect(result.terminal == 0)
+        case .seek:
+            #expect(result.bytes == 6 * 188)
+            #expect(result.marker == 2)
+            #expect(result.terminal == 0)
+        case .close, .cancel:
+            #expect(result.bytes == 0)
+            #expect(result.terminal == -1)
+            let lateRequest = try await waitFor(upTo: .milliseconds(500)) {
+                server.requests.contains(where: nextRequest)
+            }
+            #expect(!lateRequest, "a retired producer must not issue the next request")
+        }
+        if exit == .consume || exit == .seek {
+            #expect(server.requests.filter { $0.path == "/seg2.ts" }.count == 1)
+            #expect(server.connectionCount == 1)
+            #expect(server.maxInFlight == 1)
         }
     }
 }

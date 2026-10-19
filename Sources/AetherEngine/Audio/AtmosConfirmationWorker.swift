@@ -48,9 +48,20 @@ extension AetherEngine {
     /// Skipped for live sources: a second connection to a live origin costs a tuner on some backends, the
     /// pass would start at the live edge rather than where playback is, and a live Atmos badge does not
     /// justify either. Skipped for forward-only custom readers, which cannot hand out a second cursor.
+    /// Skipped where the origin rations requests (`atmosConfirmationDeclineReason`).
     func startAtmosConfirmation() {
         cancelAtmosConfirmation()
         guard loadedOptions.confirmAtmos, !isLive, let url = loadedURL else { return }
+        if let reason = Self.atmosConfirmationDeclineReason(
+            originSerial: !isCustomSource && OriginRequestBudget.shared.requiresSerialRequests(url),
+            sequentialOrigin: loadedOptions.sequentialOrigin,
+            heldSourceConnection: loadedOptions.heldSourceConnection
+        ) {
+            EngineLog.emit(
+                "[AtmosConfirmation] skipped: \(reason); isAtmos stays the pre-decode guess",
+                category: .engine)
+            return
+        }
         // A session-preserving reload of the same item keeps what the previous pass already learned and
         // only chases what is still open; a new item starts from scratch.
         if confirmedAtmosSource != url {
@@ -66,12 +77,31 @@ extension AetherEngine {
         let formatHint = customFormatHint
         let probesize = loadedOptions.probesize
         let maxAnalyzeDuration = loadedOptions.maxAnalyzeDuration
+        let budgetURL = isCustomSource ? nil : url
         atmosConfirmationTask = BlockingWork.detached(priority: .utility) { [weak self] in
             await self?.runAtmosConfirmation(
-                url: url, formatHint: formatHint, headers: headers,
+                url: url, budgetURL: budgetURL, formatHint: formatHint, headers: headers,
                 callerProbesize: probesize, callerMaxAnalyzeDuration: maxAnalyzeDuration,
                 candidates: candidates)
         }
+    }
+
+    /// Why the pass must not run on this origin, or nil when it may.
+    ///
+    /// Each track's pass is a second handle on the source (head, Matroska Cues at the tail, then paced
+    /// cluster reads), and on an origin limited to one request every one of those reads takes the slot
+    /// the video pump needs. Measured at an Xtream origin that refuses a second connection with 509: a
+    /// 4K remux with 17 E-AC-3 tracks stalled every ten seconds for as long as the pass ran, and the pass
+    /// never finished. `sequentialOrigin` and `heldSourceConnection` are declarations of the same kind of
+    /// origin, one that punishes a second request rather than merely slowing it down. The I-frame
+    /// rendition declines the same three for the same reason.
+    nonisolated static func atmosConfirmationDeclineReason(
+        originSerial: Bool, sequentialOrigin: Bool, heldSourceConnection: Bool
+    ) -> String? {
+        if originSerial { return "the origin is limited to one request at a time (#377)" }
+        if sequentialOrigin { return "sequentialOrigin" }
+        if heldSourceConnection { return "heldSourceConnection" }
+        return nil
     }
 
     /// Whether the host's reader can hand out the independent cursor each pass needs. The probe builds a
@@ -95,14 +125,23 @@ extension AetherEngine {
     /// One bounded pass per candidate, sequentially. Each opens its own demuxer and closes it before the
     /// next starts, so at most one extra handle on the source exists at a time. Every failure is silent
     /// and terminal for that track: the badge simply does not appear.
+    ///
+    /// `budgetURL` is re-checked before every track: an uncapped origin that answers 429/503/509 is lowered
+    /// to one request by the budget mid-session, and the remaining passes would then compete with the pump.
     nonisolated private func runAtmosConfirmation(
-        url: URL, formatHint: String?, headers: [String: String],
+        url: URL, budgetURL: URL?, formatHint: String?, headers: [String: String],
         callerProbesize: Int64?, callerMaxAnalyzeDuration: Int64?,
         candidates: [Int32]
     ) async {
         var confirmed: [Int32] = []
+        var scanned = 0
+        var stopReason: String?
         for index in candidates {
-            guard !Task.isCancelled else { break }
+            if Task.isCancelled { stopReason = "cancelled"; break }
+            if let budgetURL, OriginRequestBudget.shared.requiresSerialRequests(budgetURL) {
+                stopReason = "the origin dropped to one request at a time"
+                break
+            }
             if await confirmAtmosForOneTrack(
                 url: url, formatHint: formatHint, headers: headers,
                 callerProbesize: callerProbesize, callerMaxAnalyzeDuration: callerMaxAnalyzeDuration,
@@ -115,13 +154,27 @@ extension AetherEngine {
                     self.applyConfirmedTrackFlags()
                 }
             }
+            scanned += 1
         }
-        guard !Task.isCancelled else { return }
+        if stopReason == nil, Task.isCancelled { stopReason = "cancelled" }
         EngineLog.emit(
-            "[AtmosConfirmation] scanned \(candidates.count) E-AC-3 track(s), confirmed JOC on "
-            + (confirmed.isEmpty ? "none" : confirmed.map(String.init).joined(separator: ", ")),
+            Self.atmosConfirmationSummary(
+                scanned: scanned, of: candidates.count, confirmed: confirmed, stopReason: stopReason),
             category: .engine
         )
+    }
+
+    /// The pass's one log line. Emitted on every exit, a stopped pass included, so a report shows how far
+    /// it got instead of showing nothing at all.
+    nonisolated static func atmosConfirmationSummary(
+        scanned: Int, of total: Int, confirmed: [Int32], stopReason: String?
+    ) -> String {
+        let joc = confirmed.isEmpty ? "none" : confirmed.map(String.init).joined(separator: ", ")
+        guard let stopReason else {
+            return "[AtmosConfirmation] scanned \(total) E-AC-3 track(s), confirmed JOC on \(joc)"
+        }
+        return "[AtmosConfirmation] stopped (\(stopReason)) after \(scanned) of \(total) E-AC-3 track(s), "
+            + "confirmed JOC on \(joc)"
     }
 
     /// Open, detect, close. Returns whether this track is authoritatively JOC.

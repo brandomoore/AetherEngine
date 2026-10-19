@@ -150,7 +150,7 @@ extension AetherEngine {
     /// FrameExtractor (#106). It reports capability, not per-frame availability: transient
     /// nils from `scrubThumbnail` while a segment is still being produced are expected. False as well
     /// on a Dolby Vision Profile 5 / 10.0 session in a build without the `DolbyVisionStillReshaping`
-    /// trait, where no frame can become a correct still.
+    /// trait, where no frame can become a correct still; `scrubPreviewDrawsInView` covers that source.
     public var supportsCacheBackedStills: Bool {
         if let session = nativeVideoSession { return session.yieldsStills }
         guard let softwareHost else { return false }

@@ -4797,7 +4797,7 @@ public final class AetherEngine: ObservableObject {
             // The load seam preserves display criteria (#128 follow-up); an audio-only session never calls
             // apply(), so clear a criteria the previous video session left applied. The engine is a
             // process-wide singleton; without this, music playback keeps the panel in DV/HDR.
-            if Self.loadDisplayCriteriaAction(suppressDisplayCriteria: options.suppressDisplayCriteria, audioOnlyPath: true) == .clearStale {
+            if Self.loadDisplayCriteriaAction(engineWritesCriteria: options.engineWritesDisplayCriteria, audioOnlyPath: true) == .clearStale {
                 resetDisplayCriteriaRespectingOthers()
             }
             // Read codec before closing the probe; custom sources always use FFmpeg (AVPlayer can't consume a custom demuxer).
@@ -4890,7 +4890,7 @@ public final class AetherEngine: ObservableObject {
         // starts a switch, so the post-load play-gate waitForSwitch() below has nothing to settle and would
         // otherwise burn its full ~3s cap on unobservable-DV panels. Skip it in exactly that case.
         var criteriaUnchanged = false
-        switch Self.loadDisplayCriteriaAction(suppressDisplayCriteria: options.suppressDisplayCriteria, audioOnlyPath: false) {
+        switch Self.loadDisplayCriteriaAction(engineWritesCriteria: options.engineWritesDisplayCriteria, audioOnlyPath: false) {
         case .applyFresh:
             let codecTag: FourCharCode? = detectedDVProfile ? 0x64766831 : nil
             switch displayCriteria.apply(
@@ -4927,7 +4927,7 @@ public final class AetherEngine: ObservableObject {
             // load rather than when the play gate opens. After reset(), so a switch back to the default
             // mode is not recorded as this session's. Audio-only loads reach clearStale too and have no
             // panel handshake to observe.
-            if options.suppressDisplayCriteria { displayCriteria.armSwitchObservation() }
+            if !options.engineWritesDisplayCriteria { displayCriteria.armSwitchObservation() }
         }
 
         // 2.5. Post-handshake panel-mode snapshot.
@@ -4947,7 +4947,7 @@ public final class AetherEngine: ObservableObject {
         //      so a panel parked in HDR never proves itself and one tvOS 27 box stopped answering at all;
         //      a host that knows better says so, and a wrong claim costs the -11848 fallback, not the item.
         var criteriaPanelReadout: Bool? =
-            options.suppressDisplayCriteria ? nil : displayCriteria.currentPanelIsHDR()
+            options.awaitsInboundCriteriaWrite ? nil : displayCriteria.currentPanelIsHDR()
         var panelHDRAfterHandshake = Self.sessionPanelPresentsHDR(
             hostAsserts: options.panelIsInHDRMode, criteriaReadout: criteriaPanelReadout)
         // AE#459: the ROUTE may assume more than the LABEL may claim. `panelHDRAfterHandshake` stays the
@@ -4978,7 +4978,7 @@ public final class AetherEngine: ObservableObject {
                 }
                 try checkLoadCurrent(gen)
             }
-            criteriaPanelReadout = options.suppressDisplayCriteria ? nil : displayCriteria.currentPanelIsHDR()
+            criteriaPanelReadout = options.awaitsInboundCriteriaWrite ? nil : displayCriteria.currentPanelIsHDR()
             panelHDRAfterHandshake = Self.sessionPanelPresentsHDR(
                 hostAsserts: options.panelIsInHDRMode, criteriaReadout: criteriaPanelReadout)
             routingPanelHDR = Self.sessionRoutesAsHDRPanel(
@@ -5495,7 +5495,7 @@ public final class AetherEngine: ObservableObject {
                 await displayCriteria.waitForSwitch(
                     startGrace: Self.playGateGrace(
                         criteriaUnchanged: criteriaUnchanged,
-                        engineIsCriteriaWriter: !options.suppressDisplayCriteria,
+                        criteriaWrittenBeforeLoad: !options.awaitsInboundCriteriaWrite,
                         formatKnown: probeOpened,
                         effectiveFormat: effectiveFormat,
                         noWriterExpected: options.sharedOutputRole == .secondary

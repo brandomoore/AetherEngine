@@ -475,6 +475,9 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         defer { primed?.body.abandon() }
         for (offset, (segment, url)) in segments.enumerated() {
             try Task.checkCancellation()
+            // Runs on the producer's BlockingWork executor. The last offered chunk can fill the
+            // FIFO with no pending remainder, so admission must not depend on append() parking.
+            guard waitForSegmentAdmission(generation: generation) else { return }
             if let crypt = segment.crypt {
                 let bytes = try await decrypt(
                     try await fetch(url, limit: BoundedFetch.segmentLimit(forDuration: segment.duration)),
@@ -542,9 +545,8 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
             throw HLSIngestError.playlistInvalid(reason: "segment body over its limit")
         }
         guard total > 0 else { throw HLSIngestError.playlistUnreachable(status: body.response.statusCode) }
-        // Between segments the ceiling holds even when the last chunk was taken just under it: the
-        // next request waits for the reader either way, not only when bytes are left over.
-        return pending.isEmpty ? waitForRoom(generation: generation) : append(pending, generation: generation)
+        // The ceiling between segments is enforced before the next request (`waitForSegmentAdmission`).
+        return pending.isEmpty || append(pending, generation: generation)
     }
 
     private enum Offer { case taken, full, superseded }
@@ -576,16 +578,16 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         return body
     }
 
-    /// Parks until the FIFO is below its ceiling. False when the generation was superseded.
-    private func waitForRoom(generation: UInt64) -> Bool {
+    /// Wait between requests, after the previous body has completed. Seek/close wake the producer
+    /// and invalidate its generation; a superseded producer must never open the next segment.
+    private func waitForSegmentAdmission(generation: UInt64) -> Bool {
         condition.lock()
         defer { condition.unlock() }
-        while self.generation == generation,
-              !closed,
+        while self.generation == generation, !closed, !failed,
               bufferedBytes >= Self.maximumBufferedBytes {
             condition.wait()
         }
-        return self.generation == generation && !closed
+        return self.generation == generation && !closed && !failed
     }
 
     private func append(_ data: Data, generation: UInt64) -> Bool {

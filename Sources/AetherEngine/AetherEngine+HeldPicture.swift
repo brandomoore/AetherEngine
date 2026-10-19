@@ -55,16 +55,16 @@ extension AetherEngine {
         let generation = loadGeneration
         let started = ContinuousClock.now
 
+        if let host = nativeSource,
+           Self.heldPictureNeedsReshaping(videoFormat: videoFormat, dolbyVisionProfile: sourceDVProfile),
+           !OptionalComponent.dolbyVisionStillReshaping.isBuiltIn {
+            await holdThroughCompositor(host: host, view: view, generation: generation, started: started)
+            return
+        }
+
         let held: (frame: CVPixelBuffer, isHDR: Bool, route: String)?
         if let host = nativeSource {
             if Self.heldPictureNeedsReshaping(videoFormat: videoFormat, dolbyVisionProfile: sourceDVProfile) {
-                // Without the reshaping there is no correct picture to hold, so nothing is decoded.
-                guard OptionalComponent.dolbyVisionStillReshaping.isBuiltIn else {
-                    heldPictureLastSkip = "Dolby Vision still reshaping not built in"
-                    EngineLog.emit("[AetherEngine] held picture: skipped (Dolby Vision still reshaping not built in, "
-                                   + "DolbyVisionStillReshaping trait off)", category: .engine)
-                    return
-                }
                 held = await reshapedDolbyVisionStill(itemSeconds: host.avPlayer.currentTime().seconds)
                     .map { ($0, false, "Dolby Vision reshaped") }
             } else {
@@ -92,8 +92,58 @@ extension AetherEngine {
             EngineLog.emit("[AetherEngine] held picture: frame could not be wrapped for display", category: .engine)
             return
         }
+        armHeldPicture(on: view, route: held.route, nativeSource: nativeSource)
+        EngineLog.emit(
+            "[AetherEngine] held picture: up after \(Self.milliseconds(ContinuousClock.now - started))ms "
+            + "(\(held.route), \(CVPixelBufferGetWidth(held.frame))x\(CVPixelBufferGetHeight(held.frame)), "
+            + "hdr=\(held.isHDR))",
+            category: .engine)
+    }
+
+    /// Dolby Vision without a displayable base layer and without the still reshaping: the frame under
+    /// the playhead, played out of the resident segment by a player of the surface's own, so the
+    /// system compositor colours it as it colours playback. Waits at most
+    /// `heldPictureDolbyVisionBudgetSeconds`, the outgoing picture paused meanwhile.
+    private func holdThroughCompositor(host: NativeAVPlayerHost, view: any HeldStillSurface,
+                                       generation: UInt64, started: ContinuousClock.Instant) async {
+        let itemSeconds = host.avPlayer.currentTime().seconds
+        guard let session = nativeVideoSession else { return }
+        let built = await BlockingWork.detached(priority: .userInitiated) { [session] in
+            session.compositorHoldFile(atSeconds: itemSeconds)
+        }.value
+        guard let hold = built else {
+            heldPictureLastSkip = "no frame from the outgoing picture"
+            EngineLog.emit("[AetherEngine] held picture: no resident segment for the compositor hold", category: .engine)
+            return
+        }
+        let spent = Double((ContinuousClock.now - started).components.seconds)
+            + Double((ContinuousClock.now - started).components.attoseconds) / 1e18
+        let budget = max(0.2, Self.heldPictureDolbyVisionBudgetSeconds - spent)
+        let shown = await view.showCompositorStill(file: hold.url, pastFirstFrameBy: hold.offsetSeconds,
+                                                   gravity: videoGravity, budgetSeconds: budget)
+        guard shown else {
+            heldPictureLastSkip = "no frame from the outgoing picture"
+            EngineLog.emit("[AetherEngine] held picture: the compositor hold did not become displayable", category: .engine)
+            return
+        }
+        guard loadGeneration == generation, nativeHost === host, (boundStillView ?? boundView) === view else {
+            view.clearStill()
+            heldPictureLastSkip = "superseded while the frame was read"
+            EngineLog.emit("[AetherEngine] held picture: superseded while the frame was read", category: .engine)
+            return
+        }
+        armHeldPicture(on: view, route: "Dolby Vision compositor", nativeSource: host)
+        EngineLog.emit(
+            "[AetherEngine] held picture: up after \(Self.milliseconds(ContinuousClock.now - started))ms "
+            + "(Dolby Vision compositor, item \(String(format: "%.3f", itemSeconds))s)",
+            category: .engine)
+    }
+
+    /// Records the hold and arms its release: the next item's first frame (native), the next host's
+    /// (software), or `heldPictureTimeoutSeconds`.
+    private func armHeldPicture(on view: any HeldStillSurface, route: String, nativeSource: NativeAVPlayerHost?) {
         heldPictureView = view
-        heldPictureLastRoute = held.route
+        heldPictureLastRoute = route
         heldPictureShownAt = .now
         heldPictureToken &+= 1
         let token = heldPictureToken
@@ -113,11 +163,6 @@ extension AetherEngine {
             guard let self, self.heldPictureToken == token, self.heldPictureView != nil else { return }
             self.releaseHeldPicture(reason: "timeout")
         }
-        EngineLog.emit(
-            "[AetherEngine] held picture: up after \(Self.milliseconds(ContinuousClock.now - started))ms "
-            + "(\(held.route), \(CVPixelBufferGetWidth(held.frame))x\(CVPixelBufferGetHeight(held.frame)), "
-            + "hdr=\(held.isHDR))",
-            category: .engine)
     }
 
     /// visionOS has no external playback, and no `isExternalPlaybackActive` to ask.

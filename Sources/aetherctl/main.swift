@@ -1,6 +1,6 @@
 // aetherctl: standalone reproduction harness for AetherEngine on macOS.
 //
-// Twenty-one subcommands, most operating on a media source URL (file://
+// Twenty-four subcommands, most operating on a media source URL (file://
 // or http(s)://), a few on built-in synthetic fixtures. The full list
 // with flags and examples lives in docs/cli.md; the three original modes:
 //
@@ -512,6 +512,26 @@ if first == "feltest" {
     print("ERROR: feltest needs the DualLayerDolbyVision trait (swift build --traits DualLayerDolbyVision)")
     exit(64)
     #endif
+}
+
+// Compositor scrub previews (Dolby Vision Profile 5 / 10.0), resident and from the source.
+if first == "scrubpreview" {
+    var rest = Array(args.dropFirst(2))
+    let at = takeStringFlag("--at", from: &rest) ?? "2,5,30,50,65"
+    let warm = takeDoubleFlag("--warm", from: &rest) ?? 4
+    let keep = takeStringFlag("--keep", from: &rest)
+    if let kbps = takeIntFlag("--throttle-kbps", from: &rest) {
+        AetherEngine.setSourceThrottleKbpsForTesting(kbps)
+        print("[aetherctl] source throttle: \(kbps) kbit/s")
+    }
+    guard let urlArg = rest.first(where: { !$0.hasPrefix("--") }) else {
+        print("Usage: aetherctl scrubpreview [--at s1,s2,...] [--warm S] [--keep DIR] [--throttle-kbps N] <url>")
+        exit(64)
+    }
+    rest.removeAll { $0 == urlArg }
+    rejectStrayFlags(rest, subcommand: "scrubpreview")
+    let positions = at.split(separator: ",").compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }
+    exit(runScrubPreview(url: parseSourceURL(urlArg), positions: positions, warmSeconds: warm, keepDir: keep))
 }
 
 // Dolby Vision display-metadata survey: picks the pin for the on-device consumption test.

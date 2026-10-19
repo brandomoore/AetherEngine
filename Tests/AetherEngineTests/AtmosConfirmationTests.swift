@@ -164,3 +164,38 @@ struct AtmosConfirmationTests {
             callerProbesize: nil, callerMaxAnalyzeDuration: nil) == false)
     }
 }
+
+/// The pass is a second handle on the source per E-AC-3 track. On an origin that rations requests every
+/// read it makes takes the video pump's slot, so it must not run there at all.
+@Suite("Atmos confirmation: origin gate and summary line")
+struct AtmosConfirmationOriginGateTests {
+
+    @Test("an unrestricted origin runs the pass")
+    func unrestrictedOriginRuns() {
+        #expect(AetherEngine.atmosConfirmationDeclineReason(
+            originSerial: false, sequentialOrigin: false, heldSourceConnection: false) == nil)
+    }
+
+    @Test("a one-request origin, a sequential origin and a held connection each decline the pass")
+    func rationedOriginsDecline() {
+        #expect(AetherEngine.atmosConfirmationDeclineReason(
+            originSerial: true, sequentialOrigin: false, heldSourceConnection: false) != nil)
+        #expect(AetherEngine.atmosConfirmationDeclineReason(
+            originSerial: false, sequentialOrigin: true, heldSourceConnection: false) != nil)
+        #expect(AetherEngine.atmosConfirmationDeclineReason(
+            originSerial: false, sequentialOrigin: false, heldSourceConnection: true) != nil)
+    }
+
+    @Test("a completed pass keeps the summary format reports already grep for")
+    func completedSummary() {
+        #expect(AetherEngine.atmosConfirmationSummary(scanned: 3, of: 3, confirmed: [2, 5], stopReason: nil)
+            == "[AtmosConfirmation] scanned 3 E-AC-3 track(s), confirmed JOC on 2, 5")
+    }
+
+    @Test("a stopped pass still logs how far it got and what it found")
+    func stoppedSummary() {
+        let line = AetherEngine.atmosConfirmationSummary(
+            scanned: 2, of: 17, confirmed: [], stopReason: "cancelled")
+        #expect(line == "[AtmosConfirmation] stopped (cancelled) after 2 of 17 E-AC-3 track(s), confirmed JOC on none")
+    }
+}

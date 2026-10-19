@@ -18,10 +18,10 @@ struct DisplayCriteriaPlayGateTests {
     @Test("Unchanged criteria skip the gate entirely (#133 behaviour preserved)")
     func unchangedCriteriaSkip() {
         #expect(AetherEngine.playGateGrace(
-            criteriaUnchanged: true, engineIsCriteriaWriter: true,
+            criteriaUnchanged: true, criteriaWrittenBeforeLoad: true,
             formatKnown: true, effectiveFormat: .dolbyVision) == .skip)
         #expect(AetherEngine.playGateGrace(
-            criteriaUnchanged: true, engineIsCriteriaWriter: false,
+            criteriaUnchanged: true, criteriaWrittenBeforeLoad: false,
             formatKnown: false, effectiveFormat: .sdr) == .skip)
     }
 
@@ -29,7 +29,7 @@ struct DisplayCriteriaPlayGateTests {
     func engineWriterIsBrief() {
         for format: VideoFormat in [.sdr, .hdr10, .hdr10Plus, .hlg, .dolbyVision] {
             #expect(AetherEngine.playGateGrace(
-                criteriaUnchanged: false, engineIsCriteriaWriter: true,
+                criteriaUnchanged: false, criteriaWrittenBeforeLoad: true,
                 formatKnown: true, effectiveFormat: format) == .brief)
         }
     }
@@ -38,7 +38,7 @@ struct DisplayCriteriaPlayGateTests {
     func suppressedHostHDRIsFull() {
         for format: VideoFormat in [.hdr10, .hdr10Plus, .hlg, .dolbyVision] {
             #expect(AetherEngine.playGateGrace(
-                criteriaUnchanged: false, engineIsCriteriaWriter: false,
+                criteriaUnchanged: false, criteriaWrittenBeforeLoad: false,
                 formatKnown: true, effectiveFormat: format) == .full)
         }
     }
@@ -46,7 +46,7 @@ struct DisplayCriteriaPlayGateTests {
     @Test("Sole-writer host with SDR content takes the brief budget: only a rate-only write can still arrive")
     func suppressedHostSDRIsBrief() {
         #expect(AetherEngine.playGateGrace(
-            criteriaUnchanged: false, engineIsCriteriaWriter: false,
+            criteriaUnchanged: false, criteriaWrittenBeforeLoad: false,
             formatKnown: true, effectiveFormat: .sdr) == .brief)
     }
 
@@ -54,7 +54,7 @@ struct DisplayCriteriaPlayGateTests {
     func suppressedHostUnknownFormatIsFull() {
         // effectiveFormat defaults to .sdr on a failed probe, so the format alone must not decide here.
         #expect(AetherEngine.playGateGrace(
-            criteriaUnchanged: false, engineIsCriteriaWriter: false,
+            criteriaUnchanged: false, criteriaWrittenBeforeLoad: false,
             formatKnown: false, effectiveFormat: .sdr) == .full)
     }
 
@@ -63,7 +63,7 @@ struct DisplayCriteriaPlayGateTests {
         for format: VideoFormat in [.sdr, .hdr10, .dolbyVision] {
             for known in [true, false] {
                 #expect(AetherEngine.playGateGrace(
-                    criteriaUnchanged: false, engineIsCriteriaWriter: false,
+                    criteriaUnchanged: false, criteriaWrittenBeforeLoad: false,
                     formatKnown: known, effectiveFormat: format, noWriterExpected: true) == .skip)
             }
         }
@@ -97,7 +97,7 @@ struct DisplayCriteriaPlayGateTests {
     func soleWriterHDRStillWaitsWhenMatchingIsOn() {
         // playGateGrace hands this path .full; with matching on it must still be waited out (#274).
         let grace = AetherEngine.playGateGrace(
-            criteriaUnchanged: false, engineIsCriteriaWriter: false,
+            criteriaUnchanged: false, criteriaWrittenBeforeLoad: false,
             formatKnown: true, effectiveFormat: .dolbyVision)
         #expect(grace == .full)
         #expect(DisplayCriteriaController.shouldWait(startGrace: grace, matchingEnabled: true))

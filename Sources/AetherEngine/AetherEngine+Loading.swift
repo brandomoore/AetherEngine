@@ -719,12 +719,12 @@ extension AetherEngine {
     /// bypass. The loopback path applies criteria before item load from its libav probe; this path has no
     /// probe, so it applies late, once AVPlayer's parsed video-track format resolves the range. Without the
     /// panel switch a bare AVPlayerLayer presents no HDR video (audio-only, black; the reporter's symptom).
-    /// SDR needs no switch, and a sole-writer host (`suppressDisplayCriteria`) is left untouched. No-op off
+    /// SDR needs no switch, and criteria owned by AVKit or the host are left untouched (AE#842). No-op off
     /// tvOS (apply() returns .applied there) and where Match Content is off (apply() skips the write).
     @MainActor
     private func applyRemoteHLSDisplayCriteria(format: VideoFormat, options: LoadOptions) {
         guard RemoteHLSFormatDetection.shouldApplyDisplayCriteria(
-            format: format, suppressDisplayCriteria: options.suppressDisplayCriteria) else { return }
+            format: format, engineWritesCriteria: options.engineWritesDisplayCriteria) else { return }
         _ = displayCriteria.apply(
             format: format,
             frameRate: nativeHost?.detectedVideoFrameRate,
@@ -2617,7 +2617,7 @@ extension AetherEngine {
                 // #339: the only write this reload can still produce is a sole-writer host's re-write on the
                 // swapped item, which happens inside loadNative. Arm before it, or the gate below is again
                 // reading a flag for a switch whose notifications it was not registered for.
-                if loadedOptions.suppressDisplayCriteria { displayCriteria.armSwitchObservation() }
+                if !loadedOptions.engineWritesDisplayCriteria { displayCriteria.armSwitchObservation() }
                 let reloadRoutingPanelHDR = Self.reloadRoutesAsHDRPanel(
                     hostAsserts: loadedOptions.panelIsInHDRMode,
                     criteriaReadoutAtLoad: sessionPanelHDRReadout,
@@ -2693,7 +2693,7 @@ extension AetherEngine {
                 await displayCriteria.waitForSwitch(
                     startGrace: Self.playGateGrace(
                         criteriaUnchanged: false,
-                        engineIsCriteriaWriter: !loadedOptions.suppressDisplayCriteria,
+                        criteriaWrittenBeforeLoad: !loadedOptions.awaitsInboundCriteriaWrite,
                         formatKnown: true,
                         effectiveFormat: videoFormat,
                         noWriterExpected: loadedOptions.sharedOutputRole == .secondary

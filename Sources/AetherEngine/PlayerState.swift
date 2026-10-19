@@ -414,8 +414,14 @@ public enum DolbyVisionHandling: String, Sendable, Equatable, CaseIterable {
 public struct LoadOptions: Sendable, Equatable {
     /// Diagnostic lever: omit BT.2020 / transfer / YCbCr matrix from AVDisplayCriteria so AVPlayer re-reads color from the bitstream. Default off.
     public var omitCriteriaColorExtensions: Bool
-    /// Skip display-criteria handshake entirely. For previews and `aetherctl` where no panel exists. Default off.
+    /// The engine writes no display criteria because AVKit does: `true` is `DisplayCriteriaOwner.avKit`, and the
+    /// engine holds play() up to a second for AVKit's write on HDR and Dolby Vision content. Also the setting for
+    /// previews and `aetherctl`, where no panel exists. A host that keeps the panel in its system format, or
+    /// writes criteria itself, wants `displayCriteriaOwner = .host` instead. Default off.
     public var suppressDisplayCriteria: Bool
+    /// Who writes `preferredDisplayCriteria` for this load (AE#842). `.engine` (default) defers to
+    /// `suppressDisplayCriteria`; `.avKit` and `.host` win over it. See `DisplayCriteriaOwner`.
+    public var displayCriteriaOwner: DisplayCriteriaOwner = .engine
     /// Extra HTTP headers for HEAD probe, Range chunks, side-demuxer fetches. On the loopback paths they are NOT forwarded to AVPlayer (it hits the local server); on `nativeRemoteHLS` they ride into the AVURLAsset so header-enforcing origins (IPTV Referer / User-Agent / Authorization) work (#119). Forwarded to `selectSidecarSubtitle` by default; pass explicit headers to override (#32). Default empty.
     public var httpHeaders: [String: String]
 
@@ -743,7 +749,7 @@ public struct LoadOptions: Sendable, Equatable {
     /// this runs the same bounded decode pass as `AetherEngine.probeDetectingAtmos` (see `AtmosDetectionOptions`
     /// for the caps) on a second handle to the source, once per E-AC-3 track, and republishes `audioTracks` as
     /// tracks confirm. It starts only after the session is up and runs at utility priority, so it never delays
-    /// the first frame. Skipped for live sources and for forward-only custom readers, which cannot be re-read.
+    /// the first frame. Skipped for live sources, for forward-only custom readers, which cannot be re-read, and where a second request would cost the video path its link: an origin limited to one request (`maxConcurrentSourceRequests == 1`, or a limit the engine learned from 429/503/509 refusals, re-checked before every track), `sequentialOrigin` and `heldSourceConnection`. One `[AtmosConfirmation]` log line names the reason, or how far a stopped pass got.
     /// Default `false` (#214 follow-up).
     public var confirmAtmos: Bool = false
 
@@ -984,6 +990,7 @@ public struct LoadOptions: Sendable, Equatable {
     public init(
         omitCriteriaColorExtensions: Bool = false,
         suppressDisplayCriteria: Bool = false,
+        displayCriteriaOwner: DisplayCriteriaOwner = .engine,
         httpHeaders: [String: String] = [:],
         keepDvh1TagWithoutDV: Bool = false,
         forceDolbyVisionOnNonDVDisplay: Bool = false,
@@ -1038,6 +1045,7 @@ public struct LoadOptions: Sendable, Equatable {
     ) {
         self.omitCriteriaColorExtensions = omitCriteriaColorExtensions
         self.suppressDisplayCriteria = suppressDisplayCriteria
+        self.displayCriteriaOwner = displayCriteriaOwner
         self.httpHeaders = httpHeaders
         self.keepDvh1TagWithoutDV = keepDvh1TagWithoutDV
         self.forceDolbyVisionOnNonDVDisplay = forceDolbyVisionOnNonDVDisplay

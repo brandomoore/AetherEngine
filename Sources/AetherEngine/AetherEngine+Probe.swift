@@ -545,15 +545,15 @@ extension AetherEngine {
     enum LoadDisplayCriteriaAction {
         /// Engine-writer video path: apply() overwrites the preserved criteria in place, single handshake.
         case applyFresh
-        /// No engine apply() this session (audio-only, or an AVKit-sole-writer host): clear a criteria a
+        /// No engine apply() this session (audio-only, or criteria owned by AVKit or the host): clear a criteria a
         /// previous session left applied, so it can't keep the panel in DV/HDR under music playback or
         /// fight AVKit's own write. `DisplayCriteriaController.reset()` stays didApply-gated, so this is
         /// a no-op for hosts that never route criteria through the engine.
         case clearStale
     }
 
-    nonisolated static func loadDisplayCriteriaAction(suppressDisplayCriteria: Bool, audioOnlyPath: Bool) -> LoadDisplayCriteriaAction {
-        (suppressDisplayCriteria || audioOnlyPath) ? .clearStale : .applyFresh
+    nonisolated static func loadDisplayCriteriaAction(engineWritesCriteria: Bool, audioOnlyPath: Bool) -> LoadDisplayCriteriaAction {
+        (!engineWritesCriteria || audioOnlyPath) ? .clearStale : .applyFresh
     }
 
     /// #274: how long the post-load play-gate blind-polls for a panel switch to start.
@@ -571,6 +571,9 @@ extension AetherEngine {
     ///   rate-only, and the engine already declines to gate its own rate-only writes (`apply()` returns
     ///   `.applied` with no pre-flight wait) because those switches are sub-second.
     ///
+    /// AE#842: a host-owned session counts as written-before-load too. The host wrote its criteria (or none)
+    /// before calling `load()`, so like the engine's own write there is nothing inbound to blind-poll for.
+    ///
     /// `formatKnown` is false when the open-time probe failed: the real range is then unknown and a DV write
     /// may still be inbound, so a suppressed host keeps the full budget.
     ///
@@ -578,14 +581,14 @@ extension AetherEngine {
     /// no inbound switch to wait for.
     nonisolated static func playGateGrace(
         criteriaUnchanged: Bool,
-        engineIsCriteriaWriter: Bool,
+        criteriaWrittenBeforeLoad: Bool,
         formatKnown: Bool,
         effectiveFormat: VideoFormat,
         noWriterExpected: Bool = false
     ) -> DisplayCriteriaController.StartGrace {
         // #133: the criteria were already active, nothing was written, nothing can settle.
         if criteriaUnchanged || noWriterExpected { return .skip }
-        if engineIsCriteriaWriter { return .brief }
+        if criteriaWrittenBeforeLoad { return .brief }
         guard formatKnown else { return .full }
         return effectiveFormat == .sdr ? .brief : .full
     }
@@ -595,6 +598,7 @@ extension AetherEngine {
         guard options.sharedOutputRole == .secondary else { return options }
         var adjusted = options
         adjusted.suppressDisplayCriteria = true
+        adjusted.displayCriteriaOwner = .engine
         return adjusted
     }
 
@@ -665,9 +669,15 @@ extension AetherEngine {
         // another dub, not another format of this one.
         guard prefersObjectAudio,
               let fallback = tracks.first(where: { $0.id == Int(defaultIndex) }),
-              !isRenderableObjectAudio(fallback),
-              let language = fallback.language
+              !isRenderableObjectAudio(fallback)
         else { return nil }
+        // With no track tagged at all (`und`, empty, none) there is nothing to tell dubs apart by, and
+        // demo discs like Dolby's Unfold tag nothing and list the E-AC-3 JOC as the probe's best stream.
+        // One tagged track is enough to show the file names its dubs, so the default then stays.
+        guard let language = fallback.language, LanguageTag(language) != nil else {
+            guard tracks.allSatisfy({ LanguageTag($0.language) == nil }) else { return nil }
+            return tracks.first(where: isRenderableObjectAudio).map { Int32($0.id) }
+        }
         let candidates = tracks.compactMap { track -> (track: TrackInfo, rank: Int)? in
             guard isRenderableObjectAudio(track),
                   let rank = languageMatchRank(track.language, language, kind: .audio),

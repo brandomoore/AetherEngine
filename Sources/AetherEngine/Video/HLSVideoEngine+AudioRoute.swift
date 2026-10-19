@@ -21,6 +21,12 @@ extension HLSVideoEngine {
         /// that only share a container, and the routing log prints this name, so an operator reading
         /// `codec=nellymoser` learns what the file carries. None is fMP4-legal, so all three bridge.
         case nellymoser, adpcmSwf, speex
+        /// Every RealAudio an `.rm` / `.rmvb` carries (Cook, ATRAC3, Sipro, RealAudio Lossless and the
+        /// 14.4 / 28.8 speech codecs), which arrive with the RealMedia support of FFmpegBuild 3.8.0. One
+        /// family like `wma`: they share a container and nothing downstream tells them apart.
+        case realAudio
+        /// AMR narrowband and wideband, the speech audio of a feature phone's 3GP (FFmpegBuild 3.8.0).
+        case amr
         /// What this case costs is the STREAM-COPY decision, not the audio. Since the bridge cascade
         /// was rewired (2026-05-13) it asks libavcodec for a decoder by id and never consults this
         /// table, so a codec that lands here still plays if the build carries its decoder; measured
@@ -52,6 +58,14 @@ extension HLSVideoEngine {
             case AV_CODEC_ID_NELLYMOSER: return .nellymoser
             case AV_CODEC_ID_ADPCM_SWF:  return .adpcmSwf
             case AV_CODEC_ID_SPEEX:      return .speex
+            case AV_CODEC_ID_COOK,
+                 AV_CODEC_ID_ATRAC3,
+                 AV_CODEC_ID_SIPR,
+                 AV_CODEC_ID_RALF,
+                 AV_CODEC_ID_RA_144,
+                 AV_CODEC_ID_RA_288:
+                return .realAudio
+            case AV_CODEC_ID_AMR_NB, AV_CODEC_ID_AMR_WB: return .amr
             // G.711 A-law / mu-law sit here rather than in a case of their own: libavcodec spells
             // them pcm_alaw / pcm_mulaw, they decode to the same S16 the raw shapes do, and nothing
             // downstream of the bridge tells them apart. FLV is where they turn up.
@@ -62,7 +76,8 @@ extension HLSVideoEngine {
                  AV_CODEC_ID_PCM_S32LE,
                  AV_CODEC_ID_PCM_U8,
                  AV_CODEC_ID_PCM_ALAW,
-                 AV_CODEC_ID_PCM_MULAW:
+                 AV_CODEC_ID_PCM_MULAW,
+                 AV_CODEC_ID_PCM_DVD:
                 return .pcm
             default: return .unsupported
             }
@@ -77,7 +92,7 @@ extension HLSVideoEngine {
             case .flac:   return "fLaC"
             case .alac:   return "alac"
             case .mp3, .opus, .truehd, .dts, .vorbis, .pcm, .mp2, .aacLatm, .wma,
-                 .nellymoser, .adpcmSwf, .speex, .unsupported:
+                 .nellymoser, .adpcmSwf, .speex, .realAudio, .amr, .unsupported:
                 // mp3: theoretically mp4a.40.34, but AVPlayer treats any mp4a as AAC and fails; bridge to FLAC.
                 return ""
             }
@@ -87,7 +102,7 @@ extension HLSVideoEngine {
         var requiresBridge: Bool {
             switch self {
             case .opus, .mp3, .truehd, .dts, .vorbis, .pcm, .mp2, .aacLatm, .wma,
-                 .nellymoser, .adpcmSwf, .speex: return true
+                 .nellymoser, .adpcmSwf, .speex, .realAudio, .amr: return true
             default: return false
             }
         }

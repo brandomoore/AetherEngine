@@ -191,6 +191,42 @@ struct IFrameRenditionTests {
         #expect(rec.reads == [1000])
     }
 
+    @Test("a preview keyframe is the entry's own payload, read once, and never a neighbour's")
+    func previewKeyframeNoStandIn() {
+        let rec = Recorder()
+        rec.failing = [3000]
+        let (r, dir) = make(rec); defer { r.shutdown(); try? FileManager.default.removeItem(at: dir) }
+        #expect(r.keyframePayload(at: 2) == Data("key2000".utf8))
+        #expect(r.keyframePayload(at: 2) == Data("key2000".utf8))
+        #expect(r.keyframePayload(at: 3) == nil)
+        #expect(rec.reads == [2000, 3000])
+    }
+
+    @Test("a stale preview request reads nothing but still answers from the cache")
+    func previewKeyframeStale() {
+        let rec = Recorder()
+        let (r, dir) = make(rec); defer { r.shutdown(); try? FileManager.default.removeItem(at: dir) }
+        #expect(r.keyframePayload(at: 1) == Data("key1000".utf8))
+        #expect(r.keyframePayload(at: 4, isStale: { true }) == nil)
+        #expect(r.keyframePayload(at: 1, isStale: { true }) == Data("key1000".utf8))
+        #expect(rec.reads == [1000])
+    }
+
+    @Test("preview keyframes respect held source reads, the link wait and shutdown")
+    func previewKeyframeGates() {
+        let rec = Recorder()
+        let (r, dir) = make(rec); defer { try? FileManager.default.removeItem(at: dir) }
+        rec.readsAllowed = false
+        #expect(r.keyframePayload(at: 0) == nil)
+        #expect(rec.reads.isEmpty)
+        rec.readsAllowed = true
+        #expect(r.keyframePayload(at: 0) != nil)
+        #expect(rec.waits == 1)
+        r.shutdown()
+        #expect(r.keyframePayload(at: 0) == nil)
+        #expect(r.keyframePayload(at: 7) == nil)
+    }
+
     @Test("the failure line is written once per window and counts what it swallowed")
     func logThrottle() {
         var throttle = IFrameLogThrottle()

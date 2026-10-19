@@ -126,6 +126,68 @@ extension HLSVideoEngine {
     }
     #endif
 
+    /// Packets `resolveUnlabelledTrueHDAtmos` may look at. Sized for a track that starts well after the
+    /// probe window: 22 s of a 4K remux interleaved with a second audio track is about 3,000 packets.
+    static let trueHDVerdictPacketBudget = 8192
+    /// Bytes it may hold. Peeked packets stay resident until the producer reads them, so this is the
+    /// worst-case extra memory of a session start; it is paid only by a TrueHD track whose profile the
+    /// probe could not read, and the measured case (TrueHD from 22 s, 45.8 MB in) fits.
+    static let trueHDVerdictByteBudget = 64 << 20
+
+    /// A TrueHD track the probe never decoded a frame of keeps `AV_PROFILE_UNKNOWN`, which reads as
+    /// "not Atmos" everywhere below. When object rendering is wanted, look at the track's own major
+    /// sync where the first producer starts, and mark the stream Atmos if it is. Peeks without
+    /// consuming (the producer reads the same packets) and leaves the demuxer at the producer start.
+    func resolveUnlabelledTrueHDAtmos(
+        audioStream: UnsafeMutablePointer<AVStream>,
+        audioDemuxer: Demuxer,
+        streamIndex: Int32
+    ) {
+        let par = audioStream.pointee.codecpar.pointee
+        guard par.codec_id == AV_CODEC_ID_TRUEHD, par.profile == AV_PROFILE_UNKNOWN,
+              objectAudioRendering.layout != nil, ObjectAudioSource.trueHDAtmos.isBuiltIn,
+              !isLiveSession
+        else { return }
+        if audioDemuxer === demuxer {
+            seekToInitialProducerStart(audioDemuxer)
+            demuxerAtInitialProducerStart = true
+        }
+        let started = DispatchTime.now()
+        var verdict: Bool?
+        var heldBytes = 0
+        var packets = 0
+        try? audioDemuxer.peekPackets(maxPackets: Self.trueHDVerdictPacketBudget) { packet in
+            packets += 1
+            heldBytes += Int(max(packet.pointee.size, 0))
+            if heldBytes > Self.trueHDVerdictByteBudget { return true }
+            guard packet.pointee.stream_index == streamIndex,
+                  let data = packet.pointee.data, packet.pointee.size > 0 else { return false }
+            verdict = TrueHDMajorSync.isAtmos(UnsafeRawBufferPointer(start: data, count: Int(packet.pointee.size)))
+            return verdict != nil
+        }
+        let ms = Double(DispatchTime.now().uptimeNanoseconds - started.uptimeNanoseconds) / 1e6
+        let span = "\(packets) packets, \(heldBytes >> 10) KiB, \(String(format: "%.0f", ms)) ms"
+        switch verdict {
+        case true?:
+            audioStream.pointee.codecpar.pointee.profile = AV_PROFILE_TRUEHD_ATMOS
+            EngineLog.emit(
+                "[HLSVideoEngine] TrueHD profile was not probed; major sync says Atmos (\(span))",
+                category: .session
+            )
+        case false?:
+            EngineLog.emit(
+                "[HLSVideoEngine] TrueHD profile was not probed; major sync says no Atmos (\(span))",
+                category: .session
+            )
+        case nil:
+            EngineLog.emit(
+                "[HLSVideoEngine] TrueHD profile was not probed and no major sync within the budget (\(span)); "
+                + "treating it as without Atmos",
+                category: .session
+            )
+        }
+    }
+
     /// Build the producer on a `SpatialAudioBridge` when the host asked for object rendering and the
     /// source qualifies. Nil means "not this route": ineligible, unsupported OS, not DTS:X, or a
     /// bridge/header failure, each logged, and the caller carries on with the ordinary bridge

@@ -130,6 +130,25 @@ struct AudioLanguageSelectionTests {
                                               prefersObjectAudio: true) == 2)
     }
 
+    @Test("with rendering on and no track tagged, TrueHD Atmos replaces the default; any tag keeps it",
+          .enabled(if: AetherEngine.linksTrueHDObjectDecoder))
+    func untaggedTrueHDAtmosReplacesUntaggedDefault() {
+        // Dolby's Unfold demo: every track `und`, the probe's best stream the E-AC-3 JOC at index 3.
+        let unfold = [audio(1, "und", codec: "truehd", atmos: true), audio(2, "und", codec: "ac3"),
+                      audio(3, nil, codec: "eac3")]
+        #expect(AetherEngine.selectAudioIndex(tracks: unfold, override: nil, preferredLanguages: ["de"],
+                                              prefersObjectAudio: true, defaultIndex: 3) == 1)
+        #expect(AetherEngine.selectAudioIndex(tracks: unfold, override: nil, preferredLanguages: ["de"],
+                                              defaultIndex: 3) == nil, "rendering off keeps the default")
+        let tagged = [audio(1, "eng", codec: "truehd", atmos: true), audio(2, nil, codec: "eac3")]
+        #expect(AetherEngine.selectAudioIndex(tracks: tagged, override: nil, preferredLanguages: [],
+                                              prefersObjectAudio: true, defaultIndex: 2) == nil)
+        let commentaryOnly = [audio(1, nil, codec: "eac3"),
+                              audio(2, nil, codec: "truehd", atmos: true, commentary: true)]
+        #expect(AetherEngine.selectAudioIndex(tracks: commentaryOnly, override: nil, preferredLanguages: [],
+                                              prefersObjectAudio: true, defaultIndex: 1) == nil)
+    }
+
     @Test("it never crosses a language, and an override still wins",
           .enabled(if: AetherEngine.linksTrueHDObjectDecoder))
     func neverAcrossLanguage() {
@@ -149,10 +168,11 @@ struct AudioLanguageSelectionTests {
                                               prefersObjectAudio: true, defaultIndex: 1) == 3)
         #expect(AetherEngine.selectAudioIndex(tracks: tracks, override: nil, preferredLanguages: [],
                                               prefersObjectAudio: false, defaultIndex: 1) == nil)
-        let untagged = [audio(1, nil, codec: "dts"), audio(2, nil, codec: "truehd", atmos: true)]
-        #expect(AetherEngine.selectAudioIndex(tracks: untagged, override: nil, preferredLanguages: [],
+        let partlyTagged = [audio(1, nil, codec: "dts"), audio(2, nil, codec: "truehd", atmos: true),
+                            audio(3, "ger", codec: "ac3")]
+        #expect(AetherEngine.selectAudioIndex(tracks: partlyTagged, override: nil, preferredLanguages: [],
                                               prefersObjectAudio: true, defaultIndex: 1) == nil,
-                "no language to compare, so the default stays")
+                "the file tags its dubs, so an untagged default is not compared by guess")
     }
 
     @Test("a commentary in TrueHD Atmos does not displace the film",

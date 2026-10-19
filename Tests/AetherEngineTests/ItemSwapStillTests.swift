@@ -392,13 +392,14 @@ struct ItemSwapStillTests {
         #expect(view.isHoldingStill)
     }
     #else
-    /// Without the reshaping a Profile 5 picture cannot be made from the segment, so where the hold
-    /// would need it (the output presents Dolby Vision) it is skipped with its reason rather than
-    /// showing the planes read as YCbCr. Where AVPlayer presents the source as HDR10 (a Mac without a
-    /// Dolby Vision display), the output's own picture is correct and is held as before.
-    @Test("without the reshaping trait a Profile 5 title never holds a reshaped still",
+    /// Without the reshaping a Profile 5 picture cannot be made into a still, so where the hold needs
+    /// one (the output presents Dolby Vision) the engine plays the frame out of the resident segment
+    /// through a player of the surface's own, and the system compositor colours it. Where AVPlayer
+    /// presents the source as HDR10 (a Mac without a Dolby Vision display), the output's own picture
+    /// is correct and is held as before.
+    @Test("without the reshaping trait a Profile 5 title holds its frame through the compositor",
           .enabled(if: FileManager.default.fileExists(atPath: ItemSwapStillTests.profile5URL.path)))
-    func profile5WithoutReshapingHoldsNothingReshaped() async throws {
+    func profile5WithoutReshapingHoldsThroughCompositor() async throws {
         let engine = try AetherEngine()
         defer { engine.stop() }
         let view = AetherPlayerView(frame: CGRect(x: 0, y: 0, width: 320, height: 180))
@@ -406,14 +407,18 @@ struct ItemSwapStillTests {
         _ = try await engine.load(url: Self.profile5URL)
         let host = try #require(engine.nativeHost)
         try await waitFor { host.isVideoReadyForDisplay }
+        try await Task.sleep(for: .seconds(1))
         engine.pause()
-        // No scrub still either, and the capability says so up front so a host hides the preview.
+        // No scrub still either; the compositor preview stands in, and the capabilities say so up front.
         #expect(!engine.supportsCacheBackedStills)
+        #expect(engine.scrubPreviewDrawsInView)
         #expect(await engine.scrubThumbnail(atSeconds: 0.5, maxWidth: 160) == nil)
+        let started = ContinuousClock.now
         await engine.holdPictureAcrossItemSwap()
+        #expect(ContinuousClock.now - started < .seconds(AetherEngine.heldPictureDolbyVisionBudgetSeconds + 0.5))
         if AetherEngine.heldPictureNeedsReshaping(videoFormat: engine.videoFormat, dolbyVisionProfile: engine.sourceDVProfile) {
-            #expect(engine.heldPictureLastSkip == "Dolby Vision still reshaping not built in")
-            #expect(!view.isHoldingStill)
+            #expect(engine.heldPictureLastRoute == "Dolby Vision compositor")
+            #expect(view.isHoldingStill)
         } else {
             #expect(engine.heldPictureLastRoute == "native output")
         }

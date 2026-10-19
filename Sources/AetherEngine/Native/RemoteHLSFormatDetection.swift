@@ -34,10 +34,10 @@ enum RemoteHLSFormatDetection {
 
     /// Whether the nativeRemoteHLS bypass should program `preferredDisplayCriteria` for a detected format.
     /// Only an HDR range needs the panel switch that lets AVPlayer present HDR at all; SDR is presented in
-    /// any panel mode, and a sole-writer host (`suppressDisplayCriteria`) is left untouched so the engine
-    /// and the host never fight over the criteria. Pure so it is unit-testable.
-    static func shouldApplyDisplayCriteria(format: VideoFormat, suppressDisplayCriteria: Bool) -> Bool {
-        format != .sdr && !suppressDisplayCriteria
+    /// any panel mode, and criteria owned by AVKit or the host are left untouched so the engine and the
+    /// other writer never fight over them. Pure so it is unit-testable.
+    static func shouldApplyDisplayCriteria(format: VideoFormat, engineWritesCriteria: Bool) -> Bool {
+        format != .sdr && engineWritesCriteria
     }
 
     /// Video sample types the bypass can name, mapped to the libavcodec spelling the probe path publishes.

@@ -412,7 +412,7 @@ Sources/AetherEngine/
 ├── SubtitleSessionCarryover.swift           Subtitle session state carried across an engine-initiated `reloadAtCurrentPosition` (AirPlay LAN swap, background-return reopen), which otherwise rebuilds the session from `LoadOptions` alone (#170)
 ├── BackgroundTeardownSelection.swift        The session selection a teardown hands to the reload that follows it, for the one case where teardown and reload are not the same call: the paused-background teardown (#127, #357)
 ├── Audio/
-│   ├── AtmosConfirmationWorker.swift        LoadOptions.confirmAtmos: runs the bounded JOC pass on a side demuxer after the session is up, one E-AC-3 track at a time, and republishes audioTracks via a source-keyed ledger (#214)
+│   ├── AtmosConfirmationWorker.swift        LoadOptions.confirmAtmos: runs the bounded JOC pass on a side demuxer after the session is up, one E-AC-3 track at a time, and republishes audioTracks via a source-keyed ledger (#214); declined on an origin limited to one request, sequentialOrigin and heldSourceConnection, re-checked per track
 │   ├── AtmosDetectionProbe.swift            Opt-in bounded E-AC-3 JOC decode pass behind probeDetectingAtmos: AtmosDetectionOptions caps, one decoder, no playback session (#214)
 │   ├── AudioAVPlayerHost.swift              Audio-only path: bare AVPlayer host for whitelisted codecs, owns the persistent per-player MPNowPlayingSession (tvOS / iOS); publishes the rebuffer axis (`waitingToPlayAtSpecifiedRate` / `AVPlayerItemPlaybackStalled` after first play) that the engine folds into `isBuffering`
 │   ├── AACSampleTimeline.swift              Bounded MP4 audio-index check for accumulating AAC sample-clock drift; opts affected VOD tracks into timestamp-aware resampling

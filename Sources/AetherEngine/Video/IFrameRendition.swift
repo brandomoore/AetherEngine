@@ -88,30 +88,47 @@ final class IFrameRendition: IFrameSegmentSource, @unchecked Sendable {
         }
     }
 
+    /// The keyframe that opens segment `index`, from the cache or the side reader, and never a
+    /// neighbour's in its place: a scrub preview names the span it shows, so a stand-in would put
+    /// the wrong picture over the right time. `isStale` is asked before the source is touched, so a
+    /// queue of superseded requests costs no reads.
+    func keyframePayload(at index: Int, isStale: () -> Bool = { false }) -> Data? {
+        queue.sync {
+            guard !shutDown, entries.indices.contains(index) else { return nil }
+            if let cached = cache.payload(for: index) { return cached }
+            guard !isStale() else { return nil }
+            return readLocked(at: index)
+        }
+    }
+
+    /// Reads and caches one keyframe. nil when the origin has no room for it, teardown interrupted
+    /// it, or the read failed.
+    private func readLocked(at index: Int) -> Data? {
+        // An origin that went serial or started metering mid-session has one slot and a few
+        // tokens, and the pump needs them; AVKit's overview burst would take them all.
+        guard sourceReadsAllowed() else { return nil }
+        waitForLink { self.shutDown }
+        guard !shutDown else { return nil }
+        let started = DispatchTime.now()
+        let read = readPayload(entries[index])
+        // A read that teardown aborted is not a miss to paper over.
+        guard !shutDown, let read else { return nil }
+        let ms = Double(DispatchTime.now().uptimeNanoseconds - started.uptimeNanoseconds) / 1_000_000
+        EngineLog.emit("[IFrameRendition] read idx=\(index) bytes=\(read.count) "
+                       + "ms=\(String(format: "%.0f", ms))", category: .session, level: .verbose)
+        cache.store(read, for: index)
+        return read
+    }
+
     private func buildLocked(at index: Int) -> Data? {
         guard entries.indices.contains(index) else { return nil }
         let entry = entries[index]
         var payload = cache.payload(for: index)
         if payload == nil {
-            // An origin that went serial or started metering mid-session has one slot and a few
-            // tokens, and the pump needs them; AVKit's overview burst would take them all.
-            var read: Data?
-            if sourceReadsAllowed() {
-                waitForLink { self.shutDown }
-                guard !shutDown else { return nil }
-                let started = DispatchTime.now()
-                read = readPayload(entry)
-                // A read that teardown aborted is not a miss to paper over.
-                guard !shutDown else { return nil }
-                if let read {
-                    let ms = Double(DispatchTime.now().uptimeNanoseconds - started.uptimeNanoseconds) / 1_000_000
-                    EngineLog.emit("[IFrameRendition] read idx=\(index) bytes=\(read.count) "
-                                   + "ms=\(String(format: "%.0f", ms))", category: .session, level: .verbose)
-                }
-            }
-            if let read {
-                cache.store(read, for: index)
+            if let read = readLocked(at: index) {
                 payload = read
+            } else if shutDown {
+                return nil
             } else if let neighbour = cache.nearestIndex(to: index),
                       let substitute = cache.payload(for: neighbour) {
                 // AVKit keeps the last good picture for a keyframe it cannot fetch, and rate trick

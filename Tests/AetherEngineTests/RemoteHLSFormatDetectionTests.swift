@@ -88,19 +88,19 @@ struct RemoteHLSFormatDetectionTests {
     ])
     func hdrAppliesCriteria(_ format: VideoFormat) {
         #expect(RemoteHLSFormatDetection.shouldApplyDisplayCriteria(
-            format: format, suppressDisplayCriteria: false))
+            format: format, engineWritesCriteria: true))
     }
 
     @Test("SDR never warrants a panel switch")
     func sdrSkipsCriteria() {
         #expect(!RemoteHLSFormatDetection.shouldApplyDisplayCriteria(
-            format: .sdr, suppressDisplayCriteria: false))
+            format: .sdr, engineWritesCriteria: true))
     }
 
     @Test("A sole-writer host suppresses the switch even for HDR")
     func suppressedSkipsCriteria() {
         #expect(!RemoteHLSFormatDetection.shouldApplyDisplayCriteria(
-            format: .hdr10, suppressDisplayCriteria: true))
+            format: .hdr10, engineWritesCriteria: false))
     }
 
     // MARK: - codecName

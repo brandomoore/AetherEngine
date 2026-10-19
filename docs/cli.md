@@ -15,6 +15,7 @@ swift run aetherctl dvsurvey <url>       # survey per-frame Dolby Vision L1 / L2
 swift run aetherctl pktdump <url>        # dump raw demuxer packet timing (dts/pts/keyframe) per open profile
 swift run aetherctl dualsubs <file> ...  # dual subtitle-track render probe (--primary / --secondary stream index)
 swift run aetherctl extract <url>        # FrameExtractor still-image extraction + leak testing
+swift run aetherctl scrubpreview <url>   # Dolby Vision Profile 5 / 10.0 compositor scrub previews, resident and from the source
 swift run aetherctl audio [--seconds N] <url>   # audio-only pipeline smoke test (default 10 s)
 swift run aetherctl audiotap <url>       # decode the PCM audio tap headless, write mono 48 kHz WAV (#95)
 swift run aetherctl bgaudio <url>        # SW-path background-audio keepalive probe (iOS background behavior)
@@ -29,7 +30,7 @@ swift run aetherctl smbtest <smb-url>    # play a file off an SMB2/3 share via t
 swift run aetherctl <url>                # alias for serve (backwards compat)
 ```
 
-Twenty-three subcommands plus the bare-URL `serve` alias.
+Twenty-four subcommands plus the bare-URL `serve` alias.
 
 ## probe
 
@@ -519,6 +520,14 @@ swift run aetherctl pktdump --at 660 --count 300 --profile stillExtraction <url>
 `--profile` defaults to `playback`; `stillExtraction` is the third open profile, the one the `FrameExtractor` uses (a short-range AVIO with its own thread count), for comparing what a still-extraction open resolves against what playback resolves.
 
 The profile differential is the diagnostic: a `video_delay=0` plus NOPTS or non-monotonic dts under one profile while the other is clean means that profile's open path cannot reconstruct decode-order dts for B-frame content (the #93 post-recovery judder root cause). Backed by the public `PacketTimingProbe.run(url:seekSeconds:packetCount:profileName:)`.
+
+## scrubpreview
+
+Loads a Dolby Vision Profile 5 / 10.0 source on the native path, plays it for `--warm S` seconds (default 4), then asks `showScrubPreview(atSeconds:in:)` for each position in `--at s1,s2,...` and prints whether a picture came, how long it took, the span it stands for, and whether the position was resident. A position inside the resident window is cut from the segment cache, one outside it is read off the source as the keyframe that opens its plan segment, so `--throttle-kbps N` (which keeps the producer close to the playhead) is how one run covers both. `--keep DIR` copies the session's preview files out before teardown: `seg<N>-*.mp4` came from the cache, `plan<N>-*.mp4` from the source, and comparing them with `ffprobe -show_data_hash` against the source's own keyframes is the byte-for-byte check. Exit codes: `0` every position showed a picture, `1` load failed or the source does not draw its previews in a view, `2` at least one position showed none.
+
+```bash
+swift run aetherctl scrubpreview --throttle-kbps 20000 --at 2,30,50,65 --keep /tmp/previews <p5-source>
+```
 
 ## extract
 
