@@ -23,8 +23,8 @@ extension HLSVideoEngine {
     enum ObjectAudioSource: Equatable {
         /// TrueHD that FFmpeg marked Atmos.
         case trueHDAtmos
-        /// Lossless DTS-HD Master Audio, which may carry DTS:X whatever FFmpeg's label says, so
-        /// LibDTSX decides on its first frames (see `dtsxVerdict`).
+        /// Lossless DTS-HD Master Audio, which may carry DTS:X whatever the probe's label says, so its
+        /// first decoded frame decides (see `dtsxVerdict`).
         case dtsHDMasterAudio
 
         /// How the log and the pipeline description name it.
@@ -95,16 +95,17 @@ extension HLSVideoEngine {
     }
 
     #if DTSXObjectAudio
-    /// Packets of the source's head `dtsxVerdict` may look at. LibDTSX needs three frames of the
-    /// track, which a muxed file interleaves within the first few dozen packets; the same budget as
-    /// the planner's head scans bounds a file whose audio starts late.
+    /// Packets of the source's head `dtsxVerdict` may look at. A DTS:X track renders on its first
+    /// frame, which the decoder's parser hands over once the second starts, and is refused after
+    /// eight frames without heights; a muxed file interleaves those within the first few dozen
+    /// packets. The same budget as the planner's head scans bounds a file whose audio starts late.
     static let dtsxVerdictPacketBudget = 512
     /// Bytes the peek may hold. Unlike the planner's scans, peeked packets stay resident until the
     /// producer reads them, video included, so a late-starting track in a 4K remux must not pin
-    /// hundreds of megabytes; three DTS-HD frames normally sit within the first few of them.
+    /// hundreds of megabytes; the frames a verdict needs normally sit within the first few of them.
     static let dtsxVerdictByteBudget = 24 << 20
 
-    /// Shows LibDTSX the audio stream's first packets, without consuming them (the producer reads the
+    /// Shows the DTS:X decoder the audio stream's first packets, without consuming them (the producer reads the
     /// same packets afterwards), until it says whether the track is DTS:X it renders. Nil when a
     /// budget ran out or the source could not be read first.
     func dtsxVerdict(
@@ -239,7 +240,7 @@ extension HLSVideoEngine {
                     category: .session
                 )
             } else if par.codec_id == AV_CODEC_ID_DTS, objectAudioRendering != .off {
-                // Lossy DTS has no DTS:X to render; only the lossless profiles are offered to LibDTSX.
+                // Lossy DTS has no DTS:X to render; only the lossless profiles reach the DTS:X decoder.
                 EngineLog.emit(
                     "[HLSVideoEngine] object rendering requested but DTS is not 48 kHz DTS-HD Master Audio "
                     + "(profile=\(par.profile) rate=\(par.sample_rate)); keeping the channel bridge",
@@ -300,7 +301,7 @@ extension HLSVideoEngine {
                 #if DTSXObjectAudio
                 let dtsx = try DTSXObjectAudioDecoder()
                 // On a resume the verdict reads where the first producer starts, not the file head
-                // that step 8's seek would then drop; LibDTSX decides mid-stream as well.
+                // that step 8's seek would then drop; the decoder decides mid-stream as well.
                 if audioDemuxer === demuxer {
                     seekToInitialProducerStart(audioDemuxer)
                     demuxerAtInitialProducerStart = true
@@ -311,7 +312,7 @@ extension HLSVideoEngine {
                 switch verdict {
                 case .renders(let presentation):
                     EngineLog.emit(
-                        "[HLSVideoEngine] DTS-HD MA track is DTS:X \(presentation) (LibDTSX, "
+                        "[HLSVideoEngine] DTS-HD MA track is DTS:X \(presentation) (first frame, "
                         + "\(String(format: "%.0f", ms)) ms)",
                         category: .session
                     )
@@ -321,7 +322,7 @@ extension HLSVideoEngine {
                     audioIsConfirmedDTSX = true
                 case .refused(let reason):
                     EngineLog.emit(
-                        "[HLSVideoEngine] DTS-HD MA track is not DTS:X LibDTSX renders (\(reason)); "
+                        "[HLSVideoEngine] DTS-HD MA track is not DTS:X this engine renders (\(reason)); "
                         + "keeping the channel bridge",
                         category: .session
                     )

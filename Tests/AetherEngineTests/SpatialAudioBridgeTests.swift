@@ -173,7 +173,7 @@ struct SpatialAudioBridgeTests {
     func dtsEligibility() {
         let on = ObjectAudioRendering.apac(.l714)
         // FFmpeg names only two of DTS:X's markers, so a plain DTS-HD MA label can still be DTS:X;
-        // LibDTSX decides on the track's first frames.
+        // the DTS:X decoder decides on the track's first frame.
         for profile in [AV_PROFILE_DTS_HD_MA, AV_PROFILE_DTS_HD_MA_X, AV_PROFILE_DTS_HD_MA_X_IMAX] {
             #expect(HLSVideoEngine.spatialRenderingLayout(rendering: on, codecID: AV_CODEC_ID_DTS, profile: profile, sampleRate: 48_000) == .l714)
             #expect(HLSVideoEngine.objectAudioSource(codecID: AV_CODEC_ID_DTS, profile: profile) == .dtsHDMasterAudio)

@@ -387,7 +387,7 @@ Subtitle cues land in raw source PTS; render the overlay against `player.sourceT
 Install via Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.42.0")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.44.0")
 ```
 
 Three samples ship in `Examples/`:
@@ -634,10 +634,10 @@ Browse all of this as a searchable site at **[aetherengine.superuser404.de](http
 AetherEngine uses [Semantic Versioning](https://semver.org). The public API surface, every `public` declaration in `Sources/AetherEngine/`, is the stability contract. **Major** removes / renames public symbols or breaks adopters; **Minor** adds public API or codec / format support; **Patch** fixes bugs with no public API change. `internal` types are not part of the contract.
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.42.0")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.44.0")
 ```
 
-Pin to `.upToNextMinor(from: "7.42.0")` for stricter teams that prefer to opt into minor bumps explicitly.
+Pin to `.upToNextMinor(from: "7.44.0")` for stricter teams that prefer to opt into minor bumps explicitly.
 
 ## Requirements
 
@@ -661,7 +661,7 @@ Four components are compiled only when a host asks for them, each behind a packa
 | Trait | Compiles and links | Without it |
 | --- | --- | --- |
 | `TrueHDObjectAudio` | [LibTrueHD](https://github.com/superuser404notfound/LibTrueHD) and the object renderer | TrueHD Atmos keeps the channel bridge whatever `objectAudioRendering` asks |
-| `DTSXObjectAudio` | [LibDTSX](https://github.com/superuser404notfound/LibDTSX) and the object renderer | DTS:X keeps the channel bridge whatever `objectAudioRendering` asks |
+| `DTSXObjectAudio` | the DTS:X decoder (FFmpeg's `dca` with FFmpegBuild's height patch, no extra library) and the object renderer | DTS:X keeps the channel bridge whatever `objectAudioRendering` asks |
 | `DualLayerDolbyVision` | the Profile 7 FEL dual-layer composer (`DualLayerVideoDecoder`, its Metal composer and the per-frame display metadata) | a Profile 7 source keeps the native route whatever `preferDualLayerDolbyVision` asks |
 | `DolbyVisionStillReshaping` | the reshaping that turns a Dolby Vision Profile 5 / AV1 Profile 10.0 frame into a still | such a source has no scrub stills, I-frame stills or held picture (`supportsCacheBackedStills` is false); playback is unaffected |
 
@@ -672,7 +672,7 @@ These components may be subject to third-party patent licensing. Integrators who
 To enable them, list the traits on the package dependency:
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.42.0",
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.44.0",
          traits: ["TrueHDObjectAudio", "DTSXObjectAudio", "DualLayerDolbyVision", "DolbyVisionStillReshaping"])
 ```
 
@@ -702,7 +702,7 @@ The exception covers AetherEngine's own code; it does not extend to its dependen
 
 **LibTrueHD** ([superuser404notfound/LibTrueHD](https://github.com/superuser404notfound/LibTrueHD)) reaches your app as a static library and decodes TrueHD for `objectAudioRendering`. Its C API, framer and packaging are MIT (Copyright Quick104, who wrote it for Silo as SiloObjectAudio, and Vincent Herbst). It compiles in the `truehd` and `oamd` crates from [truehdd](https://github.com/truehdd/truehdd), Copyright Rainbaby and the truehdd contributors, under the Apache License 2.0, which asks for the license text and LibTrueHD's `NOTICE` to travel with the binary. Apache-2.0 combines with the engine's LGPL-3.0. It comes in only through the `TrueHDObjectAudio` trait, off by default ([Optional components](#optional-components)); with the trait on it is linked whether or not a host turns the option on.
 
-**LibDTSX** ([superuser404notfound/LibDTSX](https://github.com/superuser404notfound/LibDTSX)) reaches your app as a **dynamic framework**, `DTSX.framework`, which Xcode embeds in `YourApp.app/Frameworks/` next to the FFmpeg frameworks, and decodes DTS:X for `objectAudioRendering`. Its C API, framing and packaging are Apache-2.0, and it compiles in the `dca` crate from [harletty-bridge](https://github.com/harletty/harletty-bridge), which is labelled Apache-2.0 but is a port of FFmpeg's LGPL-2.1-or-later `dca` decoder. The built library is therefore LGPL-3.0-or-later, and it stays a separate, replaceable framework for the same reason the FFmpeg frameworks do (#798); LibDTSX's `NOTICE` and `LICENSES/` travel with the binary. It comes in only through the `DTSXObjectAudio` trait, off by default; with the trait on it is linked whether or not a host turns the option on.
+**DTS:X** is decoded by FFmpeg's own `dca` decoder in the FFmpeg frameworks above: FFmpegBuild carries a patch that decodes the height channels of DTS:X's standard presentation (#798), so the `DTSXObjectAudio` trait adds no library and no license of its own. Earlier releases linked LibDTSX instead, whose `dca` crate is a port of FFmpeg's decoder combined with Apache-2.0 code and therefore LGPL-3.0-or-later, which an App Store app cannot meet without an exception.
 
 **SMBClient** ([kishikawakatsumi/SMBClient](https://github.com/kishikawakatsumi/SMBClient), MIT) reaches your app only if you link the `AetherEngineSMB` product. Linking `AetherEngine` alone pulls in none of its symbols, even though SwiftPM still records the package in `Package.resolved`, which describes the resolved graph rather than what the linker kept.
 
@@ -713,12 +713,12 @@ bring a Rust exception personality; linking them into a host that also uses
 Objective-C and C++ exceeds Mach-O compact unwind's three-personality limit.
 The engine framework owns the decoder runtimes, separate from the host's C++
 text-rendering stack. Embed and sign `AetherEngine.framework` along with the
-FFmpeg frameworks and `DTSX.framework`. Do not disable compact unwind or remove panic handling to
+FFmpeg frameworks. Do not disable compact unwind or remove panic handling to
 work around this packaging constraint.
 
 The license exception does not waive the source obligations: point at the exact
 fork commit built, publish modifications under LGPL, and retain the dependency
-license texts and notices above. FFmpeg and DTSX remain dynamically embedded in
+license texts and notices above. FFmpeg remains dynamically embedded in
 `YourApp.app/Frameworks/`.
 
 Being dynamic is not the same as being reached. The engine calls `avcodec_*` as ordinary external symbols, so a second FFmpeg elsewhere in the app can serve them instead: a static archive pulled in with `-force_load` becomes a definition inside your executable and beats every dylib, and a dependency that exports the same symbols (libVLC does, and CocoaPods sorts a pod ahead of a vendored framework) wins on order alone. Link AetherEngine's frameworks first. `nm -m <executable> | grep _avcodec_find_encoder` says who currently wins; the engine's own startup line says the same thing from the inside.

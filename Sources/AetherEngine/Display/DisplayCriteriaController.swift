@@ -128,9 +128,9 @@ final class DisplayCriteriaController {
     ///     cap 4000: pre-flight ends +2892 on the notification, load ~850 ms, play() at ~+3740
     ///
     /// The "corrected" cap costs a full load's worth of startup, ~820 ms here, because the load is serialised
-    /// behind the wait. The way to spend that time properly is to load *during* the switch rather than to
-    /// pick a cap that overlaps them by accident (AE#348); until then this number is doing two jobs and only
-    /// one of them is written on it.
+    /// behind the wait. A VOD load no longer is: since AE#348 the segment production runs during the switch
+    /// and only the routing read waits for this gate (`preflightGateRunsBesideLoad`). Live still loads
+    /// behind it, so for live this number is still doing both jobs.
     nonisolated static let stage2CapMs = 2000
 
     /// What the settle wait is allowed to cost, decided by what else is waiting on it.
@@ -1164,7 +1164,12 @@ final class DisplayCriteriaController {
             // "Unobservable DV panel" was the blanket reading here, but a panel that was already in HDR
             // when the criteria were re-written produces the same silence: no transition, so no headroom
             // rise and no end within the cap. The proof separates the two.
-            EngineLog.emit(panelProvenToEngageHDR
+            // AE#348: the proof says the panel CAN engage HDR, not that it already has. Once this gate saw
+            // the switch start, the panel is mid-switch at the cap, and its end is still to come.
+            let startRecorded = gateSnapshot.startedAt != nil || observation.hasNewStart(since: gateSnapshot)
+            EngineLog.emit(startRecorded
+                ? "[DisplayCriteria] proceed after cap (\(timing()); engine HDR criteria, switch started and not yet ended, panel still mid-switch; EDR headroom \(headroom))"
+                : panelProvenToEngageHDR
                 ? "[DisplayCriteria] proceed after cap (\(timing()); engine HDR criteria on a panel proven to engage HDR, so most likely already in the target mode; EDR headroom \(headroom))"
                 : "[DisplayCriteria] proceed after cap (\(timing()); engine HDR criteria, switch not observable, likely DV; EDR headroom \(headroom))",
                 category: .engine)

@@ -2,7 +2,7 @@ import Testing
 import Foundation
 @testable import AetherEngine
 
-@Suite("DTS:X track flag: profile label and LibDTSX ledger")
+@Suite("DTS:X track flag: profile label and decoder ledger")
 struct DTSXConfirmationTests {
 
     private func dts(id: Int, profile: String?, codec: String = "dca") -> TrackInfo {

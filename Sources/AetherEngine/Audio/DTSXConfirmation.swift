@@ -1,7 +1,7 @@
 import Foundation
 
-// #744 follow-up: `TrackInfo.isDTSX` from LibDTSX's verdict. FFmpeg labels DTS:X by two of its
-// markers only, so a DTS-HD MA track it calls plain can turn out to be DTS:X once the object-audio
+// #744 follow-up: `TrackInfo.isDTSX` from the DTS:X decoder's verdict. The probe labels DTS:X from the
+// frames it read, so a DTS-HD MA track it calls plain can turn out to be DTS:X once the object-audio
 // route decodes it. The verdict is about the track, so it outlives the session that produced it the
 // same way a confirmed JOC flag does.
 extension AetherEngine {
@@ -23,7 +23,7 @@ extension AetherEngine {
             confirmedDTSXStreamIndices = []
         }
         guard confirmedDTSXStreamIndices.insert(streamIndex).inserted else { return }
-        EngineLog.emit("[AetherEngine] #744: stream \(streamIndex) confirmed DTS:X by LibDTSX", category: .engine)
+        EngineLog.emit("[AetherEngine] #744: stream \(streamIndex) confirmed DTS:X by its first decoded frame", category: .engine)
         applyConfirmedTrackFlags()
     }
 

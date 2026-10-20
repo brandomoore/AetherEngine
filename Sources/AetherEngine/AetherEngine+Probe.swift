@@ -556,6 +556,22 @@ extension AetherEngine {
         (!engineWritesCriteria || audioOnlyPath) ? .clearStale : .applyFresh
     }
 
+    /// AE#348: whether the pre-flight gate after an HDR/DV write runs beside the load rather than in front
+    /// of it.
+    ///
+    /// The gate guards the routing read (master or media, from the settled panel) and the AVPlayerItem,
+    /// not the segment production in front of them: `HLSVideoEngine.prepare()` reads nothing about the
+    /// panel. Serialising the two put a ~96 Mbit/s title's first two segments (2.0 s to cut) behind a
+    /// switch that ended 1.5 s before playback started (Apple TV 4K, DV, badrabbit 2026-10-16). The gate
+    /// still starts at the write and the routing read still waits for it, so the read is never taken
+    /// earlier than before.
+    ///
+    /// Live keeps the serial order: its join and rejoin are timed against the edge, and the overlap has not
+    /// been measured there.
+    nonisolated static func preflightGateRunsBesideLoad(isLive: Bool) -> Bool {
+        !isLive
+    }
+
     /// #274: how long the post-load play-gate blind-polls for a panel switch to start.
     ///
     /// The gate exists for one case: a sole-writer host (`suppressDisplayCriteria`) whose criteria write

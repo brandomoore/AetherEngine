@@ -789,7 +789,8 @@ extension AetherEngine {
         dvrWindowSeconds: Double? = nil,
         liveRejoin: Bool = false,
         preopenedDemuxer: Demuxer? = nil,
-        generation: UInt64
+        generation: UInt64,
+        resolvePanelRouting: (() async throws -> Bool)? = nil
     ) async throws {
         // companionAudioReader is set by the reader's resolver before any main-stream byte flows, so it is
         // final by the time loadNative runs; nil means muxed audio.
@@ -1323,9 +1324,29 @@ extension AetherEngine {
         session.initialStartSeconds = startPosition
 
         // session.start() opens its own Demuxer + prewarm seek (~1-3 s on slow CDN); detach so @MainActor doesn't block.
-        var playbackURL = try await BlockingWork.detached(priority: .userInitiated) { [session] in
-            try session.start()
-        }.value
+        var playbackURL: URL
+        if let resolvePanelRouting {
+            // AE#348: the panel is still switching. Produce the first segments now and choose the
+            // playlist once `resolvePanelRouting` has the settled answer; `panelIsInHDRMode` above was
+            // read before that and is not what routes this session.
+            try await BlockingWork.detached(priority: .userInitiated) { [session] in
+                try session.prepare()
+            }.value
+            let routesAsHDRPanel: Bool
+            do {
+                routesAsHDRPanel = try await resolvePanelRouting()
+            } catch {
+                session.stop()
+                throw error
+            }
+            playbackURL = try await BlockingWork.detached(priority: .userInitiated) { [session] in
+                try session.serve(panelIsInHDRMode: routesAsHDRPanel)
+            }.value
+        } else {
+            playbackURL = try await BlockingWork.detached(priority: .userInitiated) { [session] in
+                try session.start()
+            }.value
+        }
         // AirPlay (#86): while external playback is active, serve the loopback over the device's LAN IP so
         // the receiver reaches the engine-processed stream (DV/Atmos/subtitles preserved). An HDR/DV master
         // is downgraded to the media playlist there (an SDR receiver rejects it, DrHurt); an SDR master is

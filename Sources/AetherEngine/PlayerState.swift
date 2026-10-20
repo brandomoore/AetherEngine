@@ -1294,8 +1294,8 @@ public struct TrackInfo: Identifiable, Sendable, Equatable {
     public internal(set) var isAtmos: Bool
 
     /// DTS:X. True from the probe when libavcodec labels the profile DTS:X, and set during playback when
-    /// LibDTSX confirms a track FFmpeg labelled plain DTS-HD MA (FFmpeg reads only two of DTS:X's
-    /// markers). Never cleared once set for a session's source, so a confirmed track keeps its name in a
+    /// the DTS:X decoder confirms a track the probe labelled plain DTS-HD MA (the label rests on the
+    /// frames the probe read). Never cleared once set for a session's source, so a confirmed track keeps its name in a
     /// track menu after a switch away from it.
     public internal(set) var isDTSX: Bool
 
