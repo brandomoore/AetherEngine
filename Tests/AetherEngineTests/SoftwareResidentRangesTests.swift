@@ -118,12 +118,10 @@ struct SoftwareResidentRangesTests {
     @Test("History the kernel emptied in the memory store leaves the published spans (#759)")
     func purgedMemoryHistory() async throws {
         let packets = (0..<400).map { packet(Int64($0) * 40) }
-        let store = SoftwarePacketMemoryFIFO(chunkTargetBytes: 1, historyCapBytes: .max)
+        let store = SoftwarePacketMemoryFIFO(chunkTargetBytes: 1, historyCapBytes: .max, kernelMayPurge: false)
         let source = try source(packets, store: store)
         defer { source.close() }
         try await consume(source, expecting: packets, fails: false)
-        // The history is volatile VM, so under a full suite's memory pressure the kernel may already
-        // have emptied some of it here (seen: [15.36...16]); the purge below forces the rest.
         #expect(source.residentRanges.last?.upperBound == 16)
         store.purgeHistoryForTesting()
         let spans = source.residentRanges

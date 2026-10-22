@@ -12,6 +12,10 @@ import AVFoundation
 /// decodes to digital silence, so nothing is mixed into the programme. It plays only while the host
 /// player plays or waits to play an item `playsAPAC` accepts, and is released otherwise, since a
 /// prerolled E-AC-3 stream would compete with other audio.
+///
+/// #834: it runs only while every output port is HDMI. On an AirPlay route there is no sink indicator
+/// to light, and a second unmuted player restarting beside the programme on every resume left a
+/// HomePod pair silent after a pause, then froze the picture after the second one.
 @MainActor
 final class AtmosOutputActivator {
     static let silentAtmosStream = Bundle.module.url(forResource: "silent-atmos", withExtension: "mp4")!
@@ -22,9 +26,30 @@ final class AtmosOutputActivator {
     private var playsAPAC: @MainActor (AVPlayerItem) -> Bool = { _ in false }
     private var observations: [NSKeyValueObservation] = []
     private var selectionObserver: NSObjectProtocol?
+    private var routeObserver: NSObjectProtocol?
+    private let outputPortTypes: @MainActor () -> [String]
+    private var loggedRouteVerdict: Bool?
 
-    init() {
+    init(outputPortTypes: @escaping @MainActor () -> [String] = AtmosOutputActivator.currentOutputPortTypes) {
+        self.outputPortTypes = outputPortTypes
         player.automaticallyWaitsToMinimizeStalling = false
+    }
+
+    /// True only for a route whose every output is HDMI: the sink the stream exists for. An empty
+    /// route is one in transition, and the route change that ends it re-evaluates.
+    nonisolated static func routeTakesActivator(outputPortTypes: [String]) -> Bool {
+        !outputPortTypes.isEmpty && outputPortTypes.allSatisfy { $0 == hdmiPortType }
+    }
+
+    /// `AVAudioSession.Port.HDMI.rawValue`, spelled out so the rule is testable where there is no session.
+    nonisolated static let hdmiPortType = "HDMI"
+
+    static func currentOutputPortTypes() -> [String] {
+        #if os(iOS) || os(tvOS)
+        AVAudioSession.sharedInstance().currentRoute.outputs.map(\.portType.rawValue)
+        #else
+        []
+        #endif
     }
 
     /// Follows `host`: its item, its audio selection and whether it is playing.
@@ -42,12 +67,22 @@ final class AtmosOutputActivator {
                 Self.onMain { self?.update() }
             },
         ]
+        #if os(iOS) || os(tvOS)
+        routeObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.routeChangeNotification, object: nil, queue: nil
+        ) { [weak self] _ in
+            Self.onMain { self?.update() }
+        }
+        #endif
     }
 
     func detach() {
         observations.forEach { $0.invalidate() }
         observations = []
+        if let routeObserver { NotificationCenter.default.removeObserver(routeObserver) }
+        routeObserver = nil
         host = nil
+        loggedRouteVerdict = nil
         follow(nil)
     }
 
@@ -65,6 +100,19 @@ final class AtmosOutputActivator {
 
     private func update() {
         guard let host, let item = host.currentItem, playsAPAC(item) else {
+            release()
+            return
+        }
+        let ports = outputPortTypes()
+        let routeTakesIt = Self.routeTakesActivator(outputPortTypes: ports)
+        if loggedRouteVerdict != routeTakesIt {
+            loggedRouteVerdict = routeTakesIt
+            EngineLog.emit(
+                "[AtmosOutputActivator] \(routeTakesIt ? "active" : "off") on route ports=[\(ports.joined(separator: ", "))]",
+                category: .session
+            )
+        }
+        guard routeTakesIt else {
             release()
             return
         }

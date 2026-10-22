@@ -106,6 +106,10 @@ extension AetherEngine {
     /// decode pass. Bounded like every other engine seek so a stalled remote source cannot park here.
     nonisolated static let atmosProbeFlushSeekTimeout: TimeInterval = 5
 
+    /// Budget for the seek back to the start that ends the load-time interlace sample, whose demuxer
+    /// the session reuses. Bounded for the same reason.
+    nonisolated static let probeRewindSeekTimeout: TimeInterval = 5
+
     /// Pure stop-condition check for the bounded decode loop: given how much work has been done, which cap
     /// (if any) has been hit. Extracted so the cap-selection PRIORITY (packets, then bytes, then time) is
     /// unit-testable without a real demuxer/decoder. Returns `nil` while still within all three budgets.

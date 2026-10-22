@@ -1,0 +1,123 @@
+import Foundation
+import Testing
+@testable import AetherEngine
+
+// A UHD Blu-ray's Dolby Vision is two PIDs in one clip; the base layer gets the enhancement layer's RPUs.
+@Suite("Blu-ray Dolby Vision layer fold")
+struct BluRayDolbyVisionLayerFoldTests {
+
+    /// An enhancement-layer access unit as the disc carries it: AUD, a slice, then the RPU (unspec62), Annex-B.
+    private static let enhancementUnit: [UInt8] =
+        [0, 0, 0, 1, 0x46, 0x01, 0x50]                         // AUD (type 35)
+        + [0, 0, 1, 0x02, 0x01, 0xAA, 0xBB, 0xCC]               // TRAIL_R slice (type 1)
+        + [0, 0, 0, 1, 0x7C, 0x01, 0x19, 0x08, 0x09, 0x80]      // RPU (type 62), stop bit
+        + [0, 0]                                                // padding before the next unit
+
+    @Test("The RPU comes out with its own start code and without trailing zeros")
+    func rpuIsExtracted() throws {
+        let rpu = try #require(Self.enhancementUnit.withUnsafeBytes { BluRayDolbyVisionLayers.rpu(inAnnexB: $0) })
+        #expect(rpu == [0, 0, 1, 0x7C, 0x01, 0x19, 0x08, 0x09, 0x80])
+    }
+
+    @Test("A unit without an RPU gives none")
+    func noRPU() {
+        let unit: [UInt8] = [0, 0, 0, 1, 0x46, 0x01, 0x50, 0, 0, 1, 0x02, 0x01, 0xAA]
+        #expect(unit.withUnsafeBytes { BluRayDolbyVisionLayers.rpu(inAnnexB: $0) } == nil)
+    }
+
+    @Test("The level follows the luma sample rate: UHD at 23.976 is 6, at 60 is 9, 1080p24 is 3")
+    func levels() {
+        #expect(BluRayDolbyVisionLayers.level(width: 3840, height: 2160, fps: 24000.0 / 1001) == 6)
+        #expect(BluRayDolbyVisionLayers.level(width: 3840, height: 2160, fps: 24) == 6)
+        #expect(BluRayDolbyVisionLayers.level(width: 3840, height: 2160, fps: 60) == 9)
+        #expect(BluRayDolbyVisionLayers.level(width: 1920, height: 1080, fps: 24) == 3)
+    }
+
+    /// A held base picture; `rpu` is what the pairing appended to it.
+    private final class Picture {
+        let pts: Int64
+        var rpu: [UInt8]?
+        init(_ pts: Int64) { self.pts = pts }
+    }
+
+    private typealias Pairing = DolbyVisionLayerPairing<Picture>
+    private static func attach(_ picture: Picture, _ rpu: [UInt8]) -> Bool { picture.rpu = rpu; return true }
+    /// One release, outside the expectation macros (they capture their operands immutably).
+    private static func next(_ pairing: inout Pairing, atEnd: Bool = false) -> (unit: Picture, paired: Bool)? {
+        pairing.release(atEnd: atEnd)
+    }
+    private static func rpu(_ pts: Int64) -> [UInt8] { [0, 0, 1, 0x7C, 0x01, UInt8(pts)] }
+
+    @Test("A base picture waits for the enhancement unit that follows it, then goes out with its RPU")
+    func rpuAfterItsPicture() throws {
+        var pairing = Pairing()
+        pairing.addBase(Picture(10), pts: 10, attach: Self.attach)
+        #expect(Self.next(&pairing) == nil)
+        pairing.addRPU(Self.rpu(10), pts: 10, attach: Self.attach)
+        let out = try #require(Self.next(&pairing))
+        #expect(out.paired && out.unit.pts == 10 && out.unit.rpu == Self.rpu(10))
+        #expect(pairing.heldCount == 0)
+    }
+
+    @Test("An RPU that comes before its picture is attached when the picture arrives")
+    func rpuBeforeItsPicture() throws {
+        var pairing = Pairing()
+        pairing.addRPU(Self.rpu(20), pts: 20, attach: Self.attach)
+        pairing.addBase(Picture(20), pts: 20, attach: Self.attach)
+        let out = try #require(Self.next(&pairing))
+        #expect(out.paired && out.unit.rpu == Self.rpu(20))
+    }
+
+    @Test("Pictures leave in read order: a later picture's RPU does not let it overtake an earlier one")
+    func readOrderHolds() throws {
+        var pairing = Pairing()
+        pairing.addBase(Picture(1), pts: 1, attach: Self.attach)
+        pairing.addBase(Picture(2), pts: 2, attach: Self.attach)
+        pairing.addRPU(Self.rpu(2), pts: 2, attach: Self.attach)
+        #expect(Self.next(&pairing) == nil)
+        pairing.addRPU(Self.rpu(1), pts: 1, attach: Self.attach)
+        #expect(try #require(Self.next(&pairing)).unit.pts == 1)
+        #expect(try #require(Self.next(&pairing)).unit.pts == 2)
+    }
+
+    @Test("Past the hold limit the oldest picture goes out without an RPU, so a missing enhancement unit stalls nothing")
+    func holdLimitReleasesUnpaired() throws {
+        var pairing = Pairing()
+        for pts in 0..<Int64(Pairing.holdLimit) { pairing.addBase(Picture(pts), pts: pts, attach: Self.attach) }
+        #expect(Self.next(&pairing) == nil)
+        pairing.addBase(Picture(99), pts: 99, attach: Self.attach)
+        let out = try #require(Self.next(&pairing))
+        #expect(!out.paired && out.unit.pts == 0 && out.unit.rpu == nil)
+        #expect(Self.next(&pairing) == nil)
+    }
+
+    @Test("At the end of the source the last pictures go out whether paired or not")
+    func endReleasesEverything() throws {
+        var pairing = Pairing()
+        pairing.addBase(Picture(1), pts: 1, attach: Self.attach)
+        pairing.addBase(Picture(2), pts: 2, attach: Self.attach)
+        #expect(try #require(Self.next(&pairing, atEnd: true)).unit.pts == 1)
+        #expect(try #require(Self.next(&pairing, atEnd: true)).unit.pts == 2)
+        #expect(Self.next(&pairing, atEnd: true) == nil)
+    }
+
+    @Test("A drain (seek, reopen, close) hands back every held picture and forgets the early RPUs")
+    func drainForgetsEverything() {
+        var pairing = Pairing()
+        pairing.addBase(Picture(1), pts: 1, attach: Self.attach)
+        pairing.addRPU(Self.rpu(5), pts: 5, attach: Self.attach)
+        let drained = pairing.drain().map(\.pts)
+        #expect(drained == [1])
+        let after = Picture(5)
+        pairing.addBase(after, pts: 5, attach: Self.attach)
+        #expect(after.rpu == nil)
+    }
+
+    @Test("A failed append leaves the picture unpaired, so it waits for the limit instead of going out as paired")
+    func failedAppendStaysUnpaired() {
+        var pairing = Pairing()
+        pairing.addBase(Picture(1), pts: 1, attach: Self.attach)
+        pairing.addRPU(Self.rpu(1), pts: 1) { _, _ in false }
+        #expect(Self.next(&pairing) == nil)
+    }
+}

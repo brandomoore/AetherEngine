@@ -57,7 +57,28 @@ enum A53SEIParser {
     ) -> [CCDataParser.CCTriplet] {
         guard mayContainA53(data, size) else { return [] }
         var out: [CCDataParser.CCTriplet] = []
+        forEachSEIRBSP(data, size, codec: codec, framing: framing) { rbsp in
+            forEachSEIPayload(rbsp) { type, offset, payloadSize in
+                if type == 4, payloadSize > 0 {   // user_data_registered_itu_t_t35
+                    parseT35(rbsp, offset: offset, size: payloadSize, into: &out)
+                }
+                return false
+            }
+            return false
+        }
+        return out
+    }
+
+    /// The unescaped RBSP of every SEI NAL in the packet, in bitstream order, until `body` returns
+    /// true. Shared with the alternative-transfer scan (AE#839), which reads a different payload out of
+    /// the same NALs.
+    static func forEachSEIRBSP(
+        _ data: UnsafePointer<UInt8>, _ size: Int, codec: CodecKind, framing: NALFraming,
+        _ body: ([UInt8]) -> Bool
+    ) {
+        var done = false
         forEachNAL(data, size, framing) { nal, nalSize in
+            guard !done else { return }
             let headerLen: Int
             let isSEI: Bool
             switch codec {
@@ -70,10 +91,8 @@ enum A53SEIParser {
                 isSEI = type == 39 || type == 40   // prefix / suffix SEI
             }
             guard isSEI else { return }
-            let rbsp = unescapeRBSP(nal + headerLen, nalSize - headerLen)
-            parseSEIPayloads(rbsp, into: &out)
+            done = body(unescapeRBSP(nal + headerLen, nalSize - headerLen))
         }
-        return out
     }
 
     // MARK: - NAL iteration
@@ -134,7 +153,9 @@ enum A53SEIParser {
 
     // MARK: - SEI payload walk
 
-    private static func parseSEIPayloads(_ rbsp: [UInt8], into out: inout [CCDataParser.CCTriplet]) {
+    /// Every `sei_message` in one SEI RBSP as (payloadType, offset, payloadSize), until `body` returns
+    /// true. Stops at the first message whose header or size runs past the RBSP.
+    static func forEachSEIPayload(_ rbsp: [UInt8], _ body: (Int, Int, Int) -> Bool) {
         var i = 0
         let n = rbsp.count
         while i + 2 <= n {
@@ -147,9 +168,7 @@ enum A53SEIParser {
             guard i < n else { return }
             payloadSize += Int(rbsp[i]); i += 1
             guard i + payloadSize <= n else { return }
-            if payloadType == 4, payloadSize > 0 {   // user_data_registered_itu_t_t35
-                parseT35(rbsp, offset: i, size: payloadSize, into: &out)
-            }
+            if body(payloadType, i, payloadSize) { return }
             i += payloadSize
         }
     }

@@ -119,6 +119,17 @@ struct HLSPlaylistTracker {
         self.minJoinCoverageSeconds = minJoinCoverageSeconds
     }
 
+    /// A tracker whose join covers a host's `liveEdgeCushionSeconds` as well as the loopback's own
+    /// holdback, so a listing that holds the backlog fills the cushion at link speed instead of at 1x.
+    /// The segment cap grows with it on the assumption of segments of a second or longer; the
+    /// coverage, not the cap, ends the join on every listing deep enough to meet it.
+    static func joining(cushion: Double?) -> HLSPlaylistTracker {
+        guard let cushion, cushion.isFinite, cushion > 0 else { return HLSPlaylistTracker() }
+        let coverage = cushion + openGOPMarginSeconds
+        return HLSPlaylistTracker(edgeOffset: max(8, Int(coverage.rounded(.up))),
+                                  minJoinCoverageSeconds: max(8, coverage))
+    }
+
     mutating func newSegments(in playlist: HLSMediaPlaylist) -> [HLSMediaSegment] {
         let windowStart = playlist.mediaSequence
         // The parser rejects a MEDIA-SEQUENCE outside `0...Int.max/2` (audit NET-3), but the struct

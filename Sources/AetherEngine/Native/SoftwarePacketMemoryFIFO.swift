@@ -23,10 +23,11 @@ final class SoftwarePacketMemoryFIFO: @unchecked Sendable {
         let id: UInt64
         let base: UnsafeMutableRawPointer
         let capacity: Int
+        let kernelMayPurge: Bool
         var used = 0
         private(set) var isVolatile = false
 
-        init(id: UInt64, capacity: Int) throws {
+        init(id: UInt64, capacity: Int, kernelMayPurge: Bool) throws {
             var address: vm_address_t = 0
             let size = vm_size_t(capacity)
             let kr = vm_allocate(mach_task_self_, &address, size, VM_FLAGS_ANYWHERE | VM_FLAGS_PURGABLE)
@@ -36,6 +37,7 @@ final class SoftwarePacketMemoryFIFO: @unchecked Sendable {
             self.id = id
             self.base = base
             self.capacity = capacity
+            self.kernelMayPurge = kernelMayPurge
         }
 
         deinit {
@@ -50,6 +52,7 @@ final class SoftwarePacketMemoryFIFO: @unchecked Sendable {
         @discardableResult
         func setVolatile(_ volatile: Bool) -> Bool {
             guard volatile != isVolatile else { return true }
+            if volatile, !kernelMayPurge { isVolatile = true; return true }
             var state: Int32 = volatile ? VM_PURGABLE_VOLATILE : VM_PURGABLE_NONVOLATILE
             let kr = vm_purgable_control(mach_task_self_, vm_address_t(UInt(bitPattern: base)),
                                          Self.setState, &state)
@@ -73,7 +76,8 @@ final class SoftwarePacketMemoryFIFO: @unchecked Sendable {
             return kr == KERN_SUCCESS && state == VM_PURGABLE_EMPTY
         }
 
-        /// Empties the chunk now, as the kernel may once it is volatile. Tests only.
+        /// Empties the chunk now, as the kernel may once it is volatile. Works on a non-volatile
+        /// region too, so it also reaches a chunk whose kernel state was kept resident. Tests only.
         func purgeForTesting() {
             var state: Int32 = VM_PURGABLE_EMPTY
             vm_purgable_control(mach_task_self_, vm_address_t(UInt(bitPattern: base)), Self.setState, &state)
@@ -82,6 +86,7 @@ final class SoftwarePacketMemoryFIFO: @unchecked Sendable {
 
     private let chunkTargetBytes: Int
     private let historyCapBytes: Int
+    private let kernelMayPurge: Bool
     var retainsConsumedPackets: Bool { historyCapBytes > 0 }
     private let lock = NSLock()
     /// Contiguous ids, oldest first. `chunks[i].id == oldestChunkID + i`.
@@ -99,10 +104,15 @@ final class SoftwarePacketMemoryFIFO: @unchecked Sendable {
     /// History chunks found emptied by the kernel. Diagnostics and tests.
     private(set) var purgedChunks = 0
 
-    init(chunkTargetBytes: Int = 4 << 20, historyCapBytes: Int) {
+    /// `kernelMayPurge: false` keeps history resident at the kernel level while every count and
+    /// state transition still treats it as volatile, so only `purgeHistoryForTesting` empties it.
+    /// Tests that re-read history use it; otherwise memory pressure from the rest of the suite can
+    /// purge that history first.
+    init(chunkTargetBytes: Int = 4 << 20, historyCapBytes: Int, kernelMayPurge: Bool = true) {
         let page = Int(getpagesize())
         self.chunkTargetBytes = max(page, (chunkTargetBytes + page - 1) / page * page)
         self.historyCapBytes = max(0, historyCapBytes)
+        self.kernelMayPurge = kernelMayPurge
     }
 
     var snapshot: SoftwarePacketDiskFIFO.Snapshot {
@@ -126,7 +136,7 @@ final class SoftwarePacketMemoryFIFO: @unchecked Sendable {
                 let capacity = max(chunkTargetBytes, (recordBytes + page - 1) / page * page)
                 let id = chunks.isEmpty ? oldestChunkID : chunks[chunks.count - 1].id + 1
                 if chunks.isEmpty { headID = id; headOffset = 0 }
-                chunks.append(try Chunk(id: id, capacity: capacity))
+                chunks.append(try Chunk(id: id, capacity: capacity, kernelMayPurge: kernelMayPurge))
             }
         } catch {
             failure = error

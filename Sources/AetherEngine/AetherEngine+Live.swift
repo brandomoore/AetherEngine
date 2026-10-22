@@ -568,6 +568,8 @@ extension AetherEngine {
             // A route transition never transfers expanded native retention into it.
             w.setWindowSeconds(softwareHost?.liveDVRWindowSeconds)
         }
+        // AE#813: only the software path holds back from a segmented frontier; a route change clears it.
+        w.noteEdgeHoldback(videoRoute == .software ? softwareHost?.liveHoldback.edgeHoldbackSeconds : nil)
         // Resident media bounds the allowance on both playback routes.
         var residentFloor = videoRoute == .software ? softwareHost?.liveDVRResidentFloor : residentLiveFloorSessionSeconds()
         // An empty/delayed AVPlayer seekableTimeRanges mirror yields only the item's zero
@@ -811,8 +813,15 @@ extension AetherEngine {
     ///
     /// Landing the lead behind the frontier reaches the same place with the same cushion and spends
     /// nothing on the way. A target the ring already holds that lead for is untouched.
-    nonisolated static func softwareLiveLanding(requested: Double, window: LiveWindow) -> Double {
-        window.clamp(Swift.min(requested, window.edgeTime - AudioLookaheadPolicy.rebufferResumeLeadSeconds))
+    ///
+    /// AE#813: a source that delivers whole segments needs more than that lead, because nothing
+    /// arrives until the next segment does, so it lands as far back as a join would place it
+    /// (`SoftwareLiveHoldback.landingHoldbackSeconds`).
+    nonisolated static func softwareLiveLanding(
+        requested: Double, window: LiveWindow,
+        holdbackSeconds: Double = AudioLookaheadPolicy.rebufferResumeLeadSeconds
+    ) -> Double {
+        window.clamp(Swift.min(requested, window.edgeTime - holdbackSeconds))
     }
 
     /// AE#454: how close the fresh item has to be to the place it was asked for before the correcting
@@ -907,5 +916,21 @@ extension AetherEngine {
         let floor = w.seekableRange(edge: edge)?.lowerBound ?? edge
         let target = Swift.max(floor, edge - offset)
         await seek(to: target)
+    }
+
+    /// AE#851: the loopback's first-serve gate, waited out before AVPlayer asks for the playlist.
+    /// Returns when the gate does (window ready, degraded at its deadline, or cancelled by a stop),
+    /// so a superseded load still has to check its generation afterwards.
+    nonisolated static func awaitFirstLiveWindow(_ provider: VideoSegmentProvider) async {
+        let timeout = LiveEdgePolicy.firstServeTimeoutSeconds(edgeCushionSeconds: provider.liveEdgeCushionSeconds)
+        let started = DispatchTime.now()
+        let ready = await BlockingWork.detached(priority: .userInitiated) {
+            provider.waitForFirstLiveSegment(timeout: timeout)
+        }.value
+        let waited = Double(DispatchTime.now().uptimeNanoseconds &- started.uptimeNanoseconds) / 1_000_000_000
+        EngineLog.emit(
+            "[AetherEngine] AE#851 first live window \(ready ? "ready" : "not ready") after "
+            + "\(LiveEdgePolicy.seconds(waited))s, before the item was attached",
+            category: .session)
     }
 }

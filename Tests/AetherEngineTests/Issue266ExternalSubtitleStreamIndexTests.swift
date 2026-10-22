@@ -242,7 +242,7 @@ struct Issue266ExternalSubtitleStreamIndexTests {
         let stores = [NativeSubtitleCueStore(), NativeSubtitleCueStore()]
 
         let jobs = AetherEngine.externalSubtitleFillJobs(
-            table: table, registry: registry, stores: stores, defaultHeaders: [:])
+            table: table, registry: registry, stores: stores, defaultHeaders: [:], mediaURL: nil)
 
         #expect(jobs.count == 1)
         #expect(jobs.first?.url == url)
@@ -266,7 +266,7 @@ struct Issue266ExternalSubtitleStreamIndexTests {
         let stores = [NativeSubtitleCueStore(), NativeSubtitleCueStore()]
 
         let jobs = AetherEngine.externalSubtitleFillJobs(
-            table: table, registry: registry, stores: stores, defaultHeaders: [:])
+            table: table, registry: registry, stores: stores, defaultHeaders: [:], mediaURL: nil)
 
         #expect(jobs.count == 2)
         #expect(jobs.map(\.url) == [first, second])
@@ -289,7 +289,7 @@ struct Issue266ExternalSubtitleStreamIndexTests {
         let stores = [NativeSubtitleCueStore(), NativeSubtitleCueStore()]
 
         let jobs = AetherEngine.externalSubtitleFillJobs(
-            table: table, registry: registry, stores: stores, defaultHeaders: [:])
+            table: table, registry: registry, stores: stores, defaultHeaders: [:], mediaURL: nil)
 
         #expect(jobs.count == 2)
     }
@@ -353,7 +353,7 @@ struct Issue266ExternalSubtitleStreamIndexTests {
         let stores = [NativeSubtitleCueStore(), NativeSubtitleCueStore()]
 
         let jobs = AetherEngine.externalSubtitleFillJobs(
-            table: table, registry: registry, stores: stores, defaultHeaders: [:])
+            table: table, registry: registry, stores: stores, defaultHeaders: [:], mediaURL: nil)
 
         #expect(jobs.count == 1)
         #expect(jobs.first?.targets.count == 2)

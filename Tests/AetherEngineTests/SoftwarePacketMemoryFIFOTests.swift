@@ -5,16 +5,18 @@ import Testing
 /// The purgeable-memory packet store (tvOS's software VOD packet store) must behave like the
 /// disk store for everything the read-ahead relies on: FIFO order across chunks, cursors that
 /// restore backwards and forwards, the still walk, and history that is bounded and evictable.
-@Suite("Software packet memory FIFO")
+@Suite("Software packet memory FIFO", .offCooperativePool)
 struct SoftwarePacketMemoryFIFOTests {
 
     /// Records of 1000 bytes filled with their index, so a read can be checked by content.
     private func record(_ i: Int) -> Data { Data(repeating: UInt8(i & 0xff), count: 1000) }
 
-    /// Page-sized chunks (16 KiB on arm64) hold 16 records each.
-    private func filled(_ count: Int, historyCap: Int = .max) throws
+    /// Page-sized chunks (16 KiB on arm64) hold 16 records each. History stays resident unless a
+    /// test opts into real kernel purging, which may strike between any two lines under suite load.
+    private func filled(_ count: Int, historyCap: Int = .max, kernelMayPurge: Bool = false) throws
         -> (SoftwarePacketMemoryFIFO, [SoftwarePacketDiskFIFO.Cursor]) {
-        let fifo = SoftwarePacketMemoryFIFO(chunkTargetBytes: 1, historyCapBytes: historyCap)
+        let fifo = SoftwarePacketMemoryFIFO(
+            chunkTargetBytes: 1, historyCapBytes: historyCap, kernelMayPurge: kernelMayPurge)
         var cursors: [SoftwarePacketDiskFIFO.Cursor] = []
         for i in 0..<count { cursors.append(try fifo.append(record(i))) }
         return (fifo, cursors)
@@ -31,7 +33,7 @@ struct SoftwarePacketMemoryFIFOTests {
 
     @Test("consumed chunks leave the non-volatile byte count, unread ones stay in it")
     func consumedHistoryIsNotResident() throws {
-        let (fifo, _) = try filled(100)
+        let (fifo, _) = try filled(100, kernelMayPurge: true)
         let before = fifo.snapshot.diskByteCount
         for _ in 0..<80 { _ = try fifo.pop() }
         let after = fifo.snapshot.diskByteCount
@@ -81,7 +83,7 @@ struct SoftwarePacketMemoryFIFOTests {
 
     @Test("history the kernel emptied is a cache miss, and the store stays usable")
     func purgedHistoryRestore() throws {
-        let (fifo, cursors) = try filled(100)
+        let (fifo, cursors) = try filled(100, kernelMayPurge: true)
         for _ in 0..<90 { _ = try fifo.pop() }
         fifo.purgeHistoryForTesting()
         #expect(throws: SoftwarePacketDiskFIFO.Failure.invalidCursor) { try fifo.restore(to: cursors[10]) }
@@ -108,7 +110,7 @@ struct SoftwarePacketMemoryFIFOTests {
 
     @Test("a still walk into emptied history is refused and releases the store")
     func purgedHistoryWalk() async throws {
-        let (fifo, cursors) = try filled(100)
+        let (fifo, cursors) = try filled(100, kernelMayPurge: true)
         for _ in 0..<90 { _ = try fifo.pop() }
         fifo.purgeHistoryForTesting()
         #expect(throws: SoftwarePacketDiskFIFO.Failure.invalidCursor) {
@@ -150,7 +152,8 @@ struct SoftwarePacketMemoryFIFOTests {
         let source = SoftwarePacketReadAhead(
             video: .init(index: 0, numerator: 1, denominator: 1000), audio: nil,
             byteBudget: 64 << 20, forwardSeconds: 100, initialSourceClock: 0,
-            fifo: SoftwarePacketMemoryFIFO(chunkTargetBytes: 16 * 1024, historyCapBytes: 64 << 20)
+            fifo: SoftwarePacketMemoryFIFO(chunkTargetBytes: 16 * 1024, historyCapBytes: 64 << 20,
+                                       kernelMayPurge: false)
         ) { _ in
             let index = counter.next() - 1
             return index < packets.count ? packets[index] : nil

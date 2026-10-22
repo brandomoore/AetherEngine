@@ -488,6 +488,25 @@ extension AetherEngine {
 
     // MARK: - Live telemetry bridge
 
+    /// Lifecycle callbacks can arrive after stop or a new load. Only cleanup may publish after
+    /// the owning session has detached; the token still prevents it crossing into its successor.
+    func acceptSessionCacheStatus(_ status: SessionCacheStatus, token: UInt64) {
+        guard token == sessionCacheStatusToken else { return }
+        guard status.cleanupResult != .notRun || nativeVideoSession != nil else { return }
+        diagnostics.sessionCacheStatus = status
+    }
+
+    /// Read the cache ledger off-main. An old tick must never overwrite a new session or cleanup.
+    func refreshSessionCacheStatus() async {
+        guard let session = nativeVideoSession else { return }
+        let token = sessionCacheStatusToken
+        let generation = loadGeneration
+        let status = await BlockingWork.detached(priority: .utility) { session.sessionCacheStatus() }.value
+        guard !Task.isCancelled, sessionCacheStatusToken == token, loadGeneration == generation,
+              nativeVideoSession === session else { return }
+        diagnostics.sessionCacheStatus = status
+    }
+
     /// Single write-through point: sampler never reaches into `EngineDiagnostics` directly.
     func applyLiveTelemetry(_ snapshot: LiveTelemetry) {
         diagnostics.liveTelemetry = snapshot

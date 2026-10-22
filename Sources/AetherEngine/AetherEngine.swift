@@ -685,11 +685,22 @@ public final class AetherEngine: ObservableObject {
     /// Chapters of the selected title. Empty until Blu-ray chapter parsing ships (Phase 2); declared
     /// now so hosts can bind the picker against a stable API.
     @Published public internal(set) var discChapters: [ChapterInfo] = []
-    /// Container (Matroska/MP4) chapters of the loaded source, from the probe demuxer at load. Empty
-    /// when the container declares none and for disc sources (whose chapters publish on `discChapters`
-    /// with title-relative seek semantics). `startSeconds` values are content timestamps a host passes
-    /// straight to `seek(to:)`.
+    /// Container (Matroska/MP4) chapters of the loaded source. Empty when the container declares none and
+    /// for disc sources (whose chapters publish on `discChapters` with title-relative seek semantics).
+    ///
+    /// `startSeconds` and `durationSeconds` are on the same 0-based axis as `currentTime`, `duration` and
+    /// `seek(to:)`: the container's own chapter time minus the container start the playback clock begins
+    /// at. So `seek(to: mediaChapters[i].startSeconds)` lands on that chapter, on either backend. A chapter
+    /// that ends before the content starts (a pre-roll before a container start of 5 s) is not published.
+    /// The raw container times are not on this axis; `sourceTime` is the one that reads them.
     @Published public internal(set) var mediaChapters: [ChapterInfo] = []
+    /// The container chapters behind `mediaChapters`, on the source axis, snapshotted at probe time. Kept
+    /// apart from the published list so the list can be rebased when the backend (and with it the origin)
+    /// is settled, and so a reopen of the same source rebuilds it without re-probing.
+    var containerChapterSource: Demuxer.ContainerChapterSource?
+    /// The session zero the software host's clock actually anchored on, once it has re-anchored on its
+    /// first sample (a source starting past the 2 s tolerance). Nil until then, and for any other backend.
+    var softwareClockSessionZero: Double?
     /// The id of the title the disc demuxer should (re)open with. Mirrors `selectedDiscTitle?.id` but
     /// kept as plain state so it survives the stopInternal inside a reload and threads into audio-switch /
     /// background-resume reopens (a URL-disc reopen with no id would silently revert to the main title).
@@ -704,7 +715,11 @@ public final class AetherEngine: ObservableObject {
     /// Exposed for diagnostic overlays; hosts should not branch on it. Branch on `videoRoute` instead,
     /// which also separates the two native pipelines (#321).
     @Published public internal(set) var playbackBackend: PlaybackBackend = .none {
-        didSet { recomputeVideoRoute(); recomputeAudioDelivery(); recomputeAirPlayPictureStaysLocal() }
+        didSet {
+            recomputeVideoRoute(); recomputeAudioDelivery(); recomputeAirPlayPictureStaysLocal()
+            // The chapter origin depends on the backend; a backend that is not settled yet keeps the list.
+            if playbackBackend != .none { republishMediaChapters() }
+        }
     }
 
     /// True while a wireless AirPlay receiver holds the audio route and the session's picture cannot
@@ -1390,6 +1405,10 @@ public final class AetherEngine: ObservableObject {
     /// Phase D: forward-prefetch lead while the OCR worker is armed; exceeds
     /// subtitleOCRLeadSeconds so the packet store actually holds the worker's window.
     nonisolated static let subtitleOCRPrefetchLeadSeconds: Double = 270
+    /// When a native select of an OCR rendition that is still waiting for the worker to cover
+    /// `subtitleOCRLeadSeconds` reports what it is waiting on. The worker is armed on demand, so the
+    /// wait is the prefetcher reading 270 s of the source at link rate plus the recognition.
+    nonisolated static let subtitleOCRPrefillReportSeconds: Double = 60
     /// Phase D: per-tick decode cap; smooths the initial 240 s backfill over a few ticks
     /// instead of one long MainActor pass.
     nonisolated static let subtitleOCRMaxPacketsPerTick: Int = 48
@@ -1415,7 +1434,11 @@ public final class AetherEngine: ObservableObject {
     /// Nil for SRT/VTT and when markup preservation is off.
     @Published public internal(set) var sidecarASSHeader: String? = nil
 
-    /// Cues for the secondary subtitle track (#47). Text-only (bitmap rejected); independent of primary.
+    /// ASS script header for the active secondary sidecar when preserveASSMarkup is enabled.
+    /// Independent of the primary header; nil for other formats and after clearing or stopping.
+    @Published public internal(set) var secondarySidecarASSHeader: String? = nil
+
+    /// Cues for the secondary subtitle track (#47). Text and supported bitmap codecs; independent of primary.
     @Published public internal(set) var secondarySubtitleCues: [SubtitleCue] = []
     @Published public internal(set) var isLoadingSecondarySubtitles: Bool = false
     @Published public internal(set) var isSecondarySubtitleActive: Bool = false
@@ -2122,6 +2145,12 @@ public final class AetherEngine: ObservableObject {
     /// after a newer load, orphan the successor's producer+loopback server, and resurrect playback after
     /// dismissal. A superseded load throws CancellationError at the first checkpoint.
     var loadGeneration: UInt64 = 0
+
+    /// Separates cache lifecycle callbacks from superseding sessions.
+    var sessionCacheStatusToken: UInt64 = 0
+    /// Bumped by every host subtitle selection or clear on either channel (#829): a
+    /// `PreparedExternalSubtitle` from an older value is stale.
+    var externalSubtitleIntentGeneration: UInt64 = 0
 
     /// Distinct across engine instances and refreshed whenever teardown invalidates preview work.
     public private(set) var scrubPreviewSourceGeneration = UUID()
@@ -4163,6 +4192,8 @@ public final class AetherEngine: ObservableObject {
         // (audio-only fast path, suppressed hosts); a load() that throws before routing leaves it for stop().
         claimSoftwarePathTakeover()   // AE#629
         stopInternal(resetDisplayCriteria: false, keepNativeHost: preserveNativeHost, keepCurrentItem: handOverInPlace)
+        sessionCacheStatusToken &+= 1
+        diagnostics.sessionCacheStatus = .inactive
         if mediaServicesWereReset { dropAudioPlayerHostAfterMediaServicesReset() }
         // #35/#93: a genuinely new item has not rendered yet; re-arm the cold-startup wedge suspension.
         // Scrub/seek/producer-restart never route through load(), so mid-stream #93 detection stays armed.
@@ -4223,6 +4254,9 @@ public final class AetherEngine: ObservableObject {
             // AE#678: the ingest fetches from the playlist's origin, not from `aether-custom://`.
             OriginRequestBudget.shared.setHostLimit(
                 options.maxConcurrentSourceRequests, for: ingest.budgetOriginURL)
+            if options.isLive {
+                ingest.setJoinCushion(LiveEdgePolicy.edgeCushion(options.liveEdgeCushionSeconds))
+            }
         }
         // #170: the carryover is consumed by THIS load only (registration site below, or never on
         // the branches that return before it); it must not persist into loadedOptions where a later
@@ -4302,6 +4336,8 @@ public final class AetherEngine: ObservableObject {
         discTitles = []
         selectedDiscTitle = nil
         discChapters = []
+        containerChapterSource = nil
+        softwareClockSessionZero = nil
         mediaChapters = []
         subtitleCueDiagnosticBudget = .init()
         // Reset format/dimension state so paths that skip the probe (nativeRemoteHLS) or find no video
@@ -4746,7 +4782,8 @@ public final class AetherEngine: ObservableObject {
         // clamped to an in-range id); non-disc sources report empty/nil (#67).
         discTitles = probeOpened ? probe.discTitleInfos() : []
         discChapters = probeOpened ? probe.discChapterInfos() : []
-        mediaChapters = (probeOpened && discTitles.isEmpty) ? probe.mediaChapterInfos() : []
+        containerChapterSource = (probeOpened && discTitles.isEmpty) ? probe.containerChapterSource() : nil
+        republishMediaChapters()
         activeDiscTitleID = probeOpened ? probe.selectedDiscTitleID : nil
         selectedDiscTitle = activeDiscTitleID.flatMap { id in discTitles.first { $0.id == id } }
         // Content start PTS for the software-path chapter-seek base (see sourceStartSeconds). start_time is
@@ -5191,7 +5228,8 @@ public final class AetherEngine: ObservableObject {
             preferDualLayerDolbyVision: options.preferDualLayerDolbyVision,
             isLive: options.isLive,
             isSourceSeekable: dualLayerSeekable,
-            canHardwareDecode: opensHardwareHEVC) == nil {
+            canHardwareDecode: opensHardwareHEVC,
+            enhancementLayerInPackets: !probe.foldsBluRayDolbyVisionLayers) == nil {
             let vIdx = probe.videoStreamIndex
             elType = await BlockingWork.detached(priority: .userInitiated) { [probe] in
                 let result = DolbyVisionRecordAudit.probeEnhancementLayerType(demuxer: probe, streamIndex: vIdx)
@@ -5213,7 +5251,8 @@ public final class AetherEngine: ObservableObject {
             isSourceSeekable: dualLayerSeekable,
             canHardwareDecode: opensHardwareHEVC,
             elType: elType,
-            geometry: dualLayerGeometry)
+            geometry: dualLayerGeometry,
+            enhancementLayerInPackets: !probe.foldsBluRayDolbyVisionLayers)
         if let line = dualLayerDecision.logLine {
             EngineLog.emit(line, category: .engine)
         }
@@ -5252,7 +5291,11 @@ public final class AetherEngine: ObservableObject {
             let videoIdx = probe.videoStreamIndex
             let verdict = await BlockingWork.detached(priority: .userInitiated) { [probe] in
                 let verdict = InterlaceProbe.run(demuxer: probe, streamIndex: videoIdx)
-                probe.seek(to: 0)  // sample consumed packets; the session reuses this demuxer
+                // The sample consumed packets and the session reuses this demuxer. A rewind that
+                // stalls leaves the declaration standing: the sample says nothing about the title.
+                guard probe.seekBounded(to: 0, timeout: Self.probeRewindSeekTimeout) else {
+                    return InterlaceProbe.Verdict.inconclusive(reason: "source did not rewind")
+                }
                 return verdict
             }.value
             if loadGeneration != gen {
@@ -5955,7 +5998,10 @@ public final class AetherEngine: ObservableObject {
             ? (liveLanding?.sessionTarget ?? seconds)
             : max(0, min(seconds, duration))
         if isLive, softwareHost != nil, nativeHost == nil, let window = liveWindow {
-            let landing = Self.softwareLiveLanding(requested: target, window: window)
+            let landing = Self.softwareLiveLanding(
+                requested: target, window: window,
+                holdbackSeconds: softwareHost?.liveHoldback.landingHoldbackSeconds
+                    ?? AudioLookaheadPolicy.rebufferResumeLeadSeconds)
             if landing < target {
                 EngineLog.emit(
                     "[AetherEngine] #104 SW live landing held \(String(format: "%.2f", target - landing))s "
@@ -6662,7 +6708,8 @@ public final class AetherEngine: ObservableObject {
         releaseHeldPicture(reason: "stop")
         nextLoadRequestsInPlaceItemHandover = false
         stopInternal(resetDisplayCriteria: resetDisplayCriteria,
-                     finalTeardown: finalTeardown ?? resetDisplayCriteria)
+                     finalTeardown: finalTeardown ?? resetDisplayCriteria,
+                     cacheCleanupReason: .sessionStopped)
         state = .idle
         // #361: the sequence ends here without ever reaching its last checkpoint, which is the whole
         // point: nothing about a stop should read as a finished startup. Cleared in stop() and not in
@@ -6702,11 +6749,12 @@ public final class AetherEngine: ObservableObject {
         // Font attachments are session-scoped but must survive stopInternal (audio-track-switch skips the probe;
         // clearing in stopInternal would leave the session with an empty font list after any audio switch).
         fontAttachments = []
-        // Container chapters belong to the source URL, not to the pipeline, so they follow the same rule:
-        // every reopen of the same source (audio switch, iOS background return, #127 expiry) runs through
-        // stopInternal without re-probing, and a wipe there would strip them for the rest of the session.
-        // Disc chapters are NOT in this block: a title switch really does change them, and the reload path
-        // recaptures them from the reopened demuxer.
+        // Container chapters belong to the source URL, not to the pipeline: the internal reopens of the same
+        // source (audio switch, iOS background return, #127 expiry) run through stopInternal without
+        // re-probing, so stopInternal leaves them alone. This is the end of the session, so they go here,
+        // and the next load probes the new source. Disc chapters are cleared by stopInternal: a title
+        // switch really does change them, and the reload path recaptures them from the reopened demuxer.
+        containerChapterSource = nil
         mediaChapters = []
         videoFormat = .sdr
         sourceVideoFormat = .sdr
@@ -7504,6 +7552,24 @@ public final class AetherEngine: ObservableObject {
         }
     }
 
+    /// Publishes `mediaChapters` from `containerChapterSource` on the axis of the current backend. While no
+    /// backend is settled (the probe at load, before the route is chosen) nothing is published: the origin
+    /// is not known, and raw container times must not reach a host as seek targets. The backend's `didSet`
+    /// publishes once it is.
+    func republishMediaChapters() {
+        guard let source = containerChapterSource, playbackBackend != .none else {
+            if !mediaChapters.isEmpty { mediaChapters = [] }
+            return
+        }
+        let origin = PresentationAxis.containerChapterOrigin(
+            backend: playbackBackend, formatStartSeconds: source.formatStartSeconds,
+            sourceStartOrigin: source.sourceStartOrigin, softwareClockZero: softwareClockSessionZero,
+            isLive: isLive)
+        // Every reopen of the same source settles the backend again; an unchanged list must not re-fire.
+        let rebased = Demuxer.chapterInfos(source, origin: origin)
+        if rebased != mediaChapters { mediaChapters = rebased }
+    }
+
     /// Seek to a chapter within the active disc title. `id` is a `ChapterInfo.id` from `discChapters`. A thin
     /// wrapper over `seek(to:)` (no pipeline rebuild, since the chapter lives in the playing title's stream).
     /// No-op when `id` is unknown. (#67)
@@ -7656,7 +7722,8 @@ public final class AetherEngine: ObservableObject {
     ///   never settles and burns the full settle timeout (~12 s of
     ///   black-screen latency per audio switch on the old fixed 5 s
     ///   poll; capped at ~2 s since #117, but still worth skipping).
-    func stopInternal(resetDisplayCriteria: Bool = true, keepNativeHost: Bool = false, keepCustomReader: Bool = false, keepCurrentItem: Bool = false, finalTeardown: Bool = false) {
+    func stopInternal(resetDisplayCriteria: Bool = true, keepNativeHost: Bool = false, keepCustomReader: Bool = false, keepCurrentItem: Bool = false, finalTeardown: Bool = false,
+                      cacheCleanupReason: SessionCacheCleanupReason = .sourceChanged) {
         // AE#560: a recording never outlives its session. This covers stop(), a new load() and
         // every reload, all of which pass through here before the demuxer goes away.
         endRecordingIfRunning(reason: .sessionEnded)
@@ -7733,7 +7800,10 @@ public final class AetherEngine: ObservableObject {
         // host has already retired for the next item. Only the session's slot is cleared; the engine
         // keeps the host's observer and re-arms the next session with it in load().
         nativeVideoSession?.setNativeVideoFrameTimeObserver(nil)
-        nativeVideoSession?.stop()
+        if diagnostics.sessionCacheStatus.route == .nativeRemoteHLS {
+            diagnostics.sessionCacheStatus = .inactive
+        }
+        nativeVideoSession?.stop(reason: cacheCleanupReason)
         nativeVideoSession = nil
         nativeSubtitleRenditionsServed = false
         dolbyVisionConversion = nil
@@ -7773,6 +7843,7 @@ public final class AetherEngine: ObservableObject {
         }
 
         softwareCancellables.removeAll()
+        softwareClockSessionZero = nil
         // #353: the picture belongs to the session. Left standing, the next source would be laid out
         // against this one's rectangle for as long as it takes its own first frame to arrive.
         softwareDisplaySize = nil
@@ -7888,6 +7959,7 @@ public final class AetherEngine: ObservableObject {
         subtitleCues = []
         pgsStaleArrivalGates = [:]   // #100: both channels; a hold never survives the session
         sidecarASSHeader = nil
+        secondarySidecarASSHeader = nil
         isLoadingSubtitles = false
         nativeSubtitleTrackTable = []
         nativeSubtitleReapplyOrdinal = nil
@@ -7897,6 +7969,7 @@ public final class AetherEngine: ObservableObject {
         nativeSubtitleRenditionAvailable = false
         cancelSidecarTask(channel: .secondary)
         activeSecondaryEmbeddedSubtitleStreamIndex = -1
+        activeSecondaryExternalSubtitleTrackID = nil
         loadedSecondarySidecarURL = nil
         isSecondarySubtitleActive = false
         secondarySubtitleCues = []

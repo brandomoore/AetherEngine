@@ -48,7 +48,7 @@ struct RemoteHLSSubtitleProxyTests {
         let stores = tracks.map { _ in NativeSubtitleCueStore() }
 
         let jobs = RemoteHLSSubtitleProvider.fillJobs(tracks: tracks, stores: stores,
-                                                      defaultHeaders: [:])
+                                                      defaultHeaders: [:], mediaURL: nil)
         #expect(jobs.count == 1)
         #expect(jobs[0].targets.map(\.streamIndex) == [2, 3])
     }
@@ -60,7 +60,7 @@ struct RemoteHLSSubtitleProxyTests {
                       Self.track(100_001, url: container, headers: ["X-Token": "b"])]
         let stores = tracks.map { _ in NativeSubtitleCueStore() }
         #expect(RemoteHLSSubtitleProvider.fillJobs(tracks: tracks, stores: stores,
-                                                   defaultHeaders: [:]).count == 2)
+                                                   defaultHeaders: [:], mediaURL: nil).count == 2)
     }
 
     @Test("A track without its own headers inherits the load's")
@@ -68,7 +68,8 @@ struct RemoteHLSSubtitleProxyTests {
         let tracks = [Self.track(100_000, url: URL(string: "https://origin.test/en.srt")!)]
         let stores = tracks.map { _ in NativeSubtitleCueStore() }
         let jobs = RemoteHLSSubtitleProvider.fillJobs(tracks: tracks, stores: stores,
-                                                      defaultHeaders: ["Authorization": "Bearer x"])
+                                                      defaultHeaders: ["Authorization": "Bearer x"],
+                                                      mediaURL: URL(string: "https://origin.test/movie.m3u8"))
         #expect(jobs.first?.headers == ["Authorization": "Bearer x"])
     }
 
@@ -78,7 +79,7 @@ struct RemoteHLSSubtitleProxyTests {
     func masterIsServedVerbatim() async throws {
         let provider = RemoteHLSSubtitleProvider(
             tracks: [Self.track(100_000, url: URL(string: "https://origin.test/en.srt")!)],
-            masterBody: Self.master, programDuration: 1200, defaultHeaders: [:])
+            masterBody: Self.master, programDuration: 1200, defaultHeaders: [:], mediaURL: nil)
         let server = HLSLocalServer(provider: provider)
         try server.start()
         defer { server.stop() }
@@ -92,7 +93,7 @@ struct RemoteHLSSubtitleProxyTests {
     func playlistURLPrefersTheStaticMaster() throws {
         let provider = RemoteHLSSubtitleProvider(
             tracks: [Self.track(100_000, url: URL(string: "https://origin.test/en.srt")!)],
-            masterBody: Self.master, programDuration: 1200, defaultHeaders: [:])
+            masterBody: Self.master, programDuration: 1200, defaultHeaders: [:], mediaURL: nil)
         #expect(provider.masterCodecs == nil)
         let server = HLSLocalServer(provider: provider)
         try server.start()
@@ -104,7 +105,7 @@ struct RemoteHLSSubtitleProxyTests {
     func subtitlePlaylistIsWholeProgram() async throws {
         let provider = RemoteHLSSubtitleProvider(
             tracks: [Self.track(100_000, url: URL(string: "https://origin.test/en.srt")!)],
-            masterBody: Self.master, programDuration: 1234.5, defaultHeaders: [:])
+            masterBody: Self.master, programDuration: 1234.5, defaultHeaders: [:], mediaURL: nil)
         let server = HLSLocalServer(provider: provider)
         try server.start()
         defer { server.stop() }
@@ -122,7 +123,7 @@ struct RemoteHLSSubtitleProxyTests {
     func mediaIsNotServed() async throws {
         let provider = RemoteHLSSubtitleProvider(
             tracks: [Self.track(100_000, url: URL(string: "https://origin.test/en.srt")!)],
-            masterBody: Self.master, programDuration: 1200, defaultHeaders: [:])
+            masterBody: Self.master, programDuration: 1200, defaultHeaders: [:], mediaURL: nil)
         let server = HLSLocalServer(provider: provider)
         try server.start()
         defer { server.stop() }
@@ -150,7 +151,7 @@ struct RemoteHLSSubtitleProxyTests {
 
         let provider = RemoteHLSSubtitleProvider(
             tracks: [Self.track(100_000, url: file)],
-            masterBody: Self.master, programDuration: 60, defaultHeaders: [:],
+            masterBody: Self.master, programDuration: 60, defaultHeaders: [:], mediaURL: nil,
             vttFillWaitSeconds: 10)
         let server = HLSLocalServer(provider: provider)
         try server.start()
@@ -274,15 +275,15 @@ struct RemoteHLSSubtitleProxyTests {
     @Test("A non-finite or absurd program duration is clamped before it reaches the provider's segment")
     func providerClampsAHostileProgramDuration() {
         let providerInf = RemoteHLSSubtitleProvider(
-            tracks: [], masterBody: Self.master, programDuration: .infinity, defaultHeaders: [:])
+            tracks: [], masterBody: Self.master, programDuration: .infinity, defaultHeaders: [:], mediaURL: nil)
         #expect(providerInf.segmentDuration(at: 0).isFinite)
 
         let providerHuge = RemoteHLSSubtitleProvider(
-            tracks: [], masterBody: Self.master, programDuration: 5e18, defaultHeaders: [:])
+            tracks: [], masterBody: Self.master, programDuration: 5e18, defaultHeaders: [:], mediaURL: nil)
         #expect(providerHuge.segmentDuration(at: 0) <= RemoteHLSSubtitleProxy.maxProgramDurationSeconds)
 
         let providerNaN = RemoteHLSSubtitleProvider(
-            tracks: [], masterBody: Self.master, programDuration: .nan, defaultHeaders: [:])
+            tracks: [], masterBody: Self.master, programDuration: .nan, defaultHeaders: [:], mediaURL: nil)
         #expect(providerNaN.segmentDuration(at: 0) == 1)
     }
 

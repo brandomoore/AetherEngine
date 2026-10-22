@@ -119,6 +119,7 @@ func runLive(
     discontinuityAt: Double? = nil,
     realtime: Bool = false,
     fastZap: Bool = false,
+    liveCushion: Double? = nil,
     pacingPreroll: Double? = nil,
     pacingRate: Double? = nil,
     originLead: Double? = nil,
@@ -261,6 +262,7 @@ func runLive(
             return
         }
         box.value = await liveSmokeTest(url: liveURL, seconds: playSeconds, fastZap: fastZap,
+                                        liveCushion: liveCushion,
                                         dvrWindow: dvrWindow, measureRSS: measureRSS,
                                         reportCacheBytes: reportCacheBytes,
                                         checkMonotonic: discontinuityAt != nil,
@@ -275,6 +277,7 @@ func runLive(
 @MainActor
 private func liveSmokeTest(url: URL, seconds playSeconds: Double,
                            fastZap: Bool = false,
+                           liveCushion: Double? = nil,
                            dvrWindow: Double? = nil,
                            measureRSS: Bool = false,
                            reportCacheBytes: Bool = false,
@@ -292,6 +295,7 @@ private func liveSmokeTest(url: URL, seconds playSeconds: Double,
     options.suppressDisplayCriteria = true
     options.dvrWindowSeconds = dvrWindow
     options.liveJoinProfile = fastZap ? .fastZap : .standard
+    options.liveEdgeCushionSeconds = liveCushion
 
     // AE#195: load elapsed includes the startup-cushion gate, so this is the join-latency metric
     // a --realtime fixture A/Bs between profiles.

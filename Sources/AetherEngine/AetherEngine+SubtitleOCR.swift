@@ -1,6 +1,7 @@
+import AVFoundation
 import Foundation
 
-// Phase D: selection-armed worker feeding a bitmap track's native WebVTT rendition with
+// Phase D: native-selection-armed worker feeding a bitmap track's native WebVTT rendition with
 // OCR-recognized text cues, so PGS/DVB/DVD subtitles survive PiP / AirPlay / external display
 // on the native path. Packet source is the session SubtitlePacketStore (#112 harvest); the tick
 // plans and resolves on the MainActor, decodes off it (AE#628), and Vision runs on a dedicated thread.
@@ -55,6 +56,96 @@ extension AetherEngine {
         subtitleOCRSidecarFillTask = nil
         subtitleOCRDecoder = nil
         subtitleOCRLastTickUptime = nil   // #271
+    }
+
+    /// The OCR rendition only matters while the host shows it (PiP / AirPlay / external display), so
+    /// the worker follows the native selection instead of the overlay selection. Armed, it also
+    /// raises the forward prefetch to `subtitleOCRPrefetchLeadSeconds`, and on Matroska that reader
+    /// pulls every cluster: measured on a 4K remux, ten times the bytes of the overlay-only lead,
+    /// which a viewer who never leaves fullscreen paid for nothing (DerPicknicker, A10X).
+    func syncSubtitleOCRWithNativeSelection(ordinal: Int?) {
+        let wanted = ordinal.flatMap { o -> (ordinal: Int, stream: Int32)? in
+            guard o < nativeSubtitleTrackTable.count, nativeSubtitleTrackTable[o].needsOCR,
+                  let source = nativeSubtitleTrackTable[o].sourceStreamIndex,
+                  Int32(source) == activeEmbeddedSubtitleStreamIndex else { return nil }
+            return (o, Int32(source))
+        }
+        if let wanted {
+            guard subtitleOCRArmedOrdinal != wanted.ordinal else { return }
+            startSubtitleOCRWorker(ordinal: wanted.ordinal, streamIndex: wanted.stream)
+        } else {
+            guard subtitleOCRArmedOrdinal != nil else { return }
+            cancelSubtitleOCRWorker()
+        }
+        // Rebuilds the running session only when the lead actually changed.
+        startSubtitleForwardPrefetcher()
+    }
+
+    /// Whether the worker has recognized every stored composition through the window AVKit takes in
+    /// one burst at selection. A worker armed on demand starts that window empty, and AVKit caches
+    /// what it is handed, so the native select waits for this instead of the cue-end heuristic.
+    func subtitleOCRCoversNativeWindow(ordinal: Int) -> Bool {
+        guard subtitleOCRArmedOrdinal == ordinal, !subtitleOCRBatchInFlight,
+              ordinal < nativeSubtitleTrackTable.count,
+              let source = nativeSubtitleTrackTable[ordinal].sourceStreamIndex,
+              let packets = activeSubtitlePacketStore,
+              let cursor = subtitleOCRCursors[ordinal] else { return false }
+        let from = sourceTime
+        var through = from + Self.subtitleOCRLeadSeconds
+        if duration > 0 { through = min(through, duration) }
+        return Self.subtitleOCRWindowCovered(
+            harvestRead: packets.hasReadSpan(from: from, through: through),
+            undecodedPackets: packets.entries(streamIndex: Int32(source),
+                                              from: cursor.lastDecodedPts.nextUp,
+                                              through: through).count)
+    }
+
+    /// What `subtitleOCRCoversNativeWindow` saw, for the line that reports a gate that never opened.
+    func subtitleOCRCoverageState(ordinal: Int) -> String {
+        let from = sourceTime
+        var through = from + Self.subtitleOCRLeadSeconds
+        if duration > 0 { through = min(through, duration) }
+        let cursor = subtitleOCRCursors[ordinal].map { String(format: "%.2f", $0.lastDecodedPts) } ?? "nil"
+        var read = "?", undecoded = "?"
+        if ordinal < nativeSubtitleTrackTable.count,
+           let source = nativeSubtitleTrackTable[ordinal].sourceStreamIndex,
+           let packets = activeSubtitlePacketStore {
+            read = "\(packets.hasReadSpan(from: from, through: through))"
+            if let c = subtitleOCRCursors[ordinal] {
+                undecoded = "\(packets.entries(streamIndex: Int32(source), from: c.lastDecodedPts.nextUp, through: through).count)"
+            }
+        }
+        return "armed=\(subtitleOCRArmedOrdinal.map(String.init) ?? "nil") inFlight=\(subtitleOCRBatchInFlight) "
+            + "window=\(String(format: "%.1f", from))-\(String(format: "%.1f", through)) read=\(read) "
+            + "cursor=\(cursor) undecoded=\(undecoded)"
+    }
+
+    nonisolated static func subtitleOCRWindowCovered(harvestRead: Bool, undecodedPackets: Int) -> Bool {
+        harvestRead && undecodedPackets == 0
+    }
+
+    /// Polls `subtitleOCRCoversNativeWindow` until it holds, the store finished, or the request moved
+    /// on (track change, deselect, new item). No deadline: refusing an empty rendition leaves nothing
+    /// that retries it, and selecting a partial one makes AVKit cache the rest empty, while a slow
+    /// first recognition is real (Vision took over 60 s for one 4K composition in 2 of 7 Mac runs).
+    /// Returns the reason, for the pre-fill line.
+    func awaitSubtitleOCRCoverage(ordinal: Int, store: NativeSubtitleCueStore,
+                                  item: AVPlayerItem) async -> String {
+        let reportAt = Date().addingTimeInterval(Self.subtitleOCRPrefillReportSeconds)
+        var reported = false
+        while true {
+            if store.isFinished { return "finished" }
+            if subtitleOCRCoversNativeWindow(ordinal: ordinal) { return "covered" }
+            guard nativeSubtitleReapplyOrdinal == ordinal, currentAVPlayer?.currentItem === item
+            else { return "superseded" }
+            if !reported, Date() >= reportAt {
+                reported = true
+                EngineLog.emit("[AetherEngine] native subtitle OCR pre-fill still waiting after "
+                               + "\(Int(Self.subtitleOCRPrefillReportSeconds))s: "
+                               + subtitleOCRCoverageState(ordinal: ordinal), category: .engine)
+            }
+            try? await Task.sleep(nanoseconds: 250_000_000)
+        }
     }
 
     /// Load/stop teardown: forget covered-region state too (new session, new axis).

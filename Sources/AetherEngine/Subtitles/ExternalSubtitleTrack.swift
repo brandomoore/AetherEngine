@@ -7,6 +7,8 @@ import Foundation
 /// (`AetherEngine.externalSubtitleTrackIDBase` + registration ordinal) and `isExternal == true`,
 /// selectable through the same `selectSubtitleTrack(index:)` as embedded streams.
 public struct ExternalSubtitleTrack: Sendable, Equatable {
+    var preparationPolicy: ExternalSubtitlePreparationPolicy? = nil
+
     public var url: URL
     public var name: String?
     /// BCP-47 / ISO 639 code, same convention as `TrackInfo.language`.

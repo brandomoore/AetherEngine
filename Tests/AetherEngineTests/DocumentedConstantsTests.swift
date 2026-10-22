@@ -118,6 +118,16 @@ final class DocumentedConstantsTests: XCTestCase {
         assertDocumented("`SoftwareLiveJoinPolicy.leadSeconds` (4 s) behind the newest media", try documentation())
     }
 
+    /// docs/formats.md quotes the segmented holdback of a live HLS ingest on the software path (AE#813).
+    func testSoftwareLiveHoldbackMatchesDocumentation() throws {
+        XCTAssertEqual(SoftwareLiveHoldback(deliveryUnitSeconds: 2).joinLeadSeconds, 4)
+        XCTAssertEqual(SoftwareLiveHoldback(deliveryUnitSeconds: 10).joinLeadSeconds, 16)
+        XCTAssertEqual(SoftwareLiveHoldback.maximumLeadSeconds, 45)
+        XCTAssertEqual(SoftwareLiveHoldback.resumeSlackSeconds, 2)
+        assertDocumented("`1.5 x segment + 1 s` behind the newest media (4 s on 2 s segments, 16 s on 10 s segments, at most 45 s)",
+                         try documentation())
+    }
+
     // MARK: - Documentation corpus
 
     private static var repoRoot: URL {

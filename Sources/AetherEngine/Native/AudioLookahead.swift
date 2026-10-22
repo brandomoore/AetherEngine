@@ -38,17 +38,26 @@ enum AudioLookaheadPolicy {
         case resume
     }
 
+    /// `bufferedAheadSeconds` is the media the source has delivered ahead of the clock, and
+    /// `resumeCushionSeconds` how much of it a resume waits for (AE#813: a source that delivers a
+    /// whole segment at a time would otherwise resume the moment a late segment lands, with nothing
+    /// to cover the next one). nil waits for the audio lead alone.
     static func clockAction(
         rebuffering: Bool,
         lastFedAudioPTS: Double,
         clockSeconds: Double,
         atRingEnd: Bool,
-        sourceEnded: Bool
+        sourceEnded: Bool,
+        bufferedAheadSeconds: Double = .infinity,
+        resumeCushionSeconds: Double? = nil
     ) -> ClockAction {
         let lead = lastFedAudioPTS.isFinite ? lastFedAudioPTS - clockSeconds : 0
         if rebuffering {
             // sourceEnded: nothing more will arrive; resume and drain what is queued.
-            return (lead >= rebufferResumeLeadSeconds || sourceEnded) ? .resume : .none
+            if sourceEnded { return .resume }
+            guard lead >= rebufferResumeLeadSeconds else { return .none }
+            if let cushion = resumeCushionSeconds, !(bufferedAheadSeconds >= cushion) { return .none }
+            return .resume
         }
         // Only a DRY ring at the edge is a source underrun. A low lead with packets still
         // in the ring is decode lag; the next pump pass refills it without touching the clock.

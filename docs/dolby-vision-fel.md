@@ -306,6 +306,7 @@ A Profile 7 load logs exactly one line, whichever way it goes (other sources log
 [AetherEngine] DV P7 dual-layer route: not taken (built without the DualLayerDolbyVision trait), keeps the native route (8.1 where the display takes Dolby Vision)
 [AetherEngine] DV P7 dual-layer route: not taken (over the real-time budget, 3840x2160@60 needs 200% of it), keeps the native route (8.1 where the display takes Dolby Vision)
 [AetherEngine] DV P7 dual-layer route: not taken (base-layer size unknown), keeps the native route (8.1 where the display takes Dolby Vision)
+[AetherEngine] DV P7 dual-layer route: not taken (enhancement layer on its own PID (UHD Blu-ray), only its RPUs are folded in), keeps the native route (8.1 where the display takes Dolby Vision)
 ```
 
 A missing Metal device does not fall back to the native route: the routing decision above has

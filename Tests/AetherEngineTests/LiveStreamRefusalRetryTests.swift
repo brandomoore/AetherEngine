@@ -9,7 +9,8 @@ import Foundation
 /// answer, typed, rather than a minute of the same request.
 ///
 /// The loopback cases run with the reconnect backoff scaled down, the way the other reader suites
-/// do, and are judged by what came through and how many requests it took, never by the wall clock.
+/// do, and are judged by what came through and how many requests it took; the give-up case's only
+/// wall-clock check is a lower bound (time spent >= budget) that a slow runner can only satisfy.
 /// Scale and budget go to each reader at init: process-wide hooks raced between these tests, which
 /// run in parallel, and handed one test's one-second budget to its neighbour.
 /// The wait itself is a pure rule, tested as one.
@@ -171,22 +172,27 @@ struct LiveStreamRefusalRetryTests {
 
     @Test("a stream refused for longer than the budget ends as a read error")
     func refusedPastTheBudgetGivesUp() throws {
+        let budget: TimeInterval = 1
         let first = Self.streamBytes(count: 400)
         let origin = try #require(ScriptedOrigin { index in
             index == 0 ? .init(status: 200, body: first) : .init(status: 509)
         })
         defer { origin.stop() }
-        let reader = Self.makeLiveReader(origin.url, refusalBudget: 1)
+        let reader = Self.makeLiveReader(origin.url, refusalBudget: budget)
         defer { reader.markClosed(); reader.close() }
         try reader.open()
 
+        let started = DispatchTime.now()
         let drained = Self.drain(reader, expectedBytes: first.count + 1)
+        let spent = Double(DispatchTime.now().uptimeNanoseconds - started.uptimeNanoseconds) / 1e9
 
         #expect(drained.bytes == first.count)
         #expect(drained.failure == FFmpegErr.eio)
-        // Asked again more than the old count-based ladder's six would allow at this pace, and
-        // only given up once the budget ran out.
-        #expect(origin.requestCount - 1 >= 3, "\(origin.requestCount - 1) refused attempts")
+        // Given up only once the budget ran out: the old count-based ladder's six attempts at this
+        // pace end in a fraction of it. A slow runner only lengthens this, so it bounds nothing
+        // from above; how many requests fit in the second is the runner's business, not the rule's.
+        #expect(spent >= budget, "gave up after \(spent) s")
+        #expect(origin.requestCount - 1 >= 2, "\(origin.requestCount - 1) refused attempts")
     }
 
     // MARK: - The open

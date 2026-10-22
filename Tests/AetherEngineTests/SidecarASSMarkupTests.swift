@@ -1,4 +1,6 @@
 import XCTest
+import Testing
+import Foundation
 @testable import AetherEngine
 
 /// Covers AetherEngine#48: a sidecar ASS file decoded under
@@ -80,5 +82,136 @@ final class SidecarASSMarkupTests: XCTestCase {
             return XCTFail("expected a plain body for an unstyled line")
         }
         XCTAssertEqual(second, "Second line")
+    }
+}
+
+@MainActor
+@Suite(.timeLimit(.minutes(1)))
+struct SecondarySidecarASSMarkupTests {
+    @Test("secondary ASS preserves raw events and its own script header when requested")
+    func secondaryASSPreservesMarkupAndHeader() async throws {
+        let url = try MultiASSPlayResFixture.write()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let engine = try AetherEngine()
+        engine.setLoadedOptionsForTesting(LoadOptions(preserveASSMarkup: true))
+        let primary = engine.addExternalSubtitleTrack(ExternalSubtitleTrack(
+            url: url, name: "English ASS", language: "eng", formatHint: "ass",
+            sourceStreamIndex: MultiASSPlayResFixture.englishStreamIndex))
+        let secondary = engine.addExternalSubtitleTrack(ExternalSubtitleTrack(
+            url: url, name: "Spanish ASS", language: "spa", formatHint: "ass",
+            sourceStreamIndex: MultiASSPlayResFixture.spanishStreamIndex))
+
+        engine.selectSubtitleTrack(index: primary.id)
+        engine.selectSecondarySubtitleTrack(index: secondary.id)
+        await engine.sidecarTask?.value
+        await engine.secondarySidecarTask?.value
+
+        #expect(engine.sidecarASSHeader?.contains("PlayResX: 640") == true)
+        #expect(engine.secondarySidecarASSHeader?.contains("PlayResX: 1920") == true)
+        guard case .text(let primaryRaw) = try #require(engine.subtitleCues.first).body,
+              case .text(let secondaryRaw) = try #require(engine.secondarySubtitleCues.first).body
+        else {
+            Issue.record("preserved ASS cues must publish raw event lines on both channels")
+            return
+        }
+        #expect(primaryRaw.contains(#"{\pos(320,240)}"#))
+        #expect(secondaryRaw.contains(#"{\pos(320,240)}"#))
+
+        engine.loadedURL = URL(string: "https://media.example/movie.mkv")!
+        engine.selectSecondarySubtitleTrack(index: 3)
+        #expect(engine.secondarySidecarASSHeader == nil)
+    }
+
+
+    @Test("default secondary ASS output stays headerless")
+    func defaultOutput() async throws {
+        let url = try MultiASSPlayResFixture.write()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let engine = try AetherEngine()
+        defer { engine.clearSecondarySubtitle() }
+        engine.selectSecondarySidecarSubtitle(url: url)
+        await engine.secondarySidecarTask?.value
+        #expect(!engine.secondarySubtitleCues.isEmpty)
+        #expect(engine.secondarySidecarASSHeader == nil)
+        #expect(engine.secondarySubtitleCues.allSatisfy { !($0.text ?? "").contains("{\\pos") })
+    }
+
+    @Test("clear, stop and cancelled decode cannot leave secondary ASS metadata behind")
+    func lifecycle() async throws {
+        let url = try MultiASSPlayResFixture.write()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let engine = try AetherEngine()
+        engine.setLoadedOptionsForTesting(LoadOptions(preserveASSMarkup: true))
+        engine.selectSecondarySidecarSubtitle(url: url)
+        await engine.secondarySidecarTask?.value
+        #expect(engine.secondarySidecarASSHeader != nil)
+        engine.clearSubtitle()
+        #expect(engine.secondarySidecarASSHeader != nil)
+        engine.clearSecondarySubtitle()
+        #expect(engine.secondarySidecarASSHeader == nil)
+        engine.selectSecondarySidecarSubtitle(url: url)
+        let pending = engine.secondarySidecarTask
+        engine.clearSecondarySubtitle()
+        await pending?.value
+        #expect(engine.secondarySidecarASSHeader == nil)
+        #expect(engine.secondarySubtitleCues.isEmpty)
+        engine.selectSecondarySidecarSubtitle(url: url)
+        await engine.secondarySidecarTask?.value
+        #expect(engine.secondarySidecarASSHeader != nil)
+        engine.stopInternal()
+        #expect(engine.secondarySidecarASSHeader == nil)
+    }
+
+    @Test("switching to SubRip removes ASS header without turning its text into ASS")
+    func switchToSubRip() async throws {
+        let ass = try MultiASSPlayResFixture.write()
+        let srt = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".srt")
+        try "1\n00:00:01,000 --> 00:00:03,000\nHello\n".write(to: srt, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: ass); try? FileManager.default.removeItem(at: srt) }
+        let engine = try AetherEngine()
+        defer { engine.clearSecondarySubtitle() }
+        engine.setLoadedOptionsForTesting(LoadOptions(preserveASSMarkup: true))
+        engine.selectSecondarySidecarSubtitle(url: ass)
+        await engine.secondarySidecarTask?.value
+        #expect(engine.secondarySidecarASSHeader != nil)
+        engine.selectSecondarySidecarSubtitle(url: srt)
+        #expect(engine.secondarySidecarASSHeader == nil)
+        await engine.secondarySidecarTask?.value
+        #expect(engine.secondarySidecarASSHeader == nil)
+        #expect(engine.secondarySubtitleCues.compactMap(\.text) == ["Hello"])
+    }
+
+    @Test("session carryover restores the secondary ASS header from its sidecar")
+    func restoreAfterTeardown() async throws {
+        let url = try MultiASSPlayResFixture.write()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let engine = try AetherEngine()
+        defer { engine.clearSecondarySubtitle() }
+        engine.setLoadedOptionsForTesting(LoadOptions(preserveASSMarkup: true))
+        engine.selectSecondarySidecarSubtitle(url: url)
+        await engine.secondarySidecarTask?.value
+        let header = try #require(engine.secondarySidecarASSHeader)
+        let carryover = engine.captureSubtitleSessionCarryover()
+        engine.stopInternal()
+        #expect(engine.secondarySidecarASSHeader == nil)
+        engine.setLoadedOptionsForTesting(LoadOptions(preserveASSMarkup: true))
+        engine.restoreSubtitleSelection(from: carryover, resumeAnchor: 0)
+        await engine.secondarySidecarTask?.value
+        #expect(engine.secondarySidecarASSHeader == header)
+        #expect(!engine.secondarySubtitleCues.isEmpty)
+    }
+
+    @Test("preserveASSMarkup does not turn secondary WebVTT into raw ASS")
+    func webVTTStaysText() async throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".vtt")
+        try "WEBVTT\n\n00:00:01.000 --> 00:00:03.000\nHello VTT\n".write(to: url, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let engine = try AetherEngine()
+        defer { engine.clearSecondarySubtitle() }
+        engine.setLoadedOptionsForTesting(LoadOptions(preserveASSMarkup: true))
+        engine.selectSecondarySidecarSubtitle(url: url)
+        await engine.secondarySidecarTask?.value
+        #expect(engine.secondarySidecarASSHeader == nil)
+        #expect(engine.secondarySubtitleCues.compactMap(\.text) == ["Hello VTT"])
     }
 }

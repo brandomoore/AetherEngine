@@ -140,7 +140,7 @@ enum RemoteHLSSubtitleProxy {
 
         let provider = RemoteHLSSubtitleProvider(tracks: tracks, masterBody: master,
                                                  programDuration: duration,
-                                                 defaultHeaders: httpHeaders)
+                                                 defaultHeaders: httpHeaders, mediaURL: originURL)
         let relay: HLSOriginRelay? = needsRelay ? HLSOriginRelay() : nil
         // Audit NET-109: the grant belongs to the URL the host handed over. A redirect target is
         // only allowed, or a cross-host redirect would move the token to the edge and leave the

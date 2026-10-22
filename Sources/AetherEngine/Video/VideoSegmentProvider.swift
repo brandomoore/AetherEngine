@@ -36,6 +36,12 @@ struct LiveWindowSizing {
     /// AE#443: the session's disk allowance (`HLSVideoEngine.sessionRetentionBudgetBytes`). 0 means
     /// "not stated", which leaves the sizing purely time-based, as it was.
     var retentionBudgetBytes: Int = 0
+    /// `LoadOptions.liveEdgeCushionSeconds`, already validated (`LiveEdgePolicy.edgeCushion`). The
+    /// window holds at least this plus `edgeCushionWindowMarginSeconds`, so the playhead it parks that
+    /// far back never sits at the segment the next slide evicts.
+    var edgeCushionSeconds: Double? = nil
+
+    static let edgeCushionWindowMarginSeconds: Double = 15
 
     /// Number of segments the playlist keeps visible (and the cache keeps
     /// resident). Clamped up to `minSafeSegments`.
@@ -58,7 +64,8 @@ struct LiveWindowSizing {
     /// has to: comparing the served count against a value that already carries the clamps would report
     /// every clamped window as unclamped.
     func requestedSegmentCount(observedSegmentDurationSeconds: Double?) -> Int {
-        let effective = Self.effectiveWindowSeconds(dvrWindowSeconds)
+        let effective = max(Self.effectiveWindowSeconds(dvrWindowSeconds),
+                            edgeCushionSeconds.map { $0 + Self.edgeCushionWindowMarginSeconds } ?? 0)
         let divisor = max(max(0.5, targetSegmentDurationSeconds), observedSegmentDurationSeconds ?? 0)
         return Int(ceil(effective / divisor))
     }
@@ -478,6 +485,32 @@ enum LiveEdgePolicy {
     /// RFC 8216bis floor for `EXT-X-SERVER-CONTROL:HOLD-BACK`.
     static func holdBackSeconds(targetDuration: Int) -> Double { Double(3 * targetDuration) }
 
+    /// The holdback a session serves and builds its first window to: the RFC floor above, raised to a
+    /// host's `liveEdgeCushionSeconds` when that is deeper. Never below the floor, so a cushion cannot
+    /// buy back the stall-danger zone AE#189 closed.
+    static func holdBackSeconds(targetDuration: Int, edgeCushionSeconds: Double?) -> Double {
+        max(holdBackSeconds(targetDuration: targetDuration), edgeCushionSeconds ?? 0)
+    }
+
+    /// Ceiling on `LoadOptions.liveEdgeCushionSeconds`: the software join lead's own bound
+    /// (`SoftwareLiveHoldback.maximumLeadSeconds`), and with the window margin it still fits the
+    /// 60 s live-only window.
+    static let maximumEdgeCushionSeconds: Double = 45
+
+    /// `LoadOptions.liveEdgeCushionSeconds` as the engine uses it: nil unless finite and positive,
+    /// clamped to `maximumEdgeCushionSeconds`.
+    static func edgeCushion(_ requested: Double?) -> Double? {
+        guard let requested, requested.isFinite, requested > 0 else { return nil }
+        return min(requested, maximumEdgeCushionSeconds)
+    }
+
+    /// How long the first live manifest may be held. The historical 30 s, extended for a cushion a
+    /// strict-realtime origin can only fill at 1x, so a deep cushion is not cut short by the deadline
+    /// it was asked to wait for.
+    static func firstServeTimeoutSeconds(edgeCushionSeconds: Double?) -> TimeInterval {
+        max(30, (edgeCushionSeconds ?? 0) + 15)
+    }
+
     /// One observed segment duration gives a strict-realtime fastZap source one more chance to fill
     /// naturally, while the clamp keeps the startup bound useful for unusually short or long GOPs.
     static func fastZapDegradedGraceSeconds(
@@ -500,7 +533,8 @@ enum LiveEdgePolicy {
                                         cutTargetSeconds: Double?,
                                         cadenceFloorSeconds: Double?,
                                         segmentsAreCutHere: Bool = false,
-                                        windowSegmentCount: Int) -> Bool {
+                                        windowSegmentCount: Int,
+                                        edgeCushionSeconds: Double? = nil) -> Bool {
         let td = targetDurationSeconds(maxSegmentDuration: maxSegmentDuration,
                                        cutTargetSeconds: cutTargetSeconds,
                                        cadenceFloorSeconds: cadenceFloorSeconds,
@@ -509,14 +543,16 @@ enum LiveEdgePolicy {
             segmentCount: segmentCount,
             summedDurationSeconds: summedDurationSeconds,
             targetDuration: td,
-            windowSegmentCount: windowSegmentCount
+            windowSegmentCount: windowSegmentCount,
+            edgeCushionSeconds: edgeCushionSeconds
         )
     }
 
     static func startupCushionSatisfied(segmentCount: Int,
                                         summedDurationSeconds: Double,
                                         targetDuration: Int,
-                                        windowSegmentCount: Int) -> Bool {
+                                        windowSegmentCount: Int,
+                                        edgeCushionSeconds: Double? = nil) -> Bool {
         guard segmentCount >= minStartupSegments else { return false }
         if segmentCount >= windowSegmentCount { return true }
         // Judged at the served resolution too, or the depth check disagrees with the value it is checking
@@ -524,7 +560,8 @@ enum LiveEdgePolicy {
         // 6.0 for some first-segment starts and to a hair under it for others (a first start of 0.030 s
         // lands short, the reporter's 0.060 s does not), and the gate would then hold for a fourth
         // segment it does not need, a full extra segment duration, on some sessions and not others.
-        return servedSeconds(summedDurationSeconds) >= holdBackSeconds(targetDuration: targetDuration)
+        return servedSeconds(summedDurationSeconds)
+            >= holdBackSeconds(targetDuration: targetDuration, edgeCushionSeconds: edgeCushionSeconds)
     }
 
     /// AE#374: the first live manifest's own account of what it cost, for the log.
@@ -537,8 +574,9 @@ enum LiveEdgePolicy {
     static func firstServeAccount(waitedSeconds: TimeInterval,
                                   segmentCount: Int,
                                   summedDurationSeconds: Double,
-                                  targetDuration: Int) -> String {
-        let holdBack = holdBackSeconds(targetDuration: targetDuration)
+                                  targetDuration: Int,
+                                  edgeCushionSeconds: Double? = nil) -> String {
+        let holdBack = holdBackSeconds(targetDuration: targetDuration, edgeCushionSeconds: edgeCushionSeconds)
         let reached = servedSeconds(summedDurationSeconds) >= holdBack ? ">=" : "<"
         return "first live manifest served after \(seconds(waitedSeconds))s: "
             + "\(segmentCount) segments / \(seconds(summedDurationSeconds))s "
@@ -737,7 +775,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     private var liveWindowSizing: LiveWindowSizing {
         guard let limits = nativeLiveDVRPolicy?.snapshot else { return baseLiveWindowSizing }
         return LiveWindowSizing(targetSegmentDurationSeconds: baseLiveWindowSizing.targetSegmentDurationSeconds,
-                                dvrWindowSeconds: limits.windowSeconds, retentionBudgetBytes: limits.retentionBytes)
+                                dvrWindowSeconds: limits.windowSeconds, retentionBudgetBytes: limits.retentionBytes,
+                                edgeCushionSeconds: baseLiveWindowSizing.edgeCushionSeconds)
     }
 
     /// Reconcile playlist and cache off the caller's actor; this never rebuilds the source/player.
@@ -745,6 +784,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         guard isLive, nativeLiveDVRPolicy?.snapshot != nil else { return }
         cache.applyNativeLiveRetentionFloor(notePlaylistBuild().firstVisible)
     }
+    /// `LoadOptions.liveEdgeCushionSeconds`, carried by the window sizing that already holds room for it.
+    var liveEdgeCushionSeconds: Double? { baseLiveWindowSizing.edgeCushionSeconds }
     /// Only `.fastZap` sessions may serve a shallow first window after a bounded grace.
     private let allowsBoundedDegradedStart: Bool
     private let startupGraceSeconds: TimeInterval?
@@ -2769,7 +2810,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                 didLogStartupPolicy = true
                 let grace = startupGraceSeconds.map(LiveEdgePolicy.seconds) ?? "auto"
                 let single = singleSegmentStartupMinimumSeconds.map(LiveEdgePolicy.seconds) ?? "off"
-                EngineLog.emit("[HLSVideoEngine] live startup policy: bounded=\(allowsBoundedDegradedStart) grace=\(grace) singleSegmentMinimum=\(single) holdbackFloor=\(boundedStartFloorsAtHoldback)", category: .session)
+                let cushion = liveEdgeCushionSeconds.map(LiveEdgePolicy.seconds) ?? "off"
+                EngineLog.emit("[HLSVideoEngine] live startup policy: bounded=\(allowsBoundedDegradedStart) grace=\(grace) singleSegmentMinimum=\(single) holdbackFloor=\(boundedStartFloorsAtHoldback) edgeCushion=\(cushion)", category: .session)
             }
             // AE#684 latched ingest sessions; AE#686 extends it to a source the engine cuts itself,
             // where the second grace bought nothing on device but a session 1 s further from the edge.
@@ -2784,13 +2826,17 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             if LiveEdgePolicy.startupCushionSatisfied(segmentCount: snap.count,
                                                        summedDurationSeconds: snap.summed,
                                                        targetDuration: target.value,
-                                                       windowSegmentCount: window) {
+                                                       windowSegmentCount: window,
+                                                       edgeCushionSeconds: liveEdgeCushionSeconds) {
                 let sealed = sealLiveTargetDuration(target)
                 accountForFirstServe(since: enteredAt, snapshot: snap, targetDuration: sealed)
                 return true
             }
+            // A host cushion is a request to start further back, which a shallow first window would
+            // undo on exactly the slow link it was asked for.
             if allowsBoundedDegradedStart,
                !boundedStartFloorsAtHoldback,
+               liveEdgeCushionSeconds == nil,
                hasBoundedStartupMedia(snap),
                degradedDeadline == nil {
                 let grace = startupGraceSeconds ?? LiveEdgePolicy.fastZapDegradedGraceSeconds(
@@ -2814,7 +2860,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                 if LiveEdgePolicy.startupCushionSatisfied(segmentCount: after.count,
                                                           summedDurationSeconds: after.summed,
                                                           targetDuration: afterTarget.value,
-                                                          windowSegmentCount: window) {
+                                                          windowSegmentCount: window,
+                                                          edgeCushionSeconds: liveEdgeCushionSeconds) {
                     let sealed = sealLiveTargetDuration(afterTarget)
                     accountForFirstServe(since: enteredAt, snapshot: after, targetDuration: sealed)
                     return true
@@ -2881,7 +2928,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             waitedSeconds: Self.secondsSince(entered),
             segmentCount: snapshot.count,
             summedDurationSeconds: snapshot.summed,
-            targetDuration: targetDuration
+            targetDuration: targetDuration,
+            edgeCushionSeconds: liveEdgeCushionSeconds
         )
         EngineLog.emit(
             "[HLSVideoEngine] \(warning ? "WARNING: " : "")\(account)"

@@ -133,6 +133,10 @@ protocol HLSSegmentProvider: AnyObject {
     /// Block until at least one live segment is ready or timeout elapses. Holds the first live response so AVPlayer never sees an empty playlist (-12888).
     func waitForFirstLiveSegment(timeout: TimeInterval) -> Bool
 
+    /// `LoadOptions.liveEdgeCushionSeconds` as validated: raises the served `HOLD-BACK` and, with it,
+    /// the first-serve gate's depth and deadline. nil keeps `3 x TARGETDURATION`.
+    var liveEdgeCushionSeconds: Double? { get }
+
     /// LL-HLS blocking reload: block until segment at absolute index exists. Holds AVPlayer's ?_HLS_msn= reload open so it receives the new segment the instant it is cut, not a poll-interval late.
     func waitForLiveSegment(index: Int, timeout: TimeInterval) -> Bool
 
@@ -217,6 +221,7 @@ extension HLSSegmentProvider {
         )
     }
     func waitForFirstLiveSegment(timeout: TimeInterval) -> Bool { true }
+    var liveEdgeCushionSeconds: Double? { nil }
     func waitForLiveSegment(index: Int, timeout: TimeInterval) -> Bool { true }
     func waitForSequentialStartupSegments(timeout: TimeInterval) -> Bool { true }
     var liveBlockingReloadHoldSeconds: TimeInterval { 18.0 }
@@ -1171,7 +1176,8 @@ final class HLSLocalServer: @unchecked Sendable {
                         }
                     }
                 } else {
-                    _ = p.waitForFirstLiveSegment(timeout: 30.0)
+                    _ = p.waitForFirstLiveSegment(timeout: LiveEdgePolicy.firstServeTimeoutSeconds(
+                        edgeCushionSeconds: p.liveEdgeCushionSeconds))
                 }
             } else if let p = provider, p.playlistType == .event {
                 // Sequential append playlist: hold until the startup segments exist. A fast
@@ -2099,7 +2105,9 @@ final class HLSLocalServer: @unchecked Sendable {
             // stall-danger zone (-16832) whenever the served window carries less than 3 x TD behind the
             // edge (AE#189: 5.76s long-GOP segments -> TD=6 -> 18s holdback vs a 9.6s startup window). The
             // startup cushion is built to exactly this depth, so the advertised value is always satisfiable.
-            let holdBack = LiveEdgePolicy.holdBackSeconds(targetDuration: targetDuration)
+            // A host's `liveEdgeCushionSeconds` raises both together.
+            let holdBack = LiveEdgePolicy.holdBackSeconds(targetDuration: targetDuration,
+                                                          edgeCushionSeconds: provider.liveEdgeCushionSeconds)
             serverControl.append("HOLD-BACK=\(String(format: "%.3f", holdBack))")
             lines.append("#EXT-X-SERVER-CONTROL:\(serverControl.joined(separator: ","))")
         }

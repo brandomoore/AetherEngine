@@ -70,7 +70,7 @@ func printUsage() {
       aetherctl serve [--no-dv] [--force-dv] [--dv-base-layer] [--start-position S] [--iframes] [--atmos-bed 7.1.4] [--audio-index N] <url>
       aetherctl validate [--no-dv] [--force-dv] [--dv-base-layer] <url>
       aetherctl swdecode [--frames N] <url>
-      aetherctl play [--fel] [--surface | --window] [--cycle-el SECONDS] [--dv-pin SPEC] [--seconds N] [--live] [--no-sw-escalation] [--fast-zap] [--live-start-immediately] [--dvr-window N] [--subs <codec-or-lang>]
+      aetherctl play [--fel] [--surface | --window] [--cycle-el SECONDS] [--dv-pin SPEC] [--seconds N] [--live] [--no-sw-escalation] [--fast-zap] [--live-start-immediately] [--live-cushion SECONDS] [--dvr-window N] [--subs <codec-or-lang>]
                  [--assert-dv] [--dv-base-layer]
                  [--start-position S] [--switch-audio <index>[@ms]]
                  [--teletext-page N] [--switch-teletext-page <page|auto>[@ms]]
@@ -82,8 +82,7 @@ func printUsage() {
                      [--audio-stats] [--host-calls play,extractor,setrate,pausestart,reloadlive,seekback,seekfar,pauseseek,pausereload,playreload,extplayreload,reloadnext] <url>
                      (full load+play session smoke test; --fel opts into the Profile 7
                       FEL dual-layer route (off by default, as in the engine, and only in
-                      a build with the DualLayerDolbyVision trait; --no-fel
-                      is accepted and does nothing); --surface (or --window) presents
+                      a build with the DualLayerDolbyVision trait); --surface (or --window) presents
                       into a window; --cycle-el S flips the FEL residual every S
                       seconds, which needs --fel and a surface; --subs activates the first
                       matching embedded subtitle track and logs overlay cues;
@@ -617,6 +616,8 @@ if first == "live" {
     let realtime = takeFlag("--realtime", from: &rest)
     // --fast-zap: LoadOptions.liveJoinProfile = .fastZap (AE#195 low-latency live join).
     let fastZap = takeFlag("--fast-zap", from: &rest)
+    // --live-cushion N: LoadOptions.liveEdgeCushionSeconds.
+    let liveFixtureCushion = takeDoubleFlag("--live-cushion", from: &rest)
     // --preroll N: backlog seconds the paced fixture bursts before 1x pacing (default 30).
     // 0 models a strict-realtime origin with no backlog (the AE#195 slow-join case).
     let preroll = takeDoubleFlag("--preroll", from: &rest)
@@ -675,7 +676,7 @@ if first == "live" {
                  reloadTest: reloadTest,
                  forceSoftware: forceSW, dropAfter: dropAfter,
                  discontinuityAt: discontinuityAt, realtime: realtime || realtimeRate != nil,
-                 fastZap: fastZap, pacingPreroll: preroll, pacingRate: realtimeRate,
+                 fastZap: fastZap, liveCushion: liveFixtureCushion, pacingPreroll: preroll, pacingRate: realtimeRate,
                  originLead: originLead,
                  freezeAfter: freezeAfter, unfreezeAfter: unfreezeAfter,
                  rewindBeforeFreeze: rewindBeforeFreeze,
@@ -717,6 +718,8 @@ if first == "play" {
     let playLiveStartImmediately = takeFlag("--live-start-immediately", from: &rest)
     let playNoLiveStartImmediately = takeFlag("--no-live-start-immediately", from: &rest)
     let liveStartImmediately = playLiveStartImmediately ? true : !playNoLiveStartImmediately
+    // LoadOptions.liveEdgeCushionSeconds: how far behind the live edge the session plays.
+    let liveCushion = takeDoubleFlag("--live-cushion", from: &rest)
     let dvrWindow = takeDoubleFlag("--dvr-window", from: &rest)
     let subsPick = takeStringFlag("--subs", from: &rest)
     let hostCalls = takeStringFlag("--host-calls", from: &rest).map { $0.split(separator: ",").map(String.init) } ?? []
@@ -743,12 +746,8 @@ if first == "play" {
     let playRecord = takeStringFlag("--record", from: &rest).map { URL(fileURLWithPath: $0) }
     // Dolby Vision Profile 7 FEL dual-layer decoding, opt-in like the engine's own
     // `preferDualLayerDolbyVision` (default false): `--fel` turns it on, so a plain `play` runs the
-    // route a host gets by default. `--no-fel` / `--no-dual-layer` are accepted as no-ops for the
-    // scripts written when `play` turned it on by itself. Each spelling is taken separately, so
-    // passing two leaves neither behind in `rest`.
+    // route a host gets by default.
     let playFel = takeFlag("--fel", from: &rest)
-    _ = takeFlag("--no-fel", from: &rest)
-    _ = takeFlag("--no-dual-layer", from: &rest)
     let playPreferDualLayerDV = playFel
     let playSurfaceFlag = takeFlag("--surface", from: &rest)
     let playWindowFlag = takeFlag("--window", from: &rest)
@@ -1044,7 +1043,7 @@ if first == "play" {
         }
         done.wait()
     }
-    exit(runPlay(url: parseSourceURL(urlArg), seconds: seconds, live: live, nativeHLS: nativeHLS, liveIngest: liveIngest, fastZap: playFastZap, liveStartImmediately: liveStartImmediately, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats, seekEvery: seekEvery, seekPattern: seekPattern, seekCount: seekCount, startPosition: playStartPosition, mallocCensus: mallocCensus, forceSoftware: playForceSW, softwareEscalation: playSoftwareEscalation,
+    exit(runPlay(url: parseSourceURL(urlArg), seconds: seconds, live: live, nativeHLS: nativeHLS, liveIngest: liveIngest, fastZap: playFastZap, liveStartImmediately: liveStartImmediately, liveCushion: liveCushion, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats, seekEvery: seekEvery, seekPattern: seekPattern, seekCount: seekCount, startPosition: playStartPosition, mallocCensus: mallocCensus, forceSoftware: playForceSW, softwareEscalation: playSoftwareEscalation,
                  censusThresholdMB: censusThresholdMB, censusHz: censusHz, frameTimes: frameTimes, presentTimes: presentTimes, servedURL: servedURL, pictureProbe: pictureProbe, pictureOrigin: pictureOrigin, nativeVideoFrameDiagnostics: nativeVideoFrameDiagnostics, nativeVideoFrameRecovery: nativeVideoFrameRecovery, sidecars: sidecars,
                  audioSwitch: audioSwitch,
                  teletextPage: teletextPage, teletextSwitch: teletextSwitch,

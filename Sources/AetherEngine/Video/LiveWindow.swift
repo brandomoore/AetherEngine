@@ -45,6 +45,16 @@ struct LiveWindow: Equatable {
         targetDurationSeconds = seconds
     }
 
+    /// AE#813: how far behind the frontier the software live path deliberately plays a source that
+    /// delivers in segments (`SoftwareLiveHoldback.edgeHoldbackSeconds`). The distance then sawtooths
+    /// up to the holdback rather than up to one segment, and the tolerance is the holdback; without it
+    /// a session holding 16 s behind 10 s segments left the edge after every cut.
+    private(set) var edgeHoldbackSeconds: Double?
+
+    mutating func noteEdgeHoldback(_ seconds: Double?) {
+        edgeHoldbackSeconds = seconds.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
+    }
+
     /// Sodalite#104 round 2: how far behind the edge a session that IS keeping up actually plays.
     ///
     /// The software live path publishes the READER's frontier as the edge, and a client cannot sit on
@@ -175,6 +185,10 @@ struct LiveWindow: Equatable {
     /// holds below it IS this source's cadence. The observed edge step is the last resort, and on the
     /// software path it is one packet, which is why it needed the term above it (round 2).
     var edgeToleranceSeconds: Double {
-        Self.edgeTolerance + (targetDurationSeconds ?? trackingCadenceSeconds ?? lastEdgeStepSeconds)
+        // AE#813: a known holdback already spans the sawtooth, and the tracked distances must not
+        // widen it: they are sampled up to the exit slack above the tolerance, so on a distance this
+        // deep they ratcheted it until a deliberate 20 s rewind still read live.
+        if let holdback = edgeHoldbackSeconds { return Self.edgeTolerance + holdback }
+        return Self.edgeTolerance + (targetDurationSeconds ?? trackingCadenceSeconds ?? lastEdgeStepSeconds)
     }
 }

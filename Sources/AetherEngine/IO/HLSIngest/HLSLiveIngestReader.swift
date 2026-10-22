@@ -56,6 +56,9 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     /// "mpegts" or "aac", classified from the first segment's leading bytes, written before that segment's first FIFO byte.
     private var _segmentFormatHint: String?
     private var _packedAudioTimestampOffset90k: Int64?
+    /// `LoadOptions.liveEdgeCushionSeconds`, validated, set by the engine before the first read: the
+    /// join takes enough of the upstream listing to cover it (`HLSPlaylistTracker.joining(cushion:)`).
+    private var _joinCushionSeconds: Double?
     /// The Retry-After of the last refused playlist request, taken by the refresh loop as it waits.
     private var _playlistRetryAfter: TimeInterval?
 
@@ -185,7 +188,21 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     private static let formatResolveTimeout: TimeInterval = 30
 
     /// Install companion under startLock. If close() raced the resolver, the new companion is closed immediately so no loop or URLSession outlives the parent.
+    /// Set before the first read; a reader already ingesting keeps the depth it joined at.
+    func setJoinCushion(_ seconds: Double?) {
+        startLock.lock()
+        _joinCushionSeconds = seconds
+        startLock.unlock()
+    }
+
+    private var joinCushionSeconds: Double? {
+        startLock.lock()
+        defer { startLock.unlock() }
+        return _joinCushionSeconds
+    }
+
     private func installCompanion(_ companion: HLSLiveIngestReader) {
+        companion.setJoinCushion(joinCushionSeconds)
         startLock.lock()
         let raceClosed = closed
         if !raceClosed { _companionAudioReader = companion }
@@ -211,7 +228,9 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     /// audio reader's lifetime is owned by its parent and never reopens independently.
     func makeFreshMainReader() -> HLSLiveIngestReader? {
         guard role == .mainVideo else { return nil }
-        return HLSLiveIngestReader(playlistURL: playlistURL, httpHeaders: httpHeaders, role: .mainVideo)
+        let fresh = HLSLiveIngestReader(playlistURL: playlistURL, httpHeaders: httpHeaders, role: .mainVideo)
+        fresh.setJoinCushion(joinCushionSeconds)
+        return fresh
     }
 
     init(playlistURL: URL, httpHeaders: [String: String] = [:], role: Role,
@@ -289,7 +308,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
             // A media playlist the host's URL led to directly (through redirects, as an IPTV panel's
             // tokenized session URL), which that URL can lead to afresh when the session expires.
             let mediaURLIsReresolvable = seedPlaylist != nil && mediaURL != playlistURL
-            var tracker = HLSPlaylistTracker()
+            var tracker = HLSPlaylistTracker.joining(cushion: joinCushionSeconds)
             var loggedEncryptedDirectPlay = false
             var refreshInterval: Double = 2
             var pendingPlaylist: HLSMediaPlaylist? = seedPlaylist
