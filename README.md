@@ -52,6 +52,7 @@ You provide the transport bar. You provide the dropdowns. You provide the pretty
 - [WUW IPTV Player](https://apps.apple.com/tr/app/wuw-iptv-player-smart-m3u-tv/id6759220800): Watch U Want — or simply WUW — your IPTV player for iPhone, iPad, Mac, Apple TV and Apple Vision Pro.
 - [GiVo Stream](https://givostreamapp.com): media player for iPhone, iPad and Apple TV with bring-your-own playlists, live timeshift, DVR and VOD.
 - [LillyPlayer](https://lillyplayer.com): The all-in-one IPTV and media player for Apple TV, iPhone and iPad (live TV, EPG, replay, Jellyfin, Plex, SMB...).
+- [Plozz](https://plozz.app): Free forever open source native app for iPhone, iPad, and Apple TV. Supports Jellyfin, Plex, Emby, Silo, IPTV, SMB, WebDAV and more.
 <!-- used-by:end -->
 
 Shipping something on AetherEngine? [Submit it](https://github.com/superuser404notfound/AetherEngine/issues/new?template=used-by-submission.yml) to get listed here and on [aetherengine.superuser404.de](https://aetherengine.superuser404.de).
@@ -387,7 +388,7 @@ Subtitle cues land in raw source PTS; render the overlay against `player.sourceT
 Install via Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.45.0")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.47.0")
 ```
 
 Three samples ship in `Examples/`:
@@ -634,10 +635,10 @@ Browse all of this as a searchable site at **[aetherengine.superuser404.de](http
 AetherEngine uses [Semantic Versioning](https://semver.org). The public API surface, every `public` declaration in `Sources/AetherEngine/`, is the stability contract. **Major** removes / renames public symbols or breaks adopters; **Minor** adds public API or codec / format support; **Patch** fixes bugs with no public API change. `internal` types are not part of the contract.
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.45.0")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.47.0")
 ```
 
-Pin to `.upToNextMinor(from: "7.45.0")` for stricter teams that prefer to opt into minor bumps explicitly.
+Pin to `.upToNextMinor(from: "7.47.0")` for stricter teams that prefer to opt into minor bumps explicitly.
 
 ## Requirements
 
@@ -672,7 +673,7 @@ These components may be subject to third-party patent licensing. Integrators who
 To enable them, list the traits on the package dependency:
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.45.0",
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.47.0",
          traits: ["TrueHDObjectAudio", "DTSXObjectAudio", "DualLayerDolbyVision", "DolbyVisionStillReshaping"])
 ```
 

@@ -37,8 +37,9 @@ struct AllocentricPanner: Sendable {
         let rows: [Row]  // sorted by y
     }
 
-    /// `excluded` removes speakers from consideration (object zone masks). A mask that removes
-    /// every positional speaker is ignored, because silencing an object is never what it asks for.
+    /// `excluded` removes speakers from consideration (the speakers a bed lacks, and in the
+    /// measurement reference the object zone masks). A mask that removes every positional speaker is
+    /// ignored, because silencing an object is never what it asks for.
     init(layout: SpatialSpeakerLayout, excluded: Set<SpatialSpeaker> = []) {
         self.layout = layout
         self.channelCount = layout.channelCount
@@ -99,7 +100,8 @@ struct AllocentricPanner: Sendable {
         body(b, sin(angle))
     }
 
-    // MARK: - Object
+    #if TrueHDReferenceRender
+    // MARK: - Object (the measurement reference only: a shipped build renders every object as a point)
 
     /// Gains for an object: point panning, or power-summed panning over a grid spanning `size` in
     /// every direction (Atmos object size is 0 for a point up to 1 for the whole room), or the single
@@ -155,6 +157,8 @@ struct AllocentricPanner: Sendable {
         }
         return best?.channel
     }
+
+    #endif
 
     private func clamp(_ p: SIMD3<Float>) -> SIMD3<Float> {
         simd_clamp(p, SIMD3(repeating: 0), SIMD3(repeating: 1))

@@ -820,6 +820,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     private let supplementalCodecsString: String?
     private let resolution: (Int, Int)
     private let videoRange: HLSVideoRange
+    /// REQ-VIDEO-LAYOUT for a stereo session (`StereoVideoSignal.videoLayout`); nil for 2D.
+    private let videoLayout: String?
     private let frameRate: Double?
     private let hdcpLevel: String?
     private let sourceBitrate: Int64
@@ -1063,6 +1065,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         audioLanguage: String? = nil,
         audioChannelCount: Int? = nil,
         audioIsAtmosStreamCopy: Bool = false,
+        videoLayout: String? = nil,
         isLive: Bool = false,
         servesSegmentsProgressively: Bool = false,
         sequentialAppendPlaylist: Bool = false,
@@ -1126,6 +1129,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         self.audioLanguage = audioLanguage
         self.audioChannelCount = audioChannelCount
         self.audioIsAtmosStreamCopy = audioIsAtmosStreamCopy
+        self.videoLayout = videoLayout
         self.restartHandler = restartHandler
         self.unrecoverableGapHandler = unrecoverableGapHandler
         self.restartActivity = restartActivity
@@ -3039,6 +3043,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         return (resolution.0, resolution.1)
     }
     var masterVideoRange: HLSVideoRange? { videoRange }
+    var masterVideoLayout: String? { videoLayout }
     /// 25 Mbps fallback: under-declaring fires -12318 "Segment exceeds specified bandwidth" on every segment.
     var masterAverageBandwidth: Int? {
         sourceBitrate > 0 ? Int(sourceBitrate) : 25_000_000

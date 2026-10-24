@@ -219,6 +219,8 @@ extension AetherEngine {
         HTTPDiscIOReader.resetLifetimeFetchedBytes()
         // #134: currentTime()/loadedTimeRanges are sync XPC reads; hop them off the main actor.
         let probeReadQueue = DispatchQueue(label: "engine.memprobe.avfread", qos: .utility)
+        let cpuSampler = ThreadCPUSampler()
+        _ = cpuSampler.sample()
         memoryProbeTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(30))
@@ -367,6 +369,9 @@ extension AetherEngine {
                     + "seams=\(self.presentationAxis.seams.count)"
 
                 EngineLog.emit(line, category: .engine)
+                if let cpu = cpuSampler.sample() {
+                    EngineLog.emit("[AetherEngine] cpuprobe t=\(elapsed)s " + cpu.logFragment(), category: .engine)
+                }
 
                 // #250: the steady-state cadence for the subtitle-resolution statement. It rides
                 // the memprobe rather than the 2 Hz drain tick because it states a span, and a

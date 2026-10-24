@@ -195,9 +195,10 @@ final class SampleBufferRenderer: @unchecked Sendable {
     /// The preroll gate for `AudioOutput.videoPrerollSatisfied`: true once frames up to the preroll
     /// past `clock` (source seconds) are in the layer, `felPrerollSeconds` on the FEL path and
     /// `videoPrerollSeconds` on every other one. nil for a clock with no position, and off the FEL
-    /// path on a live stream, whose join starts the clock from the first audio and lets the picture
-    /// follow. On the arrival-order path only the frontier counts, the newest timestamp with every
-    /// earlier slot handed over, so a frame that came early past a gap does not open the gate.
+    /// path on a live stream, whose join already starts on its first keyframe (AE#844) and lets the
+    /// clock run from the audio there. On the arrival-order path only the frontier counts, the newest
+    /// timestamp with every earlier slot handed over, so a frame that came early past a gap does not
+    /// open the gate.
     func prerollSatisfied(clock: Double, live: Bool) -> Bool? {
         reorderLock.lock()
         defer { reorderLock.unlock() }

@@ -360,6 +360,27 @@ final class PacketRingBuffer: @unchecked Sendable {
         return lastKeyframeIndexLocked(atOrBefore: target).map { firstSeq + ($0 - head) }
     }
 
+    /// The first retained keyframe at or after `seq`, with its PTS, from the index alone (AE#844).
+    func keyframe(atOrAfterSeq seq: Int) -> (seq: Int, pts: Double)? {
+        lock.lock()
+        defer { lock.unlock() }
+        var low = keyframeHead
+        var high = keyframeSeqs.count
+        while low < high {
+            let mid = (low + high) / 2
+            if keyframeSeqs[mid] < seq { low = mid + 1 } else { high = mid }
+        }
+        guard low < keyframeSeqs.count, let idx = indexLocked(keyframeSeqs[low]) else { return nil }
+        return (keyframeSeqs[low], entries[idx].pts)
+    }
+
+    /// The PTS of the packet at `seq`, from the index alone, or nil if evicted or not yet appended.
+    func pts(atSeq seq: Int) -> Double? {
+        lock.lock()
+        defer { lock.unlock() }
+        return indexLocked(seq).map { entries[$0].pts }
+    }
+
     /// Sequence of the EARLIEST retained keyframe, or nil if the ring holds no keyframe yet. DVR reseed
     /// floor when a target precedes every keyframe: seeding seqBounds.first (firstSeq) can land mid-GOP,
     /// since leading entries appended before the first eviction are not guaranteed keyframe-aligned.

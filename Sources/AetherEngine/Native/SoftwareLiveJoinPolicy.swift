@@ -84,6 +84,63 @@ struct SoftwareLiveJoinPolicy: Equatable {
         guard span.isFinite, span >= leadSeconds + Self.minimumSkipSeconds else { return .fromStart }
         return .place(targetPts: newestPts - leadSeconds)
     }
+
+    // MARK: - Keyframe alignment (AE#844)
+
+    /// What a join that kept its cursor does before the first packet is fed.
+    ///
+    /// `.fromStart` and a `.place` with no keyframe past the cursor start on the ring's first packet,
+    /// which a source joined mid-GOP puts ahead of its first keyframe. The audio pump arms the clock
+    /// on that packet's audio, and the first picture only decodes at the keyframe: measured on an Apple
+    /// TV 4K over Plex Live TV (HDHomeRun, H.264 1080i), 1.3 to 2.9 s of sound over a black screen on
+    /// every join, on HDMI and AirPlay alike. So the start moves to the first keyframe, and nothing
+    /// before it is decoded.
+    ///
+    /// The move takes media off the session's lead over the newest packet, and nothing on the software
+    /// path wins it back. So once the keyframe is in, the start waits, the clock not yet armed, until
+    /// the lead stands where the unmoved start had it, at most `AudioLookaheadPolicy.rebufferResumeLeadSeconds`.
+    /// Both waits end at `maximumAlignmentWaitSeconds`: a stream with no keyframe by then starts where
+    /// it stood, as before, and a keyframe without its lead starts anyway.
+    enum Alignment: Equatable {
+        /// Start where the cursor stands.
+        case stay
+        /// Move the cursor to the keyframe and start there.
+        case snap
+        /// Ask again shortly.
+        case wait
+    }
+
+    static let maximumAlignmentWaitSeconds: TimeInterval = 3
+    /// Media a live join without a ring drops before it gives up on a keyframe.
+    static let maximumAlignmentSkipSeconds: Double = 6
+
+    /// The same move on a live session without a DVR ring, which reads the source in order and cannot
+    /// skip ahead: audio read before the first video keyframe is dropped instead of decoded, so the
+    /// clock arms with the picture. `waited` is the time since the first dropped packet,
+    /// `droppedSpanSeconds` the media it covered. A stream that flags no keyframe keeps its audio
+    /// after `maximumAlignmentWaitSeconds`, or sooner on a burst.
+    static func dropsAudioBeforeFirstKeyframe(waited: TimeInterval, droppedSpanSeconds: Double) -> Bool {
+        waited < maximumAlignmentWaitSeconds && !(droppedSpanSeconds >= maximumAlignmentSkipSeconds)
+    }
+
+    /// The lead a move has to keep: what the unmoved start had over the newest media when the join
+    /// was decided, at most the rebuffer resume lead. nil when either end is unknown.
+    static func alignmentLead(cursorPts: Double?, newestPts: Double) -> Double? {
+        guard let cursorPts, cursorPts.isFinite, newestPts.isFinite else { return nil }
+        return min(AudioLookaheadPolicy.rebufferResumeLeadSeconds, max(0, newestPts - cursorPts))
+    }
+
+    /// `cursorSeq` is where the join stands, `keyframe` the first keyframe at or after it,
+    /// `wantedLead` the join's `alignmentLead`, `newestPts` the newest media now, `waited` the time
+    /// since the join was decided.
+    static func alignment(cursorSeq: Int, keyframe: (seq: Int, pts: Double)?, wantedLead: Double?,
+                          newestPts: Double, waited: TimeInterval, sourceEnded: Bool) -> Alignment {
+        let giveUp = sourceEnded || waited >= maximumAlignmentWaitSeconds
+        guard let keyframe else { return giveUp ? .stay : .wait }
+        guard keyframe.seq > cursorSeq else { return .stay }
+        guard !giveUp, let wantedLead, newestPts.isFinite else { return .snap }
+        return newestPts - keyframe.pts >= wantedLead ? .snap : .wait
+    }
 }
 
 /// AE#813: how far behind the newest media a software live session holds, from the unit its source

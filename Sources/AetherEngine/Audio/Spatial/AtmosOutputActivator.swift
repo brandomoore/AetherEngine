@@ -13,6 +13,9 @@ import AVFoundation
 /// player plays or waits to play an item `playsAPAC` accepts, and is released otherwise, since a
 /// prerolled E-AC-3 stream would compete with other audio.
 ///
+/// It runs only for TrueHD Atmos rendered to APAC: a DTS:X programme is not Dolby Atmos, and the
+/// receiver must not say it is.
+///
 /// #834: it runs only while every output port is HDMI. On an AirPlay route there is no sink indicator
 /// to light, and a second unmuted player restarting beside the programme on every resume left a
 /// HomePod pair silent after a pause, then froze the picture after the second one.
@@ -42,7 +45,7 @@ final class AtmosOutputActivator {
     }
 
     /// `AVAudioSession.Port.HDMI.rawValue`, spelled out so the rule is testable where there is no session.
-    nonisolated static let hdmiPortType = "HDMI"
+    nonisolated static let hdmiPortType = "HDMIOutput"
 
     static func currentOutputPortTypes() -> [String] {
         #if os(iOS) || os(tvOS)
@@ -154,7 +157,10 @@ extension AetherEngine {
         }
         let activator = atmosOutputActivator ?? AtmosOutputActivator()
         atmosOutputActivator = activator
-        activator.attach(to: player) { [weak self] _ in self?.nativeVideoSession?.audioIsAPAC == true }
+        activator.attach(to: player) { [weak self] _ in
+            guard let session = self?.nativeVideoSession else { return false }
+            return session.audioIsAPAC && session.audioAPACIsFromDolbyAtmos
+        }
         #endif
     }
 

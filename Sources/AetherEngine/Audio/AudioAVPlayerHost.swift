@@ -23,7 +23,7 @@ final class AudioAVPlayerHost {
     /// `AVPlayerItemPlaybackStalled` and has not resumed since. The engine folds this into `isBuffering`,
     /// so `playbackPhase` reads `.rebuffering` on this path too (architecture.md promised that; the flag
     /// never existed). Startup spin-up before the first `.playing` is not a rebuffer, and a paused player
-    /// is never one. See `rebufferingFlag(hasStartedPlaying:status:stalledSinceLastPlaying:)`.
+    /// is never one. See `rebufferingFlag(hasStartedPlaying:status:waitingReason:stalledSinceLastPlaying:)`.
     @Published private(set) var isRebuffering: Bool = false
     /// #376: carries the classification with the message, so the engine can publish both.
     @Published private(set) var failure: PlaybackErrorInfo?
@@ -54,6 +54,7 @@ final class AudioAVPlayerHost {
     private var statusObservation: NSKeyValueObservation?
     private var rateObservation: NSKeyValueObservation?
     private var timeControlObservation: NSKeyValueObservation?
+    private var waitingReasonObservation: NSKeyValueObservation?
     private var endObserver: NSObjectProtocol?
     private var failObserver: NSObjectProtocol?
     private var stallObserver: NSObjectProtocol?
@@ -68,6 +69,8 @@ final class AudioAVPlayerHost {
     /// covering the notification arriving ahead of the status change (or a player configured not to wait).
     private var hasStartedPlaying = false
     private var stalledSinceLastPlaying = false
+    /// Mirrors avPlayer.reasonForWaitingToPlay for the rebuffer fold (Sodalite#168).
+    private var waitingReason: AVPlayer.WaitingReason?
 
     private var lastRate: Float = 1.0
 
@@ -159,6 +162,7 @@ final class AudioAVPlayerHost {
         duration = 0
         hasStartedPlaying = false
         stalledSinceLastPlaying = false
+        waitingReason = nil
         isRebuffering = false
         if let start = startPosition, start > 0 {
             pendingSeek = start
@@ -228,13 +232,24 @@ final class AudioAVPlayerHost {
         // it into the rebuffer flag: the first `.playing` opens the window in which a wait is a stall.
         timeControlObservation = avPlayer.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
             let status = player.timeControlStatus
+            let reason = player.reasonForWaitingToPlay?.rawValue
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                self.waitingReason = reason.map(AVPlayer.WaitingReason.init(rawValue:))
                 self.timeControlStatus = status
                 if status == .playing {
                     self.hasStartedPlaying = true
                     self.stalledSinceLastPlaying = false
                 }
+                self.refreshRebuffering()
+            }
+        }
+        waitingReasonObservation = avPlayer.observe(\.reasonForWaitingToPlay, options: [.new]) { [weak self] player, _ in
+            // A cleared reason arrives just ahead of the status that ends the wait; that edge settles it.
+            guard let reason = player.reasonForWaitingToPlay?.rawValue else { return }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.waitingReason = AVPlayer.WaitingReason(rawValue: reason)
                 self.refreshRebuffering()
             }
         }
@@ -394,6 +409,7 @@ final class AudioAVPlayerHost {
         playerItem = nil
         hasStartedPlaying = false
         stalledSinceLastPlaying = false
+        waitingReason = nil
         isRebuffering = false
         // Clear the staged dict so the next track starts clean; the auto-publishing session drops the Now-Playing
         // entry when the player has no current item.
@@ -429,6 +445,8 @@ final class AudioAVPlayerHost {
         rateObservation = nil
         timeControlObservation?.invalidate()
         timeControlObservation = nil
+        waitingReasonObservation?.invalidate()
+        waitingReasonObservation = nil
         if let endObserver {
             NotificationCenter.default.removeObserver(endObserver)
             self.endObserver = nil
@@ -454,6 +472,7 @@ final class AudioAVPlayerHost {
         let next = Self.rebufferingFlag(
             hasStartedPlaying: hasStartedPlaying,
             status: timeControlStatus,
+            waitingReason: waitingReason,
             stalledSinceLastPlaying: stalledSinceLastPlaying
         )
         if isRebuffering != next { isRebuffering = next }
@@ -461,13 +480,15 @@ final class AudioAVPlayerHost {
 
     /// Pure fold behind `isRebuffering`: a wait counts only once the item has played (`.playing` seen for
     /// this item), never while the player is paused; a stall latched since the last `.playing` counts on
-    /// its own so a notification that lands ahead of the status change is not lost.
+    /// its own so a notification that lands ahead of the status change is not lost. A resume's
+    /// `evaluatingBufferingRate` wait is not a stall (Sodalite#168).
     nonisolated static func rebufferingFlag(
         hasStartedPlaying: Bool,
         status: AVPlayer.TimeControlStatus,
+        waitingReason: AVPlayer.WaitingReason?,
         stalledSinceLastPlaying: Bool
     ) -> Bool {
         guard hasStartedPlaying, status != .paused else { return false }
-        return status == .waitingToPlayAtSpecifiedRate || stalledSinceLastPlaying
+        return AetherEngine.nativeWaitIsRebuffer(status: status, reason: waitingReason) || stalledSinceLastPlaying
     }
 }

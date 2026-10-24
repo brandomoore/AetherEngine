@@ -133,6 +133,9 @@ final class NativeAVPlayerHost {
     private var prematureEndRecoveryInFlight = false
     /// Mirrors avPlayer.timeControlStatus so the engine can reconcile when AVKit's transport bar, Control Center, or hardware buttons toggle the player externally (without this, engine state goes stale and play/pause presses are swallowed).
     @Published private(set) var timeControlStatus: AVPlayer.TimeControlStatus = .paused
+    /// Mirrors avPlayer.reasonForWaitingToPlay. Written before `timeControlStatus` on a status edge, so a
+    /// `$timeControlStatus` sink reads the reason that came with it (Sodalite#168).
+    @Published private(set) var waitingReason: AVPlayer.WaitingReason?
     /// Monotonic count of AVPlayerItem playbackStalled notifications (#93 residual): the engine
     /// opens its spurious-pause recovery window on each stall.
     @Published private(set) var stallCount: Int = 0
@@ -774,9 +777,11 @@ final class NativeAVPlayerHost {
         // separate edge from the one below. It carries no diagnostics and no state: the lever logs its
         // own outcome, and everything else here keys on the status.
         waitingReasonObservation = avPlayer.observe(\.reasonForWaitingToPlay, options: [.new]) { [weak self] player, _ in
-            guard let reason = player.reasonForWaitingToPlay?.rawValue else { return }
+            let reason = player.reasonForWaitingToPlay?.rawValue
             Task { @MainActor in
-                self?.startLiveJoinImmediatelyIfHolding(waitingReason: reason)
+                guard let self, self.sessionID == sid else { return }
+                self.waitingReason = reason.map(AVPlayer.WaitingReason.init(rawValue:))
+                if let reason { self.startLiveJoinImmediatelyIfHolding(waitingReason: reason) }
             }
         }
         timeControlObservation = avPlayer.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
@@ -788,13 +793,15 @@ final class NativeAVPlayerHost {
             case .playing:                         statusStr = "playing"
             @unknown default:                      statusStr = "@unknown"
             }
-            let reason = player.reasonForWaitingToPlay?.rawValue ?? "-"
+            let waitingReason = player.reasonForWaitingToPlay?.rawValue
+            let reason = waitingReason ?? "-"
             let elapsed = Double(DispatchTime.now().uptimeNanoseconds - (self?.loadStartTime ?? DispatchTime.now()).uptimeNanoseconds) / 1_000_000_000
             EngineLog.emit("[NativeAVPlayerHost] #\(sid) timeControlStatus=\(statusStr) reason=\(reason) t+\(String(format: "%.2f", elapsed))s", category: .engine)
             Task { @MainActor in
                 guard let self, self.sessionID == sid else { return }
                 // AE#287: swallow the pause AVPlayer takes while a premature-end recovery re-seeks.
                 if status == .paused, self.prematureEndRecoveryInFlight { return }
+                self.waitingReason = waitingReason.map(AVPlayer.WaitingReason.init(rawValue:))
                 self.timeControlStatus = status
                 self.startLiveJoinImmediatelyIfHolding(waitingReason: reason)
                 // First .playing: re-sample route after 2.5s settle -- AVKit only negotiates HDMI format on playback start (issue #24).
@@ -1013,6 +1020,7 @@ final class NativeAVPlayerHost {
         renderedTime = 0
         duration = 0
         rate = 0
+        waitingReason = nil
         timeControlStatus = .paused
         seekableEnd = 0
     }
@@ -1960,6 +1968,7 @@ final class NativeAVPlayerHost {
         guard sessionID == sid else { return true }
         avPlayer.play()
         prematureEndRecoveryInFlight = false
+        waitingReason = avPlayer.reasonForWaitingToPlay
         timeControlStatus = avPlayer.timeControlStatus
         let resumedAt = await prematureEndReading().playhead
         EngineLog.emit(
@@ -2493,6 +2502,7 @@ final class NativeAVPlayerHost {
         // The observation was invalidated above, so the pause just issued is never published. Left at the
         // outgoing item's `.playing`, the next session's sink reads a roll on subscribe and then publishes
         // its own pre-roll `.paused` as a real pause (a host raises its transport on it).
+        waitingReason = nil
         timeControlStatus = .paused
         // The AVAudioSession is NOT released here. Teardown ordering is the engine's call, not the host's:
         // AetherEngine.stopInternal deactivates once every render path is quiesced (#215).

@@ -518,7 +518,8 @@ extension AetherEngine {
                 // end must not flip it back to .loading (live HLS can reach real end-of-media).
                 if self.state == .idle || self.state == .ended { return }
                 // isBuffering only once playing (not during live startup spin-up).
-                self.isBuffering = self.state == .playing && status == .waitingToPlayAtSpecifiedRate
+                self.isBuffering = self.state == .playing
+                    && Self.nativeWaitIsRebuffer(status: status, reason: host.waitingReason)
                 switch status {
                 case .playing:
                     if self.state != .playing { self.state = .playing }
@@ -548,6 +549,18 @@ extension AetherEngine {
                 // Last, so this load's `state` and `isBuffering` writes are already in and the phase
                 // recomputes once, onto the roll.
                 if status == .playing { self.hasTransportRolled = true }
+            }
+            .store(in: &nativeCancellables)
+        // Sodalite#168: the reason moves inside one waiting stretch, from the resume's evaluation to a
+        // real stall, without a status edge.
+        host.$waitingReason
+            .sink { [weak self] reason in
+                // A cleared reason arrives just ahead of the status that ends the wait; that edge settles it.
+                guard let self, reason != nil else { return }
+                if case .error = self.state { return }
+                if self.state == .idle || self.state == .ended { return }
+                self.isBuffering = self.state == .playing
+                    && Self.nativeWaitIsRebuffer(status: host.timeControlStatus, reason: reason)
             }
             .store(in: &nativeCancellables)
 
@@ -866,6 +879,7 @@ extension AetherEngine {
             undecodableAudioStreamIndices: undecodableLiveAudioStreamIndices,
             audioBridgeMode: audioBridgeMode,
             objectAudioRendering: loadedOptions.objectAudioRendering,
+            stereoPresentation: loadedOptions.stereoPresentation,
             isLiveSession: isLive,
             dvrWindowSeconds: dvrWindowSeconds,
             // AE#195/#208: the session resolves the cut target and enables the bounded first-manifest
@@ -1601,7 +1615,8 @@ extension AetherEngine {
                 // Reconcile state with external transport commands (AVKit bar, Control Center, hardware button); without this togglePlayPause() is a no-op (swallowed press). .waitingToPlayAtSpecifiedRate maps to .playing so the icon doesn't flicker on rebuffer.
                 // isBuffering only once playback has started (not during initial load spin-up).
                 let startedPlaying = self.state == .playing || self.state == .paused
-                self.isBuffering = startedPlaying && status == .waitingToPlayAtSpecifiedRate
+                self.isBuffering = startedPlaying
+                    && Self.nativeWaitIsRebuffer(status: status, reason: host?.waitingReason)
                 // AE#440: the rate is rolling. The autostart wrote `state = .playing` before AVPlayer had
                 // moved anything, and on a live join AVPlayer can hold a presented first frame still for
                 // seconds past that, so `playbackPhase` reports `.loading` until this latches.
@@ -1636,6 +1651,16 @@ extension AetherEngine {
                 @unknown default:
                     break
                 }
+            }
+            .store(in: &nativeCancellables)
+        // Sodalite#168: a resume's evaluation can turn into a real stall without a status edge.
+        host.$waitingReason
+            .sink { [weak self, weak host] reason in
+                // A cleared reason arrives just ahead of the status that ends the wait; that edge settles it.
+                guard let self, let host, reason != nil else { return }
+                let startedPlaying = self.state == .playing || self.state == .paused
+                self.isBuffering = startedPlaying
+                    && Self.nativeWaitIsRebuffer(status: host.timeControlStatus, reason: reason)
             }
             .store(in: &nativeCancellables)
 

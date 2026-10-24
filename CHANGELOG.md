@@ -10,6 +10,70 @@ the public-API contract.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [7.47.0] - 2026-10-23
+
+### Added
+
+- **3D on visionOS: MV-HEVC keeps its second view, and side-by-side / over-under HEVC plays as stereo (AE#812, thanks @williamliu0516).**
+  An MV-HEVC stream reached AVPlayer as plain `hvc1` (movenc writes `lhvC` only for a stream marked
+  `AV_DISPOSITION_MULTILAYER`, and the muxer's new stream had no disposition), so only the base view
+  was decoded. A frame-packed source now gets Apple's `vexu { eyes, pack }` in its init segment (the box
+  AVAssetWriter writes for `ViewPackingKind`), read back by AVFoundation as a side-by-side or over-under
+  stereo track, with no re-encode. Both declare `REQ-VIDEO-LAYOUT="CH-STEREO"` (EXT-X-VERSION 12).
+  `LoadOptions.stereoPresentation` (`.automatic` default: MV-HEVC and a container's declared packing;
+  `.sideBySide` / `.overUnder` for files that say so only in their name; `.mono`). Frame packing is
+  signalled on HEVC only: AVPlayer refuses a packed H.264 init over HLS (-12927), so H.264 plays 2D.
+  Other systems still play these files in 2D. Measured on the visionOS 27 simulator and macOS 27;
+  `aetherctl serve --stereo auto|mono|sbs|ou` serves a source as visionOS gets it.
+- **MV-HEVC decodes both views through the engine.** The AE#187 hvcC canonicalization dropped every SEI
+  array, including the three_dimensional_reference_displays_info SEI (payload 176) Apple's MV-HEVC writer
+  puts in the `hvcC`; without it AVFoundation decoded the base view alone despite `lhvC` and every layer-1
+  slice (one buffer for both eyes from `AVPlayerVideoOutput`; the left eye only on a Vision Pro). A
+  multiview session now keeps that SEI and still drops every other one.
+
+### Changed
+
+- **`AtmosOutputActivator` runs for TrueHD Atmos only.** A DTS:X track rendered to APAC no longer
+  loops the silent Dolby Atmos stream beside it, so the receiver does not show Dolby Atmos for a DTS
+  programme.
+- **Object size, snap and zone masks are built only into the `TrueHDReferenceRender` measurement
+  build.** The shipped TrueHD path already took every object as a point; the panner's size and snap
+  code and the element state's size, snap and zone fields are now compiled out of it as well. No
+  change to what a shipped build plays.
+
+### Fixed
+
+- **The Atmos activator plays on HDMI again.** Since 7.45.0 (AE#834) it compared the route against
+  `"HDMI"`, while `AVAudioSession.Port.HDMI` is `"HDMIOutput"`, so it refused every HDMI route and logged
+  `off on route ports=[HDMIOutput]`. Receivers and soundbars that need the silent Atmos stream (a Samsung
+  HW-Q990C, a reporter's AV receiver) stopped showing Dolby Atmos for TrueHD Atmos rendered to APAC.
+- **A resume from pause no longer reports one tick of `.rebuffering` (Sodalite#168).** Every resume passes
+  through `waitingToPlay` with `AVPlayerWaitingWhileEvaluatingBufferingRateReason` for a frame or two, and
+  the native and audio-only hosts folded any wait into the buffering flag, so a host that raises a spinner
+  on it flickered its controls on each Play press. That evaluation no longer counts; a wait that is really
+  short of media moves on to `toMinimizeStalls`, which still does.
+- **A software live join starts picture and sound together (AE#844, thanks @l984-451).** A join reads
+  the source mid-GOP, and the clock armed on the first audio while the first picture only decoded at
+  the next keyframe: 1.3 to 2.9 s of sound over a black screen on every join, measured on an Apple TV
+  4K over Plex Live TV. The join now starts on the first keyframe. With a DVR ring the cursor moves
+  there and waits, at most 3 s, until the lead over the newest media stands where the unmoved start
+  had it (capped at the 2 s rebuffer resume lead); without one the audio read before that keyframe is
+  dropped. A stream that flags no keyframe keeps its old start after 3 s.
+
+## [7.46.0] - 2026-10-22
+
+### Added
+
+- **`ThreadCPUSampler` and a `cpuprobe` line next to every 30 s memprobe.** It states the CPU time
+  each thread group consumed over the window, as a share of one core, with the main thread and the
+  time of threads that ended inside the window on their own fields:
+  `cpuprobe t=30s cpu=87% main=6% threads=42 top=AetherEngine.HLSSegmentProducer.pump:29 ...`.
+  Consumed time, not the scheduler's decaying `cpu_usage`, so the figures add up. A field log from a
+  box nobody here owns is now a coarse profile instead of a guess. The class is public so a host can
+  sample its UI the same way outside a playback session.
+
 ### Fixed
 
 - **A live edge cushion deeper than about 20 s now starts on tvOS (AE#851).** The loopback built

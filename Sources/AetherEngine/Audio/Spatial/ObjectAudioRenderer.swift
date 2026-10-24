@@ -25,12 +25,15 @@ struct ObjectAudioElementState: Sendable, Equatable {
     var position: SIMD3<Float> = SIMD3(0.5, 0.5, 0)
     /// Linear gain.
     var gain: Float = 1
+    #if TrueHDReferenceRender
+    // The measurement reference's mapping only: a shipped build renders every object as a point.
     /// 0 = point source, 1 = whole room.
     var size: Float = 0
     /// Render to the single nearest speaker.
     var snap: Bool = false
     /// Speakers the object must not use (Atmos zone masks).
     var excluded: Set<SpatialSpeaker> = []
+    #endif
 }
 
 /// A metadata change taking effect partway through a block.
@@ -239,8 +242,12 @@ final class ObjectAudioRenderer {
             var gains = [Float](repeating: 0, count: layout.channelCount)
             switch roles[index] {
             case .object:
+                #if TrueHDReferenceRender
                 panner(excluding: state.excluded).objectGains(
                     position: state.position, size: state.size, snap: state.snap, into: &gains)
+                #else
+                panner(excluding: []).pointGains(state.position, into: &gains)
+                #endif
                 if state.gain != 1 { for c in gains.indices { gains[c] *= state.gain } }
             case .bed, .lfe, .fixed:
                 staticGains(for: roles[index], state: state, into: &gains)

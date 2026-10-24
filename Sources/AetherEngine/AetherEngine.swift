@@ -78,7 +78,8 @@ public final class AetherEngine: ObservableObject {
 
     /// Mid-playback rebuffer flag. `state` stays `.playing` across a rebuffer to avoid icon flicker;
     /// gate on this when you need to distinguish a stall from real playback (AetherEngine#35).
-    /// Always false during initial load spin-up (`state == .loading`).
+    /// Always false during initial load spin-up (`state == .loading`). On the AVPlayer paths a wait
+    /// AVPlayer spends evaluating its buffering rate (every resume from pause) does not count.
     @Published public internal(set) var isBuffering: Bool = false {
         didSet { recomputePlaybackPhase() }
     }
@@ -195,6 +196,18 @@ public final class AetherEngine: ObservableObject {
     nonisolated static func publishesTransportPause(hasTransportRolled: Bool,
                                                     transportIntentIsPlaying: Bool) -> Bool {
         hasTransportRolled || !transportIntentIsPlaying
+    }
+
+    /// Whether an AVPlayer wait is a rebuffer (Sodalite#168).
+    ///
+    /// Every resume from pause passes through `waitingToPlay` with `evaluatingBufferingRate` for a frame
+    /// or two while AVPlayer checks a buffer it already holds. Counting that as a rebuffer published
+    /// `.rebuffering` on each Play press, and a host that raises a spinner on it flashed its chrome away
+    /// and back. A wait that is really short of media moves on to `toMinimizeStalls`, which still counts,
+    /// as does any other or missing reason.
+    nonisolated static func nativeWaitIsRebuffer(status: AVPlayer.TimeControlStatus,
+                                                 reason: AVPlayer.WaitingReason?) -> Bool {
+        status == .waitingToPlayAtSpecifiedRate && reason != .evaluatingBufferingRate
     }
 
     /// Reader source-fetch axis feeding `playbackPhase`. Updated off the demux thread via

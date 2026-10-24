@@ -2749,6 +2749,10 @@ final class SoftwarePlaybackHost {
         // The join's start is placed once, before the first packet is fed; a seek before then is
         // the viewer's own choice of position and retires it.
         var liveJoinPending = true
+        // AE#844: once placed, a join that kept its cursor moves to the first keyframe past it. Set
+        // while that is pending: when the join was decided.
+        var liveJoinAlignSince: TimeInterval?
+        var liveJoinAlignLead: Double?
         // Audio look-ahead pump (#107 audio chopping): feed audio packets ahead of the
         // combined cursor so the audio renderer holds AudioLookaheadPolicy.targetLeadSeconds
         // of decoded audio regardless of video decode pace. Without it audio lead is capped
@@ -2895,6 +2899,7 @@ final class SoftwarePlaybackHost {
                 hadLead = false
                 rebuffering = false
                 liveJoinPending = false
+                liveJoinAlignSince = nil
             }
             if liveJoinPending {
                 switch liveJoinPlacement() {
@@ -2927,6 +2932,50 @@ final class SoftwarePlaybackHost {
                             category: .swPlayback
                         )
                         return true
+                    }
+                }
+                if !liveJoinPending {
+                    liveJoinAlignSince = ProcessInfo.processInfo.systemUptime
+                    liveJoinAlignLead = SoftwareLiveJoinPolicy.alignmentLead(
+                        cursorPts: ring.pts(atSeq: readCursor()), newestPts: newestSourcePts())
+                }
+            }
+            if let since = liveJoinAlignSince {
+                let cursor = readCursor()
+                let keyframe = ring.keyframe(atOrAfterSeq: cursor)
+                let cursorPts = ring.pts(atSeq: cursor)
+                let newest = newestSourcePts()
+                let waited = ProcessInfo.processInfo.systemUptime - since
+                switch SoftwareLiveJoinPolicy.alignment(cursorSeq: cursor, keyframe: keyframe,
+                                                        wantedLead: liveJoinAlignLead, newestPts: newest,
+                                                        waited: waited, sourceEnded: sourceEnded()) {
+                case .wait:
+                    condition.lock()
+                    autoreleasepool {
+                        _ = condition.wait(until: Date(timeIntervalSinceNow: 0.05))
+                    }
+                    condition.unlock()
+                    return true
+                case .snap:
+                    liveJoinAlignSince = nil
+                    if let keyframe, placeCursor(keyframe.seq, generation) {
+                        EngineLog.emit(
+                            "[SWHost] live join moved to the first keyframe: skipped "
+                            + "\(String(format: "%.2f", keyframe.pts - (cursorPts ?? keyframe.pts)))s before it "
+                            + "(cursor seq=\(cursor) -> \(keyframe.seq), keyframe pts=\(String(format: "%.2f", keyframe.pts)), "
+                            + "lead \(String(format: "%.2f", newest - keyframe.pts))s, waited \(String(format: "%.0f", waited * 1000)) ms)",
+                            category: .swPlayback
+                        )
+                        return true
+                    }
+                case .stay:
+                    liveJoinAlignSince = nil
+                    if keyframe == nil {
+                        EngineLog.emit(
+                            "[SWHost] live join found no keyframe in \(String(format: "%.0f", waited * 1000)) ms; "
+                            + "starting at the cursor (seq=\(cursor))",
+                            category: .swPlayback
+                        )
                     }
                 }
             }
@@ -3159,6 +3208,14 @@ final class SoftwarePlaybackHost {
         // the session unarmed forever. See the video-branch arming below.
         var audioPacketsSeen = 0
         var audioBuffersProduced = false
+        // AE#844: a live join reads the source from wherever it stands, mid-GOP as a rule, and
+        // would arm the clock on audio the picture only catches up with at the next keyframe.
+        // Audio up to that keyframe is dropped while the clock is unarmed
+        // (`SoftwareLiveJoinPolicy.dropsAudioBeforeFirstKeyframe`).
+        var liveJoinAwaitsKeyframe = isLive && videoStreamIndex >= 0 && audioDecoder != nil
+        var liveJoinDropStartedAt: TimeInterval?
+        var liveJoinFirstDroppedPts = Double.nan
+        var liveJoinDroppedPackets = 0
 
         // VOD audio decoupling (#107 family). The combined loop paced EVERYTHING on the video
         // renderer's ~10-frame queue, so interleaved audio could never build more than ~0.3 s
@@ -3599,6 +3656,46 @@ final class SoftwarePlaybackHost {
                             }
                         }
                     }
+                }
+            }
+
+            if liveJoinAwaitsKeyframe {
+                if clockArmed() || backgroundAudioOnly() {
+                    liveJoinAwaitsKeyframe = false
+                } else if streamIdx == videoStreamIndex, packet.pointee.flags & AV_PKT_FLAG_KEY != 0 {
+                    liveJoinAwaitsKeyframe = false
+                    if liveJoinDroppedPackets > 0 {
+                        let keyPts = packet.pointee.pts != Int64.min
+                            ? Double(packet.pointee.pts) * videoTimeBaseSeconds : Double.nan
+                        EngineLog.emit(
+                            "[SWHost] live join starts on the first keyframe: dropped \(liveJoinDroppedPackets) audio "
+                            + "packets (\(String(format: "%.2f", keyPts - liveJoinFirstDroppedPts))s) before it, "
+                            + "keyframe pts=\(String(format: "%.2f", keyPts))",
+                            category: .swPlayback
+                        )
+                    }
+                } else if streamIdx == audioStreamIndex {
+                    let now = ProcessInfo.processInfo.systemUptime
+                    let pts = packet.pointee.pts != Int64.min
+                        ? Double(packet.pointee.pts) * audioTimeBaseSeconds : Double.nan
+                    if liveJoinDropStartedAt == nil {
+                        liveJoinDropStartedAt = now
+                        liveJoinFirstDroppedPts = pts
+                    }
+                    if SoftwareLiveJoinPolicy.dropsAudioBeforeFirstKeyframe(
+                        waited: now - (liveJoinDropStartedAt ?? now),
+                        droppedSpanSeconds: pts - liveJoinFirstDroppedPts) {
+                        liveJoinDroppedPackets += 1
+                        av_packet_unref(packet)
+                        av_packet_free_safe(packet)
+                        return true
+                    }
+                    liveJoinAwaitsKeyframe = false
+                    EngineLog.emit(
+                        "[SWHost] live join found no keyframe after \(liveJoinDroppedPackets) audio packets; "
+                        + "starting on the audio",
+                        category: .swPlayback
+                    )
                 }
             }
 
