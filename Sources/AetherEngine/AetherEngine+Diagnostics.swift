@@ -562,6 +562,13 @@ extension AetherEngine {
         softwareHost?.vodPacketCacheSnapshot
     }
 
+    /// Active software/FEL read-ahead metadata. No filesystem or packet-store I/O.
+    /// Nil on native playback, before readiness, after stop, or when no store exists.
+    public var softwareReadAheadStatus: SoftwareReadAheadStatus? {
+        guard isSessionReady else { return nil }
+        return softwareHost?.readAheadStatus
+    }
+
     /// Freshly stat-ed on-disk footprint of the segment cache. nil when no native session is active. Used by `aetherctl live --report-cache-bytes`.
     public var segmentCacheDiskBytes: Int64? {
         nativeVideoSession?.segmentCacheDiskBytes

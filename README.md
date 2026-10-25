@@ -4,6 +4,12 @@
 
 <h1 align="center">AetherEngine</h1>
 
+Host diagnostics can read `softwareReadAheadStatus` for an active software/FEL
+packet cache. It reports the actual memory/disk store and its limits using only
+cached metadata. Its memory byte budget excludes purgeable played history; disk
+usage includes retained history. Use playback-clock coverage for buffered seconds,
+not a byte-to-bitrate estimate. `nil` means no ready packet cache, not zero usage.
+
 <p align="center">
   <b>A media player engine for Apple platforms.</b><br>
   FFmpeg demuxes. VideoToolbox decodes. AVPlayer handles Dolby Atmos.<br>

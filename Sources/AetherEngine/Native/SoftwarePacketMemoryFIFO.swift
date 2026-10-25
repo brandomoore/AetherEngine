@@ -19,6 +19,7 @@ import Foundation
 /// `snapshot.diskByteCount` reports only non-volatile bytes, which is what the read-ahead's byte
 /// budget bounds (the forward window). History is bounded separately by `historyCapBytes`.
 final class SoftwarePacketMemoryFIFO: @unchecked Sendable {
+    var cacheStorage: SoftwareReadAheadStatus.Storage? { .memory }
     private final class Chunk {
         let id: UInt64
         let base: UnsafeMutableRawPointer

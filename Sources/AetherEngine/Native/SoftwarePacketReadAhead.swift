@@ -36,6 +36,7 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
     private let audio: Stream?
     private let byteBudget: Int
     private let forwardSeconds: Double
+    private let storage: SoftwareReadAheadStatus.Storage?
     /// Producer thread only. See `start()` for why this is a class the producer moves itself.
     private var producerQoS: qos_class_t = QOS_CLASS_USER_INITIATED
     /// Mirror of `producerQoS` for the consumer's diagnostics, under `condition`.
@@ -109,6 +110,7 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
         self.forwardSeconds = max(1, forwardSeconds)
         self.sourceClock = initialSourceClock
         self.fifo = fifo
+        self.storage = fifo.cacheStorage
         self.videoCoverage = SoftwarePacketCoverage(maximumRangeCount: coverageRangeCap)
         self.audioCoverage = SoftwareAudioPacketCoverage(
             timeBaseNumerator: audio?.numerator ?? 1, timeBaseDenominator: audio?.denominator ?? 1,
@@ -147,6 +149,17 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
                         generation: generation, seeking: seeking, sourceEnded: ended,
                         sourceEpoch: sourceEpoch, cacheSeekHits: cacheSeekHits,
                         cacheSeekMisses: cacheSeekMisses)
+    }
+
+    var readAheadStatus: SoftwareReadAheadStatus? {
+        condition.lock(); defer { condition.unlock() }
+        guard !closed, let storage else { return nil }
+        return SoftwareReadAheadStatus(
+            storage: storage, queuedBytes: bytes, budgetedBytes: residentBytes,
+            byteBudget: byteBudget, targetSeconds: forwardSeconds,
+            byteLimitReached: producerParked && !seeking && !sourceRepositioning
+                && !ended && failure == nil && count > 0 && residentBytes >= byteBudget
+        )
     }
 
     /// Called only by a background sampler. Copy bounded metadata under the short state lock;

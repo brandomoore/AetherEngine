@@ -4,6 +4,7 @@ import Foundation
 /// keeps the records in session files; `SoftwarePacketMemoryFIFO` keeps the same records in
 /// purgeable memory, which is what tvOS uses (see there).
 protocol SoftwarePacketStore: AnyObject, Sendable {
+    var cacheStorage: SoftwareReadAheadStatus.Storage? { get }
     var snapshot: SoftwarePacketDiskFIFO.Snapshot { get }
     /// Whether consumed records stay readable as history (cached seeks, published residency).
     var retainsConsumedPackets: Bool { get }
@@ -19,7 +20,10 @@ protocol SoftwarePacketStore: AnyObject, Sendable {
 }
 
 extension SoftwarePacketStore {
+    var cacheStorage: SoftwareReadAheadStatus.Storage? { nil }
     func evictPurgedHistory() -> Bool { false }
 }
 
-extension SoftwarePacketDiskFIFO: SoftwarePacketStore {}
+extension SoftwarePacketDiskFIFO: SoftwarePacketStore {
+    var cacheStorage: SoftwareReadAheadStatus.Storage? { .disk }
+}

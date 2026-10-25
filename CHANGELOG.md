@@ -10,6 +10,10 @@ the public-API contract.
 
 ## [Unreleased]
 
+- Added metadata-only `softwareReadAheadStatus` for active software/FEL packet
+  caches: resolved storage, byte usage/budget, requested duration, and a confirmed
+  byte-budget stop. No additional I/O, sampling loop, or buffering-policy change.
+
 - Added `latestSoftwareVideoFrame()` and `softwareVideoFrameGeneration` for opt-in,
   infrequent analysis of an active software session's newest enqueued picture
   without another decoder, display readback, or an engine-owned sampling loop.

@@ -290,6 +290,7 @@ final class SoftwarePlaybackHost {
 
     var cachedVODBytes: Int64? { vodPacketReadAhead.map { Int64($0.snapshot.residentBytes) } }
     var vodPacketCacheSnapshot: SoftwarePacketReadAhead.Snapshot? { vodPacketReadAhead?.snapshot }
+    var readAheadStatus: SoftwareReadAheadStatus? { vodPacketReadAhead?.readAheadStatus }
 
     /// #107 round 2: a session-axis position on the source axis. The one place that mapping is
     /// made, for callers inside the host and outside it alike; the identity for a zero-based
