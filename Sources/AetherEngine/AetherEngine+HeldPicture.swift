@@ -4,6 +4,19 @@ import Combine
 
 extension AetherEngine {
 
+    /// Borrows the software renderer's current decoded picture for infrequent analysis.
+    ///
+    /// This does not decode, seek, install a tap, or start a sampling clock. Treat the
+    /// returned buffer as read-only, preserve its color attachments, and release it
+    /// promptly rather than retaining a history of full-resolution frames. It may be
+    /// the newest enqueued picture when the display renderer cannot supply one.
+    /// Returns nil before the first picture, after teardown, or on the native path
+    /// (whose host can use `currentAVPlayer` with its own scoped video output).
+    public func displayedSoftwareVideoFrame() -> CVPixelBuffer? {
+        guard nativeHost == nil, isSessionReady, hasFirstFrameReadyForDisplay else { return nil }
+        return softwareHost?.displayedFrame()
+    }
+
     /// The longest a held picture stays up when the next item never reports a first frame. The
     /// rebuild has its own failure paths; this only keeps a frozen frame from outliving them.
     static let heldPictureTimeoutSeconds: Double = 8

@@ -10,7 +10,8 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+- Added `displayedSoftwareVideoFrame()` for opt-in, infrequent analysis of the active
+  software picture without another decoder or an engine-owned sampling loop.
 
 ## [7.47.0] - 2026-10-23
 
