@@ -4,17 +4,25 @@ import Combine
 
 extension AetherEngine {
 
-    /// Borrows the software renderer's current decoded picture for infrequent analysis.
+    /// Borrows the software renderer's newest enqueued picture for infrequent analysis.
     ///
     /// This does not decode, seek, install a tap, or start a sampling clock. Treat the
     /// returned buffer as read-only, preserve its color attachments, and release it
-    /// promptly rather than retaining a history of full-resolution frames. It may be
-    /// the newest enqueued picture when the display renderer cannot supply one.
+    /// promptly rather than retaining a history of full-resolution frames. It can
+    /// lead the presented picture by the renderer's queue; this is not a screenshot.
     /// Returns nil before the first picture, after teardown, or on the native path
     /// (whose host can use `currentAVPlayer` with its own scoped video output).
-    public func displayedSoftwareVideoFrame() -> CVPixelBuffer? {
+    public func latestSoftwareVideoFrame() -> CVPixelBuffer? {
         guard nativeHost == nil, isSessionReady, hasFirstFrameReadyForDisplay else { return nil }
-        return softwareHost?.displayedFrame()
+        return softwareHost?.enqueuedFrameForAnalysis()
+    }
+
+    /// Generation of the current software picture's owner. Recheck after asynchronous
+    /// analysis to discard results from a replaced or stopped playback session.
+    public var softwareVideoFrameGeneration: UInt64? {
+        guard nativeHost == nil, isSessionReady, hasFirstFrameReadyForDisplay,
+              softwareHost != nil else { return nil }
+        return loadGeneration
     }
 
     /// The longest a held picture stays up when the next item never reports a first frame. The
