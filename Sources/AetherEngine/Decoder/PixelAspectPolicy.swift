@@ -3,11 +3,12 @@ import AetherLibavutil
 /// Whether a declared sample aspect ratio deserves to be believed. Two gates that catch different
 /// lies; both are cheap enough to run per frame.
 ///
-/// #177 (components): live TS has been seen carrying 1088:1 on the codec context. No legitimate
-/// pixel aspect ratio needs a component above 256.
+/// #177 (magnitude): live TS has been seen carrying 1088:1 on the codec context. Reject extreme
+/// pixel shapes, not large rational components: a container can precisely describe ordinary
+/// non-square pixels as 759:712, and rejecting that ratio squeezes a 759x574 picture to 712x574.
 ///
 /// #290 (display aspect): a wrong SAR does not have to be a large one. A live 1080p H.264 channel
-/// declaring 3:1, and 2:1 on a later run, passes the component gate and smears 1920x1080 into a
+/// declaring 3:1, and 2:1 on a later run, passes the magnitude gate and smears 1920x1080 into a
 /// 5.33:1 or 3.56:1 band. The magnitude is not the defect, the aspect it produces is, and that
 /// cannot be judged without the frame the SAR applies to: 2:1 is a standard VUI value (H.264
 /// Table E-1, `ff_h2645_pixel_aspect` idc 16) and exactly right on a 960x1080 broadcast frame,
@@ -26,15 +27,19 @@ enum PixelAspectPolicy {
     static let maxDisplayAspect: Double = 3.0
     static let minDisplayAspect: Double = 1.0 / 3.0
 
-    /// #177 component gate. Prefer `saneSAR(_:width:height:)` wherever the frame is known; this
+    /// #177 magnitude gate. Prefer `saneSAR(_:width:height:)` wherever the frame is known; this
     /// overload can only judge the numbers, not what they do.
     static func saneSAR(_ sar: AVRational) -> AVRational? {
-        guard sar.num > 0, sar.den > 0, sar.num <= 256, sar.den <= 256 else { return nil }
+        guard sar.num > 0, sar.den > 0 else { return nil }
+        // AVRational components are Int32, so these Int64 products cannot overflow.
+        let numerator = Int64(sar.num)
+        let denominator = Int64(sar.den)
+        guard numerator <= denominator * 256, denominator <= numerator * 256 else { return nil }
         return sar
     }
 
-    /// #290: the component gate plus the display aspect this SAR produces on this frame.
-    /// Non-positive dimensions fall back to the component gate alone: a frame that cannot state
+    /// #290: the magnitude gate plus the display aspect this SAR produces on this frame.
+    /// Non-positive dimensions fall back to the magnitude gate alone: a frame that cannot state
     /// its own size is not evidence against the SAR.
     static func saneSAR(_ sar: AVRational, width: Int32, height: Int32) -> AVRational? {
         guard let sar = saneSAR(sar) else { return nil }
@@ -54,7 +59,7 @@ enum PixelAspectPolicy {
     }
 
     /// The ratio a stream actually deserves, or nil when there is nothing to correct. Bitstream
-    /// first, container second (`declaredStreamSAR`), then both gates above. Square pixels return
+    /// and container are reconciled by `declaredStreamSAR`, then both gates above. Square pixels return
     /// nil rather than 1:1, because a correction of one is a correction a consumer cannot tell from
     /// a real one.
     ///

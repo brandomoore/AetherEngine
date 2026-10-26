@@ -26,9 +26,19 @@ enum ScrubSegmentTime {
 
 /// Which extraction mode produced (or is requested for) a frame.
 ///
-/// - `thumbnail`: nearest keyframe, no forward decode, downscaled. Cheap; scrub/Recents.
+/// - `thumbnail`: nearest keyframe, no forward decode, downscaled. Cheap; posters/Recents.
+/// - `preview`: frame-accurate forward decode, downscaled. Interactive scrub previews.
 /// - `snapshot`: frame-accurate (decode forward to exact PTS), full/requested res; stills.
 public enum FrameMode: Sendable, Hashable {
     case thumbnail
+    case preview
     case snapshot
+
+    var isFrameAccurate: Bool { self != .thumbnail }
+    var usesTargetWidth: Bool { self != .snapshot }
+    var isElective: Bool { self != .snapshot }
+
+    func accepts(framePTS: Int64, targetPTS: Int64) -> Bool {
+        !isFrameAccurate || framePTS == Int64.min || framePTS >= targetPTS
+    }
 }

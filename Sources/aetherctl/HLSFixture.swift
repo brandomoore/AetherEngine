@@ -424,7 +424,7 @@ final class HLSFixtureServer: @unchecked Sendable {
     private var shouldStop = false
     private let lock = NSLock()
     private var clientFds = Set<Int32>()
-    private(set) var port: UInt16 = 0
+    private var port: UInt16 = 0
 
     private var startTime: Date = Date()
 
@@ -596,7 +596,7 @@ final class HLSFixtureServer: @unchecked Sendable {
         // which is what a tokenized IPTV portal does (portal answers, CDN edge serves). 127.0.0.1 and
         // localhost are distinct origins to any HTTP client that decides header forwarding by host.
         if let redirectHost = config.redirectEntryToHost, path == "/entry.m3u8" {
-            let targetPort = config.redirectEntryToPort ?? port
+            let targetPort = config.redirectEntryToPort ?? lock.withLock { port }
             let target = "http://\(redirectHost):\(targetPort)/\(config.withMaster ? "master.m3u8" : "media.m3u8")"
             print("[HLSFixture] 302 /entry.m3u8 -> \(target)")
             send302(fd: fd, location: target)

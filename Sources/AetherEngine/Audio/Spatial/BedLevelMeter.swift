@@ -10,7 +10,7 @@ import Foundation
 /// engine handed AVPlayer. Level here means the encoder was given that channel's sound, so a height
 /// heard from the floor speakers lost it after this point. Silence here is a lead, not a verdict: the
 /// object counts come from the metadata (gain and position), and an elevated object can still be
-/// silent.
+/// silent or snap to a floor speaker.
 ///
 /// Measured on the planes the encoder is fed, gap-fill silence included, because that is what was
 /// sent. The first window after a start or a seek closes after `firstWindowSeconds`, so a short test
@@ -59,9 +59,8 @@ struct BedLevelMeter {
         peaks = Array(repeating: 0, count: layout.channelCount)
     }
 
-    /// Count the objects the metadata has playing, and how many of them sit above ear level (with
-    /// elevation allowed, in the measurement reference, the only build that reads that switch). A
-    /// new object configuration forgets the old elements' states; its first
+    /// Count the objects the metadata has playing, and how many of them sit above ear level with
+    /// elevation allowed. A new object configuration forgets the old elements' states; its first
     /// update restates every element.
     mutating func observe(roles: [ObjectAudioRole], updates: [ObjectAudioMetadataUpdate],
                           configurationChanged: Bool = false) {
@@ -83,11 +82,7 @@ struct BedLevelMeter {
             for (index, role) in roles.enumerated() where role == .object {
                 guard let state = elementStates[index], state.gain > 0 else { continue }
                 activeObjects += 1
-                #if TrueHDReferenceRender
                 if state.position.z > 0, !Self.heightSpeakers.isSubset(of: state.excluded) { elevatedObjects += 1 }
-                #else
-                if state.position.z > 0 { elevatedObjects += 1 }
-                #endif
             }
             maxActiveObjects = max(maxActiveObjects, activeObjects)
             maxElevatedObjects = max(maxElevatedObjects, elevatedObjects)

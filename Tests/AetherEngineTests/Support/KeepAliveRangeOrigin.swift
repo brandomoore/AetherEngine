@@ -9,13 +9,15 @@ final class KeepAliveRangeOrigin: @unchecked Sendable {
     let port: UInt16
     private let listener: LoopbackListener
     private let data: Data
+    private let contentType: String?
     private let lock = NSLock()
     private var connections: Set<Int32> = []
     private var stopped = false
     private var accepted = 0
 
-    init?(data: Data) {
+    init?(data: Data, contentType: String? = nil) {
         self.data = data
+        self.contentType = contentType
         guard let listener = LoopbackListener(backlog: 16) else { return nil }
         self.listener = listener
         port = listener.port
@@ -72,6 +74,7 @@ final class KeepAliveRangeOrigin: @unchecked Sendable {
             let header = "HTTP/1.1 206 Partial Content\r\n"
                 + "Content-Length: \(end - start + 1)\r\n"
                 + "Content-Range: bytes \(start)-\(end)/\(data.count)\r\n"
+                + (contentType.map { "Content-Type: \($0)\r\n" } ?? "")
                 + "Accept-Ranges: bytes\r\nConnection: keep-alive\r\n\r\n"
             guard writeAll(fd, Data(header.utf8)),
                   writeAll(fd, data.subdata(in: start..<(end + 1))) else { return }

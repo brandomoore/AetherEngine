@@ -7,12 +7,6 @@ import TrueHD
 /// a C API): lossless decode of presentation 3, which for an Atmos stream is the bed plus up to 15
 /// dynamic objects, together with the object audio metadata (OAMD) that positions them.
 ///
-/// With `splitsBed` (the engine's TrueHD path, see `BedSplitter`) the decode is a different one:
-/// the matrix interpolation values are discarded, so the object signals are approximate, every block
-/// also carries the stream's channel-based presentation (Dolby's own 7.1 or 5.1 rendering of the mix)
-/// from the same access unit, and elements are described as plain point sources: the bridge then
-/// takes every output from that bed and only reads where the objects' energy lies.
-///
 /// The library's coordinates are OAMD room coordinates (ETSI TS 103 420 4.2.1): x left→right and
 /// y front→back on 0...1, z −1 floor, 0 ear level, +1 ceiling. That is the renderer's own room
 /// model above ear level; home Atmos keeps objects at z ≥ 0, and anything below is clamped to the
@@ -29,31 +23,17 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
     private var roles: [ObjectAudioRole] = []
     private var rolesSerial: UInt32?
     private var planes: [UnsafePointer<Float>] = []
-    let splitsBed: Bool
-    var playsBedOnly: Bool { splitsBed }
-    private var bedRoles: [ObjectAudioRole] = []
-    private var bedRolesSerial: UInt32?
-    private var bedPlanes: [UnsafePointer<Float>] = []
     private(set) var selfResetCount = 0
     /// Blocks between a reset and the first metadata, so objects play from the first frame (see
     /// `ObjectMetadataHold`), and the released block last handed out, whose planes it owns.
     private let hold = ObjectMetadataHold()
     private var lent: ObjectMetadataHold.Copy?
 
-    /// `splitsBed` is false only for the measurement reference (`TrueHDReferenceRender` trait).
-    init(splitsBed: Bool = true) throws {
-        #if !TrueHDReferenceRender
-        precondition(splitsBed, "the exact decode and mix are only built with the TrueHDReferenceRender trait")
-        #endif
+    init() throws {
         guard let handle = truehd_atmos_decoder_create(TRUEHD_ATMOS_PRESENTATION_HIGHEST) else {
             throw DecoderError(status: TRUEHD_ATMOS_ERR_INVALID_ARGUMENT, message: "create failed")
         }
         self.handle = handle
-        self.splitsBed = splitsBed
-        if splitsBed {
-            _ = truehd_atmos_decoder_set_bed_companion(handle, true)
-            _ = truehd_atmos_decoder_set_ignore_interpolation(handle, true)
-        }
     }
 
     deinit { truehd_atmos_decoder_destroy(handle) }
@@ -108,18 +88,6 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
         planes.removeAll(keepingCapacity: true)
         for c in 0..<channels { planes.append(UnsafePointer(block.channels[c]!)) }
 
-        var bed: ObjectAudioBed?
-        let bedChannels = Int(block.bed_channel_count)
-        if bedChannels > 0, let channels = block.bed_channels, let speakers = block.bed_speakers {
-            if bedRolesSerial != block.layout_serial || bedRoles.count != bedChannels {
-                bedRolesSerial = block.layout_serial
-                bedRoles = (0..<bedChannels).map { Self.role(forSpeaker: speakers[$0]) }
-            }
-            bedPlanes.removeAll(keepingCapacity: true)
-            for c in 0..<bedChannels { bedPlanes.append(UnsafePointer(channels[c]!)) }
-            bed = ObjectAudioBed(roles: bedRoles, planes: bedPlanes)
-        }
-
         var updates: [ObjectAudioMetadataUpdate] = []
         var firstStates: [ObjectAudioElementState?]?
         if block.flags & TRUEHD_ATMOS_BLOCK_METADATA_UPDATED != 0, let metadata = block.metadata {
@@ -127,18 +95,16 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
             let count = min(Int(md.element_count), channels)
             for u in 0..<Int(md.update_count) {
                 let update = md.updates[u]
-                if u == 0 { firstStates = (0..<count).map { state(for: update.elements[$0]) } }
+                if u == 0 { firstStates = (0..<count).map { Self.state(for: update.elements[$0]) } }
                 var states: [ObjectAudioElementState?] = []
                 states.reserveCapacity(count)
                 for e in 0..<count {
                     let element = update.elements[e]
                     states.append(element.flags & TRUEHD_ATMOS_ELEMENT_CHANGED != 0
-                                  ? state(for: element) : nil)
+                                  ? Self.state(for: element) : nil)
                 }
                 updates.append(ObjectAudioMetadataUpdate(
-                    frameOffset: Int(update.frame_offset),
-                    // Splitting the bed, each update is taken as it stands, without the ramp towards it.
-                    rampFrames: splitsBed ? 0 : Int(update.ramp_frames), states: states))
+                    frameOffset: Int(update.frame_offset), rampFrames: Int(update.ramp_frames), states: states))
             }
         }
 
@@ -150,8 +116,7 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
             isDiscontinuity: block.flags & TRUEHD_ATMOS_BLOCK_DISCONTINUITY != 0,
             roles: roles,
             planes: planes,
-            updates: updates,
-            bed: bed), firstStates)
+            updates: updates), firstStates)
     }
 
     func reset() {
@@ -204,25 +169,6 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
         }
     }
 
-    private func state(for element: TrueHDAtmosElement) -> ObjectAudioElementState {
-        #if TrueHDReferenceRender
-        splitsBed ? Self.pointSource(for: element) : Self.state(for: element)
-        #else
-        Self.pointSource(for: element)
-        #endif
-    }
-
-    /// An element as a point at its position: no size, snap, zone exclusion, screen anchoring or
-    /// elevation switch. ISF elements, whose positions the library does not decode, sit in the room's
-    /// centre.
-    static func pointSource(for element: TrueHDAtmosElement) -> ObjectAudioElementState {
-        let active = element.flags & TRUEHD_ATMOS_ELEMENT_ACTIVE != 0
-        let p = element.kind == TRUEHD_ATMOS_ELEMENT_ISF ? (Float(0.5), Float(0.5), Float(0.5)) : element.position
-        return ObjectAudioElementState(position: SIMD3(p.0, p.1, max(0, p.2)), gain: active ? element.gain : 0)
-    }
-
-    #if TrueHDReferenceRender
-    // The reference render's mapping: size, snap, zones, screen anchoring and the elevation switch.
     static func state(for element: TrueHDAtmosElement) -> ObjectAudioElementState {
         let active = element.flags & TRUEHD_ATMOS_ELEMENT_ACTIVE != 0
         var p = element.position
@@ -274,6 +220,5 @@ final class TrueHDObjectAudioDecoder: ObjectAudioDecoding {
         default: return []
         }
     }
-    #endif
 }
 #endif

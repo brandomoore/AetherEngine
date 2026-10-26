@@ -29,6 +29,13 @@ enum DoviRpuGuard {
             u.append(b)
             zeros = b == 0 ? zeros + 1 : 0
         }
+        return verified(u)
+    }
+
+    /// `u` is an unescaped RPU, header(2) 0x19 payload... crc32(4) 0x80, possibly with trailing zeros.
+    /// Returns it trimmed when its CRC32 is right, else nil.
+    private static func verified(_ unescaped: [UInt8]) -> [UInt8]? {
+        var u = unescaped
         while let last = u.last, last == 0 { u.removeLast() }   // cabac_zero_words / trailing zeros
         guard u.count >= 8, u[2] == 0x19, u[u.count - 1] == 0x80 else { return nil }
         let tailAt = u.count - 5
@@ -248,5 +255,52 @@ enum DoviRpuGuard {
     static func parse(_ nal: UnsafePointer<UInt8>, _ len: Int) -> OpaquePointer? {
         guard let u = verifiedUnescaped(nal, len), !reachesUnimplementedPath(u) else { return nil }
         return dovi_parse_unspec62_nalu(nal, len)
+    }
+
+    /// The AV1 (Profile 10) form: `t35` runs from `itu_t_t35_country_code` (or the provider code) on.
+    /// `dovi_parse_itu_t35_dovi_metadata_obu` behind the same two checks as `parse`: the RPU is taken
+    /// out of its EMDF container the way libdovi's `convert_av1_rpu_payload_to_regular` does, then
+    /// checked as the unspec62 RPU it is. nil when it is not a Dolby Vision RPU, is corrupt, or would
+    /// abort the library.
+    static func parseAV1(_ t35: UnsafePointer<UInt8>, _ len: Int) -> OpaquePointer? {
+        guard let rpu = av1RPU(t35, len), let u = verified([0x7C, 0x01] + rpu),
+              !reachesUnimplementedPath(u) else { return nil }
+        return dovi_parse_itu_t35_dovi_metadata_obu(t35, len)
+    }
+
+    /// libdovi's fixed T.35 header: provider code 0x003B, provider-oriented code 0x800, and the first
+    /// EMDF bits (`emdf_version` 0, `key_id` 6, `emdf_payload_id` 31 extended to 225, the four flags 0,
+    /// `discard_unknown_payload` 1), which end three bits into the last byte.
+    private static let av1Header: [UInt8] = [0x00, 0x3B, 0x00, 0x00, 0x08, 0x00, 0x37, 0xCD, 0x08]
+
+    /// The RPU (0x19 payload..., no NAL header, no emulation prevention) inside an AV1 T.35 payload.
+    static func av1RPU(_ t35: UnsafePointer<UInt8>, _ len: Int) -> [UInt8]? {
+        // libdovi's own minimum, and the optional country code it skips.
+        guard len >= 34 else { return nil }
+        var bytes = Array(UnsafeBufferPointer(start: t35, count: len))
+        if bytes[0] == 0xB5 { bytes.removeFirst() }
+        guard bytes.count >= av1Header.count, Array(bytes[..<av1Header.count]) == av1Header else { return nil }
+        var r = Bits(bytes: bytes, end: bytes.count * 8, pos: 48)
+        // Mirrors `parse_emdf_container`, `emdf_payload_size` included.
+        guard r.bits(2) == 0, r.bits(3) == 6, r.bits(5) == 31, variableBits(&r, 5) == 225,
+              r.bits(4) == 0, r.bit() == 1,
+              let size = variableBits(&r, 8), r.pos + Int(size) * 8 <= r.end else { return nil }
+        var rpu = [UInt8](repeating: 0, count: Int(size) + 1)
+        rpu[0] = 0x19
+        for i in 0..<Int(size) { rpu[i + 1] = UInt8(r.bits(8)!) }
+        return rpu
+    }
+
+    /// EMDF `variable_bits`. Capped at four groups: a payload size that needs more is larger than
+    /// any T.35 payload can carry, and libdovi's u32 would overflow on it.
+    private static func variableBits(_ r: inout Bits, _ n: Int) -> UInt64? {
+        var value: UInt64 = 0
+        for _ in 0..<4 {
+            guard let group = r.bits(n), let more = r.bit() else { return nil }
+            value += group
+            if more == 0 { return value }
+            value = (value << UInt64(n)) + (1 << UInt64(n))
+        }
+        return nil
     }
 }

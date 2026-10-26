@@ -20,7 +20,9 @@ struct CancellableLoadTests {
         private var arrivals = 0
         private var releasedByEngine = false
 
-        init(fallback: TimeInterval = 120) { self.fallback = fallback }
+        static let defaultFallback: TimeInterval = 120
+
+        init(fallback: TimeInterval = defaultFallback) { self.fallback = fallback }
 
         var entered: Bool { condition.withLock { arrivals > 0 } }
         var wasReleasedByEngine: Bool { condition.withLock { releasedByEngine } }
@@ -68,6 +70,12 @@ struct CancellableLoadTests {
     /// "a timeout ended it". 1.5 s was a guess at the quiet-machine time and a loaded runner took 2 s.
     static let ceiling: Duration = .seconds(4)
 
+    /// A custom source has no timeout to tell the cancel from: the only other end of a parked read
+    /// is the reader's own fallback (`ParkedReader` and `RetainedReader` both wait 120 s), so the
+    /// bound is derived from that. 4 s failed on a loaded runner that took 7.3 s from the cancel to
+    /// the outcome.
+    static let customSourceCeiling: Duration = .seconds(ParkedReader.defaultFallback / 2)
+
     /// Cancels after the load has been held a moment and reports how long it took to end. The wait
     /// has no bound of its own, so a slow end reports its real duration instead of the poll's.
     private static func cancelAndTime(_ task: Task<Void, Never>, _ box: OutcomeBox) async throws -> Duration {
@@ -91,7 +99,7 @@ struct CancellableLoadTests {
 
         let elapsed = try await Self.cancelAndTime(task, box)
         #expect(box.outcome == .cancelled, "ended \(String(describing: box.outcome)) after \(elapsed)")
-        #expect(elapsed < Self.ceiling)
+        #expect(elapsed < Self.customSourceCeiling)
         #expect(reader.wasReleasedByEngine)
         await task.value
         #expect(engine.state == .idle)
@@ -345,7 +353,7 @@ struct CancellableLoadTests {
             defer { condition.unlock() }
             let epoch = cancels
             arrivals += 1
-            let deadline = Date().addingTimeInterval(120)
+            let deadline = Date().addingTimeInterval(ParkedReader.defaultFallback)
             while !closed, cancels == epoch, condition.wait(until: deadline) {}
             return -1
         }
@@ -383,7 +391,7 @@ struct CancellableLoadTests {
 
         let elapsed = try await Self.cancelAndTime(hostLoad, hostBox)
         #expect(hostBox.outcome == .cancelled, "ended \(String(describing: hostBox.outcome)) after \(elapsed)")
-        #expect(elapsed < Self.ceiling)
+        #expect(elapsed < Self.customSourceCeiling)
         #expect(reader.isClosed)
         await #expect(throws: CancellationError.self) { try await rebuild.value }
         await hostLoad.value

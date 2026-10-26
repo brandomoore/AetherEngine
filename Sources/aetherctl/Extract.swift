@@ -43,6 +43,7 @@ func runExtract(url: URL, at seconds: Double, mode: FrameMode, loops: Int, maxWi
         let image: CGImage? = runBlocking {
             switch mode {
             case .thumbnail: return await extractor.thumbnail(at: pos, maxWidth: maxWidth)
+            case .preview:   return await extractor.preview(at: pos, maxWidth: maxWidth)
             case .snapshot:  return await extractor.snapshot(at: pos, maxSize: nil)
             }
         }

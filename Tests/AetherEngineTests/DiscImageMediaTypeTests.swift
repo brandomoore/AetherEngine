@@ -1,0 +1,124 @@
+import Testing
+import Foundation
+@testable import AetherEngine
+
+@Suite("Disc image media types (AE#860)")
+struct DiscImageMediaTypeTests {
+
+    @Test("the type is matched without parameters, case or padding")
+    func normalizesTheType() {
+        #expect(DiscImageMediaType.isDiscImage(contentType: "application/x-iso9660-image"))
+        #expect(DiscImageMediaType.isDiscImage(contentType: "Application/X-ISO9660-Image"))
+        #expect(DiscImageMediaType.isDiscImage(contentType: " application/x-iso9660-image ; charset=binary"))
+        #expect(DiscImageMediaType.isDiscImage(contentType: "application/x-cd-image"))
+        #expect(DiscImageMediaType.isDiscImage(contentType: "application/vnd.efi.iso"))
+    }
+
+    @Test("media and generic types are not disc images")
+    func rejectsOtherTypes() {
+        #expect(!DiscImageMediaType.isDiscImage(contentType: nil))
+        #expect(!DiscImageMediaType.isDiscImage(contentType: ""))
+        #expect(!DiscImageMediaType.isDiscImage(contentType: "application/octet-stream"))
+        #expect(!DiscImageMediaType.isDiscImage(contentType: "video/mp4"))
+        #expect(!DiscImageMediaType.isDiscImage(contentType: "video/x-matroska"))
+        #expect(!DiscImageMediaType.isDiscImage(contentType: "application/x-iso9660-image-but-not"))
+    }
+}
+
+extension PrewarmStoreSuites {
+    /// AE#860: an extensionless URL whose origin declares a disc image type reaches the disc
+    /// adapter; the type stays a hint that the disc readers confirm.
+    /// `.serialized`: the warm case and the recognized-URL memo are process-wide.
+    @Suite("Extensionless disc images by Content-Type (AE#860)", .serialized, .timeLimit(.minutes(2)))
+    struct ExtensionlessDiscImageTests {
+
+        private static let iso = RemoteDiscSessionReleaseTests.isoImage(vob: RemoteDiscSessionReleaseTests.vob)
+
+        private func url(_ origin: KeepAliveRangeOrigin) -> URL {
+            URL(string: "http://127.0.0.1:\(origin.port)/t4/play/\(UUID().uuidString)")!
+        }
+
+        @Test("an extensionless URL declaring an ISO type opens through the disc adapter")
+        func declaredISOOpensAsDisc() throws {
+            let origin = try #require(KeepAliveRangeOrigin(data: Self.iso, contentType: "application/x-iso9660-image"))
+            defer { origin.stop() }
+            let source = url(origin)
+            #expect(!Demuxer.isDiscImageURL(source))
+
+            let demuxer = Demuxer()
+            defer { demuxer.close() }
+            try demuxer.open(url: source)
+            #expect(demuxer.isDiscSource, "the declared disc image was handed to libavformat raw")
+            #expect(Demuxer.isDiscImageURL(source), "a recognized disc URL was not remembered")
+        }
+
+        @Test("a warm open learns the type from the warm")
+        func warmedISOOpensAsDisc() async throws {
+            let origin = try #require(KeepAliveRangeOrigin(data: Self.iso, contentType: "application/x-iso9660-image; charset=binary"))
+            defer { origin.stop() }
+            let source = url(origin)
+            _ = await SourcePrewarmFetcher.warm(url: source, extraHeaders: [:], byteBudget: 1 << 20, into: .shared)
+            #expect(SourcePrewarmStore.shared.isWarm(for: source), "the warm was not taken")
+            defer { _ = SourcePrewarmStore.shared.take(for: source) }
+
+            let demuxer = Demuxer()
+            defer { demuxer.close() }
+            try demuxer.open(url: source)
+            #expect(demuxer.isDiscSource)
+        }
+
+        @Test("ordinary extensionless media keeps the streaming path")
+        func ordinaryMediaStreams() throws {
+            let origin = try #require(KeepAliveRangeOrigin(data: TinyTransportStreamFixture.data, contentType: "video/mp2t"))
+            defer { origin.stop() }
+            let source = url(origin)
+
+            let demuxer = Demuxer()
+            defer { demuxer.close() }
+            try demuxer.open(url: source)
+            #expect(!demuxer.isDiscSource)
+            #expect(!Demuxer.isDiscImageURL(source))
+        }
+
+        @Test("a mislabelled media body is not taken for a disc and still plays")
+        func mislabelledMediaStreams() throws {
+            let origin = try #require(KeepAliveRangeOrigin(data: TinyTransportStreamFixture.data, contentType: "application/x-iso9660-image"))
+            defer { origin.stop() }
+            let source = url(origin)
+
+            let demuxer = Demuxer()
+            defer { demuxer.close() }
+            try demuxer.open(url: source)
+            #expect(!demuxer.isDiscSource)
+            #expect(!Demuxer.isDiscImageURL(source), "a body with no disc structure was remembered as a disc")
+        }
+
+        @Test("a controlled probe enables the disc probe once the response declares an ISO type")
+        func controlledProbeEnablesTheDiscProbe() throws {
+            let origin = try #require(KeepAliveRangeOrigin(data: Self.iso, contentType: "application/x-iso9660-image"))
+            defer { origin.stop() }
+            let control = try ProbeControl(limits: nil, cancellation: ProbeCancellation())
+            let reader = ProbeHTTPReader(url: url(origin), headers: [:], control: control)
+            defer { reader.close() }
+
+            #expect(!reader.discImageProbeEnabled)
+            try reader.open()
+            #expect(reader.discImageProbeEnabled, "the probe reader ignored the declared disc image type")
+
+            let probe = try AetherEngine.probe(url: url(origin), cancellation: ProbeCancellation())
+            #expect(probe.videoWidth == 64)
+        }
+
+        @Test("a controlled probe of ordinary media keeps the disc probe off")
+        func controlledProbeOfMediaSkipsTheDiscProbe() throws {
+            let origin = try #require(KeepAliveRangeOrigin(data: TinyTransportStreamFixture.data, contentType: "video/mp2t"))
+            defer { origin.stop() }
+            let control = try ProbeControl(limits: nil, cancellation: ProbeCancellation())
+            let reader = ProbeHTTPReader(url: url(origin), headers: [:], control: control)
+            defer { reader.close() }
+
+            try reader.open()
+            #expect(!reader.discImageProbeEnabled)
+        }
+    }
+}

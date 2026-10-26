@@ -40,11 +40,16 @@ final class ProbeIOReader: IOReader, @unchecked Sendable {
 /// Its AVIO allocation stays owned here, separate from the bridge FFmpeg uses for the counted input.
 final class ProbeHTTPReader: IOReader, @unchecked Sendable {
     private let reader: AVIOReader
-    let discImageProbeEnabled: Bool
+    private let isDiscImageURL: Bool
+    /// AE#860: an extensionless URL counts once its response declared a disc image type; the
+    /// disc readers still decide whether one is there.
+    var discImageProbeEnabled: Bool {
+        isDiscImageURL || DiscImageMediaType.isDiscImage(contentType: reader.openResponseContentType)
+    }
 
     init(url: URL, headers: [String: String], control: ProbeControl,
          boundedWindowBytes: Int? = nil) {
-        discImageProbeEnabled = Demuxer.isDiscImageURL(url)
+        isDiscImageURL = Demuxer.isDiscImageURL(url)
         reader = AVIOReader(
             url: url, extraHeaders: headers, label: "probe",
             chunkSize: 64 * 1024, prefetchEnabled: false,

@@ -90,6 +90,10 @@ struct Issue281ColdStartRoundTripTests {
     /// run (every test in this suite took 24 to 29 s, the one with no origin delay at all included)
     /// spent it before the read arrived while the landed body was still queued for its delegate.
     /// The suite's time limit is the only bound this test needs.
+    ///
+    /// The fetch's own request timeout is the detour budget (4 s), and a starved run spent that too:
+    /// "tail prefetch rejected after 4057ms: transport: The request timed out" against a 550 ms
+    /// origin, then the reconnect. Raised with the wait budget, for the same reason.
     @Test("a tail read waits for a fetch already on the wire instead of connecting past it")
     func tailReadWaitsForTheInFlightPrefetch() async throws {
         let delayed = ThrottledOriginServer(
@@ -100,7 +104,8 @@ struct Issue281ColdStartRoundTripTests {
         let label = "tail-wait-\(UUID().uuidString.prefix(8))"
         let log = EngineLogCapture()
         defer { log.end() }
-        let reader = AVIOReader(url: URL(string: "http://127.0.0.1:\(server.port)/movie.bin")!, label: label)
+        let reader = AVIOReader(url: URL(string: "http://127.0.0.1:\(server.port)/movie.bin")!, label: label,
+                                detourFetchBudget: 90)
         reader.tailPrefetchWaitBudgetForTesting = 90
         defer { reader.markClosed(); reader.close() }
         try reader.open()

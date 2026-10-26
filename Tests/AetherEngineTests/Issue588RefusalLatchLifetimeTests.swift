@@ -79,4 +79,26 @@ struct Issue588RefusalLatchLifetimeTests {
         #expect(site.contains("returnedFromBackground"))
         #expect(site.contains("clearPanelRefusalOnForegroundReturn"))
     }
+    /// AE#887: the playback probe read headroom 1.20 a tenth of a second after a live PQ master was
+    /// refused, so that refusal was about the stream, and the latch must not outlive the reading.
+    @Test("An HDR reading during playback withdraws a latched refusal")
+    func anHDRReadingWithdrawsTheLatch() {
+        withLatch(true) {
+            AetherEngine.withdrawPanelRefusalOnHDRReading()
+            #expect(AetherEngine.panelRefusedHDRMaster == false)
+        }
+    }
+
+    @Test("The withdrawal sits on the playback probe's HDR answer")
+    func theWithdrawalSitsOnTheProbeAnswer() throws {
+        let source = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/AetherEngine/AetherEngine.swift")
+        let text = try #require(try? String(contentsOf: source, encoding: .utf8))
+        let probe = try #require(text.range(of: "await self.displayCriteria.probePanelDuringPlayback()"))
+        let site = String(text[probe.lowerBound...].prefix(400))
+        #expect(site.contains("withdrawPanelRefusalOnHDRReading()"))
+    }
 }

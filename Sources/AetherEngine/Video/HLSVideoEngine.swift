@@ -1111,6 +1111,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         dvrWindowSeconds: Double? = nil,
         liveJoinProfile: LiveJoinProfile = .standard,
         sourceOpenPolicy: SourceOpenPolicy = .init(),
+        diagnosticContext: SourceNetworkDiagnostics.Context? = nil,
         liveStartupGraceSeconds: TimeInterval? = nil,
         liveStartupSingleSegmentMinimumSeconds: TimeInterval? = nil,
         liveEdgeCushionSeconds: Double? = nil,
@@ -1149,6 +1150,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             .withSequentialOrigin(sequentialOrigin, declaredDuration: declaredDurationSeconds)
             .withHeldSourceConnection(heldSourceConnection)
             .withSourceOpenPolicy(sourceOpenPolicy)
+            .withDiagnosticContext(diagnosticContext)
         self.dvModeAvailable = dvModeAvailable
         self.displaySupportsHDR = displaySupportsHDR
         self.keepDvh1TagWithoutDV = keepDvh1TagWithoutDV
@@ -1307,6 +1309,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
     var restartReopenProfile: DemuxerOpenProfile {
         DemuxerOpenProfile.restartReopen
             .withSourceOpenPolicy(openProfile.sourceOpenPolicy)
+            .withDiagnosticContext(openProfile.diagnosticContext)
             .withSequentialOrigin(sequentialOrigin, declaredDuration: declaredDurationSeconds)
             .withHeldSourceConnection(heldSourceConnection)
             .withRequestHeaders(requestHeaders)
@@ -2472,7 +2475,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         #else
         let videoCodecNeedsMasterSignaling = false
         #endif
-        let useMasterPlaylist = AetherEngine.forceMasterPlaylistForTesting
+        let useMasterPlaylist = !keepsMediaPlaylistRoute && (AetherEngine.forceMasterPlaylistForTesting
             || Self.resolveUseMasterPlaylist(
             videoRange: videoRange, effectiveDvMode: effectiveDvMode,
             panelIsInHDRMode: panelIsInHDRMode, displaySupportsHDR: displaySupportsHDR,
@@ -2481,7 +2484,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             frameRateKnown: frameRate != nil,
             videoCodecNeedsMasterSignaling: videoCodecNeedsMasterSignaling,
             hasAudioRendition: servedAudioLanguage != nil || servedAudioIsAtmosStreamCopy,
-            hasIFrameRendition: iFrameCandidate == .served)
+            hasIFrameRendition: iFrameCandidate == .served))
         let resolvedURL: URL? = useMasterPlaylist
             ? srv.playlistURL
             : srv.mediaPlaylistURL
@@ -2597,6 +2600,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
     /// `true` when `start()` chose the master playlist (HDR/DV signaling). Read after `start()`.
     public private(set) var servingMasterPlaylist: Bool = false
+
+    /// AE#849: serve the media playlist whatever the routing would choose. Set by the engine before
+    /// `start()` / `serve(panelIsInHDRMode:)` on an audio switch whose session the display already
+    /// refused the HDR master for (`MasterFallbackDecision.audioSwitchKeepsMediaRoute`).
+    var keepsMediaPlaylistRoute = false
 
     /// `true` when the served variant advertises HDR (`VIDEO-RANGE` other than SDR), i.e. the master an
     /// external receiver rejects (#227). Read after `start()`.

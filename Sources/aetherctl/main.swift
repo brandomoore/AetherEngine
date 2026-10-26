@@ -113,7 +113,7 @@ func printUsage() {
       aetherctl dovitest [--out PATH.hevc] <file>
       aetherctl feltest [--frames N] <file>   (DualLayerDolbyVision trait)
       aetherctl dvsurvey [--frames N] [--list K] <file>
-      aetherctl extract [--at <sec>] [--snapshot] [--width <px>] [--loops <n>] <url>
+      aetherctl extract [--at <sec>] [--preview|--snapshot] [--width <px>] [--loops <n>] <url>
       aetherctl audio [--seconds N] <url>
       aetherctl audiotap [--duration S] [--out PATH.wav] [--remote | --software] <url>
                          (#95: decode the loopback audio track to mono 48k WAV, print continuity stats;
@@ -206,9 +206,10 @@ func printUsage() {
 
     Flags (extract only):
       --at <sec>     Seek position in seconds (default 60.0).
+      --preview      Frame-accurate decode downscaled to --width.
       --snapshot     Frame-accurate decode at full resolution instead
                      of nearest-keyframe thumbnail.
-      --width <px>   Max output width for thumbnail mode (default 320).
+      --width <px>   Max output width for thumbnail/preview mode (default 320).
       --loops <n>    Repeat extraction N times, cycling through 8
                      positions. Useful with `leaks --atExit`.
 
@@ -277,8 +278,8 @@ func printUsage() {
 
       extract   Extract a still frame from a source. Thumbnail mode
                 (default) seeks to the nearest keyframe and downscales
-                to --width. Snapshot mode (--snapshot) decodes
-                frame-accurately at full resolution. Use --loops N
+                to --width. Preview mode (--preview) decodes frame-accurately
+                at --width; snapshot mode (--snapshot) uses full resolution. Use --loops N
                 with `leaks --atExit` to detect memory leaks.
                 Writes the first frame to aetherctl-extract-<mode>.png
                 in a private per-user temporary directory, printed.
@@ -1076,6 +1077,7 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     let atSeconds = takeDoubleFlag("--at", from: &rest) ?? 60.0
     let extractLoops = takeIntFlag("--loops", from: &rest) ?? 1
     let extractWidth = takeIntFlag("--width", from: &rest) ?? 320
+    let previewMode = takeFlag("--preview", from: &rest)
     let snapshotMode = takeFlag("--snapshot", from: &rest)
     // The opt-in detail passes of `AetherEngine.probe(url:detecting:)`, so both are observable from the CLI
     // instead of only through a host. Each costs reads past find_stream_info; the bare `probe` does neither.
@@ -1196,10 +1198,14 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     case "swdecode":
         exit(runSWDecode(url: url, maxPackets: framesOverride ?? 100))
     case "extract":
+        if previewMode, snapshotMode {
+            print("ERROR: extract accepts only one of --preview or --snapshot")
+            exit(64)
+        }
         exit(runExtract(
             url: url,
             at: atSeconds,
-            mode: snapshotMode ? .snapshot : .thumbnail,
+            mode: previewMode ? .preview : (snapshotMode ? .snapshot : .thumbnail),
             loops: extractLoops,
             maxWidth: extractWidth
         ))

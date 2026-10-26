@@ -28,6 +28,9 @@ struct PrewarmedSource: Sendable {
     /// paid. The session adopts it as its pinned target (#12), so the existing expiry ladder is
     /// what handles a lease that has since run out.
     let resolvedURL: URL?
+    /// AE#860: the head response's `Content-Type`. A warm open decides before its own connection
+    /// has answered, so an extensionless disc image is recognized from this.
+    var contentType: String? = nil
 
     var byteCount: Int { head.data.count + (tail?.data.count ?? 0) }
 }

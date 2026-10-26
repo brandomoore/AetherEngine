@@ -53,3 +53,17 @@ struct Issue629MountClockHoldTests {
         #expect(host.currentTime == 0)
     }
 }
+
+/// AE#881 (martijnklomp, 7.47.0): a VOD mounted at 6 s and played read 6.000, then 0.000 for one
+/// sample, then 6.000 again. AVPlayer finished the mount seek in the millisecond it was issued, long
+/// before the item was ready, so that completion released the AE#629 hold and the periodic observer
+/// published the keyframe the start position falls behind.
+@Suite("A mount seek finished before the item is ready does not release the clock")
+struct Issue881EarlyMountSeekCompletionTests {
+
+    @Test("Only a completion on a ready item is a landing")
+    func completionBeforeReadinessHolds() {
+        #expect(!NativeAVPlayerHost.mountSeekCompletionLands(itemIsReadyToPlay: false))
+        #expect(NativeAVPlayerHost.mountSeekCompletionLands(itemIsReadyToPlay: true))
+    }
+}

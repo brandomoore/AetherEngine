@@ -1,3 +1,5 @@
+import AVFoundation
+import Combine
 import Testing
 @testable import AetherEngine
 
@@ -193,4 +195,31 @@ struct SampleBufferRendererLookaheadTests {
             rendererReady: ready, felFrameRate: rate, framePTS: pts,
             clockSeconds: clock, clockArmed: armed)
     }
+    @MainActor
+    @Test("resume flushes a failed queue before publishing play")
+    func failedQueueRecoversBeforePlay() {
+        var events: [String] = []
+        let renderer = SampleBufferRenderer(resumeQueue: .init(
+            status: { .failed }, flush: { events.append("flush") }))
+        let host = SoftwarePlaybackHost(renderer: renderer)
+        let observation = host.$rate.dropFirst().sink { rate in
+            if rate > 0 { events.append("play") }
+        }
+        host.play()
+        #expect(events == ["flush", "play"])
+        #expect(host.isPlaying)
+        observation.cancel()
+        host.stop()
+    }
+
+    @MainActor
+    @Test("resume preserves a healthy full queue's frames", arguments: [AVQueuedSampleBufferRenderingStatus.unknown, .rendering])
+    func healthyQueueIsNotFlushed(status: AVQueuedSampleBufferRenderingStatus) {
+        var flushes = 0
+        let renderer = SampleBufferRenderer(resumeQueue: .init(
+            status: { status }, flush: { flushes += 1 }))
+        renderer.recoverAfterSuspensionIfNeeded()
+        #expect(flushes == 0)
+    }
+
 }

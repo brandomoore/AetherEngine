@@ -3,20 +3,6 @@ import AetherLibavformat
 import AetherLibavcodec
 import AetherLibavutil
 
-/// Measurement only, in a build with the TrueHDReferenceRender trait: with this environment variable
-/// set to 1, TrueHD Atmos is decoded exactly and its objects mixed into the layout, the rendering
-/// `BedSplitter` is compared against. Without the trait it is always off and that path is not built.
-enum TrueHDReferenceRender {
-    static let variable = "AETHER_TRUEHD_REFERENCE_RENDER"
-    static var isOn: Bool {
-        #if TrueHDReferenceRender
-        ProcessInfo.processInfo.environment[variable] == "1"
-        #else
-        false
-        #endif
-    }
-}
-
 extension HLSVideoEngine {
 
     /// The object-audio format a source would be rendered as, before it is confirmed.
@@ -113,6 +99,15 @@ extension HLSVideoEngine {
         demuxer: Demuxer,
         streamIndex: Int32
     ) -> DTSXObjectAudioDecoder.Verdict? {
+        Self.dtsxVerdict(decoder: decoder, demuxer: demuxer, streamIndex: streamIndex)
+    }
+
+    /// The verdict without an engine, for the software host, which renders the same bed.
+    static func dtsxVerdict(
+        decoder: DTSXObjectAudioDecoder,
+        demuxer: Demuxer,
+        streamIndex: Int32
+    ) -> DTSXObjectAudioDecoder.Verdict? {
         var verdict: DTSXObjectAudioDecoder.Verdict?
         var heldBytes = 0
         try? demuxer.peekPackets(maxPackets: Self.dtsxVerdictPacketBudget) { packet in
@@ -145,19 +140,40 @@ extension HLSVideoEngine {
         streamIndex: Int32
     ) {
         let par = audioStream.pointee.codecpar.pointee
-        guard par.codec_id == AV_CODEC_ID_TRUEHD, par.profile == AV_PROFILE_UNKNOWN,
-              objectAudioRendering.layout != nil, ObjectAudioSource.trueHDAtmos.isBuiltIn,
+        guard Self.needsTrueHDMajorSyncVerdict(
+                codecID: par.codec_id, profile: par.profile, rendering: objectAudioRendering),
               !isLiveSession
         else { return }
         if audioDemuxer === demuxer {
             seekToInitialProducerStart(audioDemuxer)
             demuxerAtInitialProducerStart = true
         }
+        let peek = Self.trueHDMajorSyncVerdict(demuxer: audioDemuxer, streamIndex: streamIndex)
+        if peek.isAtmos == true { audioStream.pointee.codecpar.pointee.profile = AV_PROFILE_TRUEHD_ATMOS }
+        EngineLog.emit("[HLSVideoEngine] \(peek.summary)", category: .session)
+    }
+
+    /// Whether a track is the one `trueHDMajorSyncVerdict` exists for: TrueHD whose profile the probe
+    /// left unknown, in a session that wants object rendering from a build that renders TrueHD Atmos.
+    static func needsTrueHDMajorSyncVerdict(
+        codecID: AVCodecID, profile: Int32, rendering: ObjectAudioRendering
+    ) -> Bool {
+        codecID == AV_CODEC_ID_TRUEHD && profile == AV_PROFILE_UNKNOWN
+            && rendering.layout != nil && ObjectAudioSource.trueHDAtmos.isBuiltIn
+    }
+
+    /// Reads the first major sync of the stream's packets from where the demuxer stands, without
+    /// consuming them, within `trueHDVerdictPacketBudget` / `trueHDVerdictByteBudget`. `isAtmos` is
+    /// nil when no major sync turned up; `summary` is the session log line, which the loopback route
+    /// (`resolveUnlabelledTrueHDAtmos`) and the software host both write.
+    static func trueHDMajorSyncVerdict(
+        demuxer: Demuxer, streamIndex: Int32
+    ) -> (isAtmos: Bool?, summary: String) {
         let started = DispatchTime.now()
         var verdict: Bool?
         var heldBytes = 0
         var packets = 0
-        try? audioDemuxer.peekPackets(maxPackets: Self.trueHDVerdictPacketBudget) { packet in
+        try? demuxer.peekPackets(maxPackets: Self.trueHDVerdictPacketBudget) { packet in
             packets += 1
             heldBytes += Int(max(packet.pointee.size, 0))
             if heldBytes > Self.trueHDVerdictByteBudget { return true }
@@ -170,22 +186,12 @@ extension HLSVideoEngine {
         let span = "\(packets) packets, \(heldBytes >> 10) KiB, \(String(format: "%.0f", ms)) ms"
         switch verdict {
         case true?:
-            audioStream.pointee.codecpar.pointee.profile = AV_PROFILE_TRUEHD_ATMOS
-            EngineLog.emit(
-                "[HLSVideoEngine] TrueHD profile was not probed; major sync says Atmos (\(span))",
-                category: .session
-            )
+            return (true, "TrueHD profile was not probed; major sync says Atmos (\(span))")
         case false?:
-            EngineLog.emit(
-                "[HLSVideoEngine] TrueHD profile was not probed; major sync says no Atmos (\(span))",
-                category: .session
-            )
+            return (false, "TrueHD profile was not probed; major sync says no Atmos (\(span))")
         case nil:
-            EngineLog.emit(
-                "[HLSVideoEngine] TrueHD profile was not probed and no major sync within the budget (\(span)); "
-                + "treating it as without Atmos",
-                category: .session
-            )
+            return (nil, "TrueHD profile was not probed and no major sync within the budget (\(span)); "
+                + "treating it as without Atmos")
         }
     }
 
@@ -293,7 +299,7 @@ extension HLSVideoEngine {
             switch source {
             case .trueHDAtmos:
                 #if TrueHDObjectAudio
-                decoder = try TrueHDObjectAudioDecoder(splitsBed: !TrueHDReferenceRender.isOn)
+                decoder = try TrueHDObjectAudioDecoder()
                 #else
                 return nil
                 #endif
@@ -382,10 +388,8 @@ extension HLSVideoEngine {
             audioAPACIsFromDolbyAtmos = source == .trueHDAtmos
             let rendering: String
             switch source {
-            case .trueHDAtmos where TrueHDReferenceRender.isOn:
-                rendering = "objects rendered into \(layout.rawValue) (reference render, \(TrueHDReferenceRender.variable))"
             case .trueHDAtmos:
-                rendering = "channel presentation split into \(layout.rawValue) by the objects' energy"
+                rendering = "objects rendered into \(layout.rawValue)"
             case .dtsHDMasterAudio:
                 rendering = "bed and heights routed one to one into \(layout.rawValue)"
             }

@@ -1,5 +1,5 @@
-// Only with the DualLayerDolbyVision trait (off by default).
-#if DualLayerDolbyVision
+// The keys always compile, as the AV1 RPU route (`AV1DolbyVisionRPUTable`) attaches under them too; the
+// composed frame's attach only with the DualLayerDolbyVision trait (off by default).
 import Foundation
 import CoreVideo
 
@@ -63,7 +63,7 @@ enum DoviDisplayMetadata {
 
     // MARK: Undocumented attachment keys
     //
-    // These two strings are the ONLY undocumented platform contract the FEL route depends on, and
+    // These two strings are the ONLY undocumented platform contract the FEL and AV1 routes depend on, and
     // this is the only place they are spelled (`UndocumentedDolbyVisionKeysTests` fails the build if
     // either literal appears anywhere else in `Sources/`). Neither is in a public header; both are
     // what VideoToolbox itself attaches with `kVTDecompressionPropertyKey_PropagatePerFrameHDRDisplayMetadata`,
@@ -90,7 +90,10 @@ enum DoviDisplayMetadata {
     /// diagnosed from the resulting `backboardd-*.ips`; the type was then read back off
     /// VideoToolbox's own output to be sure. Do not "simplify" this to an integer.
     static let profile81CompatibilityID = "1"
+}
 
+#if DualLayerDolbyVision
+extension DoviDisplayMetadata {
     /// Attaches (or clears) the per-frame RPU on `buffer`.
     ///
     /// Pass `nil` to clear. Clearing matters: decoder output buffers are recycled from a

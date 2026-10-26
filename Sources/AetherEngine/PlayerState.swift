@@ -107,18 +107,19 @@ public enum AudioDelivery: String, Sendable, Equatable, CaseIterable {
     /// rung can change it. A source whose audio stream the pick passed over (its parameters left
     /// empty by the probe) is `.droppedNoPipeline`, not this (AE#641).
     case noAudioInSource
-    /// The source's audio bitstream is muxed into fMP4 unchanged: Atmos, DTS-HD and every other
-    /// bitstream reach the renderer exactly as authored.
+    /// The source's audio bitstream reaches the renderer unchanged: muxed into fMP4 on the loopback route
+    /// (Atmos, DTS-HD and every other bitstream exactly as authored), or, on the software host under
+    /// `LoadOptions.objectAudioRendering`, an E-AC-3 JOC track handed to the sample-buffer renderer compressed.
     case streamCopy
-    /// The audio is decoded and re-encoded for the fMP4 pipeline, because its codec is not fMP4-legal
-    /// or AVPlayer rejects it there. The channel bridge (FLAC or E-AC-3) is lossless for the bed
-    /// channels, and object metadata in a TrueHD-MAT or JOC bitstream does not survive its PCM
-    /// intermediate; under `LoadOptions.objectAudioRendering`, in a build with the `TrueHDObjectAudio` /
-    /// `DTSXObjectAudio` traits (off by default), TrueHD Atmos and DTS:X are rendered with
-    /// their objects and heights into a speaker bed and encoded as APAC instead.
+    /// The audio is decoded and re-encoded, because its codec is not fMP4-legal or AVPlayer rejects it
+    /// there. The channel bridge (FLAC or E-AC-3) is lossless for the bed channels, and object metadata in
+    /// a TrueHD-MAT or JOC bitstream does not survive its PCM intermediate; under
+    /// `LoadOptions.objectAudioRendering`, in a build with the `TrueHDObjectAudio` / `DTSXObjectAudio`
+    /// traits (off by default), TrueHD Atmos and DTS:X are rendered with their objects and heights into a
+    /// speaker bed and encoded as APAC instead, on the loopback route and on the software host alike.
     case bridged
-    /// libavcodec decodes the audio and the engine renders it itself (the software path and the
-    /// software audio-only host).
+    /// libavcodec decodes the audio to PCM and the engine renders it itself (the software path without an
+    /// object-audio route, and the software audio-only host).
     case decoded
     /// The source HAS audio and none of it could be delivered: no libavcodec decoder for it, the
     /// bridge could not be built or could not write its header, no stream could be picked because the
@@ -412,6 +413,8 @@ public enum DolbyVisionHandling: String, Sendable, Equatable, CaseIterable {
 }
 
 public struct LoadOptions: Sendable, Equatable {
+    /// Diagnostic identity only; retained with the source across internal reloads.
+    public var sourceDiagnosticsContext: SourceNetworkDiagnostics.Context? = nil
     /// Diagnostic lever: omit BT.2020 / transfer / YCbCr matrix from AVDisplayCriteria so AVPlayer re-reads color from the bitstream. Default off.
     public var omitCriteriaColorExtensions: Bool
     /// The engine writes no display criteria because AVKit does: `true` is `DisplayCriteriaOwner.avKit`, and the
@@ -526,7 +529,7 @@ public struct LoadOptions: Sendable, Equatable {
     public var panelIsInHDRMode: Bool
 
     /// Serve the HDR master to an HDR-eligible display whose panel state is unproven, and let AVFoundation's
-    /// acceptance or refusal be the readout. Default `true`, VOD only.
+    /// acceptance or refusal be the readout. Default `true`, VOD and live.
     ///
     /// AE#459: `UIScreen.currentEDRHeadroom` is the only tvOS property that ever reported the panel's mode,
     /// and it is measurably unreliable. On one Apple TV 4K 3rd gen on tvOS 26.6 it read a flat 1.00
@@ -542,8 +545,9 @@ public struct LoadOptions: Sendable, Equatable {
     /// through the headroom never attempts anything.
     ///
     /// Turn it off for a host that knows its display is SDR and would rather not spend that once. Live
-    /// never attempts regardless of this flag: a live fallback is a rejoin at the edge rather than a
-    /// restored position, and that cost is unmeasured.
+    /// attempts too: the refusal arrives before the first frame, so the live fallback's rejoin at the edge
+    /// (#130) lands where the session was joining anyway. Excluding it left a live session on a panel
+    /// parked in HDR with no proof at all, labelled SDR for its whole length.
     public var attemptsHDRMasterOnUnprovenPanel: Bool
 
     /// Host assertion that this display presents Dolby Vision. Default `false`. Not a capability the engine

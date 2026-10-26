@@ -80,14 +80,38 @@ struct Issue459MasterFirstRoutingTests {
 
     // MARK: - Live
 
-    @Test("Live never attempts: its fallback is a rejoin at the edge, and that cost is unmeasured")
-    func liveNeverAttempts() {
+    /// A live session on a panel parked in HDR with Match Content off has no other proof: no criteria
+    /// write, a headroom that stays at 1.00, and nothing for the playback probe to accept. The refusal on
+    /// an SDR panel lands before the first frame, so the #130 rejoin at the edge costs no position.
+    @Test("Live attempts like VOD, so acceptance can prove a panel parked in HDR")
+    func liveAttempts() {
         let live = LoadOptions(isLive: true)
         #expect(AetherEngine.sessionRoutesAsHDRPanel(
             panelPresentsHDR: false,
-            attemptWhenUnproven: live.attemptsHDRMasterOnUnprovenPanel && !live.isLive,
+            attemptWhenUnproven: live.attemptsHDRMasterOnUnprovenPanel,
             displayEligibleForHDR: true,
-            panelRefusedHDRMaster: false) == false)
+            panelRefusedHDRMaster: false))
+    }
+
+    @Test("A live attempt still honours the process's refusal latch")
+    func liveHonoursTheRefusalLatch() {
+        let live = LoadOptions(isLive: true)
+        #expect(AetherEngine.sessionRoutesAsHDRPanel(
+            panelPresentsHDR: false,
+            attemptWhenUnproven: live.attemptsHDRMasterOnUnprovenPanel,
+            displayEligibleForHDR: true,
+            panelRefusedHDRMaster: true) == false)
+    }
+
+    @Test("Neither load routing call site excludes live any more")
+    func loadCallSitesDoNotExcludeLive() throws {
+        let source = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/AetherEngine/AetherEngine.swift")
+        let text = try String(contentsOf: source, encoding: .utf8)
+        #expect(!text.contains("attemptsHDRMasterOnUnprovenPanel && !options.isLive"))
     }
 
     @Test("VOD attempts by default, so the fix reaches a host that sets nothing")
@@ -96,7 +120,7 @@ struct Issue459MasterFirstRoutingTests {
         #expect(vod.attemptsHDRMasterOnUnprovenPanel)
         #expect(AetherEngine.sessionRoutesAsHDRPanel(
             panelPresentsHDR: false,
-            attemptWhenUnproven: vod.attemptsHDRMasterOnUnprovenPanel && !vod.isLive,
+            attemptWhenUnproven: vod.attemptsHDRMasterOnUnprovenPanel,
             displayEligibleForHDR: true,
             panelRefusedHDRMaster: false))
     }

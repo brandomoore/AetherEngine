@@ -40,6 +40,40 @@ struct Issue177SARLatchTests {
         }
     }
 
+    @Test("precise and unreduced pixel ratios keep their declared components")
+    func largeComponentsPreserveRatios() {
+        for sar in [rational(759, 712), rational(1280, 900), rational(.max, .max - 1)] {
+            let sane = PixelAspectPolicy.saneSAR(sar)
+            #expect(sane?.num == sar.num)
+            #expect(sane?.den == sar.den)
+        }
+        let resolved = SoftwareVideoDecoder.resolveSAR(
+            frame: rational(0, 1), codecCtx: rational(0, 1), stream: rational(759, 712),
+            width: 712, height: 574)
+        #expect(resolved?.num == 759)
+        #expect(resolved?.den == 712)
+        #expect(PixelAspectPolicy.displayAspect(
+            sar: rational(759, 712), width: 712, height: 574) == 759.0 / 574.0)
+    }
+
+    @Test("magnitude bounds apply independently of rational representation")
+    func magnitudeBoundsAreScaleInvariant() {
+        for sar in [rational(256, 1), rational(512, 2), rational(1, 256), rational(2, 512)] {
+            #expect(PixelAspectPolicy.saneSAR(sar) != nil)
+        }
+        for sar in [rational(257, 1), rational(514, 2), rational(1, 257), rational(2, 514),
+                    rational(.max, 1), rational(1, .max)] {
+            #expect(PixelAspectPolicy.saneSAR(sar) == nil)
+        }
+    }
+
+    @Test("large components still obey the display aspect gate")
+    func preciseRatiosKeepDisplayBounds() {
+        #expect(PixelAspectPolicy.saneSAR(rational(2000, 1000), width: 1920, height: 1080) == nil)
+        #expect(PixelAspectPolicy.saneSAR(rational(2000, 1000), width: 960, height: 1080) != nil)
+        #expect(PixelAspectPolicy.saneSAR(rational(.max, .max), width: 5120, height: 1440) != nil)
+    }
+
     // MARK: - Resolution order
 
     @Test("frame SAR wins over codec context and stream")

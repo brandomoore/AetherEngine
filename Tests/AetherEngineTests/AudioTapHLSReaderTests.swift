@@ -75,4 +75,32 @@ final class AudioTapHLSReaderTests: XCTestCase {
         XCTAssertFalse(seg3.isEmpty)                // seg 3 audio present
         XCTAssertTrue(seg3.first?.discontinuity ?? false) // first buffer after reanchor flagged
     }
+
+    /// #864 on the remote-HLS VOD path: 15 s segments at a parked playhead decode once each,
+    /// then the reader waits instead of reading its own overshoot as a backward seek.
+    func testVODLongSegmentsDoNotReanchorWithoutPlayheadMovement() async {
+        let fetchedIdx = Box<[Int]>([])
+        let emitted = Box<[AudioTapBuffer]>([])
+        let pl = HLSMediaPlaylist(targetDuration: 15, mediaSequence: 0,
+            segments: (0..<10).map { HLSMediaSegment(uri: "s\($0).ts", duration: 15, discontinuityBefore: false) },
+            hasEndList: true, isEncrypted: false, hasUnsupportedEncryption: false, hasMap: false)
+        let seg = wav(seconds: 15)
+        let deps = AudioTapHLSReader.Dependencies(
+            playhead: { 95.1 },
+            mediaURL: URL(string: "https://h/media.m3u8")!,
+            fetchPlaylist: { _ in pl },
+            fetchSegment: { uri, _ in
+                fetchedIdx.value.append(Int(uri.dropFirst(1).prefix(1)) ?? -1); return seg
+            },
+            decodeSegment: { AudioTapSegmentDecoder().decode(selfContainedSegment: $0) },
+            emit: { emitted.value.append($0) })
+        let reader = AudioTapHLSReader(deps: deps)
+        reader.primeForTest(playlist: pl)
+        var steps: [AudioTapHLSReader.StepResult] = []
+        for _ in 0..<8 { steps.append(await reader.stepVOD()) }
+        XCTAssertEqual(fetchedIdx.value, [6, 7])
+        XCTAssertFalse(steps.contains(.reanchored))
+        XCTAssertLessThan(emitted.value.count, AudioTapController.streamCapacity)
+        XCTAssertEqual(emitted.value.filter(\.discontinuity).count, 1)
+    }
 }

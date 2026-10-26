@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 @testable import AetherEngine
 
@@ -51,5 +52,68 @@ struct PumpQoSRelaxationTests {
         // Degenerate durations must not produce a zero or negative threshold.
         #expect(HLSSegmentProducer.relaxedLeadSegments(targetSegmentDurationSeconds: 0) == 16)
         #expect(HLSSegmentProducer.relaxedLeadSegments(targetSegmentDurationSeconds: -1) == 16)
+    }
+
+    private final class ObservedQoS: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _parked: qos_class_t?
+        private var _finished: qos_class_t?
+        func parked(_ qos: qos_class_t) { lock.withLock { _parked = qos } }
+        func finished(_ qos: qos_class_t) { lock.withLock { _finished = qos } }
+        var parked: qos_class_t? { lock.withLock { _parked } }
+        var finished: qos_class_t? { lock.withLock { _finished } }
+    }
+
+    /// A relaxed pump is still waited on when it ends: a seek's restart stops it and blocks in
+    /// `waitForFinish` on the local server's `.userInitiated` queue. A condition donates no priority
+    /// to the thread it waits for, so the pump tore down and broadcast its finish at `.utility`, which
+    /// Xcode's Thread Performance Checker reports as a user-initiated thread waiting on a utility one.
+    @Test("A relaxed pump that is stopped and waited on unwinds at the responsive class",
+          .timeLimit(.minutes(1)))
+    func relaxedPumpUnwindsResponsive() async throws {
+        let data = try #require(Data(base64Encoded: Issue234SideReaderSeekAnchorTests.fixtureBase64,
+                                     options: .ignoreUnknownCharacters))
+        let demuxer = Demuxer()
+        try demuxer.open(reader: DataIOReader(data: data), formatHint: "matroska")
+        defer { demuxer.close() }
+        let videoIndex = demuxer.videoStreamIndex
+        let stream = try #require(demuxer.stream(at: videoIndex))
+
+        // The fixture has a keyframe every second, so one segment per second. An 8 s target puts the
+        // relaxed lead at its 2-segment floor, and a forward window of 4 parks the pump at segment 5
+        // while the consumer sits on segment 0.
+        let cache = SegmentCache(forwardWindow: 4, backwardWindow: 4)
+        defer { cache.close() }
+        cache.declareTarget(0)
+        let producer = try HLSSegmentProducer(
+            demuxer: demuxer, videoStreamIndex: videoIndex,
+            video: .init(codecpar: UnsafePointer(stream.pointee.codecpar),
+                         timeBase: stream.pointee.time_base, codecTagOverride: nil),
+            cache: cache, targetSegmentDurationSeconds: 8, videoFallbackDurationPts: 200,
+            desiredFirstVideoTfdtPts: 0, segmentBoundaries: (0..<15).map { Int64($0) * 1000 },
+            bufferAheadSegments: 4)
+        let observed = ObservedQoS()
+        producer.hasStartedRenderingProvider = { true }
+        // A paused consumer, so the park holds without the wedge breaker ending the pump on its own.
+        // Asked on the pump thread once a second while it is parked.
+        producer.wantsToPlayProvider = { observed.parked(qos_class_self()); return false }
+        // Runs on the pump thread right after the finish broadcast.
+        producer.onPumpFinished = { _ in observed.finished(qos_class_self()) }
+        producer.start()
+
+        try await waitFor { observed.parked == QOS_CLASS_UTILITY }
+
+        producer.stop()
+        await withCheckedContinuation { (exited: CheckedContinuation<Void, Never>) in
+            let waiter = Thread {
+                while !producer.waitForFinish(timeout: 1) {}
+                exited.resume()
+            }
+            waiter.qualityOfService = .userInitiated
+            waiter.start()
+        }
+        try await waitFor { observed.finished != nil }
+        #expect(observed.finished == QOS_CLASS_USER_INITIATED,
+                "the pump unwound at \(QoSClass.name(observed.finished ?? QOS_CLASS_UNSPECIFIED))")
     }
 }

@@ -292,6 +292,13 @@ final class MP4SegmentMuxer {
         return (segmentSoundFirstPts, segmentSoundLastPts)
     }
 
+    /// AE#847: where each track's written samples end, in its own muxer time base, audio before
+    /// the AE#464 offset (the axis the producer stamps). Int64.min until a packet has landed.
+    private(set) var writtenVideoEndPts: Int64 = Int64.min
+    private(set) var writtenAudioEndPts: Int64 = Int64.min
+    /// AE#847: the earliest video pts of the segment being written, Int64.min before its first.
+    private(set) var segmentVideoStartPts: Int64 = Int64.min
+
     let videoOutputStreamIndex: Int32 = 0
     let audioOutputStreamIndex: Int32 = 1
 
@@ -771,6 +778,9 @@ final class MP4SegmentMuxer {
             av_shrink_packet(packet, Int32(complete))
         }
 
+        // The packet is consumed by the write below.
+        let writtenDuration = max(packet.pointee.duration, 0)
+
         // av_write_frame was tried as a leak hypothesis; no impact on 8 MB/s mallocMB growth
         // (leak was Data(d) dispatch_data aliasing in AVIOReader). Reverted to interleaved for
         // cross-stream DTS monotonicity and audio+video re-ordering via libavformat.
@@ -793,6 +803,16 @@ final class MP4SegmentMuxer {
         // routing/placement is untouched, so no audio dropouts. The proactive flush is scoped to
         // AC-3/E-AC-3/TrueHD (audioNeedsParsedPacketForMoov): AAC (and every other codec) never wedges and
         // must keep the exact stock code path, no extra early fragment flush, so nothing perturbs its audio.
+        if rc >= 0, clean.pts != Int64.min {
+            if streamIndex == videoOutputStreamIndex {
+                writtenVideoEndPts = max(writtenVideoEndPts, clean.pts &+ writtenDuration)
+                segmentVideoStartPts = segmentVideoStartPts == Int64.min
+                    ? clean.pts : min(segmentVideoStartPts, clean.pts)
+            } else if streamIndex == audioOutputStreamIndex {
+                writtenAudioEndPts = max(writtenAudioEndPts, clean.pts &- audioDelayTicks &+ writtenDuration)
+            }
+        }
+
         if streamIndex == audioOutputStreamIndex {
             audioPacketWritten = true
             if rc >= 0, clean.pts != Int64.min {
@@ -951,6 +971,7 @@ final class MP4SegmentMuxer {
         }
         // New segment starts a fresh buffered-fragment window (#64).
         fragmentWindowFirstVideoDts = Int64.min
+        segmentVideoStartPts = Int64.min
 
         // 2. Snapshot the completed segment + reset counters.
         let completedPath = currentStagingPath

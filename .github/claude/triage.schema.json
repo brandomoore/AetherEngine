@@ -1,0 +1,16 @@
+{
+  "type": "object",
+  "properties": {
+    "labels": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Labels to add, only from the list in triage.md."
+    },
+    "comment": {
+      "type": "string",
+      "description": "The comment to post, in Markdown and without the automated footer. An empty string means no comment."
+    }
+  },
+  "required": ["labels", "comment"],
+  "additionalProperties": false
+}

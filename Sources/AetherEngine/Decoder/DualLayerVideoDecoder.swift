@@ -173,6 +173,9 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     }
     private var _skipUntilPTS: CMTime?
 
+    /// The base layer's count: the enhancement layer decodes the same pictures.
+    var framesDecoded: UInt64 { primaryDecoder.framesDecoded }
+
     /// AE#739: called when the system invalidates either layer's session. Both sub-decoders report
     /// through `reportSessionLost()` (installed outside `lock`, as `skipUntilPTS` is), the enhancement
     /// decoder from when it opens.

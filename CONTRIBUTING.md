@@ -65,6 +65,7 @@ A bug that reproduces in a host app but traces back to decoding, demuxing, the a
 - Update `CHANGELOG.md`, and the documentation in the same commit (see below; three tests enforce parts of this, so a PR that skips it fails rather than merges).
 - Follow [Conventional Commits](https://www.conventionalcommits.org/) (`feat(audio):`, `fix(muxer):`, `chore(deps):`, and so on).
 - Treat `internal` types and properties as private; they are not part of the public contract and can change in any release.
+- Every pull request that is not a draft gets an automated first-pass review (Claude, rules in [.github/claude/review.md](.github/claude/review.md)) when it opens and after each push. It reads the code and does not run it; it is advisory, and a human still reviews and merges. New issues get automatic labels and, when information is missing, one comment asking for it.
 
 ## Documentation, and the tests that hold it to the code
 

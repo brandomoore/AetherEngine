@@ -26,20 +26,23 @@ struct DisplayCriteriaPanelHDRProofTests {
     @Test("Headroom above 1.0 is authoritative on its own")
     func headroomWins() {
         #expect(DisplayCriteriaController.panelPresentsHDR(
-            headroomAboveOne: true, attribution: .engineHDR, panelProvenToEngageHDR: false))
+            headroomAboveOne: true, attribution: .engineHDR, matchingDisabled: false,
+            panelProvenToEngageHDR: false))
     }
 
     // The regression this suite exists for.
     @Test("Requested HDR on a panel proven to engage reads HDR despite the decayed headroom")
     func provenPanelSurvivesHeadroomDecay() {
         #expect(DisplayCriteriaController.panelPresentsHDR(
-            headroomAboveOne: false, attribution: .engineHDR, panelProvenToEngageHDR: true))
+            headroomAboveOne: false, attribution: .engineHDR, matchingDisabled: false,
+            panelProvenToEngageHDR: true))
     }
 
     @Test("Cold start: HDR requested but nothing proven yet keeps the conservative answer")
     func unprovenPanelStaysSDR() {
         #expect(!DisplayCriteriaController.panelPresentsHDR(
-            headroomAboveOne: false, attribution: .engineHDR, panelProvenToEngageHDR: false))
+            headroomAboveOne: false, attribution: .engineHDR, matchingDisabled: false,
+            panelProvenToEngageHDR: false))
     }
 
     // Match Frame Rate on, Match Dynamic Range off: the combined tvOS toggle reports enabled, the
@@ -48,7 +51,8 @@ struct DisplayCriteriaPanelHDRProofTests {
     @Test("A rate-only panel never proves and stays SDR across sessions")
     func rateOnlyPanelNeverProves() {
         #expect(!DisplayCriteriaController.panelPresentsHDR(
-            headroomAboveOne: false, attribution: .engineHDR, panelProvenToEngageHDR: false))
+            headroomAboveOne: false, attribution: .engineHDR, matchingDisabled: false,
+            panelProvenToEngageHDR: false))
     }
 
     // effectiveFormat is clamped to displayCapabilities before apply(), so an SDR write is the
@@ -56,7 +60,8 @@ struct DisplayCriteriaPanelHDRProofTests {
     @Test("An SDR rate-only write reads SDR even on a proven panel")
     func rateOnlyWriteIgnoresProof() {
         #expect(!DisplayCriteriaController.panelPresentsHDR(
-            headroomAboveOne: false, attribution: .engineRateOnly, panelProvenToEngageHDR: true))
+            headroomAboveOne: false, attribution: .engineRateOnly, matchingDisabled: false,
+            panelProvenToEngageHDR: true))
     }
 
     // Sole-writer hosts (suppressDisplayCriteria) get their answer from the caller's pre-load
@@ -64,12 +69,30 @@ struct DisplayCriteriaPanelHDRProofTests {
     @Test("A host-driven session claims nothing from the proof")
     func hostDrivenIgnoresProof() {
         #expect(!DisplayCriteriaController.panelPresentsHDR(
-            headroomAboveOne: false, attribution: .hostDriven, panelProvenToEngageHDR: true))
+            headroomAboveOne: false, attribution: .hostDriven, matchingDisabled: false,
+            panelProvenToEngageHDR: true))
+    }
+
+    // AE#887: Match Content off, output parked in 4K HDR. The skipped write leaves the attribution
+    // host-driven, and a live channel after a VOD title whose accepted master proved the panel read SDR.
+    @Test("With Match Content off the proof answers for the parked output")
+    func matchingDisabledHonorsProof() {
+        #expect(DisplayCriteriaController.panelPresentsHDR(
+            headroomAboveOne: false, attribution: .hostDriven, matchingDisabled: true,
+            panelProvenToEngageHDR: true))
+    }
+
+    @Test("With Match Content off and nothing proven the answer stays conservative")
+    func matchingDisabledWithoutProofStaysSDR() {
+        #expect(!DisplayCriteriaController.panelPresentsHDR(
+            headroomAboveOne: false, attribution: .hostDriven, matchingDisabled: true,
+            panelProvenToEngageHDR: false))
     }
 
     @Test("Host-driven still honors a live headroom reading")
     func hostDrivenHonorsHeadroom() {
         #expect(DisplayCriteriaController.panelPresentsHDR(
-            headroomAboveOne: true, attribution: .hostDriven, panelProvenToEngageHDR: false))
+            headroomAboveOne: true, attribution: .hostDriven, matchingDisabled: false,
+            panelProvenToEngageHDR: false))
     }
 }

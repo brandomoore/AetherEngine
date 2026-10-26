@@ -12,6 +12,12 @@ import CoreVideo
 /// (`setArrivalOrderHandover(frameRate:)`).
 final class SampleBufferRenderer: @unchecked Sendable {
 
+    struct ResumeQueue {
+        let status: @MainActor () -> AVQueuedSampleBufferRenderingStatus
+        let flush: @MainActor () -> Void
+    }
+
+    @MainActor private let resumeQueue: ResumeQueue?
     let displayLayer: AVSampleBufferDisplayLayer
 
     /// The layer's queue surface, taken once on the main actor at construction (#351). The 27 SDKs
@@ -395,7 +401,8 @@ final class SampleBufferRenderer: @unchecked Sendable {
     /// Main-actor isolated because the layer is (#351); the only production caller,
     /// `SoftwarePlaybackHost`, already is.
     @MainActor
-    init(videoGravity: AVLayerVideoGravity = .resizeAspect) {
+    init(resumeQueue: ResumeQueue? = nil, videoGravity: AVLayerVideoGravity = .resizeAspect) {
+        self.resumeQueue = resumeQueue
         let layer = Self.makeDisplayLayer(isHDR: false, gravity: videoGravity)
         displayLayer = layer
         videoRenderer = layer.sampleBufferRenderer
@@ -478,6 +485,20 @@ final class SampleBufferRenderer: @unchecked Sendable {
     /// FigVideoQueueRemote -12080 on over-enqueue.
     var isReadyForMoreMediaData: Bool {
         queueTarget.isReadyForMoreMediaData
+    }
+
+    /// A suspended process may return with a failed queue that never admits another frame.
+    /// Recover before the feeder wakes; a healthy full queue must keep its buffered frames.
+    @MainActor
+    func recoverAfterSuspensionIfNeeded() {
+        let status = resumeQueue?.status() ?? queueStatus
+        guard status == .failed else { return }
+        EngineLog.emit("[Renderer] AE#870 queue target failed while paused (\(queueError?.localizedDescription ?? "nil")), flushing before the feeder resumes", category: .swPlayback)
+        if let resumeQueue {
+            resumeQueue.flush()
+        } else {
+            queueTarget.flush()
+        }
     }
 
     private var queueStatus: AVQueuedSampleBufferRenderingStatus { videoRenderer.status }

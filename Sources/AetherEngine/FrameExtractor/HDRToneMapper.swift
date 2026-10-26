@@ -9,7 +9,8 @@ struct HDRToneMapper {
     static func toneMap(
         frame: UnsafeMutablePointer<AVFrame>,
         targetWidth: Int,
-        timeBase: AVRational
+        timeBase: AVRational,
+        highQuality: Bool = false
     ) -> UnsafeMutablePointer<AVFrame>? {
         guard let graph = avfilter_graph_alloc() else { return nil }
         var graphOpt: UnsafeMutablePointer<AVFilterGraph>? = graph
@@ -43,7 +44,7 @@ struct HDRToneMapper {
         }
 
         // BT.2020 PQ/HLG to linear, Hable tone-map to SDR, BT.709 (tv range), RGBA.
-        let chain = "zscale=w=\(targetWidth):h=-2:t=linear:npl=100," +
+        let chain = "zscale=w=\(targetWidth):h=-2:t=linear:npl=100:f=\(highQuality ? "bicubic" : "bilinear")," +
                     "tonemap=tonemap=hable:desat=0," +
                     "zscale=p=bt709:t=bt709:m=bt709:r=tv," +
                     "format=pix_fmts=rgba"

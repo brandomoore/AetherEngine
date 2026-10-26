@@ -31,7 +31,10 @@ final class AudioTapHLSReader: @unchecked Sendable {
     private var playlist: HLSMediaPlaylist?
     private var tracker = HLSPlaylistTracker()
     private var nextIndex: Int?
-    private var lastDecodedEndPTS: Double?
+    private var lastDecodedEndPTS: Double?          // end of the reader's cumulative clock
+    private var lastEmittedEndPTS: Double?          // VOD pacing input: what the consumer has
+    private var previousPlayhead: Double?
+    private var held = AudioTapHeldBuffers()
     private var pendingDiscontinuity = true
 
     init(deps: Dependencies) { self.deps = deps }
@@ -76,16 +79,23 @@ final class AudioTapHLSReader: @unchecked Sendable {
     func stepVOD() async -> StepResult {
         guard let media = playlist else { return .finished }
         let playhead = deps.playhead() ?? 0
-        switch AudioTapPacing.decide(lastDecodedEndPTS: lastDecodedEndPTS, playhead: playhead,
-                                     leadSeconds: AudioTapDefaults.leadSeconds,
-                                     toleranceSeconds: AudioTapDefaults.toleranceSeconds) {
-        case .sleep:
-            return .slept
+        let decision = AudioTapPacing.decide(lastDecodedEndPTS: lastEmittedEndPTS, playhead: playhead,
+                                             previousPlayhead: previousPlayhead,
+                                             leadSeconds: AudioTapDefaults.leadSeconds,
+                                             toleranceSeconds: AudioTapDefaults.toleranceSeconds)
+        previousPlayhead = playhead
+        switch decision {
         case .reanchor:
             nextIndex = VideoSegmentProvider.segmentIndex(forPlaylistTime: playhead, durations: durations)
             lastDecodedEndPTS = nil
+            lastEmittedEndPTS = nil
+            held.clear()
             pendingDiscontinuity = true
             return .reanchored
+        case _ where !held.isEmpty:
+            return releaseHeld(playhead: playhead) ? .decoded : .slept
+        case .sleep:
+            return .slept
         case .decodeNext:
             break
         }
@@ -100,9 +110,20 @@ final class AudioTapHLSReader: @unchecked Sendable {
         }
         let chunks = deps.decodeSegment(bytes)
         guard !chunks.isEmpty else { nextIndex = idx + 1; pendingDiscontinuity = true; return .slept }
-        emit(chunks: chunks, segmentStart: cumulativeStart[idx])
+        stamp(chunks: chunks, segmentStart: cumulativeStart[idx]) { start, buffer in
+            held.append(start: start, buffer: buffer)
+        }
         nextIndex = idx + 1
+        _ = releaseHeld(playhead: playhead)
         return .decoded
+    }
+
+    private func releaseHeld(playhead: Double) -> Bool {
+        guard let end = held.release(before: playhead + AudioTapDefaults.leadSeconds,
+                                     droppingEndsBefore: playhead - AudioTapDefaults.toleranceSeconds,
+                                     emit: deps.emit) else { return false }
+        lastEmittedEndPTS = end
+        return true
     }
 
     // MARK: - Live (internal for await-driven tests)
@@ -120,20 +141,25 @@ final class AudioTapHLSReader: @unchecked Sendable {
             }
             let chunks = deps.decodeSegment(bytes)
             if chunks.isEmpty { pendingDiscontinuity = true; continue }
-            emit(chunks: chunks, segmentStart: lastDecodedEndPTS ?? (deps.playhead() ?? 0))
+            stamp(chunks: chunks, segmentStart: lastDecodedEndPTS ?? (deps.playhead() ?? 0)) { _, buffer in
+                deps.emit(buffer)
+            }
         }
         return .decoded
     }
 
-    // MARK: - Emit
+    // MARK: - Stamp
 
-    /// Emit a segment's chunks on the reader's cumulative clock. The first chunk after an anchor
-    /// lands at `segmentStart` and carries the pending discontinuity; subsequent chunks continue
-    /// from lastDecodedEndPTS so seams abut (the monotonic filter trims priming overlaps).
-    private func emit(chunks: [AudioTapChunk], segmentStart: Double) {
+    /// Stamp a segment's chunks on the reader's cumulative clock and hand each to `deliver` with
+    /// its start. The first chunk after an anchor lands at `segmentStart` and carries the pending
+    /// discontinuity; subsequent chunks continue from lastDecodedEndPTS so seams abut (the
+    /// monotonic filter trims priming overlaps).
+    private func stamp(chunks: [AudioTapChunk], segmentStart: Double,
+                       deliver: (Double, AudioTapBuffer) -> Void) {
         var cursor = pendingDiscontinuity ? segmentStart : (lastDecodedEndPTS ?? segmentStart)
         for chunk in chunks {
-            deps.emit(AudioTapBuffer(buffer: chunk.buffer, sourceTime: cursor, discontinuity: pendingDiscontinuity))
+            deliver(cursor, AudioTapBuffer(buffer: chunk.buffer, sourceTime: cursor,
+                                           discontinuity: pendingDiscontinuity))
             pendingDiscontinuity = false
             cursor += Double(chunk.buffer.frameLength) / AudioTapDefaults.sampleRate
         }

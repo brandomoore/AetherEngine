@@ -10,6 +10,11 @@ final class AudioTapController {
     /// Registration hook the caller uses to hand back a stop closure for whatever it started.
     typealias StartReader = (_ onStop: (@escaping () -> Void) -> Void) -> Void
 
+    /// The readers hold at most tolerance + lead (12 s) in flight, about 120 buffers at the
+    /// 100 ms chunk floor (#864). Twice that, so a consumer that keeps pace never loses one; a
+    /// consumer that falls behind still sheds the oldest instead of growing without bound.
+    nonisolated static let streamCapacity = 256
+
     private var continuation: AsyncStream<AudioTapBuffer>.Continuation?
     private var filter: AudioTapMonotonicFilter?
     private var stopReader: (() -> Void)?
@@ -19,7 +24,7 @@ final class AudioTapController {
     /// synchronously; it registers a stop closure via its callback.
     func makeStream(startReader: StartReader) -> AsyncStream<AudioTapBuffer> {
         let (stream, cont) = AsyncStream.makeStream(of: AudioTapBuffer.self,
-                                                    bufferingPolicy: .bufferingNewest(64))
+                                                    bufferingPolicy: .bufferingNewest(Self.streamCapacity))
         continuation = cont
         filter = AudioTapMonotonicFilter(downstream: { buf in _ = cont.yield(buf) })
         startReader { [weak self] stop in self?.stopReader = stop }

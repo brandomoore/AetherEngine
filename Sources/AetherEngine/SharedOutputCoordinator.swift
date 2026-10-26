@@ -34,6 +34,8 @@ final class SharedOutputCoordinator {
     /// again as `.primary` drops its own reset instead of having it wipe the criteria it has just written.
     private var deferredCriteriaResets: [ObjectIdentifier: @MainActor () -> Void] = [:]
     private var lastTransition: Task<Void, Never>?
+    private var categoryConfiguration: Task<Bool, Never>?
+    private var categoryConfigured = false
 
     init() {}
 
@@ -105,6 +107,27 @@ final class SharedOutputCoordinator {
         }
         lastTransition = transition
         return transition
+    }
+
+    /// The category belongs to the process-wide session: concurrent loads share the in-flight
+    /// declaration, a successful one is never repeated, a failed one is retried by the next load.
+    /// It runs on the activation/release queue, so it is ordered with both.
+    func configureAudioSessionCategory(_ body: @escaping @Sendable () async -> Bool) async {
+        if categoryConfigured { return }
+        if let categoryConfiguration {
+            _ = await categoryConfiguration.value
+            return
+        }
+        let previous = lastTransition
+        let configuration = BlockingWork.detached(priority: .userInitiated) { () async -> Bool in
+            await previous?.value
+            return await body()
+        }
+        lastTransition = BlockingWork.detached(priority: .userInitiated) { _ = await configuration.value }
+        categoryConfiguration = configuration
+        let succeeded = await configuration.value
+        if succeeded { categoryConfigured = true }
+        categoryConfiguration = nil
     }
 
     /// Log label for an engine: its host-given tag, or the identifier's hash when there is none.

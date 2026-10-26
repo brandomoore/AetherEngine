@@ -46,7 +46,8 @@ extension AetherEngine {
         sessionRequestHeaders.replace(headers)
         let outcome = RequestHeaderUpdateOutcome.forSession(
             isCustomSource: isCustomSource,
-            isDiscImage: !isCustomSource && Demuxer.isDiscImageURL(url),
+            isDiscImage: !isCustomSource
+                && (Demuxer.isDiscImageURL(url) || DASHSourceOpener.isKnownManifest(url)),
             route: videoRoute,
             audioRequestsOwnedByAVFoundation: audioSessionRequestsOwnedByAVFoundation)
         // Names only: the values are credentials.
@@ -81,8 +82,8 @@ public enum RequestHeaderUpdateOutcome: Sendable, Equatable {
     case appliedToLiveRequests
     /// The session's requests are made by something that fixed its headers when the session was
     /// built: AVFoundation on a `.remoteBypass` route or an AVPlayer-hosted audio item, a custom
-    /// `IOReader` the host built, or a remote disc image. The set is installed for the next rebuild;
-    /// call `reloadAtCurrentPosition()` if it is needed now.
+    /// `IOReader` the host built, a remote disc image, or a DASH manifest (AE#859). The set is
+    /// installed for the next rebuild; call `reloadAtCurrentPosition()` if it is needed now.
     case installedForNextRebuild
     /// Nothing is loaded. Nothing was installed.
     case noActiveSession

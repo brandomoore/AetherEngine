@@ -72,6 +72,7 @@ final class NativeAVPlayerHost {
     /// What the current session was loaded under, carried across an item swap (#440 round 5). See
     /// `SessionLoadContract` and `swapItem`.
     private(set) var sessionContract = SessionLoadContract()
+    private var sourceDiagnosticContext: SourceNetworkDiagnostics.Context?
 
     /// Where the current item was placed when it was mounted: the explicit start seek `load` makes,
     /// or nil when it joined without one (a live rejoin). Recorded on every mount, the in-place swaps
@@ -243,6 +244,10 @@ final class NativeAVPlayerHost {
     /// software-path rebuild raised in the window resumed there and replayed the gap. So neither
     /// reading is a landing: only the seek's own completion is, or the item playing, which it cannot
     /// do short of the target. A seek of the host's own takes the clock over from here as well.
+    /// AE#881: a completion that runs before the item is ready is not a landing either. AVPlayer
+    /// answers the mount seek `finished == true` in the same millisecond it was issued, and the
+    /// periodic observer then read 0.00 (the keyframe the start position falls behind) for up to
+    /// 300 ms while `avPlayer.currentTime()` read the target. See `mountSeekCompletionLands`.
     /// Round 5: not only an in-place swap. A VOD mount a host `load()` placed past the head has the
     /// same window, and there the rebuild resumed at 12.00 s once that load had returned. See
     /// `mountHoldsClock`.
@@ -494,7 +499,7 @@ final class NativeAVPlayerHost {
     /// session, so none of them gets to re-decide whether the session is live or what headers it sends.
     func swapItem(url: URL, startPosition: Double?, skipInitialSeek: Bool = false) {
         load(url: url, startPosition: startPosition, skipInitialSeek: skipInitialSeek,
-             inPlaceSwap: true, contract: sessionContract)
+             inPlaceSwap: true, diagnosticContext: sourceDiagnosticContext, contract: sessionContract)
     }
 
     /// Load the loopback HLS-fMP4 URL into AVPlayer. DisplayCriteriaController.apply must run first so the HDR pipeline is configured before the first segment fetch.
@@ -505,11 +510,13 @@ final class NativeAVPlayerHost {
     /// keeps transport intent, clocks and the old item alive until replaceCurrentItem hands
     /// AVPlayer the fresh one.
     func load(url: URL, startPosition: Double?, perFrameHDR: Bool = true, skipInitialSeek: Bool = false,
-              inPlaceSwap: Bool = false, contract: SessionLoadContract) {
+              inPlaceSwap: Bool = false, diagnosticContext: SourceNetworkDiagnostics.Context? = nil,
+              contract: SessionLoadContract) {
         let outgoingDiagnostics = inPlaceSwap ? itemDiagnostics : nil
         unloadCurrentItem(inPlaceSwap: inPlaceSwap)
 
         self.sessionContract = contract
+        self.sourceDiagnosticContext = diagnosticContext
         mountedStartPosition = skipInitialSeek ? nil : (startPosition ?? 0)
         mountSeekPending = Self.mountHoldsClock(inPlaceSwap: inPlaceSwap, skipInitialSeek: skipInitialSeek,
                                                 startPosition: startPosition, isLive: contract.isLive)
@@ -627,7 +634,7 @@ final class NativeAVPlayerHost {
         // frame; a healthy stream's watchdog disarms and cancels it, an unjudgeable one has its verdict
         // ready by the time the watchdog arms.
         if armIngestFallback {
-            startCarriageProbe(asset: asset, url: url, httpHeaders: httpHeaders)
+            startCarriageProbe(asset: asset, url: url, httpHeaders: httpHeaders, diagnosticContext: diagnosticContext)
         }
         playerItem = item
         let diagnostics = AVPlayerItemDiagnostics(item: item, pool: diagnosticPool, read: diagnosticRead)
@@ -999,6 +1006,8 @@ final class NativeAVPlayerHost {
                 guard finished else { return }
                 Task { @MainActor in
                     guard let self, self.sessionID == sid else { return }
+                    guard Self.mountSeekCompletionLands(
+                        itemIsReadyToPlay: self.playerItem?.status == .readyToPlay) else { return }
                     self.mountSeekPending = false
                 }
             }
@@ -1537,6 +1546,13 @@ final class NativeAVPlayerHost {
     /// line. An item cannot roll before it is ready, so readiness is what separates the carry from the
     /// roll. The readyToPlay sink asks again, for a carry that never changes status on its way to motion.
     nonisolated static func playingIsThisItemsRoll(itemIsReadyToPlay: Bool) -> Bool {
+        itemIsReadyToPlay
+    }
+
+    /// AE#881: whether a finished mount seek releases the clock hold. Before the item is ready
+    /// AVPlayer completes the seek at once, as a note of where to start, and its clock still reads
+    /// the start of the stretch it decodes up from. The item's first roll releases the hold instead.
+    nonisolated static func mountSeekCompletionLands(itemIsReadyToPlay: Bool) -> Bool {
         itemIsReadyToPlay
     }
 
@@ -2586,7 +2602,8 @@ final class NativeAVPlayerHost {
     /// not what a per-token connection cap counts, so the playlist stage runs against the mount; a segment
     /// fetch is, so it waits for readyToPlay (see `awaitReadyForDeferredProbe`).
     @MainActor
-    private func startCarriageProbe(asset: AVURLAsset, url: URL, httpHeaders: [String: String]) {
+    private func startCarriageProbe(asset: AVURLAsset, url: URL, httpHeaders: [String: String],
+                                    diagnosticContext: SourceNetworkDiagnostics.Context?) {
         let sid = sessionID
         carriageProbeTask = Task { @MainActor [weak self] in
             let variants = (try? await asset.load(.variants)) ?? []
@@ -2596,12 +2613,14 @@ final class NativeAVPlayerHost {
             let codecs = variants.compactMap { $0.videoAttributes }.flatMap { $0.codecTypes }
             guard RemoteHLSIngestFallback.shouldProbeCarriage(
                 advertisesVideo: advertises, advertisedVideoCodecs: codecs) else { return }
-            let evidence = await HLSCarriageProbe.classifyFromPlaylists(
-                playlistURL: url,
-                httpHeaders: httpHeaders,
-                advertisesFragmentedMP4OnlyVideo:
-                    RemoteHLSIngestFallback.advertisesFragmentedMP4OnlyVideo(codecs)
-            )
+            let evidence = await SourceNetworkDiagnostics.$context.withValue(diagnosticContext) {
+                await HLSCarriageProbe.classifyFromPlaylists(
+                    playlistURL: url,
+                    httpHeaders: httpHeaders,
+                    advertisesFragmentedMP4OnlyVideo:
+                        RemoteHLSIngestFallback.advertisesFragmentedMP4OnlyVideo(codecs)
+                )
+            }
             guard let self, !Task.isCancelled, self.sessionID == sid else { return }
             switch evidence {
             case .settled(let verdict):
@@ -2627,8 +2646,10 @@ final class NativeAVPlayerHost {
                 case .ready:
                     break
                 }
-                let verdict = await HLSCarriageProbe.classifyDeferredSegmentHead(
-                    url: segmentURL, httpHeaders: httpHeaders, credentialOrigin: url)
+                let verdict = await SourceNetworkDiagnostics.$context.withValue(diagnosticContext) {
+                    await HLSCarriageProbe.classifyDeferredSegmentHead(
+                        url: segmentURL, httpHeaders: httpHeaders, credentialOrigin: url)
+                }
                 guard !Task.isCancelled, self.sessionID == sid else { return }
                 self.publishCarriageProbeVerdict(verdict, sid: sid, from: "segment PMT")
             }

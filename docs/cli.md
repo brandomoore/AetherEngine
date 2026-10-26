@@ -76,7 +76,7 @@ open 'http://127.0.0.1:<port>/<token>/master.m3u8'   # macOS QuickTime
 
 `--start-position S` starts the session at S seconds, the resume anchor a host passes to `load(url:startPosition:)`. Also available on `play`.
 
-`--atmos-bed <layout>` is `LoadOptions.objectAudioRendering = .apac(layout)` (`5.1.2`, `5.1.4`, `7.1.2`, `7.1.4` or `9.1.6`, #731, #744), rendered only by a build with the `TrueHDObjectAudio` / `DTSXObjectAudio` traits: a TrueHD Atmos or DTS:X track is rendered into that bed and served as APAC, so a master reads `CODECS="…,apac.31.03"` (up to 12 channels) or `apac.31.04` (16), and the log carries `TrueHD Atmos: channel presentation split into … by the objects' energy` (or `DTS:X: bed and heights routed one to one into …`) and the `[SpatialAudioBridge] bed levels` lines. A DTS-HD MA track whose frames do not decode as DTS:X logs `DTS-HD MA track is not DTS:X this engine renders (…); keeping the channel bridge` instead. `--audio-index <n>` serves source stream `n`, as a host's audio picker would. Dolby's Unfold demo, whose TrueHD Atmos track is stream 1: `serve --no-dv --atmos-bed 7.1.4 --audio-index 1 unfold.m2ts`. In a build with the `TrueHDReferenceRender` trait (and a LibTrueHD built with `matrix-interpolation`), `AETHER_TRUEHD_REFERENCE_RENDER=1` in the environment decodes the TrueHD track exactly and mixes its objects through the renderer instead (`… objects rendered into 7.1.4 (reference render, …)`), the reference the split is measured against: serve the file both ways, decode each APAC track to PCM and compare per channel.
+`--atmos-bed <layout>` is `LoadOptions.objectAudioRendering = .apac(layout)` (`5.1.2`, `5.1.4`, `7.1.2`, `7.1.4` or `9.1.6`, #731, #744), rendered only by a build with the `TrueHDObjectAudio` / `DTSXObjectAudio` traits: a TrueHD Atmos or DTS:X track is rendered into that bed and served as APAC, so a master reads `CODECS="…,apac.31.03"` (up to 12 channels) or `apac.31.04` (16), and the log carries `TrueHD Atmos: objects rendered into …` (or `DTS:X: bed and heights routed one to one into …`) and the `[SpatialAudioBridge] bed levels` lines. A DTS-HD MA track whose frames do not decode as DTS:X logs `DTS-HD MA track is not DTS:X this engine renders (…); keeping the channel bridge` instead. `--audio-index <n>` serves source stream `n`, as a host's audio picker would. Dolby's Unfold demo, whose TrueHD Atmos track is stream 1: `serve --no-dv --atmos-bed 7.1.4 --audio-index 1 unfold.m2ts`.
 
 `--stereo auto|mono|sbs|ou` serves a 3D source the way visionOS gets it, from any system (`LoadOptions.stereoPresentation`): `auto` keeps an MV-HEVC stream's second view (`lhvC` in the init) or presents the frame packing a Matroska `StereoMode` declares, `sbs` / `ou` say what a file's name says, `mono` plays it 2D. The log's `[HLSVideoEngine] stereo:` line names what was chosen and why; a stereo master carries `REQ-VIDEO-LAYOUT="CH-STEREO"` at `EXT-X-VERSION:12`, and a packed HEVC init a `vexu` with `eyes` and `pack` (H.264 stays 2D: AVPlayer refuses it packed over HLS). Without the flag the session is what this system gets: 2D everywhere but visionOS.
 
@@ -535,10 +535,11 @@ swift run aetherctl scrubpreview --throttle-kbps 20000 --at 2,30,50,65 --keep /t
 
 ## extract
 
-Opens a `FrameExtractor` against the source and pulls a still frame. Thumbnail mode (default) snaps to the nearest keyframe and downscales to `--width` (default 320); `--snapshot` decodes frame-accurately at full resolution. `--at <sec>` sets the seek position (default 60.0). The first frame is written to `aetherctl-extract-<mode>.png` in aetherctl's private per-user temporary directory (the path is printed). `--loops N` repeats the extraction across eight cycling positions, which pairs with `leaks --atExit` to validate the decode-context teardown is clean:
+Opens a `FrameExtractor` against the source and pulls a still frame. Thumbnail mode (default) snaps to the nearest keyframe and downscales to `--width` (default 320); `--preview` decodes frame-accurately at `--width`, while `--snapshot` uses full resolution. The two flags are mutually exclusive. `--at <sec>` sets the seek position (default 60.0). The first frame is written to `aetherctl-extract-<mode>.png` in aetherctl's private per-user temporary directory (the path is printed). `--loops N` repeats the extraction across eight cycling positions, which pairs with `leaks --atExit` to validate the decode-context teardown is clean:
 
 ```bash
 swift run aetherctl extract --at 612 --snapshot <url>          # frame-accurate still
+swift run aetherctl extract --at 612 --preview --width 480 <url> # accurate downscaled preview
 swift run aetherctl extract --width 480 <url>                  # keyframe thumbnail
 leaks --atExit -- .build/debug/aetherctl extract --loops 8 <url>   # leak sweep
 ```
@@ -886,6 +887,8 @@ aetherctl play --live --header "User-Agent: Mozilla/5.0 (QtEmbedded; TestSTB)" \
 ```
 
 The REQ log then carries the verdict per request (`auth=ok` / `auth=MISSING -> 403`), which is what makes "who lost the header, and on which hop" a measurement. Knobs: `--require-header "Name: Value"`, `--deny-status N` (401 and 403 reach the engine as different `NSURLError` codes), `--deny-segments-only` (refuse after readyToPlay rather than at the master), `--deny-user-agent S` (refuse `AppleCoreMedia` and serve everyone else, the one origin shape that tells the AVPlayer bypass and the engine's own ingest fetcher apart), `--redirect-entry` / `--redirect-host` / `--redirect-port` (portal-to-edge 302, cross-origin by host name and port while staying on loopback), `--media-origin H:P` (master's variants point at a second origin absolutely).
+
+Without `--redirect-port`, a redirect uses the fixture's bound port, read under the same lifecycle lock that updates it on start and stop.
 
 Measured with it before AE#363 was written, and worth knowing before suspecting the engine: `LoadOptions.httpHeaders` survive BOTH shapes on the AVPlayer bypass on macOS, the cross-origin 302 and the absolutely referenced second origin. Every request arrived with the header and the session played through.
 

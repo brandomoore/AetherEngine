@@ -3,7 +3,7 @@ import Foundation
 import AetherLibavutil
 @testable import AetherEngine
 
-/// #290: the #177 component gate bounds each SAR component to 256, which catches the pathological
+/// #290: the #177 magnitude gate bounds the SAR rather than its components, which catches the pathological
 /// values but admits small-but-wrong ratios. A live 1080p H.264 channel declaring 3:1, and 2:1 on a
 /// later run, smeared 1920x1080 into a 5.33:1 / 3.56:1 band with both values well inside the gate.
 ///
@@ -24,7 +24,7 @@ struct Issue290DisplayAspectGateTests {
     func reportedRatiosRejected() {
         #expect(PixelAspectPolicy.saneSAR(rational(3, 1), width: 1920, height: 1080) == nil)
         #expect(PixelAspectPolicy.saneSAR(rational(2, 1), width: 1920, height: 1080) == nil)
-        // Both clear the #177 component gate, which is why it could not catch them.
+        // Both clear the #177 magnitude gate, which is why it could not catch them.
         #expect(PixelAspectPolicy.saneSAR(rational(3, 1)) != nil)
         #expect(PixelAspectPolicy.saneSAR(rational(2, 1)) != nil)
     }
@@ -87,8 +87,8 @@ struct Issue290DisplayAspectGateTests {
         #expect(sane?.den == 1)
     }
 
-    @Test("a frame that cannot state its size falls back to the component gate")
-    func unknownDimensionsUseComponentGate() {
+    @Test("a frame that cannot state its size falls back to the magnitude gate")
+    func unknownDimensionsUseMagnitudeGate() {
         #expect(PixelAspectPolicy.saneSAR(rational(16, 11), width: 0, height: 0) != nil)
         #expect(PixelAspectPolicy.saneSAR(rational(3, 1), width: 0, height: 0) != nil)
         #expect(PixelAspectPolicy.saneSAR(rational(1088, 1), width: 0, height: 0) == nil)
@@ -172,9 +172,9 @@ struct Issue290DisplayAspectGateTests {
         #expect(message?.contains("(frame=3:1 ctx=0:1 stream=2:1)") == true)
     }
 
-    @Test("a ratio too broken for the component gate still reports the one that was used")
+    @Test("a ratio too broken for the magnitude gate still reports the one that was used")
     func rejectionLineSkipsComponentGarbage() {
-        // #177's 1088:1 fails the component gate, so the ctx value is what the resolution would
+        // #177's 1088:1 fails the magnitude gate, so the ctx value is what the resolution would
         // have attached, but the frame axis still has to be visible to explain the drop.
         let message = SoftwareVideoDecoder.rejectedSARMessage(
             frame: rational(1088, 1), ctx: rational(3, 1), stream: rational(0, 1),

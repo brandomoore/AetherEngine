@@ -1,0 +1,25 @@
+{
+  "type": "object",
+  "properties": {
+    "summary": {
+      "type": "string",
+      "description": "The review summary in Markdown, in the shape review.md prescribes, without the automated-review footer."
+    },
+    "inline": {
+      "type": "array",
+      "description": "Findings tied to a line. Empty when there are none.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string", "description": "Repository-relative path of a file the PR changes, e.g. Sources/AetherEngine/AetherEngine.swift." },
+          "line": { "type": "integer", "description": "Line number in the PR head version of the file; must be a line inside the diff." },
+          "body": { "type": "string", "description": "One finding: what is wrong, the scenario where it breaks, and a fix when there is one." }
+        },
+        "required": ["path", "line", "body"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["summary", "inline"],
+  "additionalProperties": false
+}

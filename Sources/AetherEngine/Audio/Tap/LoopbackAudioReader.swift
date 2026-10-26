@@ -26,7 +26,7 @@ final class LoopbackAudioReader: @unchecked Sendable {
     }
 
     enum StepResult: Equatable {
-        case decoded      // decoded + emitted one segment
+        case decoded      // decoded a segment or released held buffers
         case slept        // nothing to do right now
         case reanchored   // jumped to the playhead's segment; next step decodes there
     }
@@ -41,6 +41,8 @@ final class LoopbackAudioReader: @unchecked Sendable {
     // Worker-thread state (only touched from the loop / runOnce).
     private var nextIndex: Int?
     private var lastDecodedEndPTS: Double?
+    private var previousPlayhead: Double?
+    private var held = AudioTapHeldBuffers()
     private var pendingDiscontinuity = true
     private var missStreak = 0
 
@@ -79,18 +81,24 @@ final class LoopbackAudioReader: @unchecked Sendable {
     /// One loop iteration. Internal (not private) so tests drive it directly.
     func runOnce() -> StepResult {
         let playhead = deps.playhead() ?? 0
+        let decision = AudioTapPacing.decide(lastDecodedEndPTS: lastDecodedEndPTS, playhead: playhead,
+                                             previousPlayhead: previousPlayhead,
+                                             leadSeconds: AudioTapDefaults.leadSeconds,
+                                             toleranceSeconds: AudioTapDefaults.toleranceSeconds)
+        previousPlayhead = playhead
 
-        switch AudioTapPacing.decide(lastDecodedEndPTS: lastDecodedEndPTS, playhead: playhead,
-                                     leadSeconds: AudioTapDefaults.leadSeconds,
-                                     toleranceSeconds: AudioTapDefaults.toleranceSeconds) {
-        case .sleep:
-            return .slept
+        switch decision {
         case .reanchor:
             nextIndex = deps.anchorIndex(playhead)
             lastDecodedEndPTS = nil
+            held.clear()
             pendingDiscontinuity = true
             missStreak = 0
             return .reanchored
+        case _ where !held.isEmpty:
+            return releaseHeld(playhead: playhead) ? .decoded : .slept
+        case .sleep:
+            return .slept
         case .decodeNext:
             break
         }
@@ -128,14 +136,24 @@ final class LoopbackAudioReader: @unchecked Sendable {
 
         let shift = deps.shiftSeconds()
         for chunk in chunks {
-            deps.emit(AudioTapBuffer(buffer: chunk.buffer,
-                                     sourceTime: chunk.ptsSeconds + shift,
-                                     discontinuity: pendingDiscontinuity))
+            held.append(start: chunk.ptsSeconds,
+                        buffer: AudioTapBuffer(buffer: chunk.buffer,
+                                               sourceTime: chunk.ptsSeconds + shift,
+                                               discontinuity: pendingDiscontinuity))
             pendingDiscontinuity = false
-            lastDecodedEndPTS = chunk.ptsSeconds
-                + Double(chunk.buffer.frameLength) / AudioTapDefaults.sampleRate
         }
         nextIndex = idx + 1
+        _ = releaseHeld(playhead: playhead)
         return .decoded
+    }
+
+    /// Releases the held buffers that fall inside the lead. `lastDecodedEndPTS` tracks what was
+    /// emitted, so pacing measures the lead the consumer actually has.
+    private func releaseHeld(playhead: Double) -> Bool {
+        guard let end = held.release(before: playhead + AudioTapDefaults.leadSeconds,
+                                     droppingEndsBefore: playhead - AudioTapDefaults.toleranceSeconds,
+                                     emit: deps.emit) else { return false }
+        lastDecodedEndPTS = end
+        return true
     }
 }

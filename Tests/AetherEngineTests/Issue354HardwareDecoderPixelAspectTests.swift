@@ -1,4 +1,6 @@
 import Foundation
+import CoreVideo
+import VideoToolbox
 import AetherLibavutil
 import Testing
 @testable import AetherEngine
@@ -66,4 +68,150 @@ struct Issue354HardwareDecoderPixelAspectTests {
         #expect(resolved?.num == 2)
         #expect(resolved?.den == 1)
     }
+
+    private func makeOutput(width: Int = 16, height: Int = 16,
+                            pixelFormat: OSType = kCVPixelFormatType_32BGRA) throws -> CVPixelBuffer {
+        var buffer: CVPixelBuffer?
+        let result = CVPixelBufferCreate(kCFAllocatorDefault, width, height,
+            pixelFormat,
+            [kCVPixelBufferIOSurfacePropertiesKey: NSDictionary()] as NSDictionary, &buffer)
+        #expect(result == kCVReturnSuccess)
+        return try #require(buffer)
+    }
+
+    private func normalize(_ buffer: CVPixelBuffer, with normalizer: VideoToolboxOutputMetadataNormalizer,
+                           modifiable: Bool = false, ratio: AVRational? = nil,
+                           primaries: CFString? = nil) -> CVPixelBuffer {
+        normalizer.applyingOutputMetadata(to: buffer, isModifiable: modifiable,
+            colorPrimaries: primaries, transferFunction: nil, yCbCrMatrix: nil,
+            pixelAspectRatio: ratio)
+    }
+
+    private func aspect(_ buffer: CVPixelBuffer) -> NSDictionary? {
+        CVBufferCopyAttachment(buffer, kCVImageBufferPixelAspectRatioKey, nil) as? NSDictionary
+    }
+
+    @Test("immutable output is copied before adding display metadata")
+    func immutableOutputRetainsItsAttachments() throws {
+        let input = try makeOutput()
+        let customKey = "test.preserved" as CFString
+        CVBufferSetAttachment(input, customKey, "value" as CFString, .shouldPropagate)
+        let normalizer = VideoToolboxOutputMetadataNormalizer()
+        let output = normalize(input, with: normalizer, ratio: rational(64, 45),
+                               primaries: kCVImageBufferColorPrimaries_ITU_R_709_2)
+        #expect(output !== input)
+        #expect(aspect(input) == nil)
+        #expect(CVBufferCopyAttachment(input, kCVImageBufferColorPrimariesKey, nil) == nil)
+        #expect(aspect(output)?[kCVImageBufferPixelAspectRatioHorizontalSpacingKey] as? Int == 64)
+        #expect(CVBufferCopyAttachment(output, customKey, nil) as? String == "value")
+    }
+
+    @Test("modifiable output gets metadata in place")
+    func modifiableOutputIsReused() throws {
+        let input = try makeOutput()
+        let output = normalize(input, with: VideoToolboxOutputMetadataNormalizer(),
+                               modifiable: true, ratio: rational(64, 45))
+        #expect(output === input)
+        #expect(aspect(input)?[kCVImageBufferPixelAspectRatioVerticalSpacingKey] as? Int == 45)
+    }
+
+    @Test("matching metadata needs no copy even on an immutable output")
+    func matchingOutputIsReused() throws {
+        let input = try makeOutput()
+        let normalizer = VideoToolboxOutputMetadataNormalizer()
+        _ = normalize(input, with: normalizer, modifiable: true, ratio: rational(64, 45))
+        let output = normalize(input, with: normalizer, ratio: rational(64, 45))
+        #expect(output === input)
+    }
+
+    @Test("a matching but non-propagating attachment is not a match")
+    func nonPropagatingMatchIsRewritten() throws {
+        let input = try makeOutput()
+        let aspectValue: NSDictionary = [
+            kCVImageBufferPixelAspectRatioHorizontalSpacingKey: 64,
+            kCVImageBufferPixelAspectRatioVerticalSpacingKey: 45,
+        ]
+        CVBufferSetAttachment(input, kCVImageBufferPixelAspectRatioKey, aspectValue, .shouldNotPropagate)
+        CVBufferSetAttachment(input, kCVImageBufferColorPrimariesKey,
+                              kCVImageBufferColorPrimaries_ITU_R_709_2, .shouldNotPropagate)
+        let output = normalize(input, with: VideoToolboxOutputMetadataNormalizer(), ratio: rational(64, 45),
+                               primaries: kCVImageBufferColorPrimaries_ITU_R_709_2)
+        #expect(output !== input)
+        var mode = CVAttachmentMode.shouldNotPropagate
+        #expect(CVBufferCopyAttachment(output, kCVImageBufferPixelAspectRatioKey, &mode) != nil)
+        #expect(mode == .shouldPropagate)
+        mode = .shouldNotPropagate
+        #expect(CVBufferCopyAttachment(output, kCVImageBufferColorPrimariesKey, &mode) != nil)
+        #expect(mode == .shouldPropagate)
+    }
+
+    @Test("a stale non-propagating PAR is still removed on square pixels")
+    func staleNonPropagatingRatioIsRemoved() throws {
+        let input = try makeOutput()
+        let aspectValue: NSDictionary = [
+            kCVImageBufferPixelAspectRatioHorizontalSpacingKey: 4,
+            kCVImageBufferPixelAspectRatioVerticalSpacingKey: 3,
+        ]
+        CVBufferSetAttachment(input, kCVImageBufferPixelAspectRatioKey, aspectValue, .shouldNotPropagate)
+        let output = normalize(input, with: VideoToolboxOutputMetadataNormalizer(), modifiable: true)
+        #expect(output === input)
+        #expect(aspect(output) == nil)
+    }
+
+    @Test("square-pixel output removes stale PAR without mutating an immutable source")
+    func staleRatioIsRemovedFromOwnedCopy() throws {
+        let input = try makeOutput()
+        let normalizer = VideoToolboxOutputMetadataNormalizer()
+        _ = normalize(input, with: normalizer, modifiable: true, ratio: rational(64, 45))
+        let output = normalize(input, with: normalizer)
+        #expect(output !== input)
+        #expect(aspect(output) == nil)
+        #expect(aspect(input) != nil)
+    }
+
+    @Test("owned copies retain pixels and follow format changes")
+    func copiedPixelsSurvivePoolReconfiguration() throws {
+        let normalizer = VideoToolboxOutputMetadataNormalizer()
+        for width in [16, 32, 16] {
+            let input = try makeOutput(width: width)
+            #expect(CVPixelBufferLockBaseAddress(input, []) == kCVReturnSuccess)
+            let base = try #require(CVPixelBufferGetBaseAddress(input))
+            memset(base, 0x59, CVPixelBufferGetDataSize(input))
+            CVPixelBufferUnlockBaseAddress(input, [])
+            let output = normalize(input, with: normalizer, ratio: rational(64, 45))
+            #expect(output !== input)
+            #expect(CVPixelBufferGetWidth(output) == width)
+            #expect(CVPixelBufferLockBaseAddress(output, .readOnly) == kCVReturnSuccess)
+            let copied = try #require(CVPixelBufferGetBaseAddress(output))
+            #expect(copied.load(as: UInt8.self) == 0x59)
+            CVPixelBufferUnlockBaseAddress(output, .readOnly)
+        }
+        normalizer.reset()
+        let input = try makeOutput()
+        #expect(normalize(input, with: normalizer, ratio: rational(64, 45)) !== input)
+    }
+    @Test("owned copies preserve bi-planar decoder output",
+          arguments: [kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                      kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange])
+    func biPlanarPixelsArePreserved(pixelFormat: OSType) throws {
+        let input = try makeOutput(pixelFormat: pixelFormat)
+        #expect(CVPixelBufferLockBaseAddress(input, []) == kCVReturnSuccess)
+        for plane in 0..<CVPixelBufferGetPlaneCount(input) {
+            let base = try #require(CVPixelBufferGetBaseAddressOfPlane(input, plane))
+            // 0x8080 is a valid P010 word: its low six padding bits are zero.
+            memset(base, 0x80, CVPixelBufferGetHeightOfPlane(input, plane)
+                   * CVPixelBufferGetBytesPerRowOfPlane(input, plane))
+        }
+        CVPixelBufferUnlockBaseAddress(input, [])
+        let output = normalize(input, with: VideoToolboxOutputMetadataNormalizer(), ratio: rational(64, 45))
+        #expect(output !== input)
+        #expect(CVPixelBufferGetPixelFormatType(output) == pixelFormat)
+        #expect(CVPixelBufferLockBaseAddress(output, .readOnly) == kCVReturnSuccess)
+        defer { CVPixelBufferUnlockBaseAddress(output, .readOnly) }
+        for plane in 0..<CVPixelBufferGetPlaneCount(output) {
+            let base = try #require(CVPixelBufferGetBaseAddressOfPlane(output, plane))
+            #expect(base.load(as: UInt8.self) == 0x80)
+        }
+    }
+
 }

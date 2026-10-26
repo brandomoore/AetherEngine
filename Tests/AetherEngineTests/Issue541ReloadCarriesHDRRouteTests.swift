@@ -13,18 +13,16 @@ struct Issue541ReloadCarriesHDRRouteTests {
             hostAsserts: false,
             criteriaReadoutAtLoad: true,
             attemptWhenUnproven: false,
-            isLive: false,
             displayEligibleForHDR: true,
             panelRefusedHDRMaster: false))
     }
 
-    @Test("An unproven but eligible VOD panel the load offered the master is offered it again")
+    @Test("An unproven but eligible panel the load offered the master is offered it again")
     func unprovenAttemptSurvivesTheReload() {
         #expect(AetherEngine.reloadRoutesAsHDRPanel(
             hostAsserts: false,
             criteriaReadoutAtLoad: false,
             attemptWhenUnproven: true,
-            isLive: false,
             displayEligibleForHDR: true,
             panelRefusedHDRMaster: false))
     }
@@ -35,20 +33,8 @@ struct Issue541ReloadCarriesHDRRouteTests {
             hostAsserts: false,
             criteriaReadoutAtLoad: false,
             attemptWhenUnproven: true,
-            isLive: false,
             displayEligibleForHDR: true,
             panelRefusedHDRMaster: true) == false)
-    }
-
-    @Test("Live never attempts on an unproven panel, on the reload as on the load")
-    func liveDoesNotAttempt() {
-        #expect(AetherEngine.reloadRoutesAsHDRPanel(
-            hostAsserts: false,
-            criteriaReadoutAtLoad: false,
-            attemptWhenUnproven: true,
-            isLive: true,
-            displayEligibleForHDR: true,
-            panelRefusedHDRMaster: false) == false)
     }
 
     @Test("A suppressed-criteria session with no assertion stays media-direct, as before")
@@ -57,7 +43,6 @@ struct Issue541ReloadCarriesHDRRouteTests {
             hostAsserts: false,
             criteriaReadoutAtLoad: nil,
             attemptWhenUnproven: false,
-            isLive: false,
             displayEligibleForHDR: true,
             panelRefusedHDRMaster: false) == false)
     }
@@ -68,7 +53,6 @@ struct Issue541ReloadCarriesHDRRouteTests {
             hostAsserts: true,
             criteriaReadoutAtLoad: false,
             attemptWhenUnproven: false,
-            isLive: false,
             displayEligibleForHDR: false,
             panelRefusedHDRMaster: false))
     }
@@ -78,24 +62,21 @@ struct Issue541ReloadCarriesHDRRouteTests {
         for hostAsserts in [false, true] {
             for readout in [nil, false, true] as [Bool?] {
                 for attempt in [false, true] {
-                    for isLive in [false, true] {
-                        for eligible in [false, true] {
-                            for refused in [false, true] {
-                                let load = AetherEngine.sessionRoutesAsHDRPanel(
-                                    panelPresentsHDR: AetherEngine.sessionPanelPresentsHDR(
-                                        hostAsserts: hostAsserts, criteriaReadout: readout),
-                                    attemptWhenUnproven: attempt && !isLive,
-                                    displayEligibleForHDR: eligible,
-                                    panelRefusedHDRMaster: refused)
-                                let reload = AetherEngine.reloadRoutesAsHDRPanel(
-                                    hostAsserts: hostAsserts,
-                                    criteriaReadoutAtLoad: readout,
-                                    attemptWhenUnproven: attempt,
-                                    isLive: isLive,
-                                    displayEligibleForHDR: eligible,
-                                    panelRefusedHDRMaster: refused)
-                                #expect(load == reload)
-                            }
+                    for eligible in [false, true] {
+                        for refused in [false, true] {
+                            let load = AetherEngine.sessionRoutesAsHDRPanel(
+                                panelPresentsHDR: AetherEngine.sessionPanelPresentsHDR(
+                                    hostAsserts: hostAsserts, criteriaReadout: readout),
+                                attemptWhenUnproven: attempt,
+                                displayEligibleForHDR: eligible,
+                                panelRefusedHDRMaster: refused)
+                            let reload = AetherEngine.reloadRoutesAsHDRPanel(
+                                hostAsserts: hostAsserts,
+                                criteriaReadoutAtLoad: readout,
+                                attemptWhenUnproven: attempt,
+                                displayEligibleForHDR: eligible,
+                                panelRefusedHDRMaster: refused)
+                            #expect(load == reload)
                         }
                     }
                 }
