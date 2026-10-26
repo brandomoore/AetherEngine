@@ -100,7 +100,10 @@ let package = Package(
                 .product(name: "TrueHD", package: "LibTrueHD", condition: .when(traits: ["TrueHDObjectAudio"])),
             ],
             // Silent E-AC-3 Atmos that `AtmosOutputActivator` loops beside an APAC track on tvOS.
-            resources: [.copy("Resources/silent-atmos.mp4")],
+            resources: [
+                .copy("Resources/silent-atmos.mp4"),
+                .process("PrivacyInfo.xcprivacy"),
+            ],
             linkerSettings: [
                 .linkedFramework("AVFoundation"),
                 .linkedFramework("AVKit"),

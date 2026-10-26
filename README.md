@@ -38,6 +38,17 @@ The view is polymorphic: under the hood the engine swaps the hosted CALayer (`AV
 
 You provide the transport bar. You provide the dropdowns. You provide the pretty.
 
+## Privacy manifest
+
+The AetherEngine target includes `PrivacyInfo.xcprivacy` as an explicit Swift
+package resource. It declares app-container cache metadata (`C617.1`), elapsed
+playback/operation timing (`35F9.1`), and disk-capacity checks that constrain
+buffering (`E174.1`). It does not change playback or add data collection.
+
+Hosts must declare their own API use and data practices separately. Binary
+dependencies also need their own applicable manifests; this resource does not
+replace those declarations. Verify the manifests in the final app/archive.
+
 ## Used by
 
 <!-- used-by:start -->
