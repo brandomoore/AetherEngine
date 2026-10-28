@@ -381,6 +381,11 @@ public final class Demuxer: @unchecked Sendable {
     /// #407: video streams whose PTS `+genpts` invented out of decode order, because the container
     /// carries none of its own. Cleared on the way out of `readPacketLocked` so the decoder's reorder
     /// owns the presentation axis. Decided once at open, see `armGeneratedPTSSuppression`.
+    private var aviMPEG4CacheTimingStreams: Set<Int32> = []
+    func usesAVIMPEG4CacheTiming(at index: Int32) -> Bool {
+        streamTableLock.lock(); defer { streamTableLock.unlock() }
+        return aviMPEG4CacheTimingStreams.contains(index)
+    }
     private var generatedPTSStreams: Set<Int32> = []
 
     /// #112 round 11: whether `seekByteEstimate` has what it needs (a resolved byte size and a positive
@@ -1378,6 +1383,7 @@ public final class Demuxer: @unchecked Sendable {
     /// See `VFWDecodeOrderPTSRepair` for why the gate is an equivalence rather than a heuristic.
     private func armGeneratedPTSSuppression(_ ctx: UnsafeMutablePointer<AVFormatContext>) {
         generatedPTSStreams.removeAll()
+        streamTableLock.lock(); aviMPEG4CacheTimingStreams.removeAll(); streamTableLock.unlock()
         guard let nameC = ctx.pointee.iformat?.pointee.name else { return }
         let formatName = String(cString: nameC)
         guard VFWDecodeOrderPTSRepair.containerWithholdsPTS(formatName) else { return }
@@ -1393,6 +1399,9 @@ public final class Demuxer: @unchecked Sendable {
             guard VFWDecodeOrderPTSRepair.suppressesGeneratedPTS(formatName: formatName, shape: shape)
             else { continue }
             generatedPTSStreams.insert(index)
+            if formatName.split(separator: ",").contains("avi"), shape.codecID == AV_CODEC_ID_MPEG4 {
+                streamTableLock.lock(); aviMPEG4CacheTimingStreams.insert(index); streamTableLock.unlock()
+            }
             EngineLog.emit(
                 "[Demuxer] AE#407 stream=\(index) in \(formatName) is FourCC-carried "
                 + "(tag=\(fourCC(par.pointee.codec_tag)) "
@@ -1916,6 +1925,7 @@ public final class Demuxer: @unchecked Sendable {
         let isForced = (disposition & AV_DISPOSITION_FORCED) != 0
         let isHearingImpaired = (disposition & AV_DISPOSITION_HEARING_IMPAIRED) != 0
         let isCommentary = (disposition & AV_DISPOSITION_COMMENT) != 0
+        let isVisualImpaired = (disposition & AV_DISPOSITION_VISUAL_IMPAIRED) != 0
         let channels = Int(codecpar.pointee.ch_layout.nb_channels)
         let bitrate = declaredBitrate(stream: stream)
 
@@ -1949,6 +1959,7 @@ public final class Demuxer: @unchecked Sendable {
             isForced: isForced,
             isHearingImpaired: isHearingImpaired,
             isCommentary: isCommentary,
+            isVisualImpaired: isVisualImpaired,
             isAtmos: isAtmos,
             assHeader: assHeader,
             sampleRate: isAudio ? Int(codecpar.pointee.sample_rate) : 0,
@@ -2192,6 +2203,15 @@ public final class Demuxer: @unchecked Sendable {
             result.append((pts: placed, pos: entry.pointee.pos))
         }
         return result
+    }
+
+    /// Ticks (stream time base) by which a delivered keyframe may precede its `indexedKeyframeEntries`
+    /// timestamp: a #409 repair that synthesizes the decode ladder moves a late-written IDR back onto
+    /// its sequence. 0 when packets sit exactly on the index.
+    var indexedKeyframeAdvanceTicks: Int64 {
+        accessLock.lock()
+        defer { accessLock.unlock() }
+        return compositionRepair?.keyframeAdvanceTicks ?? 0
     }
 
     func readPacket(isCurrent: @Sendable () -> Bool = { true }) throws -> UnsafeMutablePointer<AVPacket>? {

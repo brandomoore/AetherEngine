@@ -2049,6 +2049,7 @@ extension AetherEngine {
         isLive: Bool = false,
         dvrWindowSeconds: Double? = nil,
         preopenedDemuxer: Demuxer?,
+        requiresDeinterlaceWarmup: Bool,
         generation: UInt64,
         elType: String? = nil
     ) async throws {
@@ -2057,10 +2058,11 @@ extension AetherEngine {
         diagnostics.sessionCacheStatus = .inactive
         let deinterlaceMode = loadedOptions.deinterlaceMode
         let waitStarted = DispatchTime.now()
-        if let outcome = await DeinterlaceHardwareWarmup.shared.waitIfNeeded(
-            for: deinterlaceMode
-        ) {
-            try checkLoadCurrent(generation)
+        let warmupOutcome = await DeinterlaceHardwareWarmup.shared.waitIfNeeded(
+            for: deinterlaceMode, sourceIsInterlaced: requiresDeinterlaceWarmup
+        )
+        try checkLoadCurrent(generation)
+        if let outcome = warmupOutcome {
             let elapsed = Double(
                 DispatchTime.now().uptimeNanoseconds - waitStarted.uptimeNanoseconds
             ) / 1_000_000_000
@@ -2131,6 +2133,7 @@ extension AetherEngine {
             self?.publishLiveWindow(edgeSessionTime: edge)
         }
         self.softwareHost = host
+        noteVideoPresentationToHost()
         startSoftwareNowPlaying()
         armHeldPictureRelease(onSoftwareHost: host)
         // #311: a load builds a new host and a new renderer, so an observer installed once by the
@@ -2212,6 +2215,30 @@ extension AetherEngine {
         host.$sourceClockSeconds
             .sink { [weak self] value in
                 self?.clock.sourceTime = value
+            }
+            .store(in: &softwareCancellables)
+        // The pumps pause the synchronizer to refill when the ring runs dry at the live edge (#107) or
+        // the audio lead is exhausted on demand. Folded into `isBuffering` exactly as the audio host's
+        // wait is, so `playbackPhase` reads `.rebuffering` from the moment the clock stops. Before, the
+        // phase stayed `.playing` over a standing picture until the reader's own stall timeout promoted
+        // it to `.stalled`, 20 s later on a live source that merely paused, and a host app watching the
+        // clock reloaded the session in the meantime. Gated on the engine's own `.playing`: a paused
+        // engine refilling stays `.paused`.
+        host.$isRebuffering
+            .sink { [weak self] rebuffering in
+                guard let self else { return }
+                if case .error = self.state { return }
+                self.isBuffering = self.state == .playing && rebuffering
+            }
+            .store(in: &softwareCancellables)
+        // The feeder's catch-up after an edge rebuffer that resumed behind a backlog: the engine's own
+        // rejoin, not a scrub, so it is not bound by the scrubber's contract and lands like the AE#446
+        // outage swap does.
+        host.liveResumeCatchUp
+            .sink { [weak self] target in
+                self?.hop(for: generation) { [weak self] in
+                    await self?.seek(to: target, origin: .liveRejoin)
+                }
             }
             .store(in: &softwareCancellables)
         // AE#440: this path publishes no transport status to latch a roll from, and all of its
@@ -2463,6 +2490,7 @@ extension AetherEngine {
         discTitleIDOverride: Int? = nil,
         resumeOverride: Double? = nil,
         resumePlaying: Bool? = nil,
+        restoredDeinterlaceWarmupDecision: Bool? = nil,
         keepsDisplayRefusedMediaRoute: Bool = false
     ) async -> Error? {
         // Liveness guard: a stop()/load() between scheduling and here would resurrect a dismissed session or kill the successor. Generation captured at schedule time; both stop() and load() invalidate it.
@@ -2494,7 +2522,8 @@ extension AetherEngine {
         }
         // Disc title to reopen with: an explicit override (selectTitle on a custom disc) wins, else the title
         // already playing so an audio switch / background-resume doesn't silently revert to the main title (#67).
-        let titleToReopen = discTitleIDOverride ?? activeDiscTitleID
+        let outgoingDiscTitleID = activeDiscTitleID
+        let titleToReopen = discTitleIDOverride ?? outgoingDiscTitleID
         // resumeOverride 0 restarts a title switch at the new title's head; nil keeps the current playhead.
         // AE#464 round 2: "the current playhead" is not `currentTime` while another load is in flight,
         // which has already zeroed that clock. See `AetherEngine.rebuildPosition`.
@@ -2573,6 +2602,8 @@ extension AetherEngine {
         }
         // Preserve codec so the decoder label can be reconstructed without re-probing.
         let preservedVideoCodec = lastDetectedVideoCodec
+        let preservedRequiresDeinterlaceWarmup =
+            restoredDeinterlaceWarmupDecision ?? lastRequiresDeinterlaceWarmup
         let reloadStart = DispatchTime.now()
         EngineLog.emit("[AetherEngine] reload: stopInternal start", category: .engine)
         // resetDisplayCriteria: false: video format is unchanged; resetting triggers a full waitForSwitch Stage 2 timeout (5 s at the 2026-05-26 device test, ~2 s cap since #117; Bose SLIII A2DP + 4K HDR10 PQ: each switch added ~12 s black-screen). On the same route a panel SDR drop during the reset window failed the PQ variant with AVFoundationErrorDomain -11868 / CoreMediaErrorDomain -17223.
@@ -2623,6 +2654,7 @@ extension AetherEngine {
         defer { endLoadInFlight(gen) }
         loadedURL = url
         lastDetectedVideoCodec = preservedVideoCodec
+        lastRequiresDeinterlaceWarmup = preservedRequiresDeinterlaceWarmup
 
         // Custom sources: no URL to reopen; rebuild on the retained reader. Demuxer opens at byte 0; loadSoftware/loadNative seek to startPosition.
         // Preserve the caller's probe budget (#68) across the reopen so an audio/title switch doesn't re-incur the full find_stream_info cost the caller paid to avoid.
@@ -2715,9 +2747,27 @@ extension AetherEngine {
                 // stopInternal zeroed sourceStartSeconds; recapture the software-path chapter-seek base from
                 // the reopened demuxer so a DVD chapter seek after an audio switch / custom reload still lands
                 // (the native base self-heals via onPlaylistShiftChanged, this one does not). (#67)
-                let st = pre.formatStartTime
-                reopenedStartSeconds = st > 0 ? Double(st) / Double(AV_TIME_BASE) : 0
+                // Same resolved origin as the first load (see sourceStartSeconds).
+                reopenedStartSeconds = pre.resolvedSourceStartOrigin
             }
+        }
+
+        // A same-title custom reload passes its title ID too. Keep any decoded progressive
+        // verdict for that title; only a different title invalidates the saved probe evidence.
+        // A background teardown already cleared the outgoing title; its same-source reload hands
+        // back the parked decision explicitly. An actual title switch never supplies that value.
+        let reopenedRequiresDeinterlaceWarmup: Bool = if restoredDeinterlaceWarmupDecision == nil,
+                                                         titleToReopen != outgoingDiscTitleID,
+                                                         let pre = customPreopened,
+                                                         let stream = pre.stream(at: pre.videoStreamIndex),
+                                                         let codecpar = stream.pointee.codecpar
+        {
+            VideoRoutingPolicy.requiresDeinterlaceWarmup(
+                codecID: codecpar.pointee.codec_id,
+                fieldOrder: codecpar.pointee.field_order,
+                spsIndicatesInterlaced: VideoRoutingPolicy.spsIndicatesInterlaced(codecParameters: codecpar))
+        } else {
+            preservedRequiresDeinterlaceWarmup
         }
 
         do {
@@ -2733,11 +2783,13 @@ extension AetherEngine {
                     isLive: loadedOptions.isLive,
                     dvrWindowSeconds: loadedOptions.dvrWindowSeconds,
                     preopenedDemuxer: customPreopened,
+                    requiresDeinterlaceWarmup: reopenedRequiresDeinterlaceWarmup,
                     generation: gen,
                     elType: sourceElType
                 )
                 EngineLog.emit("[AetherEngine] reload: loadSoftware done (\(elapsedMs(since: loadStart))ms)", category: .engine)
                 playbackBackend = .software
+                lastRequiresDeinterlaceWarmup = reopenedRequiresDeinterlaceWarmup
                 activeAudioTrackIndex = audioStreamIndex.map { Int($0) }
                 activeVideoDecoder = Self.videoDecoderLabel(
                     codecID: preservedVideoCodec,
@@ -2819,6 +2871,7 @@ extension AetherEngine {
                 )
                 EngineLog.emit("[AetherEngine] reload: loadNative done (\(elapsedMs(since: loadStart))ms)", category: .engine)
                 playbackBackend = .native
+                lastRequiresDeinterlaceWarmup = reopenedRequiresDeinterlaceWarmup
                 // Publish the session's actual pick (invalid override falls back to auto; demuxed-audio resolves in side-demuxer numbering).
                 syncPublishedAudioStateFromNativeSession()
                 activeVideoDecoder = Self.videoDecoderLabel(
@@ -3022,16 +3075,21 @@ extension AetherEngine {
 // Shared by picture ticks and the independent cache sampler. A paused picture
 // keeps its source-axis position while the real contiguous cache can advance.
 extension AetherEngine {
-    func refreshNativeBufferedPosition(playlistSeconds value: Double) {
+    func refreshNativeBufferedPosition(playlistSeconds rendered: Double) {
+        // A native seek publishes its target as `currentTime` up front and holds it there until the
+        // picture lands, while AVPlayer still renders the frame it left. Measuring from that frame put
+        // the buffer on another axis than the playhead: thousands of seconds "ahead" after a backward
+        // scrub, below the playhead after a forward one (StreamX, 7.48.0). Measure from the target.
+        let value = pendingRecoverySeekClockTarget ?? rendered
         let shift = presentationAxis.shiftSeconds(atItemSeconds: value)
             ?? playlistShiftSeconds
-        let renderedDisplay = isLive && videoRoute == .loopback
+        let anchorDisplay = isLive && videoRoute == .loopback
             ? value + liveSessionShiftSeconds + liveItemAxisOffsetSeconds
             : PresentationAxis.display(
                 sourcePTS: value + shift, origin: displayOrigin(forShift: shift))
         let readAhead = nativeVideoSession?
             .contiguousForwardReadAheadSeconds(playlistSeconds: value) ?? 0
-        clock.bufferedPosition = renderedDisplay + max(0, readAhead)
+        clock.bufferedPosition = max(clock.currentTime, anchorDisplay + max(0, readAhead))
     }
 }
 

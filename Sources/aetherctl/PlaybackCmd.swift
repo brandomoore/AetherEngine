@@ -994,11 +994,19 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
         && hostCalls.allSatisfy { $0 == "play" } && (!pausedMount || hostCalls == ["play"])
         && audioSwitch == nil ? startPosition : nil
     var resumeLowest: Double?
+    // AE#909: how far the clock ran during the run, not where it ended. A session resumed at 120 s
+    // that never left loading ended at 120.00 and passed a check against the final time. Each tick
+    // counts at most two seconds, so a drill's own seek forward is not mistaken for playback.
+    var clockAdvance = 0.0
+    var previousTickTime: Double? = engine.currentTime
     for tick in 1...ticks {
         try? await Task.sleep(nanoseconds: 1_000_000_000)
         if resumeAnchor != nil, tick <= 3 {
             resumeLowest = min(resumeLowest ?? .infinity, engine.currentTime)
         }
+        let tickTime = engine.currentTime
+        if let previousTickTime { clockAdvance += max(0, min(tickTime - previousTickTime, 2.0)) }
+        previousTickTime = tickTime
         var line = String(format: "  t=%02d state=%@ phase=%@ cur=%.2f src=%.2f buf=%.2f dur=%.1f",
                           tick,
                           String(describing: engine.state),
@@ -1551,7 +1559,9 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
                      + "the first sample re-anchored the session backwards", resumeAnchor, resumeLowest))
         return 2
     }
-    if finalTime <= 3.0 {
+    // A mount held paused with nothing to start it is meant to stand still (the AE#724 paused-only arm).
+    let clockShouldRun = !pausedMount || hostCalls.contains("play")
+    if clockShouldRun, clockAdvance <= 3.0 {
         if let audioSwitch {
             // #337: the wedge signature. state stays .playing with a first frame on screen, so the
             // only thing that separates it from a healthy session is this clock.
@@ -1560,7 +1570,8 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
                   + "(state=\(String(describing: endState))); the rebuilt session never armed its clock")
             return 2
         }
-        print("VERDICT: clock did not advance (t=\(String(format: "%.2f", finalTime))s); transport stalled after load")
+        print("VERDICT: clock did not advance (t=\(String(format: "%.2f", finalTime))s, "
+              + "ran \(String(format: "%.2f", clockAdvance))s); transport stalled after load")
         return 2
     }
     if let audioSwitch {

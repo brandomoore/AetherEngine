@@ -67,6 +67,7 @@ public final class AetherEngine: ObservableObject {
             ) {
                 // AE#870: a retained paused session skipped the background policy, so a resume in the
                 // background (lock screen, Control Center, AVKit) owes the playing-session decision.
+                // A seek or reload can resume while in flight, so it owes the settled decision too.
                 backgroundActionOwed = true
             }
             settleOwedBackgroundAction()
@@ -760,9 +761,11 @@ public final class AetherEngine: ObservableObject {
     /// background-resume reopens (a URL-disc reopen with no id would silently revert to the main title).
     var activeDiscTitleID: Int?
 
-    /// Source container start PTS (seconds) from the probe (AVFormatContext.start_time). The software-path
-    /// playback clock begins here (the native path's content base is `playlistShiftSeconds`), so a DVD
-    /// chapter seek adds it to the chapter's title-relative (0-based) target. 0 when unknown (#67).
+    /// Source start PTS (seconds) the software host anchors its clock on: the demuxer's resolved origin
+    /// (`Demuxer.resolvedSourceStartOrigin`: the container start, backed up by the video stream's own
+    /// start when the container states none). `PresentationAxis.discChapterSeekTarget` needs the same
+    /// origin the host derives its session zero from, so the part of it the zero did not take can be
+    /// added to a DVD chapter's title-relative (0-based) target. 0 when unknown (#67).
     var sourceStartSeconds: Double = 0
 
     /// Active playback backend: `.native` (AVPlayer) or `.software` (SoftwarePlaybackHost/dav1d/libavcodec).
@@ -944,6 +947,7 @@ public final class AetherEngine: ObservableObject {
             // SW-PiP Phase C: flip the frame compositor with the PiP state so subtitles appear in the
             // window and never double-draw under the fullscreen host overlay.
             softwareHost?.updateSubtitleCompositor(cues: subtitleCues + secondarySubtitleCues, enabled: pictureInPictureActive, delaySeconds: softwareSubtitleDelaySeconds)
+            noteVideoPresentationToHost()
             #if os(tvOS)
             // PiP window closed while backgrounded: nothing keeps the app running anymore, so the
             // wedge-safe teardown is due before idle suspension (mirrors the iOS pause-while-backgrounded path).
@@ -1331,11 +1335,15 @@ public final class AetherEngine: ObservableObject {
 
     /// AE#870: `retainsVideoPipelineWhenBackgrounded` answers only for a paused session. One that
     /// resumes while still backgrounded gets the playing-session policy (teardown with background
-    /// playback off, software audio-only), whichever transport owner started it.
+    /// playback off, software audio-only), whichever transport owner started it. A seek or reload can
+    /// carry a later play request, and remote-HLS autoplay has no paused readiness waypoint. Owe the
+    /// decision when leaving the retained pause; `backgroundDecisionMustWait` defers it until the
+    /// operation settles into its final transport state.
     nonisolated static func backgroundPolicyIsOwedOnResume(
         isBackgrounded: Bool, retainsPausedPipeline: Bool, from: PlaybackState, to: PlaybackState
     ) -> Bool {
-        isBackgrounded && retainsPausedPipeline && from == .paused && to == .playing
+        isBackgrounded && retainsPausedPipeline && from == .paused
+            && (to == .playing || to == .seeking || to == .loading)
     }
 
     /// #127: how to execute a BackgroundAction. A PAUSED teardown on platforms with quick app switches
@@ -2557,6 +2565,8 @@ public final class AetherEngine: ObservableObject {
     /// Latched at load; reused by audio-track-switch reload to re-derive activeVideoDecoder without re-probing.
     /// Reset to AV_CODEC_ID_NONE in stopInternal.
     var lastDetectedVideoCodec: AVCodecID = AV_CODEC_ID_NONE
+    /// Preserved through same-source reloads; cleared when the session stops.
+    var lastRequiresDeinterlaceWarmup = false
 
     /// In-flight probe demuxer. Registered before the detached open so stopInternal can markClosed() it:
     /// without this, player dismissal/channel zapping left the probe reconnecting through subsequent sessions.
@@ -3915,11 +3925,17 @@ public final class AetherEngine: ObservableObject {
     /// unobservable; see `SubtitleDeliveryStatement.EventBudget`.
     var subtitleCueDiagnosticBudget = SubtitleDeliveryStatement.EventBudget()
 
-    /// Trailing retention window for subtitleCues (seconds). Bounds bitmap-cue (PGS/DVB/DVD) memory:
-    /// each cue retains a decoded RGBA CGImage; a 2-hr Blu-ray PGS track emits ~1500-2000 cues.
-    /// 300 s covers normal pause durations and backward-scrub reach that doesn't trigger a restart;
-    /// evicted cues are re-emitted after a producer restart (fresh EmbeddedSubtitleDecoder, empty dedupe set).
+    /// Trailing retention window for subtitleCues (seconds). Evicted cues come back when a backward
+    /// seek re-decodes its window from the packet store. Bitmap cues are bounded by bytes as well,
+    /// see `subtitleCueBitmapByteBudget`.
     let subtitleCueRetentionSeconds: Double = 300
+
+    /// AE#879: ceiling on the decoded RGBA bytes of retained bitmap cues (PGS/DVB/DVD), enforced only
+    /// on cues that ended more than `subtitleCueBitmapFloorSeconds` behind the playhead.
+    nonisolated static let subtitleCueBitmapByteBudget = 64 * 1024 * 1024
+    /// AE#879: history the byte budget never evicts, so a host-side subtitle offset still finds its
+    /// cue without a seek. Well past any delay a host offers (Sodalite: +/-10 s per title).
+    nonisolated static let subtitleCueBitmapFloorSeconds: Double = 60
 
     /// #357: shortest window that can only be FFmpeg's open-ended placeholder, not an authored
     /// duration. A PGS composition carries no end of its own, so the decoder stamps it with
@@ -4021,7 +4037,6 @@ public final class AetherEngine: ObservableObject {
         FFmpegLogBridge.install()
         // Which FFmpeg answers is decided by the host's link, not by the package graph (AE#396).
         FFmpegRuntimeCheck.logOnce()
-        _ = DeinterlaceHardwareWarmup.shared
 
         // The category is declared off-main at the first load, once per process (#114), and the session
         // is never activated here: AVKit owns native playback activation (#24).
@@ -4963,10 +4978,10 @@ public final class AetherEngine: ObservableObject {
         republishMediaChapters()
         activeDiscTitleID = probeOpened ? probe.selectedDiscTitleID : nil
         selectedDiscTitle = activeDiscTitleID.flatMap { id in discTitles.first { $0.id == id } }
-        // Content start PTS for the software-path chapter-seek base (see sourceStartSeconds). start_time is
-        // AV_NOPTS_VALUE (Int64.min) when unknown; only a positive value is a real offset.
-        let probedStartTime = probeOpened ? probe.formatStartTime : 0
-        sourceStartSeconds = probedStartTime > 0 ? Double(probedStartTime) / Double(AV_TIME_BASE) : 0
+        // Source start PTS for the software-path chapter-seek base (see sourceStartSeconds): the same
+        // resolved origin the software host predicts its session zero from, so engine and host agree even
+        // when the container states no start and only the video stream carries one.
+        sourceStartSeconds = probeOpened ? probe.resolvedSourceStartOrigin : 0
         // Assemble SourceProbe now while the demuxer is open; ownership transfers to loadNative/loadSoftware
         // after which streams are gone (AetherEngine#28).
         let sourceProbe: SourceProbe? = probeOpened
@@ -5308,10 +5323,8 @@ public final class AetherEngine: ObservableObject {
         if detectedCodecID == AV_CODEC_ID_H264, detectedFieldOrder == AV_FIELD_UNKNOWN,
            probeOpened,
            let vStream = probe.stream(at: probe.videoStreamIndex),
-           let codecpar = vStream.pointee.codecpar,
-           let extradata = codecpar.pointee.extradata, codecpar.pointee.extradata_size > 0 {
-            let bytes = Array(UnsafeBufferPointer(start: extradata, count: Int(codecpar.pointee.extradata_size)))
-            spsIndicatesInterlaced = VideoRoutingPolicy.spsIndicatesInterlaced(extradata: bytes)
+           let codecpar = vStream.pointee.codecpar {
+            spsIndicatesInterlaced = VideoRoutingPolicy.spsIndicatesInterlaced(codecParameters: codecpar)
             if spsIndicatesInterlaced {
                 EngineLog.emit(
                     "[AetherEngine] fieldOrder=UNKNOWN but SPS frame_mbs_only_flag=0; "
@@ -5413,7 +5426,16 @@ public final class AetherEngine: ObservableObject {
             let vIdx = probe.videoStreamIndex
             elType = await BlockingWork.detached(priority: .userInitiated) { [probe] in
                 let result = DolbyVisionRecordAudit.probeEnhancementLayerType(demuxer: probe, streamIndex: vIdx)
-                probe.seek(to: 0)
+                // The session reuses this demuxer, so a type read from a position that cannot be
+                // restored is worth nothing: a seek that stalls leaves the type unknown, and the
+                // route is not taken.
+                guard probe.seekBounded(to: 0, timeout: Self.probeRewindSeekTimeout) else {
+                    EngineLog.emit(
+                        "[AetherEngine] el_type probe could not rewind the source within "
+                        + "\(Int(Self.probeRewindSeekTimeout)) s; enhancement layer type unknown",
+                        category: .engine)
+                    return nil
+                }
                 return result
             }.value
             if loadGeneration != gen {
@@ -5453,6 +5475,9 @@ public final class AetherEngine: ObservableObject {
             canHardwareDecode: opensHardwareHEVC,
             elType: elType
         )
+        var requiresDeinterlaceWarmup = VideoRoutingPolicy.requiresDeinterlaceWarmup(
+            codecID: detectedCodecID, fieldOrder: detectedFieldOrder,
+            spsIndicatesInterlaced: spsIndicatesInterlaced)
         // #232: a declared interlaced field order is not evidence that any frame IS interlaced.
         // European 25 fps Blu-ray masters ship as 1080i25 (there is no 1080p25): interlaced carriage,
         // progressive pictures, and FFmpeg's parser reports TT for them off SEI pic_struct alone while
@@ -5486,6 +5511,7 @@ public final class AetherEngine: ObservableObject {
             }
             if InterlaceProbe.refutesDeclaredInterlace(verdict) {
                 useSoftwarePath = false
+                requiresDeinterlaceWarmup = false
                 EngineLog.emit(
                     "[AetherEngine] declared interlaced (fieldOrder=\(detectedFieldOrder.rawValue)) but "
                     + "\(verdict); the deinterlacer would never engage, routing native for HW decode (#232)",
@@ -5513,23 +5539,25 @@ public final class AetherEngine: ObservableObject {
            let vStream = probe.stream(at: probe.videoStreamIndex),
            let codecpar = vStream.pointee.codecpar {
             let dvProfile = Self.dvProfile(stream: vStream)
-            let forcesSoftware = {
-                VideoRoutingPolicy.forcesSoftwareForUndecodableFormat(
-                   codecID: detectedCodecID,
-                   // A Profile 5 record served as its base layer plays as plain HEVC, which is what
-                   // the raw-hvcC probe judges; the exemption is for the dvh1 route it is not on.
-                   // AE#532: a record the RPU corrected is not on that route either, and its base layer
-                   // is standard Main10, so the gate judges it the way it judges any Profile 7 / 8.
-                   dvProfile: presentsDolbyVisionBaseLayer ? nil : (correctedDVProfile ?? dvProfile),
-                   canHardwareDecode: { VTCapabilityProbe.canHardwareDecode(codecpar: codecpar) })
-            }
-            var routesSoftware = forcesSoftware()
+            // A Profile 5 record served as its base layer plays as plain HEVC, which is what
+            // the raw-hvcC probe judges; the exemption is for the dvh1 route it is not on.
+            // AE#532: a record the RPU corrected is not on that route either, and its base layer
+            // is standard Main10, so the gate judges it the way it judges any Profile 7 / 8.
+            let gateDVProfile = presentsDolbyVisionBaseLayer ? nil : (correctedDVProfile ?? dvProfile)
+            // AE#883: called in place rather than through a stored closure. Swift 6.2 infers a stored local
+            // closure main-actor and rejects it capturing `codecpar` ("sending risks causing data races");
+            // a non-escaping argument is not sent.
+            var routesSoftware = VideoRoutingPolicy.forcesSoftwareForUndecodableFormat(
+                codecID: detectedCodecID, dvProfile: gateDVProfile,
+                canHardwareDecode: { VTCapabilityProbe.canHardwareDecode(codecpar: codecpar) })
             // AE#348: with the pre-flight gate beside the load, this probe's throwaway session can open while
             // the panel switches, which the serial order never did. Only a refusal changes the route, so a
             // refusal taken then is asked again once the panel has settled, where the serial order asked it.
             if routesSoftware, !panelRoutingSettled {
                 try await settlePanelRouting(ownsProbe: true)
-                routesSoftware = forcesSoftware()
+                routesSoftware = VideoRoutingPolicy.forcesSoftwareForUndecodableFormat(
+                    codecID: detectedCodecID, dvProfile: gateDVProfile,
+                    canHardwareDecode: { VTCapabilityProbe.canHardwareDecode(codecpar: codecpar) })
             }
             if routesSoftware {
                 useSoftwarePath = true
@@ -5692,10 +5720,12 @@ public final class AetherEngine: ObservableObject {
                     isLive: options.isLive,
                     dvrWindowSeconds: options.dvrWindowSeconds,
                     preopenedDemuxer: probeOpened ? probe : nil,
+                    requiresDeinterlaceWarmup: requiresDeinterlaceWarmup,
                     generation: gen,
                     elType: elType
                 )
                 playbackBackend = .software
+                lastRequiresDeinterlaceWarmup = requiresDeinterlaceWarmup
                 // AE#550: the one thing a viewer on a receiver needs said out loud. This backend's
                 // picture cannot leave the device, so a wireless route carries the sound alone, and
                 // the report that opened this was someone hearing a film they could not see.
@@ -5783,6 +5813,8 @@ public final class AetherEngine: ObservableObject {
                     }
                 )
                 playbackBackend = .native
+                // Preserve source evidence for a later native-to-software recovery.
+                lastRequiresDeinterlaceWarmup = requiresDeinterlaceWarmup
                 activeVideoDecoder = Self.videoDecoderLabel(
                     codecID: detectedCodecID, isSoftware: false
                 )
@@ -5932,6 +5964,11 @@ public final class AetherEngine: ObservableObject {
         if state == .paused || state == .loading {
             state = .playing
         }
+        // #882: the software pumps keep their rebuffer hold across a pause, and pause() cleared the level,
+        // so a play into a hold carries no edge. Re-read it, or the phase reads `.playing` until the hold ends.
+        if let softwareHost {
+            isBuffering = state == .playing && softwareHost.isRebuffering
+        }
         // A resume that leaves `state` at `.playing` (the end of an audio interruption) restarts the
         // renderer without a state change; the Atmos output activator follows the renderer, so tell it.
         atmosOutputActivator?.refresh()
@@ -6034,7 +6071,8 @@ public final class AetherEngine: ObservableObject {
                 audioStreamIndex: selection.audioTrackIndex.map { Int32($0) },
                 expectedGeneration: loadGeneration,
                 discTitleIDOverride: selection.discTitleID,
-                resumePlaying: loadedOptions.autoplay
+                resumePlaying: loadedOptions.autoplay,
+                restoredDeinterlaceWarmupDecision: selection.requiresDeinterlaceWarmup
             )
             // AE#460 follow-up: a rebuild that died leaves the session in `.error`, and this branch
             // used to return as if it had come back, so `reloadAtCurrentPosition(applying:)`
@@ -6404,6 +6442,7 @@ public final class AetherEngine: ObservableObject {
             // #93 retest: remember the target as recovery intent BEFORE awaiting; a wedged seek
             // never lands and the recovery chain must aim here, not at the frozen clock.
             setPendingRecoverySeekTarget(clockTarget)
+            refreshNativeBufferedPosition()
             pendingSeekProgressAccum = 0
             let renderedAtSeekStart = nativeHost?.renderedTime ?? 0
             pendingSeekInitialRenderedPosition = renderedAtSeekStart
@@ -7764,6 +7803,10 @@ public final class AetherEngine: ObservableObject {
 
         EngineLog.emit("[AetherEngine] selectTitle: scheduling switch to title \(id)", category: .engine)
         let gen = loadGeneration
+        // Stream indices are per title, so an initial subtitle track id named for the old title could
+        // activate an unrelated track on the new one. Drop it here (both reload paths read loadedOptions);
+        // the language preference decides on the new title.
+        loadedOptions.initialSubtitleTrackID = nil
         let options = loadedOptions
         let custom = isCustomSource
         Task { @MainActor [weak self] in
@@ -7829,15 +7872,18 @@ public final class AetherEngine: ObservableObject {
             return
         }
         // discChapters are title-relative (0-based: chapter 1 = 0), matching the disc timeline and the
-        // 0-based title duration. The engine clock and seek(to:) run on the source-PTS axis, which begins at
-        // the title's content start; that base differs by backend (native re-times onto a 0-based playlist
-        // shifted by playlistShiftSeconds; the software path's raw clock begins at the container start,
-        // sourceStartSeconds). Add it so the seek lands on the chapter, not the base seconds early.
-        let base = (playbackBackend == .software) ? sourceStartSeconds : playlistShiftSeconds
-        let target = chapter.startSeconds + base
+        // 0-based title duration. `seek(to:)` takes the published axis of the active backend, which differs
+        // by backend (native re-times onto a 0-based playlist shifted by playlistShiftSeconds; the software
+        // path's published axis is the clock's session zero off the raw container start, so only the part of
+        // sourceStartSeconds the zero did not take is added, see `PresentationAxis.discChapterSeekTarget`).
+        let target = PresentationAxis.discChapterSeekTarget(
+            chapterStart: chapter.startSeconds, backend: playbackBackend,
+            sourceStartSeconds: sourceStartSeconds, playlistShiftSeconds: playlistShiftSeconds,
+            softwareClockZero: softwareClockSessionZero)
+        let base = target - chapter.startSeconds
         EngineLog.emit(
             "[AetherEngine] selectChapter: seeking to chapter \(id) @ title-relative "
-            + "\(String(format: "%.2f", chapter.startSeconds))s -> source \(String(format: "%.2f", target))s "
+            + "\(String(format: "%.2f", chapter.startSeconds))s -> seek target \(String(format: "%.2f", target))s "
             + "(base \(String(format: "%.2f", base))s, backend \(playbackBackend))",
             category: .engine
         )
@@ -8167,6 +8213,7 @@ public final class AetherEngine: ObservableObject {
         activeVideoDecoder = nil
         activeAudioDecoder = nil
         lastDetectedVideoCodec = AV_CODEC_ID_NONE
+        lastRequiresDeinterlaceWarmup = false
         playlistShiftSeconds = 0
         liveDisplayShiftSeconds = nil
         // AE#105 / AE#270: the display origin belongs to the session that published it. Clearing it here
@@ -8302,6 +8349,7 @@ public final class AetherEngine: ObservableObject {
                 self.isBackgrounded = false
                 if returnedFromBackground { Self.clearPanelRefusalOnForegroundReturn() }
                 self.backgroundActionOwed = false
+                self.noteVideoPresentationToHost()
             }
         }
         lifecycleObservers.append(fgObserver)
@@ -8450,6 +8498,15 @@ public final class AetherEngine: ObservableObject {
     func noteDidEnterBackground() {
         isBackgrounded = true
         backgroundActionOwed = backgroundDecisionMustWait
+        noteVideoPresentationToHost()
+    }
+
+    /// Tells the software host whether a refused video rebuild may be retried now. A backgrounded app with
+    /// picture-in-picture on still shows the picture, and the software host keeps decoding for it, so only
+    /// a background with no picture window counts as "nothing is showing video". Also called when a load
+    /// installs a new host, which would otherwise start out believing it is on screen.
+    func noteVideoPresentationToHost() {
+        softwareHost?.noteAppInBackground(isBackgrounded && !pictureInPictureActive)
     }
 
     /// Audit LIF-105: the PiP window closed while backgrounded, so nothing keeps the app running and

@@ -144,22 +144,25 @@ extension AetherEngine {
         )
     }
 
-    /// Apply `LoadOptions.preferredSubtitleLanguages` at the end of a successful load: activate the best-ranked
-    /// subtitle track whose language matches a preference (scanned in order; see `selectSubtitleIndex`), else
-    /// leave subtitles off (the default). Uses the host-overlay path (equivalent to a `selectSubtitleTrack`
-    /// call); `startAnchor` is the
+    /// Apply `LoadOptions.initialSubtitleTrackID`, else `LoadOptions.preferredSubtitleLanguages`, at the end of a
+    /// successful load: activate the track the id names, else the best-ranked subtitle track whose language
+    /// matches a preference (scanned in order; see `selectSubtitleIndex`), else leave subtitles off (the default).
+    /// Uses the host-overlay path (equivalent to a `selectSubtitleTrack` call); `startAnchor` is the
     /// load's resume position so a mid-file resume seeks the side demuxer to the playhead instead of byte 0.
-    /// A no-op when the list is empty, no track matches, or the host already activated a subtitle. The resolved
+    /// A no-op when neither an id nor a language list is set, nothing matches, or the host already activated a subtitle. The resolved
     /// index is published via `activeSubtitleTrackIndex`. Independent of `prepareNativeSubtitles`. (#73)
     func applyPreferredSubtitleSelection(startAnchor: Double?, sourceDuration: Double?) {
-        guard !loadedOptions.preferredSubtitleLanguages.isEmpty, !isSubtitleActive,
-              !hostExplicitSubtitleAction else { return }
-        guard let index = Self.selectSubtitleIndex(
+        guard loadedOptions.initialSubtitleTrackID != nil || !loadedOptions.preferredSubtitleLanguages.isEmpty,
+              !isSubtitleActive, !hostExplicitSubtitleAction else { return }
+        guard let index = Self.resolveInitialSubtitleIndex(
             tracks: subtitleTracks,
+            initialTrackID: loadedOptions.initialSubtitleTrackID,
             preferredLanguages: loadedOptions.preferredSubtitleLanguages
         ) else { return }
         EngineLog.emit(
-            "[AetherEngine] preferred-subtitle auto-select stream=\(index) langs=\(loadedOptions.preferredSubtitleLanguages)",
+            "[AetherEngine] preferred-subtitle auto-select stream=\(index) "
+            + "initialID=\(loadedOptions.initialSubtitleTrackID.map(String.init) ?? "nil") "
+            + "langs=\(loadedOptions.preferredSubtitleLanguages)",
             category: .engine
         )
         // Bound the anchor to the probe duration (synchronously known here; the published `duration` is set
@@ -638,9 +641,14 @@ extension AetherEngine {
             }
             // Retention prune, once per batch instead of once per event: it depends only on the
             // playhead, which the batch does not move.
-            if isSubtitleActive(for: channel),
-               Self.pruneCues(&cues, before: playhead - subtitleCueRetentionSeconds) {
-                didMutate = true
+            if isSubtitleActive(for: channel) {
+                if Self.pruneCues(&cues, before: playhead - subtitleCueRetentionSeconds) {
+                    didMutate = true
+                }
+                if Self.pruneCues(&cues, toBitmapBytes: Self.subtitleCueBitmapByteBudget,
+                                  endedBefore: playhead - Self.subtitleCueBitmapFloorSeconds) {
+                    didMutate = true
+                }
             }
             if didMutate { publishRetainedSubtitleCues(cues, for: channel) }
             // #357: state what the tick did before the resolution line states how far it reached.
@@ -1372,6 +1380,29 @@ extension AetherEngine {
         return cues.count != before
     }
 
+    /// AE#879: bound the decoded bitmap history behind the playhead by bytes. A dense PGS track
+    /// retains thousands of full-RGBA images inside the 300 s window (reported: 2,207 cues, 290 MB),
+    /// most of them already behind the viewer. Cues that ended before `cutoff` are dropped oldest end
+    /// first until the bitmap total fits `budget`; cues past it (the offset floor and everything
+    /// ahead) are never touched, so the total can stay above budget. A backward seek re-decodes its
+    /// window from the packet store (`.resetAndDecode`), which is what brings an evicted cue back.
+    nonisolated static func pruneCues(_ cues: inout [SubtitleCue], toBitmapBytes budget: Int,
+                                      endedBefore cutoff: Double) -> Bool {
+        var total = cues.reduce(0) { $0 + $1.bitmapBytes }
+        guard total > budget else { return false }
+        let evictable = cues.indices
+            .filter { cues[$0].endTime < cutoff && cues[$0].bitmapBytes > 0 }
+            .sorted { cues[$0].endTime < cues[$1].endTime }
+        var drop = Set<Int>()
+        for index in evictable where total > budget {
+            total -= cues[index].bitmapBytes
+            drop.insert(index)
+        }
+        guard !drop.isEmpty else { return false }
+        cues = cues.enumerated().filter { !drop.contains($0.offset) }.map(\.element)
+        return true
+    }
+
 
     // MARK: - External subtitle tracks (#88)
 
@@ -1393,9 +1424,10 @@ extension AetherEngine {
     /// Register an external subtitle file as a first-class track (AetherEngine#88): it appears in
     /// `subtitleTracks` with a synthetic id and `isExternal == true` and is selectable via
     /// `selectSubtitleTrack(index:)`. Overlay-only (no native WebVTT rendition / PiP); declare via
-    /// `LoadOptions.externalSubtitles` for rendition eligibility. If `preferredSubtitleLanguages`
-    /// is set, nothing is active, and the host made no explicit choice yet, the preference re-runs
-    /// so a late-added matching track auto-activates.
+    /// `LoadOptions.externalSubtitles` for rendition eligibility. If `initialSubtitleTrackID` or
+    /// `preferredSubtitleLanguages` is set, nothing is active, and the host made no explicit choice
+    /// yet, the selection re-runs so a late-added track that matches the id or the preference
+    /// auto-activates.
     @discardableResult
     public func addExternalSubtitleTrack(_ track: ExternalSubtitleTrack) -> TrackInfo {
         let info = registerExternalSubtitleTrack(track)
