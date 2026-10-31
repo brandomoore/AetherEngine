@@ -9,6 +9,9 @@
 - Bound SDR NV12/BGRA analysis to 2 Hz, a 320 x 180 grid, and one serial worker
   admitting at most four sessions. Software snapshots include PTS/flush identity;
   native sampling uses the existing AVPlayer item without suppressing rendering.
+- Native SDR sampling requests CPU-readable 8-bit NV12. AVFoundation may
+  materialize or decompress that output from its preferred compressed surface;
+  the analysis limit is not a bound on that system-side cost.
 - Preserve playback pipelines. HDR/Dolby Vision analysis, nonidentity native
   display transforms, PiP and external playback currently return unknown.
   Detection is best effort, not a guarantee that borders contain no edge content.

@@ -166,7 +166,11 @@ final class ActivePictureAnalysis {
         if let player = engine.currentAVPlayer, let currentItem = player.currentItem {
             if item !== currentItem {
                 item = currentItem
-                let newOutput = AVPlayerItemVideoOutput(outputSettings: nil)
+                // Native SDR output can otherwise be losslessly compressed and
+                // unavailable to a bounded CPU luma reader.
+                let newOutput = AVPlayerItemVideoOutput(pixelBufferAttributes: [
+                    kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+                ])
                 newOutput.suppressesPlayerRendering = false
                 currentItem.add(newOutput)
                 output = newOutput
