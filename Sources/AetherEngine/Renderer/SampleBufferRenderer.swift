@@ -37,7 +37,8 @@ final class SampleBufferRenderer: @unchecked Sendable {
 
     /// B-frame reorder buffer: collects decoder output, flushes to display layer in ascending PTS order. Third tuple slot carries per-frame HDR10+ T.35 SEI bytes, paired through the reorder to kCMSampleAttachmentKey_HDR10PlusPerFrameData.
     private let reorderLock = NSLock()
-    private var reorderBuffer: [(CVPixelBuffer, CMTime, Data?)] = []
+    private var reorderBuffer: [(CVPixelBuffer, CMTime, Data?, UInt64?)] = []
+    let activePictureTimeline = ActivePictureTimeline()
 
     /// Audit PERF-104: VideoToolbox HEVC with temporal processing emits B-frames out of presentation
     /// order (19479fc5, -12080 from the layer), so its renderer holds 4 frames, enough for 3
@@ -665,6 +666,7 @@ final class SampleBufferRenderer: @unchecked Sendable {
     }
 
     #if DEBUG
+    var beforeActivePictureHandoverForTesting: (@Sendable () -> Void)?
     /// Holds the demux loop in its back-pressure wait on demand.
     var readyForMoreMediaDataForTesting: (@Sendable () -> Bool)? {
         get { testAnswerLock.lock(); defer { testAnswerLock.unlock() }; return _readyForMoreMediaDataForTesting }
@@ -683,6 +685,7 @@ final class SampleBufferRenderer: @unchecked Sendable {
     func recoverAfterSuspensionIfNeeded() {
         let status = resumeQueue?.status() ?? queueStatus
         guard status == .failed else { return }
+        activePictureTimeline.invalidate()
         EngineLog.emit("[Renderer] AE#870 queue target failed while paused (\(queueError?.localizedDescription ?? "nil")), flushing before the feeder resumes", category: .swPlayback)
         if let resumeQueue {
             resumeQueue.flush()
@@ -822,16 +825,16 @@ final class SampleBufferRenderer: @unchecked Sendable {
         let insertIdx = reorderBuffer.firstIndex(where: {
             CMTimeGetSeconds($0.1) > ptsSeconds
         }) ?? reorderBuffer.endIndex
-        reorderBuffer.insert((pixelBuffer, pts, hdr10PlusData), at: insertIdx)
+        reorderBuffer.insert((pixelBuffer, pts, hdr10PlusData, activePictureTimeline.generation(at: ptsSeconds)), at: insertIdx)
 
         while reorderBuffer.count > reorderDepth {
-            let (pb, t, hdr) = reorderBuffer.removeFirst()
+            let (pb, t, hdr, analysisGeneration) = reorderBuffer.removeFirst()
             _lastReleasedPtsSeconds = CMTimeGetSeconds(t)
             // #407: the successor is already held, so its timestamp is the frame's exact duration at
             // no extra latency. Read before the unlock, since enqueue() runs on the decode thread.
             let next = reorderBuffer.first?.1
             reorderLock.unlock()
-            flushFrame(pixelBuffer: pb, pts: t, hdr10PlusData: hdr, nextPTS: next)
+            flushFrame(pixelBuffer: pb, pts: t, hdr10PlusData: hdr, analysisGeneration: analysisGeneration, nextPTS: next)
             reorderLock.lock()
         }
 
@@ -875,10 +878,11 @@ final class SampleBufferRenderer: @unchecked Sendable {
         let belowCount = _framesBelowFloor
         let floor = arrivalFloor?.floor
         let generation = _flushGeneration
+        let analysisGeneration = activePictureTimeline.generation(at: ptsSeconds)
         reorderLock.unlock()
 
         flushFrame(pixelBuffer: pixelBuffer, pts: pts, hdr10PlusData: hdr10PlusData,
-                   displayOrderSpacing: step.contiguous)
+                   analysisGeneration: analysisGeneration, displayOrderSpacing: step.contiguous)
         if let raised = step.raisedFloor, #available(visionOS 1.1, *) {
             let source = CMTime(seconds: raised, preferredTimescale: 90_000)
             // A flush in between dropped this promise along with the frames it covered; setting it
@@ -902,6 +906,11 @@ final class SampleBufferRenderer: @unchecked Sendable {
     /// rebuild to hold when the layer cannot say what it is showing (off screen, or before tvOS 17.4's
     /// readback has anything). At most one buffer, released by `flush`.
     private var _lastEnqueuedFrame: CVPixelBuffer?
+    private var _activePictureFrame: ActivePictureFrame?
+    var activePictureFrame: ActivePictureFrame? {
+        reorderLock.lock(); defer { reorderLock.unlock() }
+        return _activePictureFrame
+    }
     var lastEnqueuedFrame: CVPixelBuffer? {
         reorderLock.lock(); defer { reorderLock.unlock() }
         return _lastEnqueuedFrame
@@ -920,6 +929,8 @@ final class SampleBufferRenderer: @unchecked Sendable {
         reorderBuffer.removeAll()
         _pendingPresentation.removeAll()
         _lastEnqueuedFrame = nil
+        _activePictureFrame = nil
+        activePictureTimeline.invalidate()
         // #407: the next frame handed over will not follow the last one, so the gap between them is
         // not a cadence measurement. Left standing, every seek would report one enormous interval.
         _lastHandedPtsSeconds = nil
@@ -958,12 +969,12 @@ final class SampleBufferRenderer: @unchecked Sendable {
         if let newest = remaining.last { _lastReleasedPtsSeconds = CMTimeGetSeconds(newest.1) }
         reorderLock.unlock()
 
-        for (i, (pb, t, hdr)) in remaining.enumerated() {
+        for (i, (pb, t, hdr, analysisGeneration)) in remaining.enumerated() {
             // The final frame has no successor, so it is handed over untimed in length: at end of
             // media that is the frame that stays on screen, and a length is exactly what it must not
             // have.
             let next = i + 1 < remaining.count ? remaining[i + 1].1 : nil
-            flushFrame(pixelBuffer: pb, pts: t, hdr10PlusData: hdr, nextPTS: next)
+            flushFrame(pixelBuffer: pb, pts: t, hdr10PlusData: hdr, analysisGeneration: analysisGeneration, nextPTS: next)
         }
     }
 
@@ -973,7 +984,10 @@ final class SampleBufferRenderer: @unchecked Sendable {
     /// path, where consecutive handovers are in decode order and their gaps say nothing about cadence:
     /// it lists the timestamps that this frame made contiguous, in the order they will be shown.
     private func flushFrame(pixelBuffer: CVPixelBuffer, pts: CMTime, hdr10PlusData: Data?,
-                            nextPTS: CMTime? = nil, displayOrderSpacing: [Double]? = nil) {
+                            analysisGeneration: UInt64?, nextPTS: CMTime? = nil, displayOrderSpacing: [Double]? = nil) {
+        #if DEBUG
+        beforeActivePictureHandoverForTesting?()
+        #endif
         let outputBuffer = subtitleCompositor.composite(pixelBuffer, ptsSeconds: pts.seconds)
         reorderLock.lock()
         let timeline = _timeline
@@ -1018,6 +1032,8 @@ final class SampleBufferRenderer: @unchecked Sendable {
             target.flush()
             reorderLock.lock()
             _pendingPresentation.removeAll()
+            _activePictureFrame = nil
+            activePictureTimeline.invalidate()
             reorderLock.unlock()
             // The flush revives the queue, but what it held is gone and the demuxer stands ahead of
             // it: the host decides how the picture comes back.
@@ -1031,6 +1047,11 @@ final class SampleBufferRenderer: @unchecked Sendable {
         let accepted = queueFlushReasonNow() == nil
         reorderLock.lock()
         _lastEnqueuedFrame = pixelBuffer
+        if accepted, let analysisGeneration,
+           analysisGeneration == activePictureTimeline.generation(at: pts.seconds), pts.isNumeric {
+            _activePictureFrame = ActivePictureFrame(buffer: pixelBuffer, time: pts.seconds,
+                                                     generation: analysisGeneration)
+        }
         if accepted {
             _acceptedFrameCount += 1
             // The queue may still refuse the frame, and says so later than this read. It counts as

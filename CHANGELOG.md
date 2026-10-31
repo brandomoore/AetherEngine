@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased: active-picture analysis
+
+- Add opt-in `sampleActivePicture()` and `stopActivePictureAnalysis()` for
+  picture-relative subtitles and optional fitting. Measurements distinguish
+  unavailable evidence from confirmed full frame and include presentation-clock
+  validity and a timeline/geometry generation.
+- Bound SDR NV12/BGRA analysis to 2 Hz, a 320 x 180 grid, and one serial worker
+  admitting at most four sessions. Software snapshots include PTS/flush identity;
+  native sampling uses the existing AVPlayer item without suppressing rendering.
+- Preserve playback pipelines. HDR/Dolby Vision analysis, nonidentity native
+  display transforms, PiP and external playback currently return unknown.
+  Detection is best effort, not a guarantee that borders contain no edge content.
+
 Quick index of AetherEngine releases. Detailed per-release notes (breaking
 changes, full fix list, acknowledgements) live on
 [GitHub Releases](https://github.com/superuser404notfound/AetherEngine/releases).

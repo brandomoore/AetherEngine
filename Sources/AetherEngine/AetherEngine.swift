@@ -293,6 +293,7 @@ public final class AetherEngine: ObservableObject {
 
     /// Every actual reposition, including a live-only edge seek, invalidates prior work.
     func advanceSeekGeneration() -> UInt64 {
+        activePictureAnalysis.reset(detach: true)
         seekGeneration &+= 1
         return seekGeneration
     }
@@ -2304,6 +2305,7 @@ public final class AetherEngine: ObservableObject {
     /// after a newer load, orphan the successor's producer+loopback server, and resurrect playback after
     /// dismissal. A superseded load throws CancellationError at the first checkpoint.
     var loadGeneration: UInt64 = 0
+    let activePictureAnalysis = ActivePictureAnalysis()
 
     /// Separates cache lifecycle callbacks from superseding sessions.
     var sessionCacheStatusToken: UInt64 = 0
@@ -8022,6 +8024,7 @@ public final class AetherEngine: ObservableObject {
         endRecordingIfRunning(reason: .sessionEnded)
         // Bump generation to invalidate in-flight load() checkpoints.
         loadGeneration &+= 1
+        activePictureAnalysis.reset(detach: true, clearTimeline: true)
         scrubPreviewSourceGeneration = UUID()
         resumeAfterInterruption = false
         playDeferredByInterruption = false

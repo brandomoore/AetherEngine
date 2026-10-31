@@ -268,6 +268,9 @@ final class SoftwarePlaybackHost {
         renderer.lastEnqueuedFrame
     }
 
+    var activePictureFrame: ActivePictureFrame? { renderer.activePictureFrame }
+    var activePictureGeneration: UInt64? { renderer.activePictureTimeline.generation(at: sourceClockSeconds) }
+
     /// AE#711 follow-up: the picture on screen now, read back from the renderer before a rebuild's
     /// `stop()` flushes it, so the engine can hold it over the new host's startup. Falls back to the
     /// newest frame enqueued, which a layer that is not on screen is all there is of.
@@ -2900,6 +2903,7 @@ final class SoftwarePlaybackHost {
             let getSourceEnded: @Sendable () -> Bool = { [weak self] in
                 self?.sourceEnded ?? true
             }
+            let activePictureTimeline = renderer.activePictureTimeline
             demuxQueue.async {
                 Self.runLiveReaderLoop(
                     demuxer: dem,
@@ -2922,7 +2926,8 @@ final class SoftwarePlaybackHost {
                     splitDisplaySetSubtitleStreamIndices: subSplitSetIndices,
                     subtitleTapSink: getSubtitleTapSink,
                     recordingTap: recordingTap,
-                    playedMedia: playedMediaLedger
+                    playedMedia: playedMediaLedger,
+                    activePictureTimeline: activePictureTimeline
                 )
             }
             let lookahead = audioLookahead
@@ -3034,7 +3039,8 @@ final class SoftwarePlaybackHost {
         splitDisplaySetSubtitleStreamIndices: Set<Int32> = [],
         subtitleTapSink: @Sendable () -> ((@Sendable (Int32, UnsafeMutablePointer<AVPacket>, AVRational, Bool) -> Void)?) = { nil },
         recordingTap: @escaping @Sendable (UnsafeMutablePointer<AVPacket>) -> Void = { _ in },
-        playedMedia: PlayedMediaLedger? = nil
+        playedMedia: PlayedMediaLedger? = nil,
+        activePictureTimeline: ActivePictureTimeline? = nil
     ) {
         let discontinuityThresholdSeconds = 10.0
         var prevRawVideoPtsSec = Double.nan
@@ -3135,6 +3141,7 @@ final class SoftwarePlaybackHost {
                         let expectedContinuation = prevRawVideoPtsSec
                             + (frameIntervalSec > 0 ? frameIntervalSec : 0)
                         discontinuityOffsetSec += (rawPtsSec - expectedContinuation)
+                        activePictureTimeline?.markSeam(at: rawPtsSec - discontinuityOffsetSec)
                         if !loggedSWDiscontinuity {
                             loggedSWDiscontinuity = true
                             EngineLog.emit(
@@ -4180,6 +4187,7 @@ final class SoftwarePlaybackHost {
                         epochBeforeRead = videoDecoder.feedEpoch
                         audioDecoder?.flush()
                         renderer.drainReorderBuffer()
+                        renderer.activePictureTimeline.markSeam(at: rawPtsSec - discontinuityOffsetSec)
                         // Chunked archives seam every minute or two; log each seam (bounded by the
                         // 10 s threshold to at most one line per 10 s of content) with a soft cap
                         // so a pathological source cannot flood the log.
