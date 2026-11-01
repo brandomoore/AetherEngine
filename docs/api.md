@@ -1311,6 +1311,27 @@ changes in the middle. On `.software` the packet ring does hold source packets, 
 behaviour on one route and not the other under one API is worse than not shipping it. If you need it,
 say so on the tracker rather than working around it.
 
+## Active-picture analysis
+
+`sampleActivePicture()` opts an engine session into bounded analysis of the existing
+native output or software-rendered pictures. Share this sampling operation between
+picture-relative subtitles and optional video fitting. `stopActivePictureAnalysis()`
+detaches the native output and invalidates outstanding analysis when no consumer needs it.
+
+`ActivePictureState` is either `.unknown(UnknownReason)` or `.measured(ActivePictureObservation)`.
+An observation's `normalizedRect` describes the upright, clean-aperture/SAR-corrected
+display canvas before host zoom; its `displaySize` retains source presentation geometry
+even when native analysis buffers are downscaled. `Evidence.sampledPixels` is measured
+evidence, not permission to discard border content. Respect `presentationTime`,
+`validUntil` and `generation`; unavailable evidence is not confirmed full frame.
+
+Hosts already owning an AVPlayer can use `NativeActivePictureAnalyzer.sample(player:generation:videoFormat:)`
+and `stop()`, sharing the same admission and temporal-stability limits without another
+player or decoder. Supply the source video format, not a panel-clamped format.
+Supported SDR/HDR pixels and upright transforms are analyzed conservatively; PiP,
+external playback, unsupported geometry and uninformative frames remain unknown.
+AVFoundation's conversion/materialization cost is separate from the bounded analysis work.
+
 ## Picture, layers and PiP
 
 | Symbol | Notes |

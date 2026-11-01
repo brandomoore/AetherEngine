@@ -952,6 +952,7 @@ extension AetherEngine {
                 guard let self = self else { return }
                 let prevShift = self.playlistShiftSeconds
                 let delta = seconds - prevShift
+                self.activePictureAnalysis.nativeTimeline.markSeam(at: seamItemSeconds)
                 // AE#105 / AE#270: `duration` is 0-based for every source, so the published playhead has to
                 // be too. The origin is the source PTS of the item's first frame: a disc re-reads it from
                 // every publish (constant STC base), any other VOD source latches the first one (its later
@@ -1084,6 +1085,7 @@ extension AetherEngine {
         session.onPlaylistShiftRebased = { [weak self] seconds, seamOutputSeconds in
             self?.hop(for: generation) { [weak self] in
                 guard let self = self else { return }
+                self.activePictureAnalysis.nativeTimeline.markSeam(at: seamOutputSeconds)
                 // Program boundary: keep the source-PTS seam for rendered cues while the item clock
                 // continues forward. The live display/seek axis stays on its initial shift.
                 var map = self.presentationAxis

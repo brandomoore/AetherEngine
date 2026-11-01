@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased: active-picture analysis
+
+- Add opt-in `sampleActivePicture()` and `stopActivePictureAnalysis()` for
+  picture-relative subtitles and optional fitting. Measurements distinguish
+  unavailable evidence from confirmed full frame and include presentation-clock
+  validity and a timeline/geometry generation.
+- Bound NV12/P010/BGRA/half-float analysis to 2 Hz, a 320 x 180 grid, and one serial worker
+  admitting at most four sessions. Software snapshots include PTS/flush identity;
+  native sampling uses the existing AVPlayer item without suppressing rendering.
+- Add `NativeActivePictureAnalyzer` for existing host-owned AVPlayers, sharing
+  the same admission, temporal stability, output ownership and invalidation.
+- Support 10-bit SDR, HDR10/HDR10+, HLG and converted Dolby Vision pixels.
+  Native SDR sampling requests CPU-readable 8-bit NV12, PQ/HLG uses P010,
+  and Dolby Vision/unknown color requests converted half-float RGB rather than
+  interpreting an IPT base layer as PQ. AVFoundation may
+  materialize or decompress that output from its preferred compressed surface;
+  the analysis limit is not a bound on that system-side cost.
+- Request a 320 x 180 native analysis output, retaining the original item's
+  upright display size separately so downscaling cannot replace aperture/SAR
+  or rotation geometry. Presentation-size changes invalidate pending work.
+- Select native analysis color from the source, not the panel-clamped playback
+  badge, so Dolby Vision still requests converted RGB on an SDR display.
+- Preserve playback pipelines. Native quarter turns and mirrors are mapped
+  to upright display geometry. Unsupported transforms, PiP and external
+  playback return unknown, as do missing or uninformative frames.
+  Detection is best effort, not a guarantee that borders contain no edge content.
+
 Quick index of AetherEngine releases. Detailed per-release notes (breaking
 changes, full fix list, acknowledgements) live on
 [GitHub Releases](https://github.com/superuser404notfound/AetherEngine/releases).
