@@ -86,7 +86,7 @@ enum UDFFixture {
     /// continuation (an AED at vblock 13) instead of inline, to exercise AED chaining.
     /// `clpiBytes`: add `BDMV/CLIPINF/00001.clpi` (vblocks 14-17, one sector of data). A CLPI fixture
     /// carries a real stream whose EP map points into it, so the m2ts is then written whole rather than
-    /// a sector per extent; each half has to fit the 10 blocks between the two extents.
+    /// a sector per extent. Larger streams move the second extent beyond the first, retaining a gap.
     static func make(mplsBytes: [UInt8], m2tsBytes: [UInt8], m2tsViaAED: Bool = false,
                      clpiBytes: [UInt8]? = nil) -> Data {
         let partStart = 270
@@ -94,8 +94,14 @@ enum UDFFixture {
         // virtual block V -> physical sector partStart + 2 + V.
         func phys(_ vblock: Int) -> Int { partStart + 2 + vblock }
 
+        let half = m2tsBytes.count / 2
+        let frag1Block = 40
+        let frag2Block = clpiBytes == nil ? 50 : max(50, frag1Block + (half + ss - 1) / ss + 1)
+        let streamEnd = frag2Block + (m2tsBytes.count - half + ss - 1) / ss
+        let partitionBlocks = clpiBytes == nil ? 64 : max(64, streamEnd + 1)
+
         // --- helpers to place a sector ---
-        var image = [UInt8](repeating: 0, count: (partStart + 64) * ss)
+        var image = [UInt8](repeating: 0, count: (partStart + partitionBlocks) * ss)
         func put(_ bytes: [UInt8], atSector s: Int) {
             precondition((s+1)*ss <= image.count || bytes.count <= ss)
             for (i, v) in bytes.enumerated() where i < ss { image[s*ss + i] = v }
@@ -103,13 +109,10 @@ enum UDFFixture {
         // UDF: metadata-partition tags record the virtual block number in TagLocation.
         func putV(_ bytes: [UInt8], vblock: Int) { put(bytes, atSector: phys(vblock)) }
 
-        // m2ts: two physical extents past the metadata region (partition-relative blocks 40 and 50).
-        let frag1Block = 40, frag2Block = 50   // physical partition (ref 0) blocks
-        let half = m2tsBytes.count / 2
+        // m2ts: two physical extents past the metadata region (partition ref 0).
         let m2tsExt1 = Array(m2tsBytes[0..<half])
         let m2tsExt2 = Array(m2tsBytes[half...])
         if clpiBytes != nil {
-            precondition(m2tsExt2.count <= 10 * ss, "a whole-stream fixture half must fit 10 blocks")
             for (i, v) in m2tsExt1.enumerated() { image[(partStart + frag1Block) * ss + i] = v }
             for (i, v) in m2tsExt2.enumerated() { image[(partStart + frag2Block) * ss + i] = v }
         } else {
@@ -302,7 +305,7 @@ enum UDFFixture {
         tag(5, location: 257, into: &pd)
         pd[22..<24] = ArraySlice(le16(0))                     // PartitionNumber 0
         pd[188..<192] = ArraySlice(le32(partStart))           // PartitionStartingLocation
-        pd[192..<196] = ArraySlice(le32(128))                 // PartitionLength (sectors, ample)
+        pd[192..<196] = ArraySlice(le32(max(128, image.count / ss - partStart))) // PartitionLength
         put(pd, atSector: 257)
 
         // --- AVDP (sector 256) -> VDS at sector 257, length 2 sectors ---

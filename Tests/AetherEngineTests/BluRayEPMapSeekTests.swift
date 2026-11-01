@@ -280,10 +280,13 @@ struct BluRayEPMapSeekTests {
         return stride(from: 0, to: ts.count, by: 188).flatMap { [0, 0, 0, 0] + ts[$0..<$0 + 188] }
     }
 
-    static func preparationImage() -> Data {
+    static func preparationImage(nullPacketCount: Int = 0) -> Data {
         let head = shiftedTinyM2TS(startSeconds: 600)
         let resume = shiftedTinyM2TS(startSeconds: 1196)
-        let starts = [(600.0, UInt32(0)), (1196.0, UInt32(head.count / 192))]
+        let nullPacket: [UInt8] = [0, 0, 0, 0, 0x47, 0x1F, 0xFF, 0x10]
+            + [UInt8](repeating: 0xFF, count: 184)
+        let padding = (0..<nullPacketCount).flatMap { _ in nullPacket }
+        let starts = [(600.0, UInt32(0)), (1196.0, UInt32((head.count + padding.count) / 192))]
         let entries = starts.flatMap { start, packetBase in
             keyframes.map {
                 CLPIEntryPoint(pts45k: UInt64(((start + $0.seconds - 1.4) * 45_000).rounded()) / 256 * 256,
@@ -292,7 +295,71 @@ struct BluRayEPMapSeekTests {
         }
         return UDFFixture.make(
             mplsBytes: mpls([(id: "00001", inT: 600 * 45_000, outT: 1204 * 45_000)]),
-            m2tsBytes: head + resume, clpiBytes: clpi([(pid: 0x1011, entries: entries)]))
+            m2tsBytes: head + padding + resume, clpiBytes: clpi([(pid: 0x1011, entries: entries)]))
+    }
+
+    @Test("Disc preparation warms the physical duration tail and preserves the head presentation origin")
+    func preparationWarmsDurationTail() throws {
+        // Null transport packets separate tiny head/tail windows beyond the shallow analysis cap.
+        let image = Self.preparationImage(nullPacketCount: 16_384)
+        let reader = ProbeRecordingReader(data: image, discImageProbeEnabled: true)
+        let limits = ProbeLimits(maxInputBytes: 8 * 1024 * 1024, maxPackets: 256, timeBudget: 3600)
+        let report = try AetherEngine.prepareSource(
+            source: .custom(reader), presentationTime: 0, duration: 1, preroll: 0, limits: limits)
+        #expect(report.outcome == .complete)
+        #expect(abs(try #require(report.sourceOrigin) - 600) < 0.001)
+        #expect(report.requestedSourceRange == 600...601)
+        #expect(reader.reads.contains { $0.offset >= Int64(image.count - 512 * 1024) && $0.returned > 0 })
+        #expect(report.inputBytesRead == reader.bytesRead)
+        #expect(report.inputBytesRead <= limits.maxInputBytes)
+        #expect(reader.closeCount == 0)
+    }
+
+    @Test("A disc duration-tail pass shares the whole preparation input budget")
+    func preparationDurationTailInputBudget() throws {
+        let image = Self.preparationImage(nullPacketCount: 16_384)
+        let baseline = ProbeRecordingReader(data: image, discImageProbeEnabled: true)
+        let baselineReport = try AetherEngine.prepareSource(
+            source: .custom(baseline), presentationTime: 0, duration: 1, preroll: 0,
+            limits: .init(maxInputBytes: 8 * 1024 * 1024, maxPackets: 256, timeBudget: 3600))
+        #expect(baselineReport.outcome == .complete)
+        let reads = baseline.reads
+        let tailIndex = try #require(reads.firstIndex {
+            $0.offset >= Int64(image.count - 512 * 1024) && $0.returned > 0
+        })
+        let beforeTail = reads[..<tailIndex].reduce(Int64(0)) { $0 + Int64(max(0, $1.returned)) }
+        let reader = ProbeRecordingReader(data: image, discImageProbeEnabled: true)
+        let limits = ProbeLimits(maxInputBytes: beforeTail + 1, maxPackets: 256, timeBudget: 3600)
+        let report = try AetherEngine.prepareSource(
+            source: .custom(reader), presentationTime: 0, duration: 1, preroll: 0, limits: limits)
+        #expect(report.outcome == .budgetExhausted(.inputLimit))
+        #expect(reader.reads.contains { $0.offset >= Int64(image.count - 512 * 1024) && $0.returned > 0 })
+        #expect(report.inputBytesRead == limits.maxInputBytes)
+        #expect(report.inputBytesRead == reader.bytesRead)
+        #expect(reader.closeCount == 0)
+    }
+
+    @Test("Cancellation during a disc duration-tail read still wins and preserves caller ownership")
+    func preparationDurationTailCancellation() throws {
+        let image = Self.preparationImage(nullPacketCount: 16_384)
+        let token = ProbeCancellation()
+        let readerBox = ProbeTestBox<ProbeRecordingReader?>(nil)
+        let reader = ProbeRecordingReader(
+            data: image, discImageProbeEnabled: true, afterRead: {
+                if let read = readerBox.value?.reads.last,
+                   read.offset >= Int64(image.count - 512 * 1024), read.returned > 0 {
+                    token.cancel()
+                }
+            })
+        readerBox.update { $0 = reader }
+        defer { readerBox.update { $0 = nil } }
+        #expect(throws: CancellationError.self) {
+            try AetherEngine.prepareSource(
+                source: .custom(reader), presentationTime: 0, duration: 1, preroll: 0,
+                limits: .init(maxInputBytes: 8 * 1024 * 1024, timeBudget: 3600), cancellation: token)
+        }
+        #expect(token.isCancelled)
+        #expect(reader.closeCount == 0)
     }
 
     @Test("Preparation seeks on presentation time and reads physical ISO extents",

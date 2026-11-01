@@ -107,7 +107,7 @@ struct ProbeControlTests {
         #expect(report.video?.streamIndex == 0)
         #expect(report.audio?.streamIndex == 1)
         #expect(reader.reads.allSatisfy { $0.offset < Int64(bytes.count / 2) },
-                "packet preparation has no use for a source-tail duration estimate")
+                "ordinary-file preparation must not fetch a source-tail duration estimate")
         #expect(reader.closeCount == 0)
     }
 

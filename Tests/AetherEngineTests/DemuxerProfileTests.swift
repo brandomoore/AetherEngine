@@ -9,11 +9,11 @@ struct DemuxerProfileTests {
         #expect(!profile.allowsProbeDecoding)
         #expect(!profile.auditsRecordlessDolbyVision)
         #expect(profile.probesize == limits.maxInputBytes)
-        #expect(profile.skipDurationEstimate)
+        #expect(profile.skipsDurationEstimate(hasDeclaredDiscTitle: false))
         #expect(!profile.skipStreamInfo)
         #expect(!DemuxerOpenProfile.labelsWithoutCompositionRepair.contains(profile.readerLabel))
         #expect(DemuxerOpenProfile.playback.allowsProbeDecoding)
-        #expect(!DemuxerOpenProfile.playback.skipDurationEstimate)
+        #expect(!DemuxerOpenProfile.playback.skipsDurationEstimate(hasDeclaredDiscTitle: false))
         #expect(AetherEngine.probeOpenProfile(limits: limits).allowsProbeDecoding)
     }
 
@@ -25,14 +25,34 @@ struct DemuxerProfileTests {
         #expect(profile.maxAnalyzeDuration == DemuxerOpenProfile.stillExtraction.maxAnalyzeDuration)
         #expect(profile.probesize < limits.maxInputBytes)
         #expect(profile.maxAnalyzeDuration < DemuxerOpenProfile.playback.maxAnalyzeDuration)
-        #expect(profile.skipDurationEstimate)
+        #expect(profile.skipsDurationEstimate(hasDeclaredDiscTitle: false))
         let metadataProfile = AetherEngine.probeOpenProfile(limits: limits)
         #expect(profile.avioChunkSize == metadataProfile.avioChunkSize)
         #expect(profile.avioPrefetch == metadataProfile.avioPrefetch)
         #expect(profile.avioRequestTimeout == metadataProfile.avioRequestTimeout)
         #expect(profile.avioMaxRetries == metadataProfile.avioMaxRetries)
-        #expect(!metadataProfile.skipDurationEstimate)
-        #expect(!DemuxerOpenProfile.restartReopen.skipDurationEstimate)
+        #expect(!metadataProfile.skipsDurationEstimate(hasDeclaredDiscTitle: false))
+        #expect(!DemuxerOpenProfile.restartReopen.skipsDurationEstimate(hasDeclaredDiscTitle: false))
+    }
+
+    @Test("Preparation warms duration tails only for recognized titles, never sequential sources",
+          arguments: [false, true])
+    func preparationDurationEstimatePolicy(hasDeclaredDiscTitle: Bool) {
+        let limits = ProbeLimits()
+        let preparation = AetherEngine.preparationOpenProfile(limits: limits)
+        #expect(preparation.skipsDurationEstimate(hasDeclaredDiscTitle: hasDeclaredDiscTitle)
+                == !hasDeclaredDiscTitle)
+        #expect(!preparation.allowsProbeDecoding)
+        #expect(preparation.probesize == 2 * 1024 * 1024)
+        #expect(preparation.maxAnalyzeDuration == 2 * 1_000_000)
+        #expect(preparation.withSequentialOrigin(true, declaredDuration: 600)
+            .skipsDurationEstimate(hasDeclaredDiscTitle: hasDeclaredDiscTitle))
+        #expect(!DemuxerOpenProfile.playback.skipsDurationEstimate(hasDeclaredDiscTitle: hasDeclaredDiscTitle))
+        #expect(DemuxerOpenProfile.playback.withSequentialOrigin(true, declaredDuration: 600)
+            .skipsDurationEstimate(hasDeclaredDiscTitle: hasDeclaredDiscTitle))
+        #expect(!AetherEngine.probeOpenProfile(limits: limits)
+            .skipsDurationEstimate(hasDeclaredDiscTitle: hasDeclaredDiscTitle))
+        #expect(!DemuxerOpenProfile.restartReopen.skipsDurationEstimate(hasDeclaredDiscTitle: hasDeclaredDiscTitle))
     }
 
     @Test("playback profile keeps the large probe budget + prefetch")

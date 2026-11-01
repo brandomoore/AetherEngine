@@ -685,8 +685,14 @@ whole-operation limits, using the existing still-extraction analysis cap. This i
 deadline: `ProbeLimits.timeBudget` still bounds the entire operation. Parser analysis remains enabled
 for origin, time bases and reorder information, and ordinary timestamp repairs remain enabled.
 Decoder-denied tracks can otherwise keep the full playback analysis reading until the caller's
-entire input budget is exhausted without returning a packet. Preparation also skips the separate
-source-tail duration estimate, since its requested window needs no total-duration measurement.
+entire input budget is exhausted without returning a packet. For a recognized disc with a known
+selected-title duration, preparation permits FFmpeg's normal tail-duration pass to warm metadata reads
+that playback would otherwise perform cold. Those reads go through the selected title's disc adapter,
+not guessed physical image offsets, and consume the same input/time budget with the same cancellation.
+Ordinary files and discs without a declared title duration still skip the separate tail estimate.
+The tail pass has no separate allowance and can exhaust preparation before packet coverage begins.
+It does not guarantee that every later playback read is cached.
+This does not change playback's analysis policy or make a preparation report reusable demux state.
 Container headers, disc recognition, AVIO read granularity and native seek work remain charged to the
 whole input budget; the stream-analysis cap is not a separate hard bound on all opening I/O.
 Fixed numeric `SourcePreparationCoverage` diagnostics report each selected stream's requested and
@@ -710,7 +716,12 @@ The seek asks for a random-access point at or before that window, so the actual 
 At the source head it consumes the packets already queued by opening rather than throwing them away.
 The default video stream is used. A nil `audioSourceStreamIndex` uses the demuxer's default audio
 stream; an explicit index must name audio. Pass the same explicit selection intended for playback:
-this API does not apply language, audio-rendering or other `LoadOptions` preferences. All interleaved
+this API does not apply language, audio-rendering or other `LoadOptions` preferences. Even with default
+playback options, the decoder-denied preparation probe can leave different audio parameters available
+to `av_find_best_stream`, so its default is not guaranteed to match a full playback probe. An audio
+coverage report proves coverage of its reported stream index, not a later session's automatic choice.
+An explicit index must identify the intended playback stream on the same source and selected title;
+do not override playback with the preparation default merely to make the two agree. All interleaved
 streams count against the budget, even though only selected A/V packets contribute to the report.
 
 The position mapping uses the engine's existing presentation-origin policy and `PresentationAxis`.

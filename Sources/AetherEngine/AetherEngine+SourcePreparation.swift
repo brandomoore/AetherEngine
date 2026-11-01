@@ -14,7 +14,9 @@ extension AetherEngine {
     /// `presentationTime` is zero-based VOD time, not an absolute container timestamp. The window
     /// starts at `max(0, presentationTime - preroll)` and ends at `presentationTime + duration`.
     /// Disc titles use the same folded timeline and EP/DVD seek machinery as playback.
-    /// `audioSourceStreamIndex` names a container audio stream; nil chooses the demuxer's default.
+    /// `audioSourceStreamIndex` names a container audio stream. Nil uses this decoder-denied probe's
+    /// default, which may differ from full playback probing even without language/rendering preferences.
+    /// Matching playback requires its intended explicit index for the same source and selected title.
     /// Custom reader ownership, cancellation cooperation and budget accounting match `probe(source:)`.
     /// Budget stops return incomplete evidence. Cancellation and source failures throw.
     public nonisolated static func prepareSource(
@@ -177,13 +179,13 @@ extension AetherEngine {
         // Decoder-denied tracks can never satisfy find_stream_info's full-metadata exit. Giving
         // them the playback probe consumed a real ISO's entire 28 MiB allowance before one packet.
         // Keep parser analysis (not skipStreamInfo) for time bases, origin and reorder information,
-        // but reserve the caller's remaining input allowance for the requested compressed window.
+        // but reserve the remaining allowance for bounded disc-tail and requested-window reads.
         var profile = probeOpenProfile(limits: limits)
         profile.probesize = min(profile.probesize, DemuxerOpenProfile.stillExtraction.probesize)
         profile.maxAnalyzeDuration = min(
             profile.maxAnalyzeDuration, DemuxerOpenProfile.stillExtraction.maxAnalyzeDuration)
         profile.allowsProbeDecoding = false
-        profile.skipDurationEstimate = true
+        profile.durationEstimatePolicy = .declaredDiscOnly
         return profile
     }
 
