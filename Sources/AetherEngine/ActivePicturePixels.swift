@@ -5,6 +5,14 @@ struct ActivePictureFrame: @unchecked Sendable {
     let buffer: CVPixelBuffer
     let time: Double
     let generation: UInt64
+    let displaySize: CGSize?
+
+    init(buffer: CVPixelBuffer, time: Double, generation: UInt64, displaySize: CGSize? = nil) {
+        self.buffer = buffer
+        self.time = time
+        self.generation = generation
+        self.displaySize = displaySize
+    }
 }
 
 struct ActivePictureGeometry: Sendable, Equatable {
@@ -47,10 +55,10 @@ actor ActivePictureWorker {
     static let shared = ActivePictureWorker()
 
     func analyze(_ frame: ActivePictureFrame) -> ActivePicturePixels {
-        Self.sample(frame.buffer)
+        Self.sample(frame.buffer, displaySize: frame.displaySize)
     }
 
-    nonisolated static func sample(_ buffer: CVPixelBuffer) -> ActivePicturePixels {
+    nonisolated static func sample(_ buffer: CVPixelBuffer, displaySize: CGSize? = nil) -> ActivePicturePixels {
         func failed(_ reason: ActivePictureState.UnknownReason) -> ActivePicturePixels {
             ActivePicturePixels(geometry: nil, bounds: nil, failure: reason)
         }
@@ -86,7 +94,7 @@ actor ActivePictureWorker {
         guard !linear || halfFloat else { return failed(.unsupportedColor) }
         let coded = CGSize(width: CVPixelBufferGetWidth(buffer), height: CVPixelBufferGetHeight(buffer))
         let clean = CVImageBufferGetCleanRect(buffer)
-        let display = CVImageBufferGetDisplaySize(buffer)
+        let display = displaySize ?? CVImageBufferGetDisplaySize(buffer)
         guard clean.minX.isFinite, clean.minY.isFinite, clean.width.isFinite, clean.height.isFinite,
             clean.width >= 8, clean.height >= 8,
             CGRect(origin: .zero, size: coded).contains(clean),

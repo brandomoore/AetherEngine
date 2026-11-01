@@ -63,7 +63,7 @@ enum ActivePictureSource {
     var nativePixelFormat: OSType {
         let format: VideoFormat?
         switch self {
-        case .engine(let engine): format = engine.videoFormat
+        case .engine(let engine): format = engine.sourceVideoFormat
         case .native(_, _, let value): format = value
         }
         switch format {
@@ -84,6 +84,7 @@ private struct ActivePictureOwner: Equatable {
     let native: ObjectIdentifier?
     let nativeEpoch: UInt64?
     let nativePixelFormat: OSType?
+    let nativeDisplaySize: CGSize?
 }
 
 @MainActor
@@ -137,7 +138,8 @@ final class ActivePictureAnalysis {
             native: source.player?.currentItem.map(ObjectIdentifier.init),
             nativeEpoch: source.player.map { nativeTimeline.generation(at: $0.currentTime().seconds) }
                 ?? nil,
-            nativePixelFormat: source.player == nil ? nil : source.nativePixelFormat)
+            nativePixelFormat: source.player == nil ? nil : source.nativePixelFormat,
+            nativeDisplaySize: source.player?.currentItem?.presentationSize)
     }
 
     private func playhead(_ source: ActivePictureSource) -> Double {
@@ -245,6 +247,8 @@ final class ActivePictureAnalysis {
                 // Wide color preserves HDR rather than forcing an SDR tap.
                 let newOutput = AVPlayerItemVideoOutput(outputSettings: [
                     kCVPixelBufferPixelFormatTypeKey as String: source.nativePixelFormat,
+                    kCVPixelBufferWidthKey as String: 320,
+                    kCVPixelBufferHeightKey as String: 180,
                     AVVideoAllowWideColorKey: true,
                 ])
                 newOutput.suppressesPlayerRendering = false
@@ -293,8 +297,12 @@ final class ActivePictureAnalysis {
                 nativeTimeline.generation(at: displayed.seconds) == frameGeneration,
                 requested.seconds - displayed.seconds <= ActivePictureStability.maximumAge
             {
+                // AVPlayer's presentation size is already upright and includes
+                // aperture/SAR. The resized analysis buffer is not the canvas.
+                let displaySize = CGRect(origin: .zero, size: currentItem.presentationSize)
+                    .applying((nativeTransform ?? .identity).inverted()).size
                 frame = ActivePictureFrame(
-                    buffer: buffer, time: displayed.seconds, generation: frameGeneration)
+                    buffer: buffer, time: displayed.seconds, generation: frameGeneration, displaySize: displaySize)
             } else {
                 frame = nil
             }

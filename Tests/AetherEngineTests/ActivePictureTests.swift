@@ -5,6 +5,23 @@ import Testing
 
 @Suite("Active picture")
 struct ActivePictureTests {
+    @Test("Native analysis follows source color, not the panel-clamped badge")
+    @MainActor
+    func sourceColor() throws {
+        let engine = try AetherEngine()
+        defer { engine.stop() }
+        engine.videoFormat = .sdr
+        for format in [VideoFormat.dolbyVision, .hdr10, .hdr10Plus, .hlg, .sdr] {
+            engine.sourceVideoFormat = format
+            let expected: OSType = switch format {
+            case .dolbyVision: kCVPixelFormatType_64RGBAHalf
+            case .sdr: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            default: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+            }
+            #expect(ActivePictureSource.engine(engine).nativePixelFormat == expected)
+        }
+    }
+
     @Test("Detects full, letterboxed, pillarboxed, asymmetric and windowboxed pictures")
     func geometry() throws {
         for expected in [
@@ -88,6 +105,9 @@ struct ActivePictureTests {
         CVPixelBufferUnlockBaseAddress(image, [])
         let result = ActivePictureWorker.sample(image)
         #expect(result.failure == nil)
+        let resized = ActivePictureWorker.sample(image, displaySize: CGSize(width: 1024, height: 576))
+        #expect(resized.geometry?.displaySize == CGSize(width: 1024, height: 576))
+        #expect(ActivePictureWorker.sample(image, displaySize: .zero).failure == .unsupportedGeometry)
         let rect = try #require(result.bounds)
         #expect(rect.minY > 0.15 && rect.maxY < 0.85)
         CVBufferSetAttachment(

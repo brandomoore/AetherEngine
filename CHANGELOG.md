@@ -17,6 +17,11 @@
   interpreting an IPT base layer as PQ. AVFoundation may
   materialize or decompress that output from its preferred compressed surface;
   the analysis limit is not a bound on that system-side cost.
+- Request a 320 x 180 native analysis output, retaining the original item's
+  upright display size separately so downscaling cannot replace aperture/SAR
+  or rotation geometry. Presentation-size changes invalidate pending work.
+- Select native analysis color from the source, not the panel-clamped playback
+  badge, so Dolby Vision still requests converted RGB on an SDR display.
 - Preserve playback pipelines. Native quarter turns and mirrors are mapped
   to upright display geometry. Unsupported transforms, PiP and external
   playback return unknown, as do missing or uninformative frames.
