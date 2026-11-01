@@ -235,7 +235,7 @@ enum ProbeTestFixtures {
     }
 
     /// Remux the existing synthetic fixtures in memory; no CLI, downloaded media or global hooks.
-    static func combined() throws -> Data {
+    static func combined(audioCopies: Int = 1) throws -> Data {
         let video = Demuxer()
         let audio = Demuxer()
         defer { video.close(); audio.close() }
@@ -260,7 +260,7 @@ enum ProbeTestFixtures {
             av_free(bytes)
         }
 
-        let streams = [(video, videoStream), (audio, audioStream)]
+        let streams = [(video, videoStream)] + Array(repeating: (audio, audioStream), count: audioCopies)
         for (_, source) in streams {
             let target = try #require(avformat_new_stream(context, nil))
             try #require(avcodec_parameters_copy(target.pointee.codecpar, source.pointee.codecpar) >= 0)
@@ -269,6 +269,7 @@ enum ProbeTestFixtures {
         try #require(avformat_write_header(context, nil) >= 0)
         for (index, pair) in streams.enumerated() {
             let (demuxer, source) = pair
+            if index > 1 { demuxer.seek(to: 0) }
             let target = try #require(context.pointee.streams[index])
             while let packet = try demuxer.readPacket() {
                 var owned: UnsafeMutablePointer<AVPacket>? = packet

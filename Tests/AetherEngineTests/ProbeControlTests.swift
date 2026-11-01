@@ -13,6 +13,277 @@ struct ProbeControlTests {
     private static let atmos = AtmosDetectionOptions(timeBudget: 3600)
     private static let hdr = HDR10PlusDetectionOptions(timeBudget: 3600)
 
+    // MARK: Demux-only source preparation
+
+    private static let invalidPreparationCoordinates: [(time: Double, duration: Double, preroll: Double)] = [
+        (-1.0, 4.0, 2.0), (Double.nan, 4, 2), (Double.infinity, 4, 2),
+        (0, -1, 2), (0, Double.nan, 2), (0, Double.infinity, 2),
+        (0, 4, -1), (0, 4, Double.nan), (0, 4, Double.infinity),
+        (Double.greatestFiniteMagnitude, Double.greatestFiniteMagnitude, 0),
+    ]
+
+    private static let preparationBudgetCases: [(limits: ProbeLimits, expected: ProbeError)] = [
+        (ProbeLimits(maxInputBytes: 31, timeBudget: 3600), ProbeError.inputLimit),
+        (ProbeLimits(maxPackets: 0, timeBudget: 3600), ProbeError.packetLimit),
+        (ProbeLimits(maxPackets: 1, timeBudget: 3600), ProbeError.packetLimit),
+        (ProbeLimits(maxPacketBytes: 0, timeBudget: 3600), ProbeError.packetSizeLimit),
+        (ProbeLimits(timeBudget: 0), ProbeError.timedOut),
+    ]
+
+    @Test("Preparation rejects invalid coordinates before touching the reader",
+          arguments: ProbeControlTests.invalidPreparationCoordinates)
+    func invalidPreparationTime(time: Double, duration: Double, preroll: Double) {
+        let reader = ProbeRecordingReader(data: TinyTransportStreamFixture.data)
+        #expect(throws: SourcePreparationError.invalidRequest) {
+            try AetherEngine.prepareSource(source: .custom(reader), presentationTime: time,
+                                            duration: duration, preroll: preroll, limits: Self.ample)
+        }
+        #expect(reader.reads.isEmpty)
+        #expect(reader.seeks.isEmpty)
+        #expect(reader.closeCount == 0)
+    }
+
+    @Test("Preparation requires a custom reader and valid explicit limits")
+    func preparationInputContract() {
+        #expect(throws: SourcePreparationError.customSourceRequired) {
+            try AetherEngine.prepareSource(
+                source: .url(URL(string: "https://example.invalid/synthetic.mp4")!),
+                presentationTime: 0, limits: Self.ample)
+        }
+        let reader = ProbeRecordingReader(data: TinyTransportStreamFixture.data)
+        #expect(throws: ProbeError.invalidLimits) {
+            try AetherEngine.prepareSource(source: .custom(reader), presentationTime: 0,
+                                            limits: .init(maxPackets: -1))
+        }
+        #expect(throws: SourcePreparationError.invalidRequest) {
+            try AetherEngine.prepareSource(source: .custom(reader), presentationTime: 0,
+                                            audioSourceStreamIndex: -1, limits: Self.ample)
+        }
+        #expect(reader.reads.isEmpty)
+        #expect(reader.seeks.isEmpty)
+    }
+
+    @Test("Preparation reports budget exhaustion, not a complete or late positive window",
+          arguments: ProbeControlTests.preparationBudgetCases)
+    func preparationBudgetReport(limits: ProbeLimits, expected: ProbeError) throws {
+        let reader = ProbeRecordingReader(data: TinyTransportStreamFixture.data, chunkSize: 7)
+        let report = try AetherEngine.prepareSource(
+            source: .custom(reader, formatHint: "mpegts"), presentationTime: 0, limits: limits)
+        #expect(report.outcome == .budgetExhausted(expected))
+        #expect(report.inputBytesRead == reader.bytesRead)
+        #expect(report.inputBytesRead <= limits.maxInputBytes)
+        #expect(report.demuxedPackets <= limits.maxPackets)
+        #expect(reader.closeCount == 0)
+        if expected == .timedOut {
+            #expect(reader.reads.isEmpty)
+            #expect(reader.seeks.isEmpty)
+        }
+    }
+
+    @Test("Preparation shares the disc-recognition input budget below physical adaptation")
+    func preparationDiscRecognitionBudget() throws {
+        let reader = ProbeRecordingReader(
+            data: BluRayEPMapSeekTests.preparationImage(), discImageProbeEnabled: true)
+        let report = try AetherEngine.prepareSource(
+            source: .custom(reader), presentationTime: 600, limits: .init(maxInputBytes: 37, timeBudget: 3600))
+        #expect(report.outcome == .budgetExhausted(.inputLimit))
+        #expect(report.inputBytesRead == 37)
+        #expect(report.sourceOrigin == nil)
+        #expect(reader.closeCount == 0)
+    }
+
+    @Test("A budget report cannot hide a cancellation or an invalid reader result")
+    func budgetReportPublicationFence() throws {
+        let token = ProbeCancellation()
+        let control = try Self.control(cancellation: token)
+        defer { control.finish() }
+        control.stop(ProbeError.inputLimit)
+        token.cancel()
+        #expect(throws: CancellationError.self) { try control.completeBudgetReport() }
+        let malformed = try Self.control()
+        defer { malformed.finish() }
+        malformed.stop(ProbeError.invalidReaderResult)
+        #expect(throws: ProbeError.invalidReaderResult) { try malformed.completeBudgetReport() }
+    }
+
+    @Test("Preparation cancellation waits for parked custom I/O without taking reader ownership",
+          .timeLimit(.minutes(1)), arguments: ProbeParkedReader.Operation.allCases)
+    func cancellationOfPreparation(operation: ProbeParkedReader.Operation) async throws {
+        let reader = ProbeParkedReader(operation: operation)
+        defer { reader.release() }
+        let token = ProbeCancellation()
+        let job = ProbeTestJob {
+            try AetherEngine.prepareSource(
+                source: .custom(reader), presentationTime: 600, limits: Self.ample, cancellation: token)
+        }
+        try await waitFor { reader.interrupted.entered }
+        token.cancel()
+        #expect(reader.cancelCount == 1)
+        #expect(!job.isFinished)
+        reader.mayReturn.open()
+        Self.expectCancellation(try await job.outcome())
+        #expect(reader.closeCount == 0)
+        token.cancel()
+        #expect(reader.cancelCount == 1)
+    }
+
+    @Test("Precancelled preparation never touches its reader")
+    func preparationPrecancelled() {
+        let reader = ProbeRecordingReader(data: TinyTransportStreamFixture.data)
+        let token = ProbeCancellation()
+        token.cancel()
+        #expect(throws: CancellationError.self) {
+            try AetherEngine.prepareSource(source: .custom(reader), presentationTime: 0,
+                                            limits: Self.ample, cancellation: token)
+        }
+        #expect(reader.reads.isEmpty)
+        #expect(reader.seeks.isEmpty)
+        #expect(reader.closeCount == 0)
+    }
+
+    @Test("Ordinary transport streams prepare from the same zero-based origin as playback",
+          arguments: [0.0, 4.0])
+    func preparesOrdinaryTransport(time: Double) throws {
+        let reader = ProbeRecordingReader(data: TinyTransportStreamFixture.data)
+        let token = ProbeCancellation()
+        let report = try AetherEngine.prepareSource(
+            source: .custom(reader, formatHint: "mpegts"), presentationTime: time,
+            duration: 2, preroll: 1, limits: Self.ample, cancellation: token)
+        #expect(report.outcome == .complete)
+        #expect(abs(try #require(report.sourceOrigin) - 1.4) < 0.001)
+        let video = try #require(report.video)
+        #expect(video.packetCount > 0)
+        #expect(video.packetBytes > 0)
+        #expect(video.untimedPacketCount == 0)
+        #expect(try #require(video.randomAccessSourceTime) <= 1.4 + max(0, time - 1) + 0.001)
+        #expect(try #require(video.observedSourceRange).upperBound >= time + 3.4 - 0.001)
+        #expect(report.audio == nil)
+        #expect(reader.closeCount == 0)
+        token.cancel()
+        #expect(reader.cancelCount == 0, "return must unregister the reader interruption")
+        #expect(reader.seek(offset: 0, whence: SEEK_SET) == 0)
+        #expect(Self.read(reader, size: 188) == 188)
+    }
+
+    @Test("Preparation reports EOF honestly when the requested window extends beyond the source")
+    func preparationEndOfSource() throws {
+        let report = try AetherEngine.prepareSource(
+            source: .custom(ProbeRecordingReader(data: TinyTransportStreamFixture.data), formatHint: "mpegts"),
+            presentationTime: 6, duration: 10, preroll: 1, limits: Self.ample)
+        #expect(report.outcome == .endOfSource)
+        let range = try #require(report.video?.observedSourceRange)
+        #expect(range.lowerBound < 9.4)
+        #expect(range.upperBound < 17.4)
+    }
+
+    @Test("Forward-only preparation cannot pretend a resume seek landed")
+    func preparationSeekFailure() throws {
+        let report = try AetherEngine.prepareSource(
+            source: .custom(TinyTransportStreamFixture.LiveReader(), formatHint: "mpegts"),
+            presentationTime: 4, preroll: 0, limits: Self.ample)
+        #expect(report.outcome == .seekFailed)
+        #expect(report.video?.packetCount == 0)
+    }
+
+    @Test("Preparation reports selected audio only while all demuxed streams consume the packet budget")
+    func preparationAudioSelection() throws {
+        let bytes = try ProbeTestFixtures.combined(audioCopies: 2)
+        let reader = ProbeRecordingReader(data: bytes)
+        let report = try AetherEngine.prepareSource(
+            source: .custom(reader, formatHint: "mp4"), presentationTime: 0,
+            audioSourceStreamIndex: 2, limits: Self.ample)
+        #expect(report.outcome == .endOfSource)
+        #expect(report.video?.streamIndex == 0)
+        #expect(report.audio?.streamIndex == 2)
+        #expect(try #require(report.video).packetCount > 0)
+        #expect(try #require(report.audio).packetCount > 0)
+        #expect(report.demuxedPackets > (report.video?.packetCount ?? 0) + (report.audio?.packetCount ?? 0))
+        #expect(reader.closeCount == 0)
+        #expect(reader.seek(offset: 0, whence: SEEK_SET) == 0)
+        #expect(throws: SourcePreparationError.invalidAudioStream) {
+            try AetherEngine.prepareSource(source: .custom(reader, formatHint: "mp4"), presentationTime: 0,
+                                            audioSourceStreamIndex: 0, limits: Self.ample)
+        }
+        #expect(reader.closeCount == 0)
+    }
+
+    @Test("Audio-only preparation reads compressed packets without requiring video")
+    func preparationAudioOnly() throws {
+        let reader = ProbeRecordingReader(data: try ProbeTestFixtures.eac3())
+        let report = try AetherEngine.prepareSource(
+            source: .custom(reader, formatHint: "mp4"), presentationTime: 0, limits: Self.ample)
+        #expect(report.video == nil)
+        #expect(try #require(report.audio).packetCount > 0)
+        #expect(report.outcome == .endOfSource)
+        #expect(reader.closeCount == 0)
+    }
+
+    @Test("Malformed media throws instead of a success-shaped preparation report")
+    func preparationOpenFailure() {
+        let reader = ProbeRecordingReader(data: Data([1, 2, 3]))
+        let result = Result {
+            try AetherEngine.prepareSource(source: .custom(reader, formatHint: "mp4"),
+                                            presentationTime: 0, limits: Self.ample)
+        }
+        if case .success = result { Issue.record("Malformed input returned a preparation report") }
+        #expect(reader.closeCount == 0)
+    }
+
+    @Test("Compressed coverage needs an independent start, selected audio and a decode-order frontier")
+    func preparationCoverageEvidence() {
+        var video = SourcePreparationProgress(index: 0, isVideo: true, requestedRange: 600...604)
+        var audio = SourcePreparationProgress(index: 1, isVideo: false, requestedRange: 600...604)
+        video.record(pts: 600, dts: 599, duration: 1, bytes: 10, randomAccess: true)
+        video.record(pts: 605, dts: 600, duration: 1, bytes: 10, randomAccess: false)
+        #expect(!video.isComplete, "reordered future PTS must not end the read early")
+        video.record(pts: 604, dts: 604, duration: 1, bytes: 10, randomAccess: false)
+        #expect(video.isComplete)
+        #expect(!audio.isComplete)
+        audio.record(pts: 600, dts: 600, duration: 1, bytes: 10, randomAccess: false)
+        audio.record(pts: 604, dts: 604, duration: 1, bytes: 10, randomAccess: false)
+        #expect(audio.isComplete)
+
+        var late = SourcePreparationProgress(index: 0, isVideo: true, requestedRange: 600...604)
+        late.record(pts: 600, dts: 600, duration: 1, bytes: 10, randomAccess: false)
+        late.record(pts: 604, dts: 604, duration: 1, bytes: 10, randomAccess: true)
+        #expect(!late.isComplete)
+        video.record(pts: nil, dts: 605, duration: 1, bytes: 10, randomAccess: false)
+        #expect(video.stream.untimedPacketCount == 1)
+        #expect(!video.isComplete, "unknown presentation timestamps must not fabricate coverage")
+
+        var noDTS = SourcePreparationProgress(index: 0, isVideo: true, requestedRange: 600...604)
+        noDTS.record(pts: 600, dts: nil, duration: 1, bytes: 10, randomAccess: true)
+        noDTS.record(pts: 604, dts: nil, duration: 1, bytes: 10, randomAccess: false)
+        #expect(!noDTS.isComplete)
+        noDTS.record(pts: 605, dts: nil, duration: 1, bytes: 10, randomAccess: true)
+        #expect(noDTS.isComplete)
+    }
+
+    @Test("Preparation checks compressed video random access, not an index or packet key flag alone")
+    func preparationRandomAccessEvidence() throws {
+        let context = try #require(avformat_alloc_context())
+        defer { avformat_free_context(context) }
+        let stream = try #require(avformat_new_stream(context, nil))
+        var packet = AVPacket()
+        packet.flags = AV_PKT_FLAG_KEY
+        let cases: [(AVCodecID, [UInt8], Bool)] = [
+            (AV_CODEC_ID_H264, [0, 0, 1, 0x41, 0x80], false),
+            (AV_CODEC_ID_H264, [0, 0, 1, 0x65, 0x80], true),
+            (AV_CODEC_ID_HEVC, [0, 0, 1, 0x02, 0x01, 0x80], false),
+            (AV_CODEC_ID_HEVC, [0, 0, 1, 0x26, 0x01, 0x80], true),
+            (AV_CODEC_ID_HEVC, [0, 0, 1, 0x2A, 0x01, 0x80], true),
+        ]
+        for (codec, sample, expected) in cases {
+            stream.pointee.codecpar.pointee.codec_id = codec
+            var sample = sample
+            packet.size = Int32(sample.count)
+            sample.withUnsafeMutableBufferPointer {
+                packet.data = $0.baseAddress
+                #expect(AetherEngine.preparationRandomAccess(&packet, stream: stream) == expected)
+            }
+        }
+    }
+
     private static func control(
         _ limits: ProbeLimits? = ample,
         cancellation: ProbeCancellation? = nil

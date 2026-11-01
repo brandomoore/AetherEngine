@@ -2,6 +2,17 @@ import Testing
 @testable import AetherEngine
 
 struct DemuxerProfileTests {
+    @Test("Packet preparation prohibits decoder opens without changing playback or metadata probes")
+    func preparationDoesNotDecode() {
+        let limits = ProbeLimits(maxInputBytes: 12345)
+        let profile = AetherEngine.preparationOpenProfile(limits: limits)
+        #expect(!profile.allowsProbeDecoding)
+        #expect(!profile.auditsRecordlessDolbyVision)
+        #expect(profile.probesize == limits.maxInputBytes)
+        #expect(DemuxerOpenProfile.playback.allowsProbeDecoding)
+        #expect(AetherEngine.probeOpenProfile(limits: limits).allowsProbeDecoding)
+    }
+
     @Test("playback profile keeps the large probe budget + prefetch")
     func playbackDefaults() {
         let p = DemuxerOpenProfile.playback

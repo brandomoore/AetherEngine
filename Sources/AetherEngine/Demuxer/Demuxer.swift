@@ -45,6 +45,8 @@ struct DemuxerOpenProfile: Sendable {
     /// flat ~5 s startup stall on a slow remote source. The side reader runs a bounded find_stream_info
     /// on demand only if its target subtitle stream's codec is genuinely unresolved at open.
     var skipStreamInfo: Bool
+    /// Packet preparation must not let find_stream_info open a decoder either.
+    var allowsProbeDecoding: Bool = true
 
     /// Bound the open-time data connection to a finite byte range (`bytes=0-N`) instead of the
     /// open-ended `bytes=0-` streaming request (#93 residual). Only the wedge-restart reopen sets
@@ -1014,6 +1016,9 @@ public final class Demuxer: @unchecked Sendable {
         var opts: OpaquePointer? = nil
         Self.applyDemuxerOptions(&opts, isLive: isLive,
                                  skipDurationEstimate: openProfile.avioSequentialOnly)
+        if !openProfile.allowsProbeDecoding {
+            av_dict_set(&opts, "codec_whitelist", "aether_no_decoders", 0)
+        }
         let ret = avformat_open_input(&ctxPtr, nil, inputFormat, &opts)
         av_dict_free(&opts)
         guard ret == 0 else {
@@ -2775,9 +2780,10 @@ public final class Demuxer: @unchecked Sendable {
     /// pacing stream silently moved the anchor onto video keyframes (#234). A caller that reads one
     /// sparse stream wants its own axis, so it says so. An index outside the source falls back to
     /// the default rather than failing the seek.
+    /// `atOrBefore` constrains the native search's upper bound for packet preparation's preroll.
     @discardableResult
     func seekBounded(to seconds: Double, anchorStreamIndex: Int32 = -1,
-                     timeout: TimeInterval) -> Bool {
+                     timeout: TimeInterval, atOrBefore: Bool = false) -> Bool {
         accessLock.lock()
         defer { accessLock.unlock() }
         guard let ctx = formatContext else { return false }
@@ -2820,7 +2826,8 @@ public final class Demuxer: @unchecked Sendable {
         if seekByDiscTableLocked(ctx, sourceSeconds: seconds) || seekByDVDTimeMapLocked(ctx, sourceSeconds: seconds) {
             return !(avioProvider?.readDeadlineFired ?? false) && probeControl?.isStopped != true
         }
-        let ret = avformat_seek_file(ctx, anchor, Int64.min, timestamp, Int64.max, 0)
+        let ret = avformat_seek_file(ctx, anchor, Int64.min, timestamp,
+                                     atOrBefore ? timestamp : Int64.max, 0)
         avformat_flush(ctx)
         resetSubpictureAssembly()  // #651: libavformat just dropped the parsers this stands in for
         lastReadClipIdx = -1  // AE#105: post-seek reads may land mid-clip; require a fresh clean crossing

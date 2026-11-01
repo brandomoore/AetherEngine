@@ -1,7 +1,7 @@
 import Foundation
 import AetherLibavcodec
 
-/// Optional limits for an entire static metadata probe, including open, stream analysis and seeks.
+/// Limits for an entire static probe or packet preparation, including open, stream analysis and seeks.
 /// Input counts bytes delivered by the reader, including rereads, not network traffic or prefetch.
 public struct ProbeLimits: Sendable, Equatable {
     public var maxInputBytes: Int64
@@ -26,7 +26,8 @@ public struct ProbeLimits: Sendable, Equatable {
     }
 }
 
-/// A controlled probe throws rather than publishing a partial or late positive after a whole-probe stop.
+/// Controlled metadata probes throw on a whole-probe stop. Packet preparation reports budget stops
+/// explicitly as incomplete, and still throws on cancellation or invalid reader results.
 public enum ProbeError: Error, Sendable, Equatable, LocalizedError {
     case invalidLimits
     case inputLimit
@@ -36,6 +37,13 @@ public enum ProbeError: Error, Sendable, Equatable, LocalizedError {
     case invalidReaderResult
     case unsupportedURL
     case sourceBusy
+
+    var isPreparationBudget: Bool {
+        switch self {
+        case .inputLimit, .packetLimit, .packetSizeLimit, .timedOut: true
+        default: false
+        }
+    }
 
     public var errorDescription: String? {
         switch self {
@@ -197,6 +205,26 @@ final class ProbeControl: @unchecked Sendable {
         deadline.map { max(0, $0 - now()) }
     }
 
+    var usage: (inputBytes: Int64, packets: Int) {
+        lock.withLock { (inputBytes, packets) }
+    }
+
+    /// Only the packet-preparation API publishes an explicitly incomplete budget report.
+    /// Cancellation still wins at the publication boundary, including after a budget fired first.
+    func completeBudgetReport() throws {
+        func commit() throws {
+            try lock.withLock {
+                guard let error = failure as? ProbeError, error.isPreparationBudget else {
+                    if let failure { throw failure }
+                    throw ProbeError.invalidLimits
+                }
+                completed = true
+            }
+        }
+        if let cancellation { try cancellation.completing(commit) }
+        else { try commit() }
+    }
+
     func inputAllowance(_ requested: Int32) throws -> Int32 {
         try check()
         guard let limits else { return requested }
@@ -226,12 +254,16 @@ final class ProbeControl: @unchecked Sendable {
     }
 
     func receivedPacket(_ packet: UnsafePointer<AVPacket>) throws {
+        try checkPacketSize(packet)
+        lock.withLock { packets += 1 }
+    }
+
+    func checkPacketSize(_ packet: UnsafePointer<AVPacket>) throws {
         try check()
         if let limits, Int(packet.pointee.size) > limits.maxPacketBytes {
             stop(ProbeError.packetSizeLimit)
             throw ProbeError.packetSizeLimit
         }
-        lock.withLock { packets += 1 }
     }
 
     /// The result's linearization point: cancellation before this wins, cancellation afterwards is too late.

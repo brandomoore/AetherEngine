@@ -291,7 +291,7 @@ extension AetherEngine {
     /// this probe's budget and cancellation do not reach, and `open(reader:)` clears `auditSource`
     /// regardless. A controlled probe of an untagged 10-bit HEVC source therefore reports no Dolby
     /// Vision record where an uncontrolled one does (AE#567).
-    private nonisolated static func probeOpenProfile(limits: ProbeLimits?) -> DemuxerOpenProfile {
+    nonisolated static func probeOpenProfile(limits: ProbeLimits?) -> DemuxerOpenProfile {
         guard let limits else { return .playback }
         var profile = DemuxerOpenProfile.playback
         // FFmpeg has a minimum probe size. The input seam still enforces smaller caller limits.

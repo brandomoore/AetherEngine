@@ -10,6 +10,14 @@ the public-API contract.
 
 ## [Unreleased]
 
+- **Prepare compressed source bytes around a resume position without playback.**
+  `AetherEngine.prepareSource` opens a caller-owned custom reader, maps zero-based presentation time
+  through the existing container/disc timeline, seeks via the disc or native demuxer and reads a bounded
+  selected A/V packet window. This reaches resume bytes that header-only warming misses without a player
+  or decoder. Required whole-operation limits and cancellation cover recognition, open, seek and reads;
+  numeric reports distinguish observed landing/coverage, EOF, seek failure and exhausted budgets.
+  The caller owns byte caching and reader lifetime. No source bytes or demux state are retained.
+
 - Added metadata-only `softwareReadAheadStatus` for active software/FEL packet
   caches: resolved storage, byte usage/budget, requested duration, and a confirmed
   byte-budget stop. No additional I/O, sampling loop, or buffering-policy change.

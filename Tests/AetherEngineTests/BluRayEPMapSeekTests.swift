@@ -237,4 +237,101 @@ struct BluRayEPMapSeekTests {
         #expect(abs(landed - keyframe) < 0.01)
         #expect(!capture.matching(String(format: "EP map seek: source=%.3fs", target)).isEmpty)
     }
+
+    /// Two short packet windows on a long timeline, not a long media fixture. PCR and PES timestamps
+    /// move together; payloads, keyframes and their transport packet numbers stay unchanged.
+    static func shiftedTinyM2TS(startSeconds: Double) -> [UInt8] {
+        var ts = [UInt8](TinyTransportStreamFixture.data)
+        let delta = Int64(((startSeconds - 1.4) * 90_000).rounded())
+        func shiftStamp(at i: Int) {
+            let old = Int64(ts[i] & 0x0E) << 29 | Int64(ts[i + 1]) << 22
+                | Int64(ts[i + 2] & 0xFE) << 14 | Int64(ts[i + 3]) << 7 | Int64(ts[i + 4] >> 1)
+            let new = old + delta
+            ts[i] = (ts[i] & 0xF1) | UInt8((new >> 29) & 0x0E)
+            ts[i + 1] = UInt8((new >> 22) & 0xFF)
+            ts[i + 2] = UInt8((new >> 14) & 0xFE) | 1
+            ts[i + 3] = UInt8((new >> 7) & 0xFF)
+            ts[i + 4] = UInt8((new << 1) & 0xFE) | 1
+        }
+        for base in stride(from: 0, to: ts.count, by: 188) {
+            let adaptation = (ts[base + 3] >> 4) & 3
+            var payload = base + 4
+            if adaptation & 2 != 0 {
+                let length = Int(ts[payload])
+                if length >= 7, ts[payload + 1] & 0x10 != 0 {
+                    let p = payload + 2
+                    let old = Int64(ts[p]) << 25 | Int64(ts[p + 1]) << 17
+                        | Int64(ts[p + 2]) << 9 | Int64(ts[p + 3]) << 1 | Int64(ts[p + 4] >> 7)
+                    let new = old + delta
+                    ts[p] = UInt8((new >> 25) & 0xFF)
+                    ts[p + 1] = UInt8((new >> 17) & 0xFF)
+                    ts[p + 2] = UInt8((new >> 9) & 0xFF)
+                    ts[p + 3] = UInt8((new >> 1) & 0xFF)
+                    ts[p + 4] = (ts[p + 4] & 0x7F) | UInt8((new & 1) << 7)
+                }
+                payload += length + 1
+            }
+            guard adaptation & 1 != 0, ts[base + 1] & 0x40 != 0, payload + 14 <= base + 188,
+                  ts[payload] == 0, ts[payload + 1] == 0, ts[payload + 2] == 1,
+                  ts[payload + 3] & 0xF0 == 0xE0 else { continue }
+            if ts[payload + 7] & 0x80 != 0 { shiftStamp(at: payload + 9) }
+            if ts[payload + 7] & 0x40 != 0 { shiftStamp(at: payload + 14) }
+        }
+        return stride(from: 0, to: ts.count, by: 188).flatMap { [0, 0, 0, 0] + ts[$0..<$0 + 188] }
+    }
+
+    static func preparationImage() -> Data {
+        let head = shiftedTinyM2TS(startSeconds: 600)
+        let resume = shiftedTinyM2TS(startSeconds: 1196)
+        let starts = [(600.0, UInt32(0)), (1196.0, UInt32(head.count / 192))]
+        let entries = starts.flatMap { start, packetBase in
+            keyframes.map {
+                CLPIEntryPoint(pts45k: UInt64(((start + $0.seconds - 1.4) * 45_000).rounded()) / 256 * 256,
+                               spn: packetBase + $0.packet)
+            }
+        }
+        return UDFFixture.make(
+            mplsBytes: mpls([(id: "00001", inT: 600 * 45_000, outT: 1204 * 45_000)]),
+            m2tsBytes: head + resume, clpiBytes: clpi([(pid: 0x1011, entries: entries)]))
+    }
+
+    @Test("Preparation seeks on presentation time and reads physical ISO extents",
+          arguments: [0.0, 600.0])
+    func preparesHeadAndResume(presentationTime: Double) throws {
+        let reader = ProbeRecordingReader(data: Self.preparationImage(), discImageProbeEnabled: true)
+        let report = try AetherEngine.prepareSource(
+            source: .custom(reader), presentationTime: presentationTime, duration: 2, preroll: 2,
+            discTitleID: 0,
+            limits: .init(maxInputBytes: 4 * 1024 * 1024, maxPackets: 256, timeBudget: 3600))
+        #expect(report.outcome == .complete)
+        #expect(abs(try #require(report.sourceOrigin) - 600) < 0.001)
+        #expect(report.selectedDiscTitleID == 0)
+        let sourceRange = try #require(report.requestedSourceRange)
+        #expect(abs(sourceRange.lowerBound - (600 + max(0, presentationTime - 2))) < 0.001)
+        #expect(abs(sourceRange.upperBound - (602 + presentationTime)) < 0.001)
+        let video = try #require(report.video)
+        let landed = try #require(video.randomAccessSourceTime)
+        #expect(landed <= sourceRange.lowerBound + 0.001)
+        #expect(landed >= sourceRange.lowerBound - 1.01)
+        #expect(try #require(video.observedSourceRange).upperBound >= sourceRange.upperBound)
+        #expect(report.audio == nil)
+        #expect(report.inputBytesRead == reader.bytesRead)
+        #expect(reader.closeCount == 0)
+        #expect(reader.cancelCount == 0)
+        if presentationTime > 0 {
+            // The second packet window lives in the second fragmented physical extent.
+            #expect(reader.reads.contains { $0.offset >= 320 * 2048 && $0.returned > 0 })
+            #expect(landed > 1196, "seeking absolute 600 would have warmed the head again")
+        }
+    }
+
+    @Test("Preparation refuses an invalid title instead of warming a silently substituted title")
+    func preparationRejectsTitleFallback() throws {
+        let reader = ProbeRecordingReader(data: Self.image(), discImageProbeEnabled: true)
+        #expect(throws: SourcePreparationError.invalidDiscTitle) {
+            try AetherEngine.prepareSource(source: .custom(reader), presentationTime: 0,
+                                            discTitleID: 999, limits: .init(timeBudget: 3600))
+        }
+        #expect(reader.closeCount == 0)
+    }
 }

@@ -257,6 +257,13 @@ final class DocumentedConstantsTests: XCTestCase {
 
     // MARK: - Probe budgets
 
+    func testSourcePreparationDefaultsMatchDocumentation() throws {
+        XCTAssertEqual(AetherEngine.defaultPreparationDuration, 4)
+        XCTAssertEqual(AetherEngine.defaultPreparationPreroll, 2)
+        assertDocumented("`defaultPreparationDuration` (4 s)", try documentation())
+        assertDocumented("`defaultPreparationPreroll` (2 s)", try documentation())
+    }
+
     func testWholeProbeDefaultsMatchDocumentation() throws {
         let docs = try documentation()
         let limits = ProbeLimits()

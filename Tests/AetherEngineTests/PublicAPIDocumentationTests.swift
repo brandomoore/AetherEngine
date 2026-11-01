@@ -33,6 +33,7 @@ final class PublicAPIDocumentationTests: XCTestCase {
         "PlayerState.swift",
         "PlaybackErrorInfo.swift",
         "ProbeControl.swift",
+        "SourcePreparation.swift",
         "PlaybackClock.swift",
         "SeekEvent.swift",
         "StartupProgress.swift",

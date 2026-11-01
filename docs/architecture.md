@@ -422,6 +422,8 @@ batch's advanced cursor so re-selection collects it again rather than skipping u
 Sources/AetherEngine/
 ├── AetherEngine.swift                       Engine core: stored state, load dispatch, transport, stop/seek, track selection
 ├── AetherEngine+Probe.swift Static probe machinery: probe(url:/source:), shared HDR10+/Atmos detail orchestration, swDecodeProbe, format / frame-rate / codec-label detection
+├── AetherEngine+SourcePreparation.swift Bounded demux-only custom-source packet preparation on the presentation axis; uses the existing disc/native seek path and never retains a demuxer
+├── SourcePreparation.swift Numeric packet-preparation outcomes, per-stream evidence and traversal completion policy, not playback readiness or byte storage
 ├── ProbeControl.swift Opt-in whole-probe input/packet/deadline accounting and caller cancellation; native callbacks retain their control until synchronous work returns
 ├── AetherEngine+Loading.swift               The per-backend loaders (remote-HLS, native, software, audio, audio-native) + reload
 ├── AetherEngine+OptionalComponents.swift   `AetherEngine.OptionalComponent`: which trait-gated components (object audio, dual-layer DV, DV still reshaping) this build carries

@@ -669,6 +669,96 @@ probe with `carriesHDR10PlusMetadata == false` or an unconfirmed Atmos track mea
 the requested passes/budgets**, never proof of absence. Atmos detection means E-AC-3 JOC, not TrueHD Atmos.
 These are source-metadata answers, not evidence of HDMI output or display mode.
 
+### Preparing compressed packets at a presentation position
+
+`AetherEngine.prepareSource(source:presentationTime:duration:preroll:audioSourceStreamIndex:discTitleID:limits:cancellation:)`
+is a `nonisolated static throws -> SourcePreparationReport` operation for an independent
+`MediaSource.custom` reader. It opens the source, resolves its presentation position, seeks through the
+normal disc/native demux machinery, reads compressed packets, and closes the demuxer before returning.
+It creates no player, audio session, server, video decoder or audio decoder. Even libavformat's
+stream-info pass is prohibited from opening decoders for this operation. Containers that require a
+decoder to discover usable streams can consequently fail preparation rather than relaxing that rule.
+Ordinary playback and the metadata-probe open policy are unchanged.
+
+```swift
+let report = try AetherEngine.prepareSource(
+    source: .custom(preparationReader),
+    presentationTime: resumePosition,
+    audioSourceStreamIndex: selectedAudioStream,
+    limits: preparationLimits,
+    cancellation: cancellation)
+```
+
+`presentationTime` is zero-based VOD time, not an absolute source PTS. The requested video window runs
+from `max(0, presentationTime - preroll)` through `presentationTime + duration`. Defaults are
+`defaultPreparationDuration` (4 s) after the position and `defaultPreparationPreroll` (2 s) before it.
+The seek asks for a random-access point at or before that window, so the actual read can start earlier.
+At the source head it consumes the packets already queued by opening rather than throwing them away.
+The default video stream is used. A nil `audioSourceStreamIndex` uses the demuxer's default audio
+stream; an explicit index must name audio. Pass the same explicit selection intended for playback:
+this API does not apply language, audio-rendering or other `LoadOptions` preferences. All interleaved
+streams count against the budget, even though only selected A/V packets contribute to the report.
+
+The position mapping uses the engine's existing presentation-origin policy and `PresentationAxis`.
+For ordinary containers, zero is the nonnegative container start. A disc uses its first compressed
+video random-access timestamp, the same source origin its native playback publishes. The demuxer
+continues to fold multi-clip Blu-ray and DVD-cell timestamps and uses the selected title's EP map,
+DVD time map, or bounded native timestamp seek. No logical title byte offset is handed to the host:
+all reads go through the disc adapter to the original reader's physical byte space. `discTitleID`
+defaults to the main title; a supplied invalid title is rejected, not silently substituted. This is
+a fresh VOD coordinate mapping, not a reconstruction of a running player's later timeline drift.
+
+The report contains numeric evidence, never bytes or handles:
+
+| Symbol | Contract |
+| --- | --- |
+| `SourcePreparationReport` | `outcome`, `requestedPresentationTime`, `requestedPresentationRange`, `sourceOrigin`, `requestedSourceRange`, `selectedDiscTitleID`, optional `video` and `audio`, `inputBytesRead`, `demuxedPackets`. Origin/range/stream fields can be absent when opening exhausts the budget. |
+| `SourcePreparationStream` | The selected `streamIndex`, `packetCount`, `packetBytes`, `untimedPacketCount`, `firstSourceTime`, `observedSourceRange`, and video's `randomAccessSourceTime`. Times are folded source PTS; subtract `sourceOrigin` for presentation time. `firstSourceTime` is the first timed packet actually returned after positioning, not the requested seek. |
+| `SourcePreparationOutcome` | `complete`, `endOfSource`, `seekFailed`, or `budgetExhausted(ProbeError)`. Only `complete` met the packet-window criteria below. |
+| `SourcePreparationError` | Throws `invalidRequest` for invalid coordinates/selection values, `customSourceRequired` for a URL source, `noMediaStreams`, `invalidAudioStream`, or `invalidDiscTitle`. Ordinary source/open/read errors propagate. |
+
+`complete` requires a video random-access packet at or before the window's start, a timed packet
+covering that start, and traversal through its end in presentation and decode order. H.264 and HEVC
+random access is checked in compressed NAL data as well as the packet flag, not inferred from index
+entries; other codecs use the demuxer's packet key flag. A video stream without DTS can instead
+establish the ending frontier with a later random-access packet. Selected audio must cover the
+requested playback position and traverse the ending boundary; earlier interleaved audio is read
+too. Audio-only sources require only that audio evidence. Comparisons tolerate one stream time-base
+tick. Missing video presentation timestamps leave the result incomplete; audio can use DTS when PTS
+is absent. An unknown packet duration contributes no invented duration. EOF before the criteria are
+met returns `endOfSource`, including a window extending beyond the title, rather than silently
+clamping the request or claiming success. A refused seek returns `seekFailed` without reading an
+unverified landing forward.
+
+**This is packet traversal, not playback readiness.** `observedSourceRange` is the timestamp envelope
+of observed packets, not proof of continuous timestamps, independent frame decode, cached residency,
+a ready HLS segment or an AVPlayer buffer. The API frees packets as it proceeds and keeps no source,
+URL, credentials, seek map or demux state after return. It does not populate the URL-keyed `prewarm`
+store. It is useful only when the caller's independent reader retains the validated physical bytes
+for a later, separately opened playback reader. Representation/auth scope, sparse cache limits,
+expiration, validation and adoption remain the caller's responsibility. A smaller host cache can
+evict bytes before preparation returns; engine completion does not override that.
+
+`limits` is required and follows [whole-probe accounting](#whole-probe-limits-and-cancellation).
+The input and monotonic deadline start before recognition/open and include seeking and rereads.
+`demuxedPackets` counts admitted native packets across all streams, including demux-side inspection;
+packets FFmpeg consumes internally during open/seek are bounded by input and time instead.
+Individual oversized packets, including disc packets joined after demux, are refused before this
+API inspects them. Budgets are not native-memory or network-traffic ceilings. The defaults of
+`ProbeLimits` target metadata probes and do not guarantee this packet window fits: allow for container
+metadata, compressed bitrate, preceding GOPs, selected audio and rereads. No host cache budget is
+changed automatically.
+
+Budget stops return `budgetExhausted` with partial evidence and actual accounting, including when
+they occur while opening. Explicit cancellation always throws `CancellationError`, even when it
+races a budget stop; malformed reader responses and source failures are not converted to success.
+The method blocks its thread, so run it on a blocking-work queue and connect task cancellation to
+`ProbeCancellation`. The reader must cooperate with concurrent `cancel()`; no deadline can forcibly
+end a noncooperating reader. `close()` is never called on the caller's reader, its cursor is left
+unspecified, and interruption callbacks are drained before return. Do not share that cursor with
+playback. As with controlled probes, disc-folder readers and their child-file traversal are not
+supported by the counting wrapper; use a byte-addressed disc image or ordinary container.
+
 ### Warming a source before it is loaded
 
 ```swift
