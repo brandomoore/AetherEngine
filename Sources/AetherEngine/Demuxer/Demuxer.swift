@@ -47,6 +47,8 @@ struct DemuxerOpenProfile: Sendable {
     var skipStreamInfo: Bool
     /// Packet preparation must not let find_stream_info open a decoder either.
     var allowsProbeDecoding: Bool = true
+    /// Preparation needs timestamps at its landing, not a separate read of the source tail.
+    var skipDurationEstimate: Bool = false
 
     /// Bound the open-time data connection to a finite byte range (`bytes=0-N`) instead of the
     /// open-ended `bytes=0-` streaming request (#93 residual). Only the wedge-restart reopen sets
@@ -1015,7 +1017,7 @@ public final class Demuxer: @unchecked Sendable {
         var ctxPtr: UnsafeMutablePointer<AVFormatContext>? = ctx
         var opts: OpaquePointer? = nil
         Self.applyDemuxerOptions(&opts, isLive: isLive,
-                                 skipDurationEstimate: openProfile.avioSequentialOnly)
+                                 skipDurationEstimate: openProfile.avioSequentialOnly || openProfile.skipDurationEstimate)
         if !openProfile.allowsProbeDecoding {
             av_dict_set(&opts, "codec_whitelist", "aether_no_decoders", 0)
         }

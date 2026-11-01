@@ -92,6 +92,25 @@ struct ProbeControlTests {
         #expect(reader.closeCount == 0)
     }
 
+    @Test("Decoder-denied stream analysis leaves input for packets and does not fetch a duration tail")
+    func preparationOpeningDoesNotSpendTheWindowBudget() throws {
+        let bytes = SyntheticTS.broadcast(accessUnits: 3000, audio: .unresolvedAAC)
+        let reader = ProbeRecordingReader(data: bytes)
+        let limits = ProbeLimits(maxInputBytes: 4 * 1024 * 1024, maxPackets: 1, timeBudget: 3600)
+        let report = try AetherEngine.prepareSource(
+            source: .custom(reader, formatHint: "mpegts"), presentationTime: 0, limits: limits)
+        // A single packet proves opening returned and traversal began. A playback-sized profile
+        // can instead exhaust the entire input allowance inside find_stream_info.
+        #expect(report.outcome == .budgetExhausted(.packetLimit))
+        #expect(report.demuxedPackets == 1)
+        #expect(report.inputBytesRead < limits.maxInputBytes)
+        #expect(report.video?.streamIndex == 0)
+        #expect(report.audio?.streamIndex == 1)
+        #expect(reader.reads.allSatisfy { $0.offset < Int64(bytes.count / 2) },
+                "packet preparation has no use for a source-tail duration estimate")
+        #expect(reader.closeCount == 0)
+    }
+
     @Test("A budget report cannot hide a cancellation or an invalid reader result")
     func budgetReportPublicationFence() throws {
         let token = ProbeCancellation()
@@ -257,6 +276,20 @@ struct ProbeControlTests {
         #expect(!noDTS.isComplete)
         noDTS.record(pts: 605, dts: nil, duration: 1, bytes: 10, randomAccess: true)
         #expect(noDTS.isComplete)
+    }
+
+    @Test("Coverage diagnostics distinguish a missing start interval from exhausted forward coverage")
+    func preparationCoverageDiagnostics() {
+        var audio = SourcePreparationProgress(
+            index: 1, isVideo: false, requestedRange: 600...604, timestampTolerance: 0.001)
+        audio.record(pts: 599.98, dts: 599.98, duration: 0, bytes: 10, randomAccess: false)
+        audio.record(pts: 600.02, dts: 600.02, duration: 0, bytes: 10, randomAccess: false)
+        audio.record(pts: 604.02, dts: 604.02, duration: 0, bytes: 10, randomAccess: false)
+        #expect(!audio.isComplete, "an envelope does not invent the missing packet durations")
+        #expect(audio.diagnosticSummary.contains("startCovered=0"))
+        #expect(audio.diagnosticSummary.contains("untimedPackets=0 durationlessPackets=3"))
+        #expect(audio.diagnosticSummary.contains("decodeFrontier=604.020000"))
+        #expect(audio.diagnosticSummary.contains("observedLower=599.980000 observedUpper=604.020000"))
     }
 
     @Test("Preparation checks compressed video random access, not an index or packet key flag alone")

@@ -53,6 +53,7 @@ struct SourcePreparationProgress {
     private var randomAccessFrontier: Double?
     private var hasStartPacket = false
     private var unknownTiming = false
+    private var durationlessPackets = 0
 
     init(index: Int32, isVideo: Bool, requestedRange: ClosedRange<Double>, timestampTolerance: Double = 0) {
         stream = SourcePreparationStream(streamIndex: index)
@@ -65,6 +66,7 @@ struct SourcePreparationProgress {
                          randomAccess: Bool) {
         stream.packetCount += 1
         stream.packetBytes += Int64(max(0, bytes))
+        if duration <= 0 { durationlessPackets += 1 }
         // DTS alone cannot prove presentation coverage of reordered video.
         guard let pts = pts ?? (isVideo ? nil : dts), pts.isFinite else {
             stream.untimedPacketCount += 1
@@ -106,5 +108,23 @@ struct SourcePreparationProgress {
                   start <= requestedRange.lowerBound + timestampTolerance else { return false }
         }
         return true
+    }
+
+    /// Fixed numeric evidence for a budget stop whose timestamp envelope alone cannot explain it.
+    var diagnosticSummary: String {
+        func number(_ value: Double?) -> String {
+            value.map { String(format: "%.6f", $0) } ?? "none"
+        }
+        return "stream=\(stream.streamIndex) video=\(isVideo ? 1 : 0)"
+            + " packets=\(stream.packetCount) bytes=\(stream.packetBytes)"
+            + " requestedLower=\(number(requestedRange.lowerBound)) requestedUpper=\(number(requestedRange.upperBound))"
+            + " first=\(number(stream.firstSourceTime))"
+            + " observedLower=\(number(stream.observedSourceRange?.lowerBound))"
+            + " observedUpper=\(number(stream.observedSourceRange?.upperBound))"
+            + " randomAccess=\(number(stream.randomAccessSourceTime))"
+            + " startCovered=\(hasStartPacket ? 1 : 0)"
+            + " untimedPackets=\(stream.untimedPacketCount) durationlessPackets=\(durationlessPackets)"
+            + " decodeFrontier=\(number(decodeFrontier)) randomAccessFrontier=\(number(randomAccessFrontier))"
+            + " complete=\(isComplete ? 1 : 0)"
     }
 }

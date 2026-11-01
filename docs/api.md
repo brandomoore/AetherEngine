@@ -680,6 +680,20 @@ stream-info pass is prohibited from opening decoders for this operation. Contain
 decoder to discover usable streams can consequently fail preparation rather than relaxing that rule.
 Ordinary playback and the metadata-probe open policy are unchanged.
 
+Preparation's stream analysis is capped at **2 MiB / 2 s of media**, further restricted by the caller's
+whole-operation limits, using the existing still-extraction analysis cap. This is not a wall-clock
+deadline: `ProbeLimits.timeBudget` still bounds the entire operation. Parser analysis remains enabled
+for origin, time bases and reorder information, and ordinary timestamp repairs remain enabled.
+Decoder-denied tracks can otherwise keep the full playback analysis reading until the caller's
+entire input budget is exhausted without returning a packet. Preparation also skips the separate
+source-tail duration estimate, since its requested window needs no total-duration measurement.
+Container headers, disc recognition, AVIO read granularity and native seek work remain charged to the
+whole input budget; the stream-analysis cap is not a separate hard bound on all opening I/O.
+Fixed numeric `SourcePreparationCoverage` diagnostics report each selected stream's requested and
+observed ranges, independent start, start-interval coverage, missing timestamps/durations and
+decode/random-access frontiers. These distinguish a budget spent short of the end from a start or
+timing prerequisite that remains unproved; they contain no source identity.
+
 ```swift
 let report = try AetherEngine.prepareSource(
     source: .custom(preparationReader),

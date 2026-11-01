@@ -264,6 +264,13 @@ final class DocumentedConstantsTests: XCTestCase {
         assertDocumented("`defaultPreparationPreroll` (2 s)", try documentation())
     }
 
+    func testSourcePreparationAnalysisCapMatchesDocumentation() throws {
+        let profile = AetherEngine.preparationOpenProfile(limits: .init(maxInputBytes: 28 * 1024 * 1024))
+        XCTAssertEqual(profile.probesize, 2 * 1024 * 1024)
+        XCTAssertEqual(profile.maxAnalyzeDuration, 2 * 1_000_000)
+        assertDocumented("stream analysis is capped at **2 MiB / 2 s of media**", try documentation())
+    }
+
     func testWholeProbeDefaultsMatchDocumentation() throws {
         let docs = try documentation()
         let limits = ProbeLimits()

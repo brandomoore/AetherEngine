@@ -168,13 +168,22 @@ extension AetherEngine {
         let usage = control.usage
         report.inputBytesRead = usage.inputBytes
         report.demuxedPackets = usage.packets
+        if let video { EngineLog.emit("[SourcePreparationCoverage] \(video.diagnosticSummary)", category: .demux) }
+        if let audio { EngineLog.emit("[SourcePreparationCoverage] \(audio.diagnosticSummary)", category: .demux) }
         return report
     }
 
     nonisolated static func preparationOpenProfile(limits: ProbeLimits) -> DemuxerOpenProfile {
+        // Decoder-denied tracks can never satisfy find_stream_info's full-metadata exit. Giving
+        // them the playback probe consumed a real ISO's entire 28 MiB allowance before one packet.
+        // Keep parser analysis (not skipStreamInfo) for time bases, origin and reorder information,
+        // but reserve the caller's remaining input allowance for the requested compressed window.
         var profile = probeOpenProfile(limits: limits)
-        // find_stream_info ordinarily tries decoders when headers alone leave parameters unset.
+        profile.probesize = min(profile.probesize, DemuxerOpenProfile.stillExtraction.probesize)
+        profile.maxAnalyzeDuration = min(
+            profile.maxAnalyzeDuration, DemuxerOpenProfile.stillExtraction.maxAnalyzeDuration)
         profile.allowsProbeDecoding = false
+        profile.skipDurationEstimate = true
         return profile
     }
 

@@ -219,7 +219,7 @@ enum SyntheticTS {
     static let subtitlePID: UInt16 = 0x0102
 
     /// What the PMT declares on the audio PID.
-    enum AudioShape { case none, ac4 }
+    enum AudioShape { case none, ac4, unresolvedAAC }
 
     /// What the PMT declares on the subtitle PID. `.pgs` is a Blu-ray PGS track that never carries a
     /// packet, the shape of a sparse track whose first cue lies past the probe.
@@ -268,6 +268,11 @@ enum SyntheticTS {
         switch audio {
         case .none:
             break
+        case .unresolvedAAC:
+            // A compiled-in codec whose missing parameters a decoder-denied preparation cannot
+            // resolve. The deliberately invalid payload is not a playable audio fixture.
+            body.append(contentsOf: [0x0F, UInt8(0xE0 | (audioPID >> 8)), UInt8(audioPID & 0xFF),
+                                     0xF0, 0x00])
         case .ac4:
             body.append(contentsOf: [0x06, UInt8(0xE0 | (audioPID >> 8)), UInt8(audioPID & 0xFF),
                                      0xF0, 0x06,

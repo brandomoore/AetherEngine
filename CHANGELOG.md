@@ -17,6 +17,8 @@ the public-API contract.
   or decoder. Required whole-operation limits and cancellation cover recognition, open, seek and reads;
   numeric reports distinguish observed landing/coverage, EOF, seek failure and exhausted budgets.
   The caller owns byte caching and reader lifetime. No source bytes or demux state are retained.
+  Preparation uses shallow parser analysis and skips unused tail-duration estimation, so unresolved
+  decoder-denied tracks cannot consume the full playback probe allowance before packet traversal.
 
 - Added metadata-only `softwareReadAheadStatus` for active software/FEL packet
   caches: resolved storage, byte usage/budget, requested duration, and a confirmed

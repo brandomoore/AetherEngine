@@ -9,8 +9,30 @@ struct DemuxerProfileTests {
         #expect(!profile.allowsProbeDecoding)
         #expect(!profile.auditsRecordlessDolbyVision)
         #expect(profile.probesize == limits.maxInputBytes)
+        #expect(profile.skipDurationEstimate)
+        #expect(!profile.skipStreamInfo)
+        #expect(!DemuxerOpenProfile.labelsWithoutCompositionRepair.contains(profile.readerLabel))
         #expect(DemuxerOpenProfile.playback.allowsProbeDecoding)
+        #expect(!DemuxerOpenProfile.playback.skipDurationEstimate)
         #expect(AetherEngine.probeOpenProfile(limits: limits).allowsProbeDecoding)
+    }
+
+    @Test("A larger preparation allowance funds packet reads, not full playback stream analysis")
+    func preparationKeepsOpeningShallow() {
+        let limits = ProbeLimits(maxInputBytes: 28 * 1024 * 1024, maxPackets: 4096, timeBudget: 20)
+        let profile = AetherEngine.preparationOpenProfile(limits: limits)
+        #expect(profile.probesize == DemuxerOpenProfile.stillExtraction.probesize)
+        #expect(profile.maxAnalyzeDuration == DemuxerOpenProfile.stillExtraction.maxAnalyzeDuration)
+        #expect(profile.probesize < limits.maxInputBytes)
+        #expect(profile.maxAnalyzeDuration < DemuxerOpenProfile.playback.maxAnalyzeDuration)
+        #expect(profile.skipDurationEstimate)
+        let metadataProfile = AetherEngine.probeOpenProfile(limits: limits)
+        #expect(profile.avioChunkSize == metadataProfile.avioChunkSize)
+        #expect(profile.avioPrefetch == metadataProfile.avioPrefetch)
+        #expect(profile.avioRequestTimeout == metadataProfile.avioRequestTimeout)
+        #expect(profile.avioMaxRetries == metadataProfile.avioMaxRetries)
+        #expect(!metadataProfile.skipDurationEstimate)
+        #expect(!DemuxerOpenProfile.restartReopen.skipDurationEstimate)
     }
 
     @Test("playback profile keeps the large probe budget + prefetch")
