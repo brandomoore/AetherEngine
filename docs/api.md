@@ -733,6 +733,15 @@ all reads go through the disc adapter to the original reader's physical byte spa
 defaults to the main title; a supplied invalid title is rejected, not silently substituted. This is
 a fresh VOD coordinate mapping, not a reconstruction of a running player's later timeline drift.
 
+A native DVD timestamp seek can land on DTS at the target while its first video PTS and independent
+packet are later. Only after observing that late first random-access packet, preparation permits
+at most **one DVD-only retry**, seeking up to **2 s earlier**, clamped to the source origin through the
+same demuxer and disc adapter. The requested presentation/source window does not move. Both streams'
+coverage evidence restarts, while all reads and packets from both attempts consume the original
+input, packet and time limits and cancellation. Per-stream counters describe the final attempt;
+whole-operation counters include the discarded attempt. Failed retry seeks and windows still lacking
+an independent start remain incomplete. Ordinary sources, Blu-ray seeks and playback policy do not change.
+
 The report contains numeric evidence, never bytes or handles:
 
 | Symbol | Contract |

@@ -275,6 +275,14 @@ URLs are retained in metadata. A source libavformat opens itself, which is a
 local path, stays on the direct loop: the spool exists to avoid a second trip to
 a source, and re-reading a file is a page-cache hit.
 
+When the decode consumer has parked foreground video, it caps the empty packet-store
+condition wait at **20 ms**. The ordinary consumer loop then rechecks play/seek admission
+and renderer readiness before feeding those packets with their existing generation and decoder
+epoch. A slow source read can no longer strand already available video below the clock's
+preroll threshold. This wake is neither EOF nor a source failure, and it does not cancel the
+producer's read. Without parked foreground work the consumer keeps its indefinite wait.
+Clock-start thresholds, rendered-frame reporting, audio lead and producer backpressure do not change.
+
 The host uses the existing `forwardBufferSegments` clamp and native session
 retention/volume-safety policy. The forward-second limit is measured on the
 reservoir, from the packet the consumer last took to the newest one stored,

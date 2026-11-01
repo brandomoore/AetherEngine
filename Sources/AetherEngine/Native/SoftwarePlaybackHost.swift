@@ -1089,6 +1089,15 @@ final class SoftwarePlaybackHost {
         ) == .stop
     }
 
+    nonisolated static let parkedVideoReadServiceInterval: TimeInterval = 0.020
+
+    nonisolated static func parkedVideoReadWaitSeconds(
+        decoupleAudio: Bool, parkedCount: Int, backgroundAudioOnly: Bool
+    ) -> TimeInterval? {
+        guard decoupleAudio, parkedCount > 0, !backgroundAudioOnly else { return nil }
+        return parkedVideoReadServiceInterval
+    }
+
     /// How long the parked demux loop waits before it re-checks the renderer, in seconds. The renderer
     /// drains at frame cadence and the audio lead shrinks with the clock, and nothing signals either,
     /// so this is a timed wait (audit PERF-110: the fixed 5 ms sleep was 200 wakeups a second in every
@@ -4091,7 +4100,15 @@ final class SoftwarePlaybackHost {
             let packet: UnsafeMutablePointer<AVPacket>?
             do {
                 if let readAhead {
-                    packet = try readAhead.read(isCurrent: { admitsRead(genBeforeRead) })?.makeAVPacket()
+                    // The renderer can become ready while the producer is still blocked on I/O.
+                    // Return to the ordinary, generation-checked drain instead of stranding video
+                    // already parked here. No parked work means the original indefinite wait.
+                    let wait = Self.parkedVideoReadWaitSeconds(
+                        decoupleAudio: decoupleAudio, parkedCount: parkedVideo.count,
+                        backgroundAudioOnly: backgroundAudioOnly())
+                    packet = try readAhead.read(
+                        until: wait.map { Date(timeIntervalSinceNow: $0) },
+                        isCurrent: { admitsRead(genBeforeRead) })?.makeAVPacket()
                 } else {
                     if replayGeneration != genBeforeRead {
                         replayReader?.reset()
@@ -4111,6 +4128,7 @@ final class SoftwarePlaybackHost {
                 // captured host generation, just like packets and EOF.
                 guard admitsRead(genBeforeRead) else { return !stopRequested() }
                 if case SoftwarePacketReadAhead.ReadError.interrupted = error { return true }
+                if case SoftwarePacketReadAhead.ReadError.serviceDue = error { return true }
                 EngineLog.emit("[SWHost] demux read failed: \(error)", category: .swPlayback)
                 if terminalGeneration.record(genBeforeRead) {
                     onError("Playback error: \(error.localizedDescription)", genBeforeRead)

@@ -43,7 +43,7 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
         let cacheSeekHits: UInt64
         let cacheSeekMisses: UInt64
     }
-    enum ReadError: Error { case interrupted, closed, corruptFIFO }
+    enum ReadError: Error { case interrupted, closed, corruptFIFO, serviceDue }
 
     private let condition = NSCondition()
     /// Never acquired by a main-thread API. Serializes reset with append/pop, including the
@@ -424,12 +424,15 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
         if needsCleanup { DispatchQueue.global(qos: .utility).async { try? self.fifo.close() } }
     }
 
-    /// Consumer thread only. nil means true EOF; a seek wake is explicitly different from EOF.
-    func read(isCurrent: @Sendable () -> Bool = { true }) throws -> SoftwareStoredPacket? {
+    /// Consumer thread only. nil means true EOF. An optional deadline yields `serviceDue` only
+    /// while the store is empty, letting the host service parked video without ending source I/O.
+    func read(until deadline: Date? = nil,
+              isCurrent: @Sendable () -> Bool = { true }) throws -> SoftwareStoredPacket? {
         condition.lock()
         let token = generation
         var waitStart: DispatchTime?
         var starvationLine: String?
+        var serviceDue = false
         while count == 0, !ended, failure == nil, !closed, !seeking,
               token == generation, isCurrent() {
             if waitStart == nil {
@@ -438,7 +441,14 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
                 // Wake a parked producer so it can see the waiter at its next retune point.
                 condition.broadcast()
             }
-            condition.wait()
+            if let deadline {
+                if !condition.wait(until: deadline) {
+                    serviceDue = true
+                    break
+                }
+            } else {
+                condition.wait()
+            }
         }
         if let waitStart {
             waitingConsumers -= 1
@@ -473,7 +483,10 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
             let sourceEnded = ended
             condition.unlock()
             if let error { throw error }
-            guard sourceEnded else { throw ReadError.interrupted }
+            guard sourceEnded else {
+                if serviceDue { throw ReadError.serviceDue }
+                throw ReadError.interrupted
+            }
             return nil
         }
         condition.unlock()

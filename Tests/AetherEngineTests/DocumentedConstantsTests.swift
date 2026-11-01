@@ -36,6 +36,11 @@ final class DocumentedConstantsTests: XCTestCase {
         assertDocumented("**30 s positioning\nbudget**", try documentation())
     }
 
+    func testSoftwareParkedVideoServiceWaitMatchesDocumentation() throws {
+        XCTAssertEqual(SoftwarePlaybackHost.parkedVideoReadServiceInterval, 0.020)
+        assertDocumented("condition wait at **20 ms**", try documentation())
+    }
+
     func testItemDiagnosticBoundsMatchDocumentation() throws {
         let docs = try documentation()
         XCTAssertEqual(ItemDiagnosticReadPool.maximumConcurrentReads, 2)
@@ -269,6 +274,12 @@ final class DocumentedConstantsTests: XCTestCase {
         XCTAssertEqual(profile.probesize, 2 * 1024 * 1024)
         XCTAssertEqual(profile.maxAnalyzeDuration, 2 * 1_000_000)
         assertDocumented("stream analysis is capped at **2 MiB / 2 s of media**", try documentation())
+    }
+
+    func testSourcePreparationDVDRecoveryBoundsMatchDocumentation() throws {
+        XCTAssertEqual(SourcePreparationDVDSeekRecovery.maxAttempts, 1)
+        XCTAssertEqual(SourcePreparationDVDSeekRecovery.maxLookbackSeconds, 2)
+        assertDocumented("at most **one DVD-only retry**, seeking up to **2 s earlier**", try documentation())
     }
 
     func testWholeProbeDefaultsMatchDocumentation() throws {

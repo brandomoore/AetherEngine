@@ -110,6 +110,10 @@ extension AetherEngine {
                 audio = SourcePreparationProgress(index: audioIndex, isVideo: false, requestedRange: audioStart...upper,
                                                   timestampTolerance: tickSeconds(audioIndex))
             }
+            let isDVD = demuxer.discTitles.first { $0.id == report.selectedDiscTitleID }?.dvdVTSN != nil
+            var seekRecovery = SourcePreparationDVDSeekRecovery(
+                isDVD: isDVD && report.requestedPresentationRange.lowerBound > 0,
+                sourceOrigin: origin, requestedStart: lower, timestampTolerance: tickSeconds(videoIndex))
 
             // At the head, retain the packets stream analysis already queued, including audio priming.
             // A resume always goes through the demuxer, never a disc table's logical byte offsets.
@@ -141,9 +145,28 @@ extension AetherEngine {
                     let dts = seconds(packet.pointee.dts)
                     let packetDuration = max(0, seconds(packet.pointee.duration) ?? 0)
                     if index == videoIndex {
+                        let randomAccess = preparationRandomAccess(packet, stream: stream)
+                        if randomAccess, let keyframePTS = pts, video?.stream.randomAccessSourceTime == nil,
+                           let earlier = seekRecovery.earlierAnchor(afterFirstRandomAccess: keyframePTS) {
+                            // Never combine a late landing's audio or timestamp envelope with the retry.
+                            video?.resetEvidence()
+                            audio?.resetEvidence()
+                            try control.check()
+                            EngineLog.emit(
+                                "[SourcePreparationSeekRecovery] requestedStart=\(lower) "
+                                + "firstKeyframe=\(keyframePTS) retrySource=\(earlier)", category: .demux)
+                            let sought = demuxer.seekBounded(
+                                to: earlier, anchorStreamIndex: videoIndex,
+                                timeout: control.remainingTime ?? 0, atOrBefore: true)
+                            try control.check()
+                            if !sought {
+                                report.outcome = .seekFailed
+                                break
+                            }
+                            continue
+                        }
                         video?.record(pts: pts, dts: dts, duration: packetDuration,
-                                      bytes: Int(packet.pointee.size),
-                                      randomAccess: preparationRandomAccess(packet, stream: stream))
+                                      bytes: Int(packet.pointee.size), randomAccess: randomAccess)
                     } else {
                         audio?.record(pts: pts, dts: dts, duration: packetDuration,
                                       bytes: Int(packet.pointee.size), randomAccess: false)

@@ -278,6 +278,55 @@ struct ProbeControlTests {
         #expect(noDTS.isComplete)
     }
 
+    @Test("A late DVD random-access witness permits only one bounded earlier anchor")
+    func preparationDVDSeekRecovery() {
+        var recovery = SourcePreparationDVDSeekRecovery(
+            isDVD: true, sourceOrigin: 0.54, requestedStart: 3.54, timestampTolerance: 1 / 90_000)
+        #expect(recovery.earlierAnchor(afterFirstRandomAccess: nil) == nil)
+        #expect(recovery.earlierAnchor(afterFirstRandomAccess: .nan) == nil)
+        #expect(recovery.earlierAnchor(afterFirstRandomAccess: .infinity) == nil)
+        #expect(recovery.earlierAnchor(afterFirstRandomAccess: 3.42) == nil)
+        #expect(recovery.earlierAnchor(afterFirstRandomAccess: 3.54 + 1 / 90_000) == nil)
+        #expect(recovery.attempts == 0)
+        #expect(recovery.earlierAnchor(afterFirstRandomAccess: 3.9) == 1.54)
+        #expect(recovery.earlierAnchor(afterFirstRandomAccess: 3.9) == nil)
+        #expect(recovery.attempts == 1)
+
+        var nearHead = SourcePreparationDVDSeekRecovery(
+            isDVD: true, sourceOrigin: 600, requestedStart: 601, timestampTolerance: 0)
+        #expect(nearHead.earlierAnchor(afterFirstRandomAccess: 601.5) == 600)
+        var atHead = SourcePreparationDVDSeekRecovery(
+            isDVD: true, sourceOrigin: 600, requestedStart: 600, timestampTolerance: 0)
+        #expect(atHead.earlierAnchor(afterFirstRandomAccess: 600.5) == nil)
+        var otherSource = SourcePreparationDVDSeekRecovery(
+            isDVD: false, sourceOrigin: 600, requestedStart: 1200, timestampTolerance: 0)
+        #expect(otherSource.earlierAnchor(afterFirstRandomAccess: 1201) == nil)
+        #expect(otherSource.attempts == 0)
+    }
+
+    @Test("Retry evidence forgets prior video/audio intervals, keyframes and unknown timestamps",
+          arguments: [false, true])
+    func preparationResetsCoverage(isVideo: Bool) {
+        var progress = SourcePreparationProgress(
+            index: 3, isVideo: isVideo, requestedRange: 3.54...7.54, timestampTolerance: 0.001)
+        progress.record(pts: nil, dts: nil, duration: 0, bytes: 15, randomAccess: false)
+        progress.record(pts: 3.9, dts: 3.86, duration: 0.04, bytes: 25, randomAccess: isVideo)
+        progress.record(pts: 10, dts: 10, duration: 1, bytes: 35, randomAccess: false)
+        progress.resetEvidence()
+        #expect(progress.stream.streamIndex == 3)
+        #expect(progress.stream.packetCount == 0)
+        #expect(progress.stream.packetBytes == 0)
+        #expect(progress.stream.untimedPacketCount == 0)
+        #expect(progress.stream.firstSourceTime == nil)
+        #expect(progress.stream.observedSourceRange == nil)
+        #expect(progress.stream.randomAccessSourceTime == nil)
+        #expect(progress.requestedRange == 3.54...7.54)
+        progress.record(pts: 3.42, dts: 3.38, duration: 0.2, bytes: 10, randomAccess: isVideo)
+        #expect(!progress.isComplete, "the failed landing's forward coverage must not survive")
+        progress.record(pts: 7.54, dts: 7.54, duration: 0.04, bytes: 10, randomAccess: false)
+        #expect(progress.isComplete)
+    }
+
     @Test("Coverage diagnostics distinguish a missing start interval from exhausted forward coverage")
     func preparationCoverageDiagnostics() {
         var audio = SourcePreparationProgress(

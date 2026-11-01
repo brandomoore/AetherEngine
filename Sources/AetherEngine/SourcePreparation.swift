@@ -43,6 +43,36 @@ public struct SourcePreparationReport: Sendable, Equatable {
     public internal(set) var demuxedPackets: Int = 0
 }
 
+/// A DVD timestamp seek can land on DTS at the target, with PTS and the next keyframe after it.
+/// Recovery changes the seek anchor, never the requested coverage or the whole-operation limits.
+struct SourcePreparationDVDSeekRecovery {
+    static let maxAttempts = 1
+    static let maxLookbackSeconds: Double = 2
+
+    let isDVD: Bool
+    let sourceOrigin: Double
+    let requestedStart: Double
+    let timestampTolerance: Double
+    private(set) var attempts = 0
+
+    init(isDVD: Bool, sourceOrigin: Double, requestedStart: Double, timestampTolerance: Double) {
+        self.isDVD = isDVD
+        self.sourceOrigin = sourceOrigin
+        self.requestedStart = requestedStart
+        self.timestampTolerance = timestampTolerance
+    }
+
+    mutating func earlierAnchor(afterFirstRandomAccess pts: Double?) -> Double? {
+        guard isDVD, attempts < Self.maxAttempts,
+              let pts, pts.isFinite,
+              pts > requestedStart + timestampTolerance else { return nil }
+        let earlier = max(sourceOrigin, requestedStart - Self.maxLookbackSeconds)
+        guard earlier < requestedStart else { return nil }
+        attempts += 1
+        return earlier
+    }
+}
+
 /// Timestamp evidence is deliberately distinct from a decoder or a cache's residency guarantee.
 struct SourcePreparationProgress {
     var stream: SourcePreparationStream
@@ -60,6 +90,11 @@ struct SourcePreparationProgress {
         self.isVideo = isVideo
         self.requestedRange = requestedRange
         self.timestampTolerance = timestampTolerance
+    }
+
+    mutating func resetEvidence() {
+        self = Self(index: stream.streamIndex, isVideo: isVideo, requestedRange: requestedRange,
+                    timestampTolerance: timestampTolerance)
     }
 
     mutating func record(pts: Double?, dts: Double?, duration: Double, bytes: Int,

@@ -20,6 +20,13 @@ the public-API contract.
   Preparation uses shallow parser analysis, so unresolved decoder-denied tracks cannot consume the
   full playback probe allowance before packet traversal. Recognized disc titles also warm playback's
   duration-tail reads within the same whole-operation limits; ordinary files still skip that pass.
+  A DVD preparation whose first random-access packet lands late gets one bounded earlier seek,
+  preserving the requested window and cumulative limits rather than claiming the late landing is covered.
+
+- **Software startup services parked video during slow source reads.** An empty packet-cache
+  wait yields when the consumer has foreground video to feed, so renderer readiness is rechecked
+  without waiting for the producer's network I/O. Clock preroll, packet budgets, backpressure and
+  seek/decoder-generation checks are unchanged; service wakes are not EOF or playback failures.
 
 - Added metadata-only `softwareReadAheadStatus` for active software/FEL packet
   caches: resolved storage, byte usage/budget, requested duration, and a confirmed
