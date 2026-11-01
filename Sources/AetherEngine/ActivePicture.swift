@@ -95,7 +95,7 @@ struct ActivePictureStability {
 /// A spatially bounded, conservative detector. Sampling cannot guarantee that
 /// small or transient edge graphics are absent.
 enum ActivePictureDetector {
-    static func bounds(luma: [UInt8], width: Int, height: Int) -> CGRect? {
+    static func bounds(luma: [UInt8], width: Int, height: Int, blackThreshold: Int = 8) -> CGRect? {
         guard width >= 8, height >= 8, width <= 320, height <= 180,
               luma.count == width * height else { return nil }
         var centerSum = 0
@@ -108,7 +108,7 @@ enum ActivePictureDetector {
                     centerSum += value
                     centerCount += 1
                 }
-                if value > 8 {
+                if value > blackThreshold {
                     left = min(left, x); right = max(right, x)
                     top = min(top, y); bottom = max(bottom, y)
                 }

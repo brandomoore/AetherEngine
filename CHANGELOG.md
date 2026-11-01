@@ -6,14 +6,20 @@
   picture-relative subtitles and optional fitting. Measurements distinguish
   unavailable evidence from confirmed full frame and include presentation-clock
   validity and a timeline/geometry generation.
-- Bound SDR NV12/BGRA analysis to 2 Hz, a 320 x 180 grid, and one serial worker
+- Bound NV12/P010/BGRA/half-float analysis to 2 Hz, a 320 x 180 grid, and one serial worker
   admitting at most four sessions. Software snapshots include PTS/flush identity;
   native sampling uses the existing AVPlayer item without suppressing rendering.
-- Native SDR sampling requests CPU-readable 8-bit NV12. AVFoundation may
+- Add `NativeActivePictureAnalyzer` for existing host-owned AVPlayers, sharing
+  the same admission, temporal stability, output ownership and invalidation.
+- Support 10-bit SDR, HDR10/HDR10+, HLG and converted Dolby Vision pixels.
+  Native SDR sampling requests CPU-readable 8-bit NV12, PQ/HLG uses P010,
+  and Dolby Vision/unknown color requests converted half-float RGB rather than
+  interpreting an IPT base layer as PQ. AVFoundation may
   materialize or decompress that output from its preferred compressed surface;
   the analysis limit is not a bound on that system-side cost.
-- Preserve playback pipelines. HDR/Dolby Vision analysis, nonidentity native
-  display transforms, PiP and external playback currently return unknown.
+- Preserve playback pipelines. Native quarter turns and mirrors are mapped
+  to upright display geometry. Unsupported transforms, PiP and external
+  playback return unknown, as do missing or uninformative frames.
   Detection is best effort, not a guarantee that borders contain no edge content.
 
 Quick index of AetherEngine releases. Detailed per-release notes (breaking
