@@ -1332,6 +1332,14 @@ Supported SDR/HDR pixels and upright transforms are analyzed conservatively; PiP
 external playback, unsupported geometry and uninformative frames remain unknown.
 AVFoundation's conversion/materialization cost is separate from the bounded analysis work.
 
+Stopping either analyzer detaches its output immediately on the main actor and
+invalidates pending results. Bounded in-flight sampling drains through the normal
+worker-admission and cancellation checks. Releasing an idle engine or native analyzer
+does not require a Swift task context or an explicit stop to avoid a teardown crash.
+Native-output lifetime cleanup unregisters its observer before detachment and keeps
+AVFoundation removal on the main actor, dispatching there after an off-actor final
+release without retaining the analyzer.
+
 ## Picture, layers and PiP
 
 | Symbol | Notes |

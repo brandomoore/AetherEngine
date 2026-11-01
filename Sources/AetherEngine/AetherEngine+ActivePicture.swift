@@ -87,6 +87,54 @@ private struct ActivePictureOwner: Equatable {
     let nativeDisplaySize: CGSize?
 }
 
+/// Ownership is lock-protected; AVFoundation attachment/access/removal stays on the main actor.
+/// The immutable detached resources may cross threads only to reach main-queue cleanup.
+final class ActivePictureNativeOutput: @unchecked Sendable {
+    private struct Resources: @unchecked Sendable {
+        let item: AVPlayerItem
+        let output: AVPlayerItemVideoOutput
+        let observer: NSObjectProtocol
+
+        @MainActor func removeOutput() { item.remove(output) }
+    }
+
+    private let lock = NSLock()
+    private var resources: Resources?
+
+    @MainActor
+    init(item: AVPlayerItem, output: AVPlayerItemVideoOutput,
+         onTimeJump: @escaping @MainActor @Sendable () -> Void) {
+        item.add(output)
+        let observer = NotificationCenter.default.addObserver(
+            forName: AVPlayerItem.timeJumpedNotification, object: item, queue: .main
+        ) { _ in
+            MainActor.assumeIsolated { onTimeJump() }
+        }
+        resources = Resources(item: item, output: output, observer: observer)
+    }
+
+    @MainActor var item: AVPlayerItem? { lock.withLock { resources?.item } }
+    @MainActor var output: AVPlayerItemVideoOutput? { lock.withLock { resources?.output } }
+
+    func detach() {
+        let detached = lock.withLock {
+            defer { resources = nil }
+            return resources
+        }
+        guard let detached else { return }
+        NotificationCenter.default.removeObserver(detached.observer)
+        if Thread.isMainThread {
+            MainActor.assumeIsolated { detached.removeOutput() }
+        } else {
+            DispatchQueue.main.async { detached.removeOutput() }
+        }
+    }
+
+    // Do not use isolated deinit: the older-runtime executor trampoline can corrupt task-local
+    // state when a synchronous owner dies outside a Swift task. Never capture the dying owner.
+    deinit { detach() }
+}
+
 @MainActor
 final class ActivePictureAnalysis {
     let nativeTimeline = ActivePictureTimeline()
@@ -104,12 +152,8 @@ final class ActivePictureAnalysis {
     private var lastPlayhead: Double?
     private var busy = false
     private var failure = ActivePictureState.UnknownReason.insufficientEvidence
-    private var item: AVPlayerItem?
-    private var output: AVPlayerItemVideoOutput?
-    private var timeJumpObserver: NSObjectProtocol?
+    private var nativeOutput: ActivePictureNativeOutput?
     private var nativeTransform: CGAffineTransform?
-
-    isolated deinit { reset(detach: true) }
 
     func reset(detach: Bool = false, clearTimeline: Bool = false) {
         if clearTimeline { nativeTimeline.reset() }
@@ -121,11 +165,8 @@ final class ActivePictureAnalysis {
         lastPlayhead = nil
         failure = .discontinuity
         if detach {
-            if let timeJumpObserver { NotificationCenter.default.removeObserver(timeJumpObserver) }
-            timeJumpObserver = nil
-            if let output { item?.remove(output) }
-            output = nil
-            item = nil
+            nativeOutput?.detach()
+            nativeOutput = nil
             nativeTransform = nil
             owner = nil
         }
@@ -241,8 +282,8 @@ final class ActivePictureAnalysis {
         let token = revision
         let frame: ActivePictureFrame?
         if let player = source.player, let currentItem = player.currentItem {
-            if item !== currentItem {
-                item = currentItem
+            if nativeOutput?.item !== currentItem {
+                nativeOutput?.detach()
                 // Ask AVFoundation for display-referred, CPU-readable pixels.
                 // Wide color preserves HDR rather than forcing an SDR tap.
                 let newOutput = AVPlayerItemVideoOutput(outputSettings: [
@@ -252,12 +293,8 @@ final class ActivePictureAnalysis {
                     AVVideoAllowWideColorKey: true,
                 ])
                 newOutput.suppressesPlayerRendering = false
-                currentItem.add(newOutput)
-                output = newOutput
-                timeJumpObserver = NotificationCenter.default.addObserver(
-                    forName: AVPlayerItem.timeJumpedNotification, object: currentItem, queue: .main
-                ) { [weak self] _ in
-                    MainActor.assumeIsolated { self?.reset() }
+                nativeOutput = ActivePictureNativeOutput(item: currentItem, output: newOutput) { [weak self] in
+                    self?.reset()
                 }
             }
             if nativeTransform == nil {
@@ -291,7 +328,7 @@ final class ActivePictureAnalysis {
             guard nativeTransform != nil else { return .unknown(.unsupportedGeometry) }
             let requested = player.currentTime()
             var displayed = CMTime.invalid
-            if let output, output.hasNewPixelBuffer(forItemTime: requested),
+            if let output = nativeOutput?.output, output.hasNewPixelBuffer(forItemTime: requested),
                 let buffer = output.copyPixelBuffer(forItemTime: requested, itemTimeForDisplay: &displayed),
                 displayed.isNumeric, displayed.seconds <= requested.seconds,
                 nativeTimeline.generation(at: displayed.seconds) == frameGeneration,

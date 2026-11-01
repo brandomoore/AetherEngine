@@ -1,10 +1,118 @@
 import AVFoundation
 import Testing
+import XCTest
 
 @testable import AetherEngine
 
+final class ActivePictureLifetimeTests: XCTestCase {
+    @MainActor
+    func testSynchronousEngineAndAnalyzerReleaseWithoutTaskContext() throws {
+        XCTAssertTrue(withUnsafeCurrentTask { $0 == nil }, "exercise XCTest's synchronous, non-task entry")
+        weak var releasedEngine: AetherEngine?
+        weak var releasedAnalysis: ActivePictureAnalysis?
+        weak var releasedNative: NativeActivePictureAnalyzer?
+        let admitted = ActivePictureAnalysis.admittedWorkers
+        try autoreleasepool {
+            let engine = try AetherEngine()
+            let native = NativeActivePictureAnalyzer()
+            releasedEngine = engine
+            releasedAnalysis = engine.activePictureAnalysis
+            releasedNative = native
+        }
+        XCTAssertNil(releasedEngine)
+        XCTAssertNil(releasedAnalysis)
+        XCTAssertNil(releasedNative)
+        XCTAssertEqual(ActivePictureAnalysis.admittedWorkers, admitted)
+    }
+
+    @MainActor
+    func testSynchronousAttachedOutputReleaseWithoutTaskContext() {
+        XCTAssertTrue(withUnsafeCurrentTask { $0 == nil })
+        let item = AVPlayerItem(asset: AVMutableComposition())
+        let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [:])
+        let events = ProbeTestBox(0)
+        weak var releasedOwner: ActivePictureNativeOutput?
+        autoreleasepool {
+            let owner = ActivePictureNativeOutput(item: item, output: output) { events.update { $0 += 1 } }
+            releasedOwner = owner
+            withExtendedLifetime(owner) {
+                XCTAssertTrue(item.outputs.first === output)
+                NotificationCenter.default.post(name: AVPlayerItem.timeJumpedNotification, object: item)
+                XCTAssertEqual(events.value, 1)
+            }
+        }
+        XCTAssertNil(releasedOwner)
+        XCTAssertTrue(item.outputs.isEmpty)
+        NotificationCenter.default.post(name: AVPlayerItem.timeJumpedNotification, object: item)
+        XCTAssertEqual(events.value, 1)
+    }
+}
+
 @Suite("Active picture")
 struct ActivePictureTests {
+    @Test("native output cleanup is immediate, idempotent and does not detach a replacement")
+    @MainActor
+    func nativeOutputDetach() {
+        let item = AVPlayerItem(asset: AVMutableComposition())
+        let firstOutput = AVPlayerItemVideoOutput(pixelBufferAttributes: [:])
+        let nextOutput = AVPlayerItemVideoOutput(pixelBufferAttributes: [:])
+        let firstEvents = ProbeTestBox(0)
+        let nextEvents = ProbeTestBox(0)
+        var first: ActivePictureNativeOutput? = ActivePictureNativeOutput(item: item, output: firstOutput) {
+            firstEvents.update { $0 += 1 }
+        }
+        weak var releasedFirst = first
+        #expect(first?.item === item && first?.output === firstOutput)
+        NotificationCenter.default.post(name: AVPlayerItem.timeJumpedNotification, object: item)
+        #expect(firstEvents.value == 1)
+        first?.detach()
+        #expect(first?.item == nil && first?.output == nil && item.outputs.isEmpty)
+        let next = ActivePictureNativeOutput(item: item, output: nextOutput) {
+            nextEvents.update { $0 += 1 }
+        }
+        first?.detach()
+        #expect(item.outputs.count == 1 && item.outputs.first === nextOutput)
+        first = nil
+        #expect(releasedFirst == nil)
+        NotificationCenter.default.post(name: AVPlayerItem.timeJumpedNotification, object: item)
+        #expect(firstEvents.value == 1 && nextEvents.value == 1)
+        next.detach()
+        #expect(item.outputs.isEmpty)
+        NotificationCenter.default.post(name: AVPlayerItem.timeJumpedNotification, object: item)
+        #expect(firstEvents.value == 1 && nextEvents.value == 1)
+    }
+
+    @Test("off-actor final release drains native output cleanup without retaining the analyzers",
+          .timeLimit(.minutes(1)))
+    @MainActor
+    func offActorRelease() async throws {
+        let item = AVPlayerItem(asset: AVMutableComposition())
+        let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [:])
+        let events = ProbeTestBox(0)
+        let references = ProbeTestBox<(ActivePictureAnalysis?, NativeActivePictureAnalyzer?, ActivePictureNativeOutput?)>(
+            (ActivePictureAnalysis(), NativeActivePictureAnalyzer(),
+             ActivePictureNativeOutput(item: item, output: output) { events.update { $0 += 1 } }))
+        weak var releasedAnalysis = references.value.0
+        weak var releasedNative = references.value.1
+        weak var releasedOutputOwner = references.value.2
+        NotificationCenter.default.post(name: AVPlayerItem.timeJumpedNotification, object: item)
+        #expect(events.value == 1)
+        let releasedOffActor = ProbeTestBox<Bool?>(nil)
+        Thread.detachNewThread {
+            let outsideTask = withUnsafeCurrentTask { $0 == nil }
+            autoreleasepool { references.update { $0 = (nil, nil, nil) } }
+            releasedOffActor.update { $0 = outsideTask && !Thread.isMainThread }
+        }
+        try await waitFor { releasedOffActor.value != nil }
+        #expect(releasedOffActor.value == true)
+        try await waitFor {
+            releasedAnalysis == nil && releasedNative == nil && releasedOutputOwner == nil
+                && item.outputs.isEmpty
+        }
+        NotificationCenter.default.post(name: AVPlayerItem.timeJumpedNotification, object: item)
+        #expect(events.value == 1)
+    }
+
     @Test("Native analysis follows source color, not the panel-clamped badge")
     @MainActor
     func sourceColor() throws {

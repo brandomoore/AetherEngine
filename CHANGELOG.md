@@ -37,6 +37,14 @@ the public-API contract.
 
 ## [Unreleased]
 
+- **Avoid an active-picture teardown crash on older runtimes.** Synchronous engine
+  or native-analyzer destruction no longer enters the isolated-deinit
+  back-deployment trampoline. A separate lifetime owner removes the notification
+  observer and detaches the native output on the main actor, including an
+  off-actor final release. Explicit stop still detaches immediately and
+  invalidates pending results; bounded in-flight sampling retains its normal
+  cancellation checks and worker-admission draining.
+
 - **Prepare compressed source bytes around a resume position without playback.**
   `AetherEngine.prepareSource` opens a caller-owned custom reader, maps zero-based presentation time
   through the existing container/disc timeline, seeks via the disc or native demuxer and reads a bounded
