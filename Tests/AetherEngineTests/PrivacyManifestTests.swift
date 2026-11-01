@@ -15,7 +15,7 @@ final class PrivacyManifestTests: XCTestCase {
             reasons[category] = Set(try XCTUnwrap(entry["NSPrivacyAccessedAPITypeReasons"] as? [String]))
         }
         XCTAssertEqual(reasons, [
-            "NSPrivacyAccessedAPICategoryFileTimestamp": ["C617.1"],
+            "NSPrivacyAccessedAPICategoryFileTimestamp": ["C617.1", "3B52.1"],
             "NSPrivacyAccessedAPICategorySystemBootTime": ["35F9.1"],
             "NSPrivacyAccessedAPICategoryDiskSpace": ["E174.1"],
         ])

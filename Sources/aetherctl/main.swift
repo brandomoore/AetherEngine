@@ -70,11 +70,12 @@ func printUsage() {
       aetherctl serve [--no-dv] [--force-dv] [--dv-base-layer] [--start-position S] [--iframes] [--atmos-bed 7.1.4 [--bed-format apac|lpcm]] [--audio-index N] [--stereo auto|mono|sbs|ou] <url>
       aetherctl validate [--no-dv] [--force-dv] [--dv-base-layer] <url>
       aetherctl swdecode [--frames N] <url>
-      aetherctl play [--fel] [--surface | --window] [--cycle-el SECONDS] [--dv-pin SPEC] [--seconds N] [--live] [--no-sw-escalation] [--fast-zap] [--live-start-immediately] [--live-cushion SECONDS] [--dvr-window N] [--subs <codec-or-lang>]
+      aetherctl play [--fel] [--upscale] [--surface | --window] [--cycle-el SECONDS] [--dv-pin SPEC] [--seconds N] [--live] [--no-sw-escalation] [--fast-zap] [--live-start-immediately] [--live-cushion SECONDS] [--dvr-window N] [--subs <codec-or-lang>]
                  [--assert-dv] [--dv-base-layer]
                  [--start-position S] [--switch-audio <index>[@ms]]
                  [--teletext-page N] [--switch-teletext-page <page|auto>[@ms]]
                  [--audio-delay <ms>] [--switch-audio-delay <ms>[@ms]]... [--paused]
+                 [--audio-shaping <spec>] [--switch-audio-shaping <spec>[@ms]]...
                  [--reload-applying <key>=<value>]... [--reload-applying-at <ms>]
                  [--drop-audio]
                  [--sequential-origin] [--declared-duration S]
@@ -82,7 +83,9 @@ func printUsage() {
                      [--audio-stats] [--host-calls play,extractor,setrate,pausestart,reloadlive,seekback,seekfar,pauseseek,pausereload,playreload,extplayreload,reloadnext] <url>
                      (full load+play session smoke test; --fel opts into the Profile 7
                       FEL dual-layer route (off by default, as in the engine, and only in
-                      a build with the DualLayerDolbyVision trait); --surface (or --window) presents
+                      a build with the DualLayerDolbyVision trait); --upscale opts into
+                      upscaling sub-1080p SDR video to the display (#846);
+                      --surface (or --window) presents
                       into a window; --cycle-el S flips the FEL residual every S
                       seconds, which needs --fel and a surface; --subs activates the first
                       matching embedded subtitle track and logs overlay cues;
@@ -766,6 +769,8 @@ if first == "play" {
     // route a host gets by default.
     let playFel = takeFlag("--fel", from: &rest)
     let playPreferDualLayerDV = playFel
+    // #846: `LoadOptions.upscalesLowResolutionVideo`, off by default as in the engine.
+    let playUpscale = takeFlag("--upscale", from: &rest)
     let playSurfaceFlag = takeFlag("--surface", from: &rest)
     let playWindowFlag = takeFlag("--window", from: &rest)
     let playAttachSurface = playSurfaceFlag || playWindowFlag
@@ -938,6 +943,26 @@ if first == "play" {
             milliseconds: ms,
             delayMilliseconds: parts.count == 2 ? (Int(parts[1]) ?? 20_000) : 20_000))
     }
+    // AE#923: `--audio-shaping <spec>` is the load option, `--switch-audio-shaping <spec>[@ms]` the
+    // runtime setter. A spec is `off` or a comma list of `ch=N`, `dialogue=DB`, `night`.
+    var audioShaping = AudioShaping()
+    if let spec = takeStringFlag("--audio-shaping", from: &rest) {
+        guard let parsed = parseAudioShapingSpec(spec) else {
+            print("ERROR: --audio-shaping takes off or ch=N,dialogue=DB,night; got '\(spec)'")
+            exit(64)
+        }
+        audioShaping = parsed
+    }
+    var audioShapingSwitches: [AudioShapingSwitchRequest] = []
+    while let spec = takeStringFlag("--switch-audio-shaping", from: &rest) {
+        let parts = spec.split(separator: "@", maxSplits: 1).map(String.init)
+        guard let parsed = parseAudioShapingSpec(parts[0]) else {
+            print("ERROR: --switch-audio-shaping takes <spec>[@ms], got '\(spec)'")
+            exit(64)
+        }
+        audioShapingSwitches.append(AudioShapingSwitchRequest(
+            shaping: parsed, delayMilliseconds: parts.count == 2 ? (Int(parts[1]) ?? 20_000) : 20_000))
+    }
     // AE#464 round 2: mount with `autoplay = false`, the shape of a host that owns transport.
     let pausedMount = takeFlag("--paused", from: &rest)
     // AE#587: LoadOptions.preserveASSMarkup, documented as ASS/SSA only. The report that it leaks
@@ -1066,6 +1091,7 @@ if first == "play" {
                  audioSwitch: audioSwitch,
                  teletextPage: teletextPage, teletextSwitch: teletextSwitch,
                  audioDelayMs: audioDelayMs, audioDelaySwitches: audioDelaySwitches,
+                 audioShaping: audioShaping, audioShapingSwitches: audioShapingSwitches,
                  pausedMount: pausedMount,
                  optionCorrection: optionCorrection,
                  sequentialOrigin: sequentialOrigin, maxConcurrentRequests: maxConcurrentRequests,
@@ -1079,6 +1105,7 @@ if first == "play" {
                  preserveASSMarkup: preserveASSMarkup,
                  dolbyVisionHandling: playDVHandling,
                  preferDualLayerDolbyVision: playPreferDualLayerDV,
+                 upscalesLowResolutionVideo: playUpscale,
                  attachSurface: playAttachSurface,
                  record: playRecord))
 }

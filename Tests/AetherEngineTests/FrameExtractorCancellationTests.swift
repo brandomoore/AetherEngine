@@ -23,12 +23,14 @@ struct FrameExtractorCancellationTests {
         }
         defer { reader.release(); pending.cancel() }
         try await waitFor { reader.isBlocked }
+        // Only Demuxer.close cancels the reader, so the count is sampled before the idle task can
+        // run: sampled after the request returns, a close that already fired was never counted.
+        let cancellations = reader.cancellationCount
         pending.cancel()
         reader.release()
         #expect(await pending.value == false)
-        let cancellations = reader.cancellationCount
-        // Demuxer.close cancels its custom reader. Keep the extractor alive while its idle task
-        // releases the context; dropping the extractor would hide the leak.
+        // Keep the extractor alive while its idle task releases the context; dropping the
+        // extractor would hide the leak.
         try await waitFor { reader.cancellationCount > cancellations }
         await extractor.shutdown()
     }
@@ -39,15 +41,18 @@ struct FrameExtractorCancellationTests {
         let reader = StillGateReader(data: try LongGOPTransportStreamFixture.data())
         let extractor = FrameExtractor(reader: reader, formatHint: "mpegts",
                                        yieldWhile: { starved.withLock { $0 } })
+        await extractor.setIdleIntervalForTesting(.milliseconds(200))
         reader.arm()
         let older = Task { await extractor.preview(at: 2, maxWidth: 16) }
         defer { reader.release(); older.cancel() }
         try await waitFor { reader.isBlocked }
+        // The yielding request starts the idle countdown while the older decode is still gated, so
+        // the close can land before that decode returns. Sampled here, it is counted either way.
+        let cancellations = reader.cancellationCount
         starved.withLock { $0 = true }
         #expect(await extractor.preview(at: 25, maxWidth: 16) == nil)
         reader.release()
         #expect(await older.value == nil)
-        let cancellations = reader.cancellationCount
         try await waitFor { reader.cancellationCount > cancellations }
         await extractor.shutdown()
     }

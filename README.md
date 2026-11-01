@@ -41,7 +41,8 @@ You provide the transport bar. You provide the dropdowns. You provide the pretty
 ## Privacy manifest
 
 The AetherEngine target includes `PrivacyInfo.xcprivacy` as an explicit Swift
-package resource. It declares app-container cache metadata (`C617.1`), elapsed
+package resource. It declares app-container cache metadata (`C617.1`), host-opened
+local media metadata (`3B52.1`), elapsed
 playback/operation timing (`35F9.1`), and disk-capacity checks that constrain
 buffering (`E174.1`). It does not change playback or add data collection.
 
@@ -69,6 +70,7 @@ replace those declarations. Verify the manifests in the final app/archive.
 - [GiVo Stream](https://givostreamapp.com): media player for iPhone, iPad and Apple TV with bring-your-own playlists, live timeshift, DVR and VOD.
 - [LillyPlayer](https://lillyplayer.com): The all-in-one IPTV and media player for Apple TV, iPhone and iPad (live TV, EPG, replay, Jellyfin, Plex, SMB...).
 - [Plozz](https://plozz.app): Free forever open source native app for iPhone, iPad, and Apple TV. Supports Jellyfin, Plex, Emby, Silo, IPTV, SMB, WebDAV and more.
+- [Crivid IPTV Player](https://apps.apple.com/app/id6783083716): IPTV player for M3U and Xtream on Apple TV.
 <!-- used-by:end -->
 
 Shipping something on AetherEngine? [Submit it](https://github.com/superuser404notfound/AetherEngine/issues/new?template=used-by-submission.yml) to get listed here and on [aetherengine.superuser404.de](https://aetherengine.superuser404.de).
@@ -407,7 +409,7 @@ Subtitle cues land in raw source PTS; render the overlay against `player.sourceT
 Install via Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.51.0")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.53.1")
 ```
 
 Three samples ship in `Examples/`:
@@ -660,10 +662,10 @@ Browse all of this as a searchable site at **[aetherengine.superuser404.de](http
 AetherEngine uses [Semantic Versioning](https://semver.org). The public API surface, every `public` declaration in `Sources/AetherEngine/`, is the stability contract. **Major** removes / renames public symbols or breaks adopters; **Minor** adds public API or codec / format support; **Patch** fixes bugs with no public API change. `internal` types are not part of the contract.
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.51.0")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.53.1")
 ```
 
-Pin to `.upToNextMinor(from: "7.51.0")` for stricter teams that prefer to opt into minor bumps explicitly.
+Pin to `.upToNextMinor(from: "7.53.1")` for stricter teams that prefer to opt into minor bumps explicitly.
 
 ## Requirements
 
@@ -677,8 +679,10 @@ Pin to `.upToNextMinor(from: "7.51.0")` for stricter teams that prefer to opt in
 | Xcode | 27.0 |
 
 The Swift and Xcode rows are the supported toolchain CI builds and tests with (GitHub's
-`xcode-27` image). Older toolchains are not tested or supported; the deployment floor above
-stays iOS / tvOS 18 and macOS 15, with newer calls behind `#available`.
+`xcode-27` image). Older toolchains are not supported; the deployment floor above
+stays iOS / tvOS 18 and macOS 15, with newer calls behind `#available`. A weekly best-effort job
+(`xcode26-compat.yml`, also run before each release) builds the package for tvOS and iOS with
+Xcode 26.3 (Swift 6.2), so a break there is known before a release ships, but it does not block one.
 
 Supplemental AV1/VP9 registration also has a narrow compile-time guard around
 `VTRegisterSupplementalVideoDecoderIfAvailable`, first declared by the mobile SDKs in Xcode 26.2.
@@ -687,6 +691,8 @@ stock Xcode 26.0/26.1 while leaving hardware queries and software fallback intac
 establish that the rest of the package builds there or lower the supported toolchain above.
 A separately installed newer Swift toolchain paired with an older SDK is not covered by this
 proxy. The existing macOS registration path is unchanged.
+
+**Privacy manifest.** The engine ships a `PrivacyInfo.xcprivacy` in its resource bundle for the required-reason APIs it calls (#920): system boot time (35F9.1, `systemUptime` for elapsed time), disk space (E174.1, checked before packets spool to disk) and file timestamp (C617.1 for its own temp and cache files, 3B52.1 for local media the host opens). The FFmpeg frameworks carry their own from FFmpegBuild 3.10.2 on. Neither tracks or collects anything, so an app embedding the engine has nothing of the engine's to add to its own manifest.
 
 The 7.x line raised the floor from iOS 16, tvOS 17 and macOS 14. A project that still supports those pins the 6.x line with `.upToNextMajor(from: "6.89.1")`.
 
@@ -708,7 +714,7 @@ These components may be subject to third-party patent licensing. Integrators who
 To enable them, list the traits on the package dependency:
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.51.0",
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.53.1",
          traits: ["TrueHDObjectAudio", "DTSXObjectAudio", "DualLayerDolbyVision", "DolbyVisionStillReshaping"])
 ```
 

@@ -114,6 +114,7 @@ swift run aetherctl play --atmos-bed 7.1.4 <truehd-atmos.mkv>  # render TrueHD A
 swift run aetherctl play --fel <p7-file.mkv>                    # opt in to the Profile 7 FEL dual-layer route (off by default, like LoadOptions.preferDualLayerDolbyVision)
 swift run aetherctl play --fel --surface --cycle-el 10 <p7-file.mkv>   # flip the residual off and on every 10 s over a visible window (--window is the same flag)
 swift run aetherctl play --fel --surface --dv-pin 'darkest:240,period:2' <url>   # DEBUG: pulse a pinned frame's DV metadata (from dvsurvey)
+swift run aetherctl play --upscale <sd-or-720p-url>           # opt in to upscaling sub-1080p SDR video to the display (LoadOptions.upscalesLowResolutionVideo, #846); logs one [Upscale] line and an UPSCALE line once the first frame is upscaled
 ```
 
 `--host-calls nativesubs,nativerender@N,subsoff@N,subson@N` drives the NATIVE SUBTITLE RENDITION path
@@ -204,6 +205,8 @@ arms read as `The system does not trust the origin's certificate` without the fl
 aetherctl play --preserve-ass-markup --subs eng --seconds 7 file://$PWD/ass-srt.mkv   # subrip: plain text
 aetherctl play --preserve-ass-markup --subs ger --seconds 7 file://$PWD/ass-srt.mkv   # ass: raw event lines
 ```
+
+`--audio-shaping <spec>` sets `LoadOptions.audioShaping` for the load and `--switch-audio-shaping <spec>[@ms]` calls `setAudioShaping(_:)` mid-session (repeatable, default +20 s). A spec is `off` or a comma list of `ch=N`, `dialogue=DB` and `night`. The run prints `shaping=` next to the audio delivery, and the log names the pipeline each rebuild chose: on an E-AC-3 5.1 source, `--switch-audio-shaping ch=2,dialogue=6,night@4000` moves a `streamCopy` session to `[AudioBridge] init: ... encoder=flac ... encoderChannels=2 ... AE#923 shaping ...` and `audio shaping applied`, and `--switch-audio-shaping off@9000` takes it back to `streamCopy` (AE#923).
 
 `--audio-delay <ms>` sets `LoadOptions.audioDelaySeconds` for the load, and `--switch-audio-delay <ms>[@ms]` calls `setAudioDelay(_:)` on a session that is already playing (default +20 s, same reason as the teletext switch). The runtime half is the interesting one: at load the offset is just a number handed to a muxer or a renderer, while mid-session it has to reach media the session has already committed to the previous value, and the two routes pay differently for that (a seek on `.software`, the session-preserving reload on `.loopback`). The engine states the delivered offset rather than the requested one: `[AudioOutput] AE#464 audio delay in effect: +200 ms (sample at 3.994s delivered at 4.194s)` on the software path, `[MP4SegmentMuxer] AE#464 cutting seg1+ with audio delay -150 ms` on the loopback one (AE#464).
 
