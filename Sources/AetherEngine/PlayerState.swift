@@ -513,6 +513,21 @@ public struct LoadOptions: Sendable, Equatable {
     /// which also decodes it and loses the objects. Not engineered around.
     public var preferDualLayerDolbyVision: Bool = false
 
+    /// Opt in to upscaling SDR video below 1080p (coded width under 1920 and height under 1080) to the
+    /// display's native pixel size (#846). Such a source routes through `SoftwarePlaybackHost`, where every
+    /// decoded frame runs VideoToolbox low-latency super resolution where the device and frame size allow
+    /// it, then MetalFX spatial scaling to the display aspect. Needs tvOS / iOS / macOS 26 and a GPU that
+    /// supports MetalFX spatial scaling. HDR (PQ, HLG), Dolby Vision, a display no larger than the source,
+    /// an AirPlay receiver showing the video and a demuxed-audio live stream keep their usual route; the
+    /// load logs one `[Upscale]` line saying which. The stage never stops playback: a frame it cannot
+    /// process is delivered as decoded, and repeated failures or a sustained overrun of the frame budget
+    /// switch it off for the session (`AetherEngine.activeUpscale`). Default false.
+    ///
+    /// A tuning field: `reloadAtCurrentPosition(applying:)` carries a change on a URL source, which
+    /// re-runs `load()` and re-decides the route. On a custom `IOReader` source turning it off is honoured
+    /// in place, and turning it on is refused with `SessionReloadRefusal.upscaleRouteNeedsFreshLoad`.
+    public var upscalesLowResolutionVideo: Bool = false
+
     /// Mirror of `AVDisplayManager.isDisplayCriteriaMatchingEnabled`. Default `true`. When `false`, engine routes HDR sources through the media playlist (auto-tonemap path) because AVKit cannot switch the panel.
     public var matchContentEnabled: Bool
 
@@ -974,6 +989,13 @@ public struct LoadOptions: Sendable, Equatable {
     /// `AetherEngine.setAudioDelay(_:)`, which is the same value seen from the other end.
     public var audioDelaySeconds: Double = 0
 
+    /// AE#923: shape the session's audio before it reaches the output (a channel cap, a dialogue
+    /// lift, night-mode compression). The default shapes nothing and leaves every route as it was.
+    /// Active shaping needs PCM, so a stream-copied track is bridged while it is on and the session
+    /// trades Atmos and bitstream passthrough for it; `AetherEngine.audioShapingState` says whether
+    /// it is carried. Change it mid-session with `AetherEngine.setAudioShaping(_:)`.
+    public var audioShaping: AudioShaping = AudioShaping()
+
     /// Teletext caption page for `dvb_teletext` subtitle decode. nil (default) = libzvbi auto-detect
     /// (`txt_page=subtitle`); an explicit page (e.g. 801 for AU) targets channels whose caption page
     /// libzvbi does not flag as a subtitle page. Only affects teletext streams (#107).
@@ -1051,6 +1073,7 @@ public struct LoadOptions: Sendable, Equatable {
         forceDolbyVisionOnNonDVDisplay: Bool = false,
         dolbyVisionHandling: DolbyVisionHandling = .automatic,
         preferDualLayerDolbyVision: Bool = false,
+        upscalesLowResolutionVideo: Bool = false,
         matchContentEnabled: Bool = true,
         panelIsInHDRMode: Bool = false,
         attemptsHDRMasterOnUnprovenPanel: Bool = true,
@@ -1094,6 +1117,7 @@ public struct LoadOptions: Sendable, Equatable {
         autoplay: Bool = true,
         teletextPage: Int? = nil,
         audioDelaySeconds: Double = 0,
+        audioShaping: AudioShaping = AudioShaping(),
         deinterlaceMode: DeinterlaceMode = .auto,
         deinterlaceFieldRate: DeinterlaceFieldRate = .field,
         preferredDecodePath: DecodePath = .automatic,
@@ -1111,6 +1135,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.forceDolbyVisionOnNonDVDisplay = forceDolbyVisionOnNonDVDisplay
         self.dolbyVisionHandling = dolbyVisionHandling
         self.preferDualLayerDolbyVision = preferDualLayerDolbyVision
+        self.upscalesLowResolutionVideo = upscalesLowResolutionVideo
         self.matchContentEnabled = matchContentEnabled
         self.panelIsInHDRMode = panelIsInHDRMode
         self.attemptsHDRMasterOnUnprovenPanel = attemptsHDRMasterOnUnprovenPanel
@@ -1154,6 +1179,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.autoplay = autoplay
         self.teletextPage = teletextPage
         self.audioDelaySeconds = audioDelaySeconds
+        self.audioShaping = audioShaping.clamped
         self.deinterlaceMode = deinterlaceMode
         self.deinterlaceFieldRate = deinterlaceFieldRate
         self.preferredDecodePath = preferredDecodePath
@@ -1718,4 +1744,53 @@ func makeResamplerOutputLayout(_ channels: Int32, into layout: inout AVChannelLa
                        + "which no CoreAudio tag matches (#401)", category: .swPlayback)
     }
     av_channel_layout_default(&layout, channels)
+}
+
+/// What the low-resolution upscale stage is doing for the current session (#846), published as
+/// `AetherEngine.activeUpscale` once the first upscaled frame is delivered, nil otherwise.
+public struct UpscaleStatus: Sendable, Equatable {
+    /// The decoded (coded) size the stage receives.
+    public let sourceSize: CGSize
+    /// The VideoToolbox super-resolution factor, nil when MetalFX alone scales.
+    public let mlScale: Float?
+    /// The size the stage delivers: the source's display aspect fitted into the display.
+    public let targetSize: CGSize
+    /// Set when the stage switched itself off mid-session (repeated failures or a sustained overrun of
+    /// the frame budget); frames are then delivered as decoded.
+    public let disabledReason: String?
+    /// True once a sustained overrun made the stage drop MetalFX and deliver the VideoToolbox output at
+    /// its own size (`targetSize`, carrying the source's pixel aspect). Kept when it later disables.
+    public let degraded: Bool
+
+    init(plan: UpscalePlan, degraded: Bool = false, disabledReason: String? = nil) {
+        sourceSize = CGSize(width: plan.sourceWidth, height: plan.sourceHeight)
+        mlScale = plan.mlScale
+        targetSize = CGSize(width: plan.targetWidth, height: plan.targetHeight)
+        self.degraded = degraded
+        self.disabledReason = disabledReason
+    }
+
+    /// An upscaled frame of a new plan (first frame, rebuild, degrade) publishes it, unless a disable
+    /// was already published.
+    static func afterFirstFrame(_ plan: UpscalePlan, degraded: Bool = false, current: UpscaleStatus?) -> UpscaleStatus {
+        if let current, current.disabledReason != nil { return current }
+        return UpscaleStatus(plan: plan, degraded: degraded)
+    }
+
+    /// A disable keeps what was published and adds the reason; `plan` stands in when nothing was.
+    static func afterDisable(reason: String, current: UpscaleStatus?, plan: UpscalePlan) -> UpscaleStatus {
+        UpscaleStatus(sourceSize: current?.sourceSize ?? CGSize(width: plan.sourceWidth, height: plan.sourceHeight),
+                      mlScale: current.map(\.mlScale) ?? plan.mlScale,
+                      targetSize: current?.targetSize ?? CGSize(width: plan.targetWidth, height: plan.targetHeight),
+                      degraded: current?.degraded ?? false,
+                      disabledReason: reason)
+    }
+
+    private init(sourceSize: CGSize, mlScale: Float?, targetSize: CGSize, degraded: Bool, disabledReason: String?) {
+        self.sourceSize = sourceSize
+        self.mlScale = mlScale
+        self.targetSize = targetSize
+        self.degraded = degraded
+        self.disabledReason = disabledReason
+    }
 }

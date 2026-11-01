@@ -150,6 +150,17 @@ struct AACTimelineTests {
           .timeLimit(.minutes(2)),
           arguments: [Timing.compressed, .expanded, .lateCompressed], [Int32(44_100), 48_000])
     func boundsDecodedTimeline(timing: Timing, rate: Int32) throws {
+        try assertDecodedTimeline(timing: timing, rate: rate, shaping: AudioShaping())
+    }
+
+    @Test("AAC timeline correction and audio shaping retain their EOF tails across restarts",
+          .timeLimit(.minutes(2)), arguments: [Timing.compressed, .expanded], [Int32(44_100), 48_000])
+    func boundsShapedDecodedTimeline(timing: Timing, rate: Int32) throws {
+        try assertDecodedTimeline(
+            timing: timing, rate: rate, shaping: AudioShaping(dialogueGainDB: 6, compressor: .night))
+    }
+
+    private func assertDecodedTimeline(timing: Timing, rate: Int32, shaping: AudioShaping) throws {
         let data = try Self.fixture(timing: timing, rate: rate)
         let source = Demuxer()
         defer { source.close() }
@@ -157,7 +168,7 @@ struct AACTimelineTests {
         let stream = try #require(source.stream(at: source.audioStreamIndex))
         let bridge = try AudioBridge(
             srcCodecpar: stream.pointee.codecpar, srcTimeBase: stream.pointee.time_base,
-            correctSourceTimeline: true)
+            correctSourceTimeline: true, shaping: shaping)
         defer { bridge.close() }
 
         for epoch in [0, 120] {

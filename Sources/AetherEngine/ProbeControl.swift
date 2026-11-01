@@ -225,6 +225,11 @@ final class ProbeControl: @unchecked Sendable {
         else { try commit() }
     }
 
+    /// Input the probe may still consume, or nil when no numeric limits were installed.
+    var remainingInputBytes: Int64? {
+        limits.map { limits in lock.withLock { max(0, limits.maxInputBytes - inputBytes) } }
+    }
+
     func inputAllowance(_ requested: Int32) throws -> Int32 {
         try check()
         guard let limits else { return requested }

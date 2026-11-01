@@ -19,8 +19,14 @@ extension SoftwarePlaybackHost {
         }
         func pcm() throws -> (producer: any SoftwareAudioProducing, route: SoftwareAtmosRoute) {
             let decoder = AudioDecoder()
+            decoder.shaping = audioShaping
             try decoder.open(stream: stream)
             return (decoder, .pcm)
+        }
+        if audioShaping.isActive {
+            EngineLog.emit("[SWHost] audio: AE#923 shaping (\(audioShaping.summary)) keeps the track on the PCM decode",
+                           category: .swPlayback)
+            return try pcm()
         }
         guard objectAudioRendering != .off, !isLive else {
             if let note = Self.eac3PCMRouteNote(

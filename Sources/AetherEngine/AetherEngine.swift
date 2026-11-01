@@ -200,6 +200,20 @@ public final class AetherEngine: ObservableObject {
         sourceAuthorizationRefusedSubject.eraseToAnyPublisher()
     }
 
+    /// Forwards a refusal from the current session's header store to `sourceAuthorizationRefused`. The store holds
+    /// this closure, so it holds the store weakly: a strong capture kept every session's store (and its headers)
+    /// alive after the session ended.
+    func relayCredentialRefusals(of store: RequestHeaderStore) {
+        store.onCredentialRefusal = { [weak self, weak store] status in
+            Task { @MainActor [weak self, weak store] in
+                guard let self, let store, self.sessionRequestHeaders === store else { return }
+                EngineLog.emit("[AetherEngine] AE#792: source refused the request headers (HTTP \(status))",
+                               category: .engine)
+                self.sourceAuthorizationRefusedSubject.send(status)
+            }
+        }
+    }
+
     let sourceAuthorizationRefusedSubject = PassthroughSubject<Int, Never>()
 
     /// Monotonic id source for `SeekEvent`. Deliberately NOT `seekGeneration`: that counter is the
@@ -684,6 +698,12 @@ public final class AetherEngine: ObservableObject {
     /// Enhancement layer type for Profile 7 streams ("FEL" or "MEL") extracted from the first RPU.
     var sourceElType: String? = nil
 
+    /// #846: the upscale plan the load decided, carried to every software host this session builds.
+    var sourceUpscalePlan: UpscalePlan? = nil
+
+    /// #846: set when the session's stage disabled itself, so no later host of the session builds one again.
+    var sourceUpscaleDisabled: UpscaleStatus? = nil
+
     /// Whether the loaded source's Dolby Vision has a base layer `LoadOptions.dolbyVisionHandling =
     /// .baseLayerOnly` can present (`VideoRoutingPolicy.dolbyVisionBaseLayerIsPresentable`), decided
     /// on the probe stream for the same reason as `sourceDVBLCompatID`: a correction that turns the
@@ -904,11 +924,48 @@ public final class AetherEngine: ObservableObject {
                                         loopbackSession: pipeline.loopback,
                                         softwareHost: pipeline.software,
                                         audioOnlyHost: pipeline.audioOnly)
+        recomputeAudioShapingState()
         guard audioDelivery != next else { return }
         audioDelivery = next
         if next != .none {
             EngineLog.emit("[AetherEngine] AE#462: audio delivery = \(next.rawValue)", category: .engine)
         }
+    }
+
+    /// AE#923: whether this session's audio is shaped as `audioShaping` asks. Derived next to
+    /// `audioDelivery`, from the pipeline's own report, for the same reason.
+    @Published public internal(set) var audioShapingState: AudioShapingState = .off
+
+    /// Whether the pipeline serving the session carries shaping: true when it does, false when this
+    /// session cannot (AVPlayer owns the audio, or there is no audio to shape), nil while no pipeline
+    /// is live or the live one was built before the value changed and its rebuild is on the way.
+    private var livePipelineAppliesShaping: Bool? {
+        func engineOwned(applied: Bool?, delivery: AudioDelivery?) -> Bool? {
+            guard let applied, let delivery else { return nil }
+            if applied { return true }
+            return delivery == .noAudioInSource || delivery == .droppedNoPipeline ? false : nil
+        }
+        switch playbackBackend {
+        case .none, .aether: return nil
+        case .native:
+            if loadedOptions.nativeRemoteHLS { return false }
+            return engineOwned(applied: nativeVideoSession?.audioShapingApplied,
+                               delivery: nativeVideoSession?.audioDelivery)
+        case .software:
+            return engineOwned(applied: softwareHost?.audioShapingApplied, delivery: softwareHost?.audioDelivery)
+        case .audio:
+            if audioAVPlayerHost != nil { return false }
+            return audioHost.flatMap { $0.audioShaping.isActive ? true : nil }
+        }
+    }
+
+    func recomputeAudioShapingState() {
+        let next = AudioShapingState.derive(shaping: loadedOptions.audioShaping,
+                                            pipelineApplies: livePipelineAppliesShaping)
+        guard audioShapingState != next else { return }
+        audioShapingState = next
+        EngineLog.emit("[AetherEngine] AE#923: audio shaping \(next.rawValue) (\(loadedOptions.audioShaping.summary))",
+                       category: .engine)
     }
 
     /// Timing adjustment for subtitles composited into software PiP frames, in media seconds.
@@ -1110,6 +1167,12 @@ public final class AetherEngine: ObservableObject {
     /// this one's rectangle. The native and bypass paths mount an `AVPlayerLayer`, which measures its
     /// own `videoRect` and carries `AVPlayerItem.presentationSize`; this stays nil there.
     @Published public internal(set) var softwareDisplaySize: CGSize?
+
+    /// #846: what the low-resolution upscale stage (`LoadOptions.upscalesLowResolutionVideo`) does for this
+    /// session. Published on the first upscaled frame, not when the load decides the route, and again with
+    /// `disabledReason` set if the stage switches itself off. nil when the stage is not running, and
+    /// cleared with the session.
+    @Published public internal(set) var activeUpscale: UpscaleStatus?
 
     /// #288: the native-path counterpart of `softwarePiPSource.layer`. `AVPictureInPictureController`
     /// wants the layer, not the player, so a host presenting its own PiP on the native path (tvOS has
@@ -1446,6 +1509,9 @@ public final class AetherEngine: ObservableObject {
     /// drainer (SubtitleOverlayDrainer) from the session's SubtitlePacketStore. Replaces
     /// the embedded side-demuxer reader for every host, VOD and live, text and bitmap.
     var subtitleDrainTargets: [SubtitleChannel: Int32] = [:]
+    /// #921: channels whose drain target is a bitmap sidecar read into packets. Such a channel
+    /// drains from the source's own store under `SidecarBitmapSource.streamKey`.
+    var sidecarBitmapSources: [SubtitleChannel: SidecarBitmapSource] = [:]
     var subtitleDrainerTask: Task<Void, Never>?
     /// AE#628: the drain tick whose decode is running off the MainActor, nil while none is. At most
     /// one at a time, because a channel's decoder is one AVCodecContext and the tick in flight owns
@@ -2475,6 +2541,9 @@ public final class AetherEngine: ObservableObject {
     /// value has to live where the session's own rebuilds replay it from, or a lip-sync correction
     /// would be lost at the next audio-track switch or background return.
     func setLoadedAudioDelay(_ seconds: Double) { loadedOptions.audioDelaySeconds = seconds }
+
+    /// AE#923: the narrow write for `setAudioShaping`, for the same reason as the delay above.
+    func setLoadedAudioShaping(_ shaping: AudioShaping) { loadedOptions.audioShaping = shaping }
 
     /// AE#464 round 2: the fourth narrow write, and the one that makes a session-preserving reload
     /// preserve the session's transport. `autoplay` describes a MOUNT, and a rebuild is not a mount;
@@ -3867,6 +3936,9 @@ public final class AetherEngine: ObservableObject {
     /// the rebuild already in flight delivers the newest one. See `reanchorForAudioDelay`.
     var audioDelayReanchorInFlight = false
 
+    /// AE#923: the same latch for `setAudioShaping`'s rebuilds.
+    var audioShapingReanchorInFlight = false
+
     /// The playhead a rebuild of this session has to come back to (#464 round 2).
     var positionForSessionRebuild: Double {
         let pending = !isLive && nativeHost != nil
@@ -4428,15 +4500,7 @@ public final class AetherEngine: ObservableObject {
         // AE#792: a fresh store per load, so a header rotated on the previous session can never reach
         // this one through a reader that outlived it.
         sessionRequestHeaders = RequestHeaderStore(options.httpHeaders)
-        let refusalStore = sessionRequestHeaders
-        refusalStore.onCredentialRefusal = { [weak self] status in
-            Task { @MainActor [weak self] in
-                guard let self, self.sessionRequestHeaders === refusalStore else { return }
-                EngineLog.emit("[AetherEngine] AE#792: source refused the request headers (HTTP \(status))",
-                               category: .engine)
-                self.sourceAuthorizationRefusedSubject.send(status)
-            }
-        }
+        relayCredentialRefusals(of: sessionRequestHeaders)
         audioSessionRequestsOwnedByAVFoundation = false
         // #377: register the host's concurrency ceiling for this origin before anything fetches
         // from it. Keyed on the origin rather than the load, so the subtitle side reader and any
@@ -4541,6 +4605,8 @@ public final class AetherEngine: ObservableObject {
         dolbyVisionConversion = nil
         sourceCarriesHDR10PlusMetadata = false
         sourceElType = nil
+        sourceUpscalePlan = nil
+        sourceUpscaleDisabled = nil
         sourceDVBLCompatID = nil
         sourceDolbyVisionBaseLayerPresentable = false
         sourceDolbyVisionRPUProfile = nil
@@ -5648,6 +5714,23 @@ public final class AetherEngine: ObservableObject {
         }
         useSoftwarePath = VideoRoutingPolicy.usesSoftwarePath(
             routedSoftware: useSoftwarePath, preferred: options.preferredDecodePath)
+        // #846: after every other routing decision, because this one only ever adds the software path and
+        // the interlace refute probe above can take that path away again.
+        let upscaleDecision = !options.upscalesLowResolutionVideo
+            ? UpscaleRouteDecision.notTaken(.preferenceOff)
+            : upscaleRouteDecision(
+                options: options,
+                videoStream: probeOpened ? probe.stream(at: probe.videoStreamIndex) : nil,
+                dvProfile: detectedDVProfileNum,
+                airPlayVideoReceiver: airPlayVideoReceiver,
+                demuxedAudioLive: SessionOptionCorrection.isDemuxedAudioLive(
+                    isLive: options.isLive,
+                    hasCompanionAudioReader: (customReader as? LiveIngestSourceInfo)?.companionAudioReader != nil))
+        if let line = upscaleDecision.logLine {
+            EngineLog.emit(line, category: .engine)
+        }
+        sourceUpscalePlan = upscaleDecision.plan
+        if sourceUpscalePlan != nil { useSoftwarePath = true }
         // TEST-ONLY: forces SW path for aetherctl live --sw; unset in shipping builds.
         if Self.forceSoftwarePathForTesting {
             useSoftwarePath = true
@@ -7008,6 +7091,8 @@ public final class AetherEngine: ObservableObject {
         dolbyVisionConversion = nil
         sourceCarriesHDR10PlusMetadata = false
         sourceElType = nil
+        sourceUpscalePlan = nil
+        sourceUpscaleDisabled = nil
         sourceDVBLCompatID = nil
         sourceDolbyVisionBaseLayerPresentable = false
         sourceDolbyVisionRPUProfile = nil
@@ -8156,6 +8241,7 @@ public final class AetherEngine: ObservableObject {
         // #353: the picture belongs to the session. Left standing, the next source would be laid out
         // against this one's rectangle for as long as it takes its own first frame to arrive.
         softwareDisplaySize = nil
+        activeUpscale = nil
         decodedVideoFormat = nil
         // #314: same detach on the software path, where the outgoing renderer's decode thread is what
         // can still hand a frame over while the next host comes up.

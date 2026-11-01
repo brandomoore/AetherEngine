@@ -601,6 +601,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// second is a reason for a fallback ladder to demote. Set at each of the cascade's three exits.
     public internal(set) var audioDelivery: AudioDelivery = .none
 
+    /// AE#923: whether the audio pipeline this session built carries `audioShaping`. Set at the
+    /// cascade's exits: true only for a bridge opened with active shaping.
+    public internal(set) var audioShapingApplied = false
+
     /// AE#520: the stream-copied audio bitstream carries JOC, so this session's `ec-3` track is
     /// Atmos and reaches the receiver as a 2-channel MAT carrier. A host that reads a channel count
     /// off the HDMI route has to know that, or it reads the carrier as a downmix.
@@ -891,6 +895,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// that has already been cut; `AetherEngine.setAudioDelay` writes it as part of a reload, which is
     /// what actually replaces the segments and the item holding them.
     public var audioDelaySeconds: Double = 0
+
+    /// AE#923: the host's audio shaping, read by the audio cascade. Active shaping takes the session
+    /// off stream copy and object rendering and onto the PCM bridge. Like the delay above it is fixed
+    /// for a producer's life, so a change arrives as a reload. Set before `start()`.
+    public var audioShaping = AudioShaping()
 
     /// `LoadOptions.progressiveSegmentDelivery`, handed to the provider and to every producer this
     /// session builds. Set before `start()`.
@@ -2383,6 +2392,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
             // escalate to restart instead of parking on its frozen front.
             producerFinished: isLiveSession ? nil : { [weak self] in
                 self?.currentProducerFinished ?? false
+            },
+            // Throughput fallback of the forward-wait march-rate estimate.
+            sourceBytesFetched: isLiveSession ? nil : { [weak self] in
+                self?.demuxerBytesFetched ?? 0
             },
             // #93 residual: the first producer may be anchored at the resume segment; without this
             // the cold-start heuristic (abs(index - lastRestartIndex) > 2) restarts it immediately.
