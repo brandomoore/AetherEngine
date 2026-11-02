@@ -137,6 +137,63 @@ struct Issue38SeekEventsTests {
 
     // MARK: - Native scrub landing (the falling edge that preceded the picture)
 
+    @Test("only a VOD mount's startup preroll owns its backward fetches")
+    func mountRestartAdmission() {
+        #expect(AetherEngine.nativeRestartBelongsToMount(
+            target: 36, mount: 54.06, hasPlayed: false, isLive: false))
+        #expect(AetherEngine.nativeRestartBelongsToMount(
+            target: 54.06, mount: 54.06, hasPlayed: false, isLive: false))
+        #expect(!AetherEngine.nativeRestartBelongsToMount(
+            target: 60, mount: 54.06, hasPlayed: false, isLive: false))
+        #expect(!AetherEngine.nativeRestartBelongsToMount(
+            target: 36, mount: 54.06, hasPlayed: true, isLive: false))
+        #expect(!AetherEngine.nativeRestartBelongsToMount(
+            target: 36, mount: 54.06, hasPlayed: false, isLive: true))
+        #expect(!AetherEngine.nativeRestartBelongsToMount(
+            target: 0, mount: 0, hasPlayed: false, isLive: false))
+        #expect(!AetherEngine.nativeRestartBelongsToMount(
+            target: 36, mount: nil, hasPlayed: false, isLive: false))
+        #expect(!AetherEngine.nativeRestartBelongsToMount(
+            target: .nan, mount: 54.06, hasPlayed: false, isLive: false))
+    }
+
+    @MainActor
+    @Test("resume preroll backfill is not a backward user scrub")
+    func resumeBackfillDoesNotWaitForBackwardLanding() throws {
+        let engine = try AetherEngine()
+        let host = NativeAVPlayerHost()
+        engine.nativeHost = host
+        defer { engine.stop() }
+        host.load(url: URL(string: "http://127.0.0.1:1/vod/media.m3u8")!,
+                  startPosition: 54.06, contract: .init())
+        var events: [SeekEvent] = []
+        let sub = engine.seekEvents.sink { events.append($0) }
+        defer { sub.cancel() }
+
+        engine.setNativeScrubSeek(inFlight: true, target: 36)
+        #expect(engine.isSeeking)
+        engine.hasTransportRolled = true
+        engine.setNativeScrubSeek(inFlight: true, target: 40)
+        engine.setNativeScrubSeek(inFlight: false, target: nil)
+
+        #expect(!engine.isSeeking)
+        #expect(engine.pendingScrubLanding == nil)
+        #expect(engine.scrubLandingWatchdog == nil)
+        #expect(events.isEmpty)
+
+        // Once the item has played, the same request can be a genuine backward scrub.
+        engine.setNativeScrubSeek(inFlight: true, target: 36)
+        engine.setNativeScrubSeek(inFlight: false, target: nil)
+        #expect(engine.isSeeking)
+        #expect(engine.pendingScrubLanding != nil)
+        engine.checkPendingScrubLanding(rendered: 55.3)
+        #expect(engine.isSeeking)
+        engine.checkPendingScrubLanding(rendered: 36.1)
+        #expect(!engine.isSeeking)
+        #expect(events.count == 2)
+        #expect(events.first?.origin == .nativeScrub)
+    }
+
     @Test("a forward scrub lands when the picture reaches the restarted region")
     func scrubLandingForward() {
         #expect(AetherEngine.nativeScrubLanded(rendered: 100, target: 100, frozen: 20))

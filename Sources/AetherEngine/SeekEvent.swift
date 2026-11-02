@@ -101,6 +101,14 @@ extension SeekEvent: CustomStringConvertible {
 
 extension AetherEngine {
 
+    nonisolated static func nativeRestartBelongsToMount(
+        target: Double?, mount: Double?, hasPlayed: Bool, isLive: Bool
+    ) -> Bool {
+        guard !hasPlayed, !isLive, let target, let mount,
+              target.isFinite, mount.isFinite, mount > 0 else { return false }
+        return target <= mount
+    }
+
     /// Pure decision: has a native AVKit scrub physically landed, i.e. is the picture in the region the
     /// producer restarted for?
     ///

@@ -350,6 +350,7 @@ public final class AetherEngine: ObservableObject {
     /// Was the in-flight restart run caused by a programmatic seek rather than a user scrub? Captured at
     /// the rising edge, because by the drain the programmatic seek may already have finalized.
     var scrubRestartOwnedByProgrammaticSeek = false
+    private var scrubRestartOwnedByMountSeek = false
 
     private func nextSeekEventID() -> UInt64 {
         seekEventCounter &+= 1
@@ -484,6 +485,14 @@ public final class AetherEngine: ObservableObject {
             // would report a miss on a seek that landed fine, so this restart keeps the old drain-edge
             // semantics and the programmatic ticket carries the outcome.
             scrubRestartOwnedByProgrammaticSeek = programmaticSeekInFlight
+            // Resume preroll may fetch below the mount position (54.06 -> segment 36).
+            // The mount still owns that landing; no picture should ever jump back to 36.
+            scrubRestartOwnedByMountSeek = !programmaticSeekInFlight
+                && Self.nativeRestartBelongsToMount(
+                    target: target,
+                    mount: nativeHost?.mountedStartPosition.map { displaySeconds(forPlaylistSeconds: $0) },
+                    hasPlayed: hasTransportRolled && !scrubRestartOwnedByMountSeek,
+                    isLive: isLive)
             guard let target else {
                 // No resolvable segment time (index outside the plan): keep the flag honest but publish no
                 // target, and leave the landing watch unarmed.
@@ -498,7 +507,8 @@ public final class AetherEngine: ObservableObject {
             // No ticket for a programmatic seek's own restart: that seek's events are the authority, and a
             // second pair reporting a landing at the RESTART target (a segment below where the picture
             // ends up) would contradict them. The level flag is still set, exactly as before.
-            if nativeScrubSeekTicket == nil, !scrubRestartOwnedByProgrammaticSeek {
+            if nativeScrubSeekTicket == nil,
+               !scrubRestartOwnedByProgrammaticSeek, !scrubRestartOwnedByMountSeek {
                 nativeScrubSeekTicket = beginSeekTicket(origin: .nativeScrub, target: target)
             }
             nativeScrubSeekInFlight = true
@@ -513,7 +523,7 @@ public final class AetherEngine: ObservableObject {
         }
         // Coalesced restart run drained. Hand the falling edge to the landing watch when this restart was
         // a user scrub with a target and a native host to watch; otherwise settle now, exactly as before.
-        guard !scrubRestartOwnedByProgrammaticSeek,
+        guard !scrubRestartOwnedByProgrammaticSeek, !scrubRestartOwnedByMountSeek,
               let watchTarget = nativeScrubSeekTarget,
               let host = nativeHost else {
             // AE#270: the event's `target` is on the display axis, so its landing has to be too.
@@ -558,6 +568,7 @@ public final class AetherEngine: ObservableObject {
         closeSeekTicket(&nativeScrubSeekTicket, with: outcome)
         nativeScrubSeekInFlight = false
         nativeScrubSeekTarget = nil
+        scrubRestartOwnedByMountSeek = false
         recomputeSeekSignal()
     }
 
@@ -8331,6 +8342,7 @@ public final class AetherEngine: ObservableObject {
         scrubLandingWatchdog = nil
         programmaticSeekInFlight = false
         nativeScrubSeekInFlight = false
+        scrubRestartOwnedByMountSeek = false
         deferredSeekInFlight = false
         programmaticSeekTarget = nil
         nativeScrubSeekTarget = nil
