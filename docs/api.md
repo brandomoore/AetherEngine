@@ -318,6 +318,29 @@ session sat in `.error`; it now throws what the rebuild threw, the way the URL b
 rebuild superseded by a newer `load` or `stop` is not a failure and still returns normally, because
 the newer load owns the session.
 
+### Changing display matching without reopening an SDR stream
+
+`updateDisplayMatching(enabled:)` changes a ready SDR session between engine-owned
+matching (`true`) and a fixed-output, host-owned preview (`false`). It returns
+`DisplayMatchingUpdate`: `.applied` preserves the AVPlayer/item, source handle,
+buffers, tracks, position and playing/paused state; `.requiresReload` leaves all
+options untouched when HDR pipeline changes or AVKit/shared-secondary ownership
+prevent an in-place update; `.notReady` leaves everything untouched until playing
+or paused with authoritative source dimensions and format.
+
+This works for forward-only live sources as well as files, because it does not
+seek or reopen media. A late native-HLS format notification uses the current
+policy, not the original load's policy. HDR hosts should use the existing
+`reloadAtCurrentPosition(applying:)` correction with the desired
+`displayCriteriaOwner`, `suppressDisplayCriteria` and `matchContentEnabled`.
+Wait for readiness before retrying `.notReady`.
+
+On tvOS, enabling matching requests the source's known frame rate; an unknown
+rate supplies no rate hint. Disabling clears only this controller's display
+criteria, never a newer engine owner's. An actual HDMI frame-rate switch can
+still interrupt the display even though the playback session is unchanged.
+This API does not read or override the user's configured output format.
+
 ### Rotating a credential without a rebuild
 
 A media server that requires a bearer token on every request, with tokens that expire while a title

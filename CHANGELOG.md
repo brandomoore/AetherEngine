@@ -37,6 +37,12 @@ the public-API contract.
 
 ## [Unreleased]
 
+- Add `updateDisplayMatching(enabled:)` for ready SDR preview/fullscreen
+  transitions without reopening media, including forward-only live streams.
+  HDR and AVKit/shared-secondary pipelines keep the explicit reload path.
+  Late native-HLS format updates retain the current policy, and an outgoing
+  engine cannot clear a newer engine's display criteria.
+
 - **Avoid an active-picture teardown crash on older runtimes.** Synchronous engine
   or native-analyzer destruction no longer enters the isolated-deinit
   back-deployment trampoline. A separate lifetime owner removes the notification

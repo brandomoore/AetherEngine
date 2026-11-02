@@ -71,6 +71,8 @@ final class DisplayCriteriaController {
     #endif
 
     #if os(tvOS)
+    private static let writers = NSMapTable<AVDisplayManager, DisplayCriteriaController>.weakToWeakObjects()
+
     /// #339: armed at the criteria write, not when the play gate opens, so an engine-written switch is
     /// observable end to end instead of having to be guessed at from the in-progress flag.
     private let observation = SwitchObservation()
@@ -839,7 +841,8 @@ final class DisplayCriteriaController {
                 category: .engine
             )
         }
-        let managerHoldsCriteria = displayManager.preferredDisplayCriteria != nil
+        let managerHoldsCriteria = Self.writers.object(forKey: displayManager) === self
+            && displayManager.preferredDisplayCriteria != nil
         if didApply, !managerHoldsCriteria {
             EngineLog.emit(
                 "[DisplayCriteria] criteria were cleared outside the engine since its last SET; writing again",
@@ -885,6 +888,7 @@ final class DisplayCriteriaController {
         // three device runs in Sodalite#49 never saw an end for a switch that was already over.
         observation.arm()
         displayManager.preferredDisplayCriteria = criteria
+        Self.writers.setObject(self, forKey: displayManager)
         didApply = true
         lastCriteriaWasHDR = isHDR
         lastApplied = target
@@ -1339,7 +1343,7 @@ final class DisplayCriteriaController {
         EngineLog.emit("[DisplayCriteria] \(reason) clears the panel's HDR proof; the next session asks the display again",
                        category: .engine)
     }
-    /// Nil-out preferredDisplayCriteria to return the panel to default. No-op when apply() was never called this session (suppressed host) to avoid racing AVKit's in-flight criteria management.
+    /// Return the panel to default only while this controller remains its latest engine writer.
     func reset() {
         #if os(tvOS)
         guard didApply else { return }
@@ -1348,8 +1352,14 @@ final class DisplayCriteriaController {
             lastApplied = nil
             return
         }
+        guard Self.writers.object(forKey: window.avDisplayManager) === self else {
+            didApply = false
+            lastApplied = nil
+            return
+        }
         logPanelReadout("before reset", window: window)
         window.avDisplayManager.preferredDisplayCriteria = nil
+        Self.writers.removeObject(forKey: window.avDisplayManager)
         didApply = false
         lastApplied = nil   // #133: a RESET returns the panel to default; the next apply must re-establish it.
         EngineLog.emit("[DisplayCriteria] RESET", category: .engine)

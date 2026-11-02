@@ -449,7 +449,8 @@ extension AetherEngine {
                 // Same reason as the rate: this bypass runs no libav probe, so without the read-back the
                 // codec row on a remote-HLS session stays empty for a source that is plainly playing.
                 if let codec = self.nativeHost?.detectedVideoCodecName { self.sourceVideoCodecName = codec }
-                self.applyRemoteHLSDisplayCriteria(format: fmt, options: options)
+                // Presentation can change without remounting this item.
+                self.applyRemoteHLSDisplayCriteria(format: fmt, options: self.loadedOptions)
             }
             .store(in: &nativeCancellables)
         // What was DELIVERED, which on a capped transcode is not what the host's library holds: without it
