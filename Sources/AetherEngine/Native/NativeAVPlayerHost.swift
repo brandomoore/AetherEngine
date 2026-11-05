@@ -1026,8 +1026,8 @@ final class NativeAVPlayerHost {
         didSet {
             if let playerItem { applyAuthoredPlaybackRange(to: playerItem) }
         }
-        var authoredMountPending = false
     }
+    var authoredMountPending = false
 
     func applyAuthoredPlaybackRange(to item: AVPlayerItem) {
         item.reversePlaybackEndTime = authoredPlaybackRange.map {
