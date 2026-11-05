@@ -37,6 +37,12 @@ the public-API contract.
 
 ## [Unreleased]
 
+- **Keep media-selection reads off the UI thread during a media-service stall.**
+  Subtitle pinning, native track selection and audio readback use a bounded
+  background reader. A timeout is not a confirmed empty selection, and a late
+  result cannot change a replaced item or superseded selection. Timed-out
+  readers retain their admission slot until the native getter actually returns.
+
 - Add `updateDisplayMatching(enabled:)` for ready SDR preview/fullscreen
   transitions without reopening media, including forward-only live streams.
   HDR and AVKit/shared-secondary pipelines keep the explicit reload path.

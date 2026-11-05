@@ -29,10 +29,13 @@ extension AetherEngine {
                 AudibleSelectionReadback.Option(
                     displayName: $0.displayName, languageTag: $0.extendedLanguageTag)
             }
-            let selected = group
-                .flatMap { item.currentMediaSelection.selectedMediaOption(in: $0) }
-                .map { AudibleSelectionReadback.Option(
+            var selected: AudibleSelectionReadback.Option?
+            if let group {
+                guard let reading = await NativeMediaSelectionReader.shared.read(item: item, group: group),
+                      !Task.isCancelled, self.currentAVPlayer?.currentItem === item else { return }
+                selected = reading.option.map { AudibleSelectionReadback.Option(
                     displayName: $0.displayName, languageTag: $0.extendedLanguageTag) }
+            }
             EngineLog.emit(
                 AudibleSelectionReadback.line(
                     served: served,

@@ -2696,6 +2696,7 @@ public final class AetherEngine: ObservableObject {
     /// so the reload re-applies this to keep an active rendition (PiP) rendering. Cleared with
     /// the track table on load/stop so a new session never inherits a stale selection.
     var nativeSubtitleReapplyOrdinal: Int?
+    var nativeSubtitleSelectionGeneration = UUID()
 
     /// Whole-file decode tasks filling native stores for load-declared external tracks (#88).
     var externalNativeStoreFillTask: Task<Void, Never>? = nil
@@ -2739,6 +2740,7 @@ public final class AetherEngine: ObservableObject {
     /// the pin from spinning if the system re-selects after every deselect. Session-scoped, all four
     /// dropped together by `cancelNativeLegibleDeselectPin()`.
     var nativeLegibleDeselectPinTask: Task<Void, Never>? = nil
+    var nativeLegibleReselectionTask: Task<Void, Never>? = nil
     var nativeLegibleDeselectPinObserver: NSObjectProtocol? = nil
     var nativeLegibleDeselectPinItem: AVPlayerItem? = nil
     var nativeLegibleDeselectPinGroup: AVMediaSelectionGroup? = nil

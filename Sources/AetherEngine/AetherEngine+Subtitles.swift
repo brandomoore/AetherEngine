@@ -2274,6 +2274,8 @@ extension AetherEngine {
         // Remembered before any guard: the #93 recovery reload replays the host's last request
         // onto the fresh item even when this call raced a not-yet-current player.
         nativeSubtitleReapplyOrdinal = ordinal
+        let selectionGeneration = UUID()
+        nativeSubtitleSelectionGeneration = selectionGeneration
         syncSubtitleOCRWithNativeSelection(ordinal: ordinal)
         // #15: lazy readers, run the side-demuxer only while a native track is selected (PiP), idle otherwise.
         // Sodalite#32: an eager read-to-EOF reader survives deselect (it is building whole-session coverage;
@@ -2292,7 +2294,9 @@ extension AetherEngine {
             // renders immediately and survives.
             currentAVPlayer?.appliesMediaSelectionCriteriaAutomatically = false
             guard let group = try? await item.asset.loadMediaSelectionGroup(for: .legible) else { return }
-            guard !group.options.isEmpty else { return }
+            guard !Task.isCancelled, currentAVPlayer?.currentItem === item,
+                  nativeSubtitleSelectionGeneration == selectionGeneration,
+                  nativeSubtitleReapplyOrdinal == ordinal, !group.options.isEmpty else { return }
             guard let ordinal else {
                 item.select(nil, in: group)
                 return
@@ -2352,6 +2356,8 @@ extension AetherEngine {
                 let began = Date()
                 var exit = "target"
                 while store.readMaxCueEnd() < target, Date() < deadline {
+                    guard !Task.isCancelled, currentAVPlayer?.currentItem === item,
+                          nativeSubtitleSelectionGeneration == selectionGeneration else { return }
                     let m = store.readMaxCueEnd()
                     if m > lastMax {
                         lastMax = m
@@ -2398,23 +2404,41 @@ extension AetherEngine {
             // drawn until re-asserted. Deselect, hop one runloop, then reselect to force the renderer to attach
             // (documented workaround; the same effect a PiP round-trip had). Needs the manual-criteria pin above.
             let itemID = String(UInt(bitPattern: ObjectIdentifier(item).hashValue) & 0xffff, radix: 16)
+            guard !Task.isCancelled, currentAVPlayer?.currentItem === item,
+                  nativeSubtitleSelectionGeneration == selectionGeneration,
+                  nativeSubtitleReapplyOrdinal == ordinal else { return }
             EngineLog.emit("[AetherEngine] native subtitle select: item=\(itemID) opt=\(option.displayName) groupOpts=\(group.options.count) criteriaAuto=\(currentAVPlayer?.appliesMediaSelectionCriteriaAutomatically ?? true) itemIsCurrent=\(currentAVPlayer?.currentItem === item)", category: .engine)
             item.select(nil, in: group)
             try? await Task.sleep(nanoseconds: 100_000_000)
+            guard !Task.isCancelled, currentAVPlayer?.currentItem === item,
+                  nativeSubtitleSelectionGeneration == selectionGeneration,
+                  nativeSubtitleReapplyOrdinal == ordinal else { return }
             item.select(option, in: group)
-            let after = item.currentMediaSelection.selectedMediaOption(in: group)?.displayName ?? "nil"
+            guard var reading = await NativeMediaSelectionReader.shared.read(item: item, group: group),
+                  !Task.isCancelled, currentAVPlayer?.currentItem === item,
+                  nativeSubtitleSelectionGeneration == selectionGeneration,
+                  nativeSubtitleReapplyOrdinal == ordinal else { return }
+            let after = reading.option?.displayName ?? "nil"
             EngineLog.emit("[AetherEngine] native subtitle select done: selected=\(after) itemIsCurrent=\(currentAVPlayer?.currentItem === item)", category: .engine)
             // Sodalite#32: a select landing inside a stall recovery gets dropped outright by AVFoundation
             // (device: PiP entry 0.1s after waitingToPlay -> playing read back nil and STAYED nil; the same
             // select succeeded on the previous entry). Re-assert briefly until it sticks or the item changes.
             var retries = 0
-            while item.currentMediaSelection.selectedMediaOption(in: group) == nil,
+            while reading.option == nil,
                   retries < 4,
                   currentAVPlayer?.currentItem === item {
                 retries += 1
                 try? await Task.sleep(nanoseconds: 700_000_000)
+                guard !Task.isCancelled, currentAVPlayer?.currentItem === item,
+                      nativeSubtitleSelectionGeneration == selectionGeneration,
+                      nativeSubtitleReapplyOrdinal == ordinal else { return }
                 item.select(option, in: group)
-                let retried = item.currentMediaSelection.selectedMediaOption(in: group)?.displayName ?? "nil"
+                guard let next = await NativeMediaSelectionReader.shared.read(item: item, group: group),
+                      !Task.isCancelled, currentAVPlayer?.currentItem === item,
+                      nativeSubtitleSelectionGeneration == selectionGeneration,
+                      nativeSubtitleReapplyOrdinal == ordinal else { return }
+                reading = next
+                let retried = reading.option?.displayName ?? "nil"
                 EngineLog.emit("[AetherEngine] native subtitle select retry #\(retries): selected=\(retried)", category: .engine)
             }
         }
@@ -2679,14 +2703,23 @@ extension AetherEngine {
             while attempts < 25,
                   self.nativeSubtitleReapplyOrdinal == nil,
                   self.currentAVPlayer?.currentItem === item {
-                if attempts == 0 || item.currentMediaSelection.selectedMediaOption(in: group) != nil {
+                guard !Task.isCancelled else { return }
+                var shouldDeselect = attempts == 0
+                if !shouldDeselect {
+                    let reading = await NativeMediaSelectionReader.shared.read(item: item, group: group)
+                    guard !Task.isCancelled, self.nativeSubtitleReapplyOrdinal == nil,
+                          self.currentAVPlayer?.currentItem === item else { return }
+                    guard let reading else { break }
+                    shouldDeselect = reading.option != nil
+                }
+                if shouldDeselect {
                     item.select(nil, in: group)
                     EngineLog.emit("[AetherEngine] Sodalite#38 native legible force-deselected (attempt \(attempts))", category: .engine)
                 }
                 attempts += 1
                 try? await Task.sleep(nanoseconds: 40_000_000)
             }
-            guard self.nativeSubtitleReapplyOrdinal == nil,
+            guard !Task.isCancelled, self.nativeSubtitleReapplyOrdinal == nil,
                   self.currentAVPlayer?.currentItem === item else { return }
             self.armNativeLegibleReselectionObserver(item: item, group: group)
         }
@@ -2716,24 +2749,34 @@ extension AetherEngine {
                     self.cancelNativeLegibleDeselectPin()
                     return
                 }
-                guard let selected = pinned.currentMediaSelection.selectedMediaOption(in: group) else { return }
-                guard self.nativeLegibleDeselectPinBurst.admit(now: Date().timeIntervalSinceReferenceDate) else {
+                guard self.nativeLegibleReselectionTask == nil else { return }
+                self.nativeLegibleReselectionTask = Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    defer {
+                        if !Task.isCancelled { self.nativeLegibleReselectionTask = nil }
+                    }
+                    guard let reading = await NativeMediaSelectionReader.shared.read(item: pinned, group: group),
+                          !Task.isCancelled, self.nativeLegibleDeselectPinItem === pinned,
+                          self.currentAVPlayer?.currentItem === pinned,
+                          self.nativeSubtitleReapplyOrdinal == nil,
+                          let selected = reading.option else { return }
+                    guard self.nativeLegibleDeselectPinBurst.admit(now: Date().timeIntervalSinceReferenceDate) else {
+                        EngineLog.emit(
+                            "[AetherEngine] Sodalite#65: the system keeps re-selecting legible option "
+                            + "\"\(selected.displayName)\"; standing down, the caption box stays",
+                            category: .engine)
+                        self.cancelNativeLegibleDeselectPin()
+                        return
+                    }
+                    pinned.select(nil, in: group)
                     EngineLog.emit(
-                        "[AetherEngine] Sodalite#65: the system keeps re-selecting legible option "
-                        + "\"\(selected.displayName)\"; standing down, the caption box stays",
+                        "[AetherEngine] Sodalite#65: legible option \"\(selected.displayName)\" was selected "
+                        + "from outside the engine (iOS automatic captions); deselected again, "
+                        + "publishing the request (lang=\(selected.extendedLanguageTag ?? "none"))",
                         category: .engine)
-                    self.cancelNativeLegibleDeselectPin()
-                    return
+                    // The selection is the only trace of the user's automatic-captions settings.
+                    self.systemCaptionRequest.send(SystemCaptionRequest(language: selected.extendedLanguageTag))
                 }
-                pinned.select(nil, in: group)
-                EngineLog.emit(
-                    "[AetherEngine] Sodalite#65: legible option \"\(selected.displayName)\" was selected "
-                    + "from outside the engine (iOS automatic captions); deselected again, "
-                    + "publishing the request (lang=\(selected.extendedLanguageTag ?? "none"))",
-                    category: .engine)
-                // The selection is the only trace of the user's automatic-captions settings, which have
-                // no read API. Hand it to the host, which can render it in its own subtitle presentation.
-                self.systemCaptionRequest.send(SystemCaptionRequest(language: selected.extendedLanguageTag))
             }
         }
     }
@@ -2743,6 +2786,8 @@ extension AetherEngine {
     func cancelNativeLegibleDeselectPin() {
         nativeLegibleDeselectPinTask?.cancel()
         nativeLegibleDeselectPinTask = nil
+        nativeLegibleReselectionTask?.cancel()
+        nativeLegibleReselectionTask = nil
         if let observer = nativeLegibleDeselectPinObserver {
             NotificationCenter.default.removeObserver(observer)
             nativeLegibleDeselectPinObserver = nil
@@ -2806,12 +2851,17 @@ extension AetherEngine {
             for await ready in host.$isReady.values where ready { break }
             guard !Task.isCancelled, self.currentAVPlayer?.currentItem === item,
                   !self.hostExplicitSubtitleAction else { return }
-            if let selected = item.currentMediaSelection.selectedMediaOption(in: group),
+            guard let reading = await NativeMediaSelectionReader.shared.read(item: item, group: group),
+                  !Task.isCancelled, self.currentAVPlayer?.currentItem === item,
+                  !self.hostExplicitSubtitleAction else { return }
+            if let selected = reading.option,
                let ordinal = group.options.firstIndex(of: selected) {
                 // #316: an auto-selected injected rendition mirrors back as the EXTERNAL id it was
                 // declared under, not as a second identity in the legible id range.
                 let selectedName = await RemoteHLSMediaSelection.playlistName(of: selected)
                     ?? selected.displayName
+                guard !Task.isCancelled, self.currentAVPlayer?.currentItem === item,
+                      !self.hostExplicitSubtitleAction else { return }
                 self.activeSubtitleTrackIndex = self.injectedSubtitleRenditionNames
                     .first { $0.value == selectedName }?.key
                     ?? RemoteHLSMediaSelection.subtitleTrackIDBase + ordinal

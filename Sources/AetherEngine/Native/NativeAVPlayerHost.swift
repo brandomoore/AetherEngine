@@ -2868,10 +2868,12 @@ final class NativeAVPlayerHost {
         let sid = sessionID
         guard sid != 0, playerItem === item, sessionContract.readsBackAudioTracks else { return }
         var selectedOptionLanguage: String?
-        if let group = try? await item.asset.loadMediaSelectionGroup(for: .audible),
-           let option = item.currentMediaSelection.selectedMediaOption(in: group) {
-            selectedOptionLanguage = option.extendedLanguageTag
+        if let group = try? await item.asset.loadMediaSelectionGroup(for: .audible) {
+            let reading = await NativeMediaSelectionReader.shared.read(item: item, group: group)
+            guard !Task.isCancelled, sessionID == sid, playerItem === item else { return }
+            selectedOptionLanguage = reading?.option?.extendedLanguageTag
         }
+        guard !Task.isCancelled, sessionID == sid, playerItem === item else { return }
         var readings: [RemoteHLSStreamDescription.AudioReading] = []
         for itemTrack in item.tracks {
             guard let assetTrack = itemTrack.assetTrack, assetTrack.mediaType == .audio else { continue }
