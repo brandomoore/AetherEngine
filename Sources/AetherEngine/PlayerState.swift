@@ -978,6 +978,12 @@ public struct LoadOptions: Sendable, Equatable {
     /// waypoint; the host resumes later with `play()`. Same declared-vs-real family as #122/#123 (#124).
     public var autoplay: Bool = true
 
+    /// An authored interval in raw source PTS seconds, for a single seekable video source.
+    /// Native loopback playback seeks to its start and stops at its end on the renderer's
+    /// timebase, retaining the final frame. Internal reloads retain the interval.
+    /// Live, sequential, audio-only and software-rendered sources are not supported.
+    public var nativeSourcePlaybackRange: Range<Double>? = nil
+
     /// AE#464: audio presentation offset for this session, in seconds. Positive presents audio
     /// LATER relative to video, negative earlier. Default 0.
     ///

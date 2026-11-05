@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased: authored native playback intervals
+
+- Add `LoadOptions.nativeSourcePlaybackRange` for a single seekable video source,
+  expressed in raw source PTS. Native loopback playback uses the presentation-axis
+  map and AVPlayer's renderer-owned endpoint, retaining the final frame without
+  a sampled-clock pause. Reapply the endpoint on item replacement and timeline
+  rebasing, preserve it across reloads, and constrain engine seeks to the interval.
+- Reject unsupported live, sequential, audio-only and software-rendered paths
+  instead of playing past an authored boundary. Ordinary unbounded playback
+  retains its existing end-of-video/audio-tail recovery.
+
 ## Unreleased: active-picture analysis
 
 - Add opt-in `sampleActivePicture()` and `stopActivePictureAnalysis()` for

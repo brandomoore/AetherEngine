@@ -597,8 +597,33 @@ extension AetherEngine {
         let inPlaceHandover = pendingInPlaceItemHandover
         pendingInPlaceItemHandover = false
         if loadGeneration == bypassGeneration { recordStartupCheckpoint(.sessionConstructed) }   // #361
+        var itemStartPosition = startPosition
+        if let range = loadedOptions.nativeSourcePlaybackRange {
+            guard isSourceSeekable == true, !displayAxisIsItemAxis, discTitles.isEmpty else {
+                throw HLSVideoEngine.HLSVideoEngineError.openFailed(
+                    reason: "The authored playback interval requires a seekable source timeline.")
+            }
+            let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+            while presentationAxis.isEmpty, ContinuousClock.now < deadline {
+                try await Task.sleep(nanoseconds: 10_000_000)
+                try checkLoadCurrent(generation)
+            }
+            let sourceStart = min(max(startPosition.map { $0 + sourcePresentationOrigin } ?? range.lowerBound,
+                                      range.lowerBound), range.upperBound)
+            guard let start = presentationAxis.itemSeconds(forSourceSeconds: range.lowerBound),
+                  let end = presentationAxis.itemSeconds(forSourceSeconds: range.upperBound),
+                  let initial = presentationAxis.itemSeconds(forSourceSeconds: sourceStart),
+                  start.isFinite, end.isFinite, initial.isFinite, end > max(0, start) else {
+                throw HLSVideoEngine.HLSVideoEngineError.openFailed(
+                    reason: "The source did not establish the authored playback timeline.")
+            }
+            host.authoredPlaybackRange = max(0, start)..<end
+            itemStartPosition = max(0, initial)
+        } else {
+            host.authoredPlaybackRange = nil
+        }
         host.load(url: playbackURL,
-                  startPosition: startPosition,
+                  startPosition: itemStartPosition,
                   perFrameHDR: true,
                   // AE#154: a VOD resume anchor seeks; nil keeps the live no-initial-seek contract.
                   skipInitialSeek: startPosition == nil,
@@ -1994,6 +2019,14 @@ extension AetherEngine {
         elType: String? = nil
     ) async throws {
         try checkLoadCurrent(generation)
+        if loadedOptions.nativeSourcePlaybackRange != nil {
+            preopenedDemuxer?.markClosed()
+            if let preopenedDemuxer {
+                BlockingWork.detached { preopenedDemuxer.close() }
+            }
+            throw HLSVideoEngine.HLSVideoEngineError.openFailed(
+                reason: "Authored playback intervals are not supported by the software renderer.")
+        }
         sessionCacheStatusToken &+= 1
         diagnostics.sessionCacheStatus = .inactive
         let deinterlaceMode = loadedOptions.deinterlaceMode

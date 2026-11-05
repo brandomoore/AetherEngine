@@ -2512,6 +2512,12 @@ public final class AetherEngine: ObservableObject {
     func setPresentationAxis(_ map: PresentationAxisMap) {
         presentationAxis = map
         presentationAxisMirror.set(map)
+        if let range = loadedOptions.nativeSourcePlaybackRange,
+           let start = map.itemSeconds(forSourceSeconds: range.lowerBound),
+           let end = map.itemSeconds(forSourceSeconds: range.upperBound),
+           start.isFinite, end.isFinite, end > start {
+            nativeHost?.authoredPlaybackRange = max(0, start)..<max(0, end)
+        }
     }
 
     /// 1 Hz live-window updater, independent of the periodic time observer (which only fires while playing).
@@ -4416,6 +4422,14 @@ public final class AetherEngine: ObservableObject {
         var source = source
         var startPosition = startPosition
         var options = options
+        if let range = options.nativeSourcePlaybackRange {
+            guard range.lowerBound.isFinite, range.upperBound.isFinite,
+                  range.lowerBound >= 0, range.upperBound > range.lowerBound,
+                  !options.isLive, !options.sequentialOrigin, !options.nativeRemoteHLS else {
+                throw HLSVideoEngine.HLSVideoEngineError.openFailed(
+                    reason: "An authored playback interval requires a finite, seekable native video source.")
+            }
+        }
         options = Self.applyingSharedOutputRole(options)
         SharedOutputCoordinator.shared.join(ObjectIdentifier(self), role: options.sharedOutputRole, tag: logTag, owner: self)
         // #436: a speed the host set belongs to the item it was set on. The rebuilds a session makes
@@ -4508,6 +4522,7 @@ public final class AetherEngine: ObservableObject {
         }
         loadedURL = url
         loadedOptions = options
+        nativeHost?.authoredPlaybackRange = nil
         // AE#792: a fresh store per load, so a header rotated on the previous session can never reach
         // this one through a reader that outlived it.
         sessionRequestHeaders = RequestHeaderStore(options.httpHeaders)
@@ -5014,6 +5029,15 @@ public final class AetherEngine: ObservableObject {
         // Forward-only custom sources cannot rewind; audio-switch and background-reload stay no-op for them.
         customSourceIsSeekable = isCustomSource ? probe.isSourceSeekable : false
         isSourceSeekable = probeOpened ? probe.isSourceSeekable : nil
+        if options.nativeSourcePlaybackRange != nil,
+           !probeOpened || probe.videoStreamIndex < 0 || !probe.isSourceSeekable {
+            probe.markClosed()
+            BlockingWork.detached { [probe] in probe.close() }
+            let failure = HLSVideoEngine.HLSVideoEngineError.openFailed(
+                reason: "An authored playback interval requires a seekable video stream.")
+            publishError(.sourceOpenFailed, failure.localizedDescription, underlying: failure)
+            throw failure
+        }
         if !options.isLive, isSourceSeekable == false {
             // The byte source and AVPlayer must mount at the same place. A container duration
             // does not make a saved position reachable on a forward-only source.
@@ -5796,6 +5820,12 @@ public final class AetherEngine: ObservableObject {
         }
 
         do {
+            if options.nativeSourcePlaybackRange != nil, useSoftwarePath {
+                probe.markClosed()
+                BlockingWork.detached { [probe] in probe.close() }
+                throw HLSVideoEngine.HLSVideoEngineError.openFailed(
+                    reason: "Authored playback intervals are not supported by the software renderer.")
+            }
             if useSoftwarePath {
                 if !panelRoutingSettled {
                     try await settlePanelRouting(ownsProbe: true)
@@ -6336,6 +6366,10 @@ public final class AetherEngine: ObservableObject {
         var target: Double = isLive
             ? (liveLanding?.sessionTarget ?? seconds)
             : max(0, min(seconds, duration))
+        if let range = loadedOptions.nativeSourcePlaybackRange {
+            target = min(max(target, range.lowerBound - sourcePresentationOrigin),
+                         range.upperBound - sourcePresentationOrigin)
+        }
         if isLive, softwareHost != nil, nativeHost == nil, let window = liveWindow {
             let landing = Self.softwareLiveLanding(
                 requested: target, window: window,

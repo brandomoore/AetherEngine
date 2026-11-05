@@ -594,6 +594,7 @@ final class NativeAVPlayerHost {
 
         let asset = AVURLAsset(url: url, options: Self.assetCreationOptions(httpHeaders: httpHeaders))
         let item = AVPlayerItem(asset: asset)
+        applyAuthoredPlaybackRange(to: item)
         AudioRatePolicy.apply(to: item)
         // 4s default matches loopback HLS segment cadence; raising it for live makes AVPlayer race to the edge and stall at the transcode warm-up gap.
         // Remote-HLS passes 0 (system adaptive): 4s forced a 3-4s black screen on bandwidth-limited Jellyfin live transcodes.
@@ -925,7 +926,7 @@ final class NativeAVPlayerHost {
                 guard let self, self.sessionID == sid else { return }
                 // AE#287: AVPlayer ends a VOD the moment its video renderer runs dry, even with the
                 // audio-only tail still ahead. Recover before `.ended` latches; it is terminal.
-                if await self.recoverFromPrematureEnd() { return }
+                if self.authoredPlaybackRange == nil, await self.recoverFromPrematureEnd() { return }
                 guard self.sessionID == sid else { return }
                 self.didReachEnd = true
             }
@@ -1018,6 +1019,21 @@ final class NativeAVPlayerHost {
 
     func tearDown() {
         unloadCurrentItem()
+    }
+
+    var authoredPlaybackRange: Range<Double>? {
+        didSet {
+            if let playerItem { applyAuthoredPlaybackRange(to: playerItem) }
+        }
+    }
+
+    func applyAuthoredPlaybackRange(to item: AVPlayerItem) {
+        item.reversePlaybackEndTime = authoredPlaybackRange.map {
+            CMTime(seconds: $0.lowerBound, preferredTimescale: 90_000)
+        } ?? .invalid
+        item.forwardPlaybackEndTime = authoredPlaybackRange.map {
+            CMTime(seconds: $0.upperBound, preferredTimescale: 90_000)
+        } ?? .invalid
     }
 
     /// Retire the outgoing session before the engine subscribes for its successor, without
