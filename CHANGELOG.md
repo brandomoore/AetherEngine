@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased: native dependency visibility
+
+- **Keep Rust implementation symbols private to the dynamic engine.** Exported
+  Rust standard-library wrappers kept unused process-launch code in Release
+  iOS/tvOS binaries. Limit their visibility so the linker can discard unreachable
+  code without replacing operating-system calls. Swift APIs and the decoders'
+  C entry points remain available.
+
 ## Unreleased: authored native playback intervals
 
 - Add `LoadOptions.nativeSourcePlaybackRange` for a single seekable video source,

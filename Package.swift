@@ -103,6 +103,9 @@ let package = Package(
                 .copy("Resources/PrivacyInfo.xcprivacy"),
             ],
             linkerSettings: [
+                // Rust's unstable implementation symbols are not the framework ABI.
+                // Keeping them exported retains unused std::process code on iOS/tvOS.
+                .unsafeFlags(["-Xlinker", "-unexported_symbol", "-Xlinker", "__R*"]),
                 .linkedFramework("AVFoundation"),
                 .linkedFramework("AVKit"),
                 .linkedFramework("CoreMedia"),

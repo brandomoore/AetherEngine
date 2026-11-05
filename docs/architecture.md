@@ -2,6 +2,13 @@
 
 How AetherEngine is put together: the three playback pipelines, the source-file map, and the dependency surface. For the public API and integration, see the [README](../README.md); for format and codec depth, [docs/formats.md](formats.md).
 
+The dynamic engine keeps Rust v0-mangled implementation symbols private. Its ABI
+is the documented Swift interface and decoder C entry points, not Rust's unstable
+standard-library symbols. This permits ordinary dead stripping of unreachable
+process-launch wrappers retained by exported dependency symbols; it does not stub
+process APIs or remove reachable decoder code. Hosts must still audit their final
+device artifacts, including every embedded dependency.
+
 ## Playback pipelines
 
 AetherEngine has three playback pipelines, picked once at `load(url:)`: the audio-only path when `LoadOptions.audioOnly` is set, otherwise the native or software video path based on the source's video codec.
