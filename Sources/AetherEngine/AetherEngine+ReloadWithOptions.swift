@@ -359,6 +359,7 @@ enum SessionOptionCorrection {
         if proposed.isLive != current.isLive { refused.append("isLive") }
         if proposed.audioOnly != current.audioOnly { refused.append("audioOnly") }
         if proposed.nativeRemoteHLS != current.nativeRemoteHLS { refused.append("nativeRemoteHLS") }
+        if proposed.nativeSourcePlaybackRange != current.nativeSourcePlaybackRange { refused.append("nativeSourcePlaybackRange") }
         if proposed.sequentialOrigin != current.sequentialOrigin { refused.append("sequentialOrigin") }
         // #377: the transport is chosen when the source is opened, so a correction here would be
         // accepted and then not happen until something else reopened the source.

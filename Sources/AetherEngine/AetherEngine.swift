@@ -5034,9 +5034,8 @@ public final class AetherEngine: ObservableObject {
            !probeOpened || probe.videoStreamIndex < 0 || !probe.isSourceSeekable {
             probe.markClosed()
             BlockingWork.detached { [probe] in probe.close() }
-            let failure = HLSVideoEngine.HLSVideoEngineError.openFailed(
-                reason: "An authored playback interval requires a seekable video stream.")
-            publishError(.sourceOpenFailed, failure.localizedDescription, underlying: failure)
+            let failure = AetherEngineError.authoredPlaybackIntervalUnsupported
+            publishLoadFailure(failure)
             throw failure
         }
         if !options.isLive, isSourceSeekable == false {
@@ -5824,8 +5823,7 @@ public final class AetherEngine: ObservableObject {
             if options.nativeSourcePlaybackRange != nil, useSoftwarePath {
                 probe.markClosed()
                 BlockingWork.detached { [probe] in probe.close() }
-                throw HLSVideoEngine.HLSVideoEngineError.openFailed(
-                    reason: "Authored playback intervals are not supported by the software renderer.")
+                throw AetherEngineError.authoredPlaybackIntervalUnsupported
             }
             if useSoftwarePath {
                 if !panelRoutingSettled {
@@ -8915,6 +8913,7 @@ public struct LiveResumeClamp: Sendable, Equatable {
 // MARK: - Errors
 
 public enum AetherEngineError: Error, LocalizedError {
+    case authoredPlaybackIntervalUnsupported
     case noVideoStream
     case noAudioStream
     /// AE#140: an HLS playlist body arrived on the generic raw-byte live path. Since AE#363 a `.url`
@@ -8936,6 +8935,8 @@ public enum AetherEngineError: Error, LocalizedError {
 
     public var errorDescription: String? {
         switch self {
+        case .authoredPlaybackIntervalUnsupported:
+            return "This source cannot use renderer-bounded authored playback intervals."
         case .noVideoStream: return "No video stream in source"
         case .noAudioStream: return "No audio stream in source"
         case .hlsPlaylistOnRawLivePath:

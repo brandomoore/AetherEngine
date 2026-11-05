@@ -17,6 +17,7 @@ public struct PlaybackErrorKind: RawRepresentable, Sendable, Equatable, Hashable
     /// The source could not be opened, probed or routed. `underlyingDomain` / `underlyingCode` name the
     /// failure the open ran into.
     public static let sourceOpenFailed = PlaybackErrorKind(rawValue: "sourceOpenFailed")
+    public static let authoredPlaybackIntervalUnsupported = PlaybackErrorKind(rawValue: "authoredPlaybackIntervalUnsupported")
     /// The origin answered the source request with an HTTP status instead of media: a 401/403 refusal,
     /// a 404, a 5xx. `underlyingCode` is that status; `underlyingDomain` is nil, the sentence is the
     /// engine's. Before this kind existed both this and a corrupt file arrived as `sourceOpenFailed`
@@ -185,6 +186,11 @@ extension AetherEngine {
     /// names the cause of a live start the error itself (an FFmpeg open failure) cannot.
     @MainActor
     func publishLoadFailure(_ error: Error, isLiveStart: Bool = false, transportFailureCode: Int? = nil) {
+        if let engineError = error as? AetherEngineError,
+           case .authoredPlaybackIntervalUnsupported = engineError {
+            publishError(.authoredPlaybackIntervalUnsupported, engineError.localizedDescription)
+            return
+        }
         if let ingest = error as? HLSIngestError {
             switch ingest {
             case .playlistUnreachable(let status) where status > 0:

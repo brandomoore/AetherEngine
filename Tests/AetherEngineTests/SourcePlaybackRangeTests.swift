@@ -4,6 +4,12 @@ import Testing
 
 @MainActor
 struct SourcePlaybackRangeTests {
+    @Test func unsupportedIntervalsHaveAStableFailureKind() {
+        let engine = AetherEngine()
+        engine.publishLoadFailure(AetherEngineError.authoredPlaybackIntervalUnsupported)
+        #expect(engine.errorInfo?.kind == .authoredPlaybackIntervalUnsupported)
+    }
+
     @Test func mountingRecordsIntentWithoutStartingUnboundedPlayback() {
         let host = NativeAVPlayerHost()
         host.authoredMountPending = true

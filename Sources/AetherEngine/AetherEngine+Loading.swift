@@ -370,8 +370,7 @@ extension AetherEngine {
         url: URL, options: LoadOptions, startPosition: Double? = nil, generation: UInt64? = nil
     ) async throws {
         guard options.nativeSourcePlaybackRange == nil else {
-            throw HLSVideoEngine.HLSVideoEngineError.openFailed(
-                reason: "Authored playback intervals require the native loopback renderer.")
+            throw AetherEngineError.authoredPlaybackIntervalUnsupported
         }
         // Audit CORE-6: the generation of the load() that routed here, not a fresh read of it, so a
         // stale caller cannot adopt its successor's generation.
@@ -2036,8 +2035,7 @@ extension AetherEngine {
             if let preopenedDemuxer {
                 BlockingWork.detached { preopenedDemuxer.close() }
             }
-            throw HLSVideoEngine.HLSVideoEngineError.openFailed(
-                reason: "Authored playback intervals are not supported by the software renderer.")
+            throw AetherEngineError.authoredPlaybackIntervalUnsupported
         }
         sessionCacheStatusToken &+= 1
         diagnostics.sessionCacheStatus = .inactive
