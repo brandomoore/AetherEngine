@@ -1004,7 +1004,8 @@ final class NativeAVPlayerHost {
                 + "live=\(contract.isLive))",
                 category: .engine)
             // Load-time seek (not a user scrub): no seekInFlight needed; the async seek(to:) carries #37/#38 semantics for user seeks.
-            avPlayer.seek(to: CMTime(seconds: startPosition ?? 0, preferredTimescale: 600),
+            avPlayer.seek(to: CMTime(seconds: startPosition ?? 0,
+                                    preferredTimescale: authoredPlaybackRange == nil ? 600 : 90_000),
                           toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
                 guard finished else { return }
                 Task { @MainActor in
