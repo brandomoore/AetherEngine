@@ -8,6 +8,22 @@ import XCTest
 /// the path from there to the track list.
 final class DiscTrackLanguageTests: XCTestCase {
 
+    func test_transportPIDIsNotTheTrackIndex() {
+        XCTAssertEqual(Demuxer.mpegTransportStreamPID(streamID: 0x1100, formatName: "mpegts"), 0x1100)
+        for format in [nil, "mpeg", "matroska,webm", "mov,mp4"] {
+            XCTAssertNil(Demuxer.mpegTransportStreamPID(streamID: 0x1100, formatName: format))
+        }
+        for id in [Int32(-1), 0, 0x1f, 0x1fff, 0x2000] {
+            XCTAssertNil(Demuxer.mpegTransportStreamPID(streamID: id, formatName: "mpegts"))
+        }
+        let track = TrackInfo(id: 3, name: "Audio", codec: "ac3", language: "eng",
+                              isDefault: true, mpegTSPID: 0x1100)
+        XCTAssertEqual(track.id, 3)
+        XCTAssertEqual(track.mpegTSPID, 0x1100)
+        XCTAssertNil(TrackInfo(id: 3, name: "Audio", codec: "ac3", language: nil,
+                              isDefault: false).mpegTSPID)
+    }
+
     // MARK: - The backfill rule
 
     func test_backfillsAnUndeterminedLanguageFromTheDiscTable() {

@@ -37,6 +37,10 @@ the public-API contract.
 
 ## [Unreleased]
 
+- Expose MPEG-TS elementary-stream PIDs as `TrackInfo.mpegTSPID`, independently
+  of the FFmpeg track index. Other containers and synthetic/native tracks leave
+  it nil so disc-navigation hosts never infer a PID from list order.
+
 - Add `updateDisplayMatching(enabled:)` for ready SDR preview/fullscreen
   transitions without reopening media, including forward-only live streams.
   HDR and AVKit/shared-secondary pipelines keep the explicit reload path.

@@ -1997,8 +1997,17 @@ public final class Demuxer: @unchecked Sendable {
             bitsPerSample: isAudio ? Int(max(codecpar.pointee.bits_per_raw_sample, 0)) : 0,
             sampleFormat: isAudio ? Self.sampleFormatName(codecpar.pointee.format) : nil,
             channelLayout: isAudio ? Self.channelLayoutDescription(&codecpar.pointee.ch_layout) : nil,
-            profile: VideoStreamFormat.profileName(codecID: codecID, profile: codecpar.pointee.profile)
+            profile: VideoStreamFormat.profileName(codecID: codecID, profile: codecpar.pointee.profile),
+            mpegTSPID: Self.mpegTransportStreamPID(
+                streamID: stream.pointee.id, formatName: containerFormatName
+            )
         )
+    }
+
+    static func mpegTransportStreamPID(streamID: Int32, formatName: String?) -> Int? {
+        guard formatName?.split(separator: ",").contains("mpegts") == true,
+              (0x20..<0x1fff).contains(streamID) else { return nil }
+        return Int(streamID)
     }
 
     static func sampleFormatName(_ raw: Int32) -> String? {

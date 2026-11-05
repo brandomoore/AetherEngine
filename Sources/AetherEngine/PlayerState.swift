@@ -1363,6 +1363,9 @@ public struct SoftwareDecodeProbeResult: Sendable {
 public struct TrackInfo: Identifiable, Sendable, Equatable {
     /// FFmpeg AVStream index.
     public let id: Int
+    /// Elementary-stream PID when demuxing MPEG-TS, independent of `id`.
+    /// Nil for other containers, external tracks and native HLS selections.
+    public let mpegTSPID: Int?
     public let name: String
     /// Lower-case libavcodec name (e.g. "aac", "ac3", "subrip").
     public let codec: String
@@ -1417,13 +1420,14 @@ public struct TrackInfo: Identifiable, Sendable, Equatable {
     /// nil when undeclared. This is where DTS:X and TrueHD Atmos show up; `isAtmos` covers E-AC-3 JOC only.
     public let profile: String?
 
-    public init(id: Int, name: String, codec: String, language: String?, channels: Int = 0, bitrate: Int64 = 0, isDefault: Bool, isForced: Bool = false, isHearingImpaired: Bool = false, isCommentary: Bool = false, isVisualImpaired: Bool = false, isAtmos: Bool = false, assHeader: String? = nil, isExternal: Bool = false, isNativelyRenderedSubtitle: Bool = false, sampleRate: Int = 0, bitsPerSample: Int = 0, sampleFormat: String? = nil, channelLayout: String? = nil, profile: String? = nil, isDTSX: Bool = false) {
+    public init(id: Int, name: String, codec: String, language: String?, channels: Int = 0, bitrate: Int64 = 0, isDefault: Bool, isForced: Bool = false, isHearingImpaired: Bool = false, isCommentary: Bool = false, isVisualImpaired: Bool = false, isAtmos: Bool = false, assHeader: String? = nil, isExternal: Bool = false, isNativelyRenderedSubtitle: Bool = false, sampleRate: Int = 0, bitsPerSample: Int = 0, sampleFormat: String? = nil, channelLayout: String? = nil, profile: String? = nil, isDTSX: Bool = false, mpegTSPID: Int? = nil) {
         self.sampleRate = sampleRate
         self.bitsPerSample = bitsPerSample
         self.sampleFormat = sampleFormat
         self.channelLayout = channelLayout
         self.profile = profile
         self.id = id
+        self.mpegTSPID = mpegTSPID
         self.name = name
         self.codec = codec
         self.language = language
