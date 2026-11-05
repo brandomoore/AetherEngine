@@ -1895,35 +1895,12 @@ extension AetherEngine {
         // behind one it must precede. The generation guard is what keeps a superseded loader from
         // writing into its successor's sequence.
         if loadGeneration == generation { recordStartupCheckpoint(.sessionConstructed) }
-        var itemStartPosition = startPosition
-        if let range = loadedOptions.nativeSourcePlaybackRange {
-            guard isSourceSeekable == true, !displayAxisIsItemAxis, discTitles.isEmpty else {
-                throw HLSVideoEngine.HLSVideoEngineError.openFailed(
-                    reason: "The authored playback interval requires a seekable source timeline.")
-            }
-            let deadline = ContinuousClock.now.advanced(by: .seconds(5))
-            while presentationAxis.isEmpty, ContinuousClock.now < deadline {
-                try await Task.sleep(nanoseconds: 10_000_000)
-                try checkLoadCurrent(generation)
-            }
-            let sourceStart = min(max(startPosition.map { $0 + sourcePresentationOrigin } ?? range.lowerBound,
-                                      range.lowerBound), range.upperBound)
-            guard let start = presentationAxis.itemSeconds(forSourceSeconds: range.lowerBound),
-                  let end = presentationAxis.itemSeconds(forSourceSeconds: range.upperBound),
-                  let initial = presentationAxis.itemSeconds(forSourceSeconds: sourceStart),
-                  start.isFinite, end.isFinite, initial.isFinite, end > max(0, start) else {
-                throw HLSVideoEngine.HLSVideoEngineError.openFailed(
-                    reason: "The source did not establish the authored playback timeline.")
-            }
-            host.authoredPlaybackRange = max(0, start)..<end
-            itemStartPosition = max(0, initial)
-        } else {
-            host.authoredPlaybackRange = nil
-        }
+        host.authoredMountPending = loadedOptions.nativeSourcePlaybackRange != nil
+        host.authoredPlaybackRange = nil
         host.load(url: playbackURL,
-                  startPosition: itemStartPosition,
+                  startPosition: startPosition,
                   perFrameHDR: true,
-                  skipInitialSeek: LiveReloadPolicy.skipInitialSeek(
+                  skipInitialSeek: host.authoredMountPending || LiveReloadPolicy.skipInitialSeek(
                       isLive: isLive, isRejoin: liveRejoin),
                   inPlaceSwap: inPlaceHandover,
                   diagnosticContext: loadedOptions.sourceDiagnosticsContext,
@@ -1937,6 +1914,37 @@ extension AetherEngine {
                       audioIsAtmosStreamCopy: nativeVideoSession?.audioIsAtmosStreamCopy == true,
                       nativeVideoFrameDiagnostics: loadedOptions.nativeVideoFrameDiagnostics,
                       nativeVideoFrameRecovery: loadedOptions.nativeVideoFrameRecovery))
+        if let range = loadedOptions.nativeSourcePlaybackRange {
+            guard isSourceSeekable == true, !displayAxisIsItemAxis, discTitles.isEmpty else {
+                throw HLSVideoEngine.HLSVideoEngineError.openFailed(
+                    reason: "The authored playback interval requires a seekable source timeline.")
+            }
+            // VOD placement is published when the mounted consumer fetches its segments.
+            // Keep transport gated until that actual item axis and the initial seek exist.
+            let deadline = ContinuousClock.now.advanced(by: .seconds(10))
+            while (presentationAxis.isEmpty || !host.isReady), ContinuousClock.now < deadline {
+                try await Task.sleep(nanoseconds: 10_000_000)
+                try checkLoadCurrent(generation)
+            }
+            let sourceStart = min(max(startPosition.map { $0 + sourcePresentationOrigin } ?? range.lowerBound,
+                                      range.lowerBound), range.upperBound)
+            guard host.isReady,
+                  let start = presentationAxis.itemSeconds(forSourceSeconds: range.lowerBound),
+                  let end = presentationAxis.itemSeconds(forSourceSeconds: range.upperBound),
+                  let initial = presentationAxis.itemSeconds(forSourceSeconds: sourceStart),
+                  start.isFinite, end.isFinite, initial.isFinite, end > max(0, start) else {
+                throw HLSVideoEngine.HLSVideoEngineError.openFailed(
+                    reason: "The source did not establish the authored playback timeline.")
+            }
+            host.authoredPlaybackRange = max(0, start)..<end
+            let landed = await host.seek(to: max(0, initial), deadlineSeconds: 5)
+            try checkLoadCurrent(generation)
+            guard landed else {
+                throw HLSVideoEngine.HLSVideoEngineError.openFailed(
+                    reason: "The source could not seek to the authored playback interval.")
+            }
+            host.authoredMountPending = false
+        }
         forceNativeLegibleDeselectedUntilHostSelects()
         // Sodalite#175: from the session's own pick, since a track-switch reload has no active index yet.
         let sessionAudioPick = nativeVideoSession.map(\.activeAudioSourceStreamIndex).flatMap { $0 >= 0 ? Int($0) : nil }

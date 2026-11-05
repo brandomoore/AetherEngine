@@ -735,7 +735,7 @@ final class NativeAVPlayerHost {
                     self.duration = item.duration.seconds.isFinite ? item.duration.seconds : 0
                     self.isReady = true
                     // Re-assert play() if the replaceCurrentItem swap swallowed it (playIntent latch).
-                    if self.playIntent, self.avPlayer.timeControlStatus == .paused {
+                    if self.playIntent, !self.authoredMountPending, self.avPlayer.timeControlStatus == .paused {
                         EngineLog.emit(
                             "[NativeAVPlayerHost] #\(self.sessionID) readyToPlay with play intent "
                             + "but player parked (swallowed play() during item swap); re-issuing play()",
@@ -1026,6 +1026,7 @@ final class NativeAVPlayerHost {
         didSet {
             if let playerItem { applyAuthoredPlaybackRange(to: playerItem) }
         }
+        var authoredMountPending = false
     }
 
     func applyAuthoredPlaybackRange(to item: AVPlayerItem) {
@@ -1905,6 +1906,7 @@ final class NativeAVPlayerHost {
     func play() {
         // Set intent before play() so readyToPlay observer can re-assert if the replaceCurrentItem swap swallowed it.
         playIntent = true
+        guard !authoredMountPending else { return }
         // Call play() immediately (no defer-until-ready): item.status never advances past .unknown until AVPlayer is told to play.
         avPlayer.play()
     }
@@ -2050,7 +2052,7 @@ final class NativeAVPlayerHost {
     /// engine reconcile a clock that would otherwise stay latched at an unreachable optimistic target.
     @discardableResult
     func seek(to seconds: Double, deadlineSeconds: Double?) async -> Bool {
-        let target = CMTime(seconds: seconds, preferredTimescale: 600)
+        let target = CMTime(seconds: seconds, preferredTimescale: authoredPlaybackRange == nil ? 600 : 90_000)
         seekGeneration &+= 1
         let gen = seekGeneration
         seekInFlight = true
@@ -2204,7 +2206,7 @@ final class NativeAVPlayerHost {
         // so recording the speed there is what makes it survive all of them, with no rate write in
         // anyone's resume window. Setting `rate` does not update it (AVPlayer.h), hence both.
         if value != 0 { avPlayer.defaultRate = value }
-        avPlayer.rate = value
+        avPlayer.rate = authoredMountPending ? 0 : value
     }
 
     func setResumeRate(_ rate: Float) {

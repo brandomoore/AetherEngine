@@ -4523,6 +4523,7 @@ public final class AetherEngine: ObservableObject {
         loadedURL = url
         loadedOptions = options
         nativeHost?.authoredPlaybackRange = nil
+        nativeHost?.authoredMountPending = false
         // AE#792: a fresh store per load, so a header rotated on the previous session can never reach
         // this one through a reader that outlived it.
         sessionRequestHeaders = RequestHeaderStore(options.httpHeaders)

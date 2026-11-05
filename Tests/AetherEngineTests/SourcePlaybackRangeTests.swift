@@ -4,6 +4,19 @@ import Testing
 
 @MainActor
 struct SourcePlaybackRangeTests {
+    @Test func mountingRecordsIntentWithoutStartingUnboundedPlayback() {
+        let host = NativeAVPlayerHost()
+        host.authoredMountPending = true
+        host.play()
+        #expect(host.transportIntentIsPlaying)
+        #expect(host.avPlayer.rate == 0)
+        host.setRate(2)
+        #expect(host.transportIntentIsPlaying)
+        #expect(host.avPlayer.rate == 0)
+        host.pause()
+        #expect(!host.transportIntentIsPlaying)
+    }
+
     @Test func boundsUseTheRendererTimebaseAndClearForOrdinaryPlayback() {
         let host = NativeAVPlayerHost()
         let item = AVPlayerItem(asset: AVMutableComposition())
