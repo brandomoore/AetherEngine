@@ -2741,6 +2741,7 @@ public final class AetherEngine: ObservableObject {
     /// dropped together by `cancelNativeLegibleDeselectPin()`.
     var nativeLegibleDeselectPinTask: Task<Void, Never>? = nil
     var nativeLegibleReselectionTask: Task<Void, Never>? = nil
+    var nativeLegibleReselectionRevision: UInt64 = 0
     var nativeLegibleDeselectPinObserver: NSObjectProtocol? = nil
     var nativeLegibleDeselectPinItem: AVPlayerItem? = nil
     var nativeLegibleDeselectPinGroup: AVMediaSelectionGroup? = nil

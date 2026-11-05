@@ -2749,17 +2749,24 @@ extension AetherEngine {
                     self.cancelNativeLegibleDeselectPin()
                     return
                 }
+                self.nativeLegibleReselectionRevision &+= 1
                 guard self.nativeLegibleReselectionTask == nil else { return }
                 self.nativeLegibleReselectionTask = Task { @MainActor [weak self] in
                     guard let self else { return }
                     defer {
                         if !Task.isCancelled { self.nativeLegibleReselectionTask = nil }
                     }
-                    guard let reading = await NativeMediaSelectionReader.shared.read(item: pinned, group: group),
-                          !Task.isCancelled, self.nativeLegibleDeselectPinItem === pinned,
-                          self.currentAVPlayer?.currentItem === pinned,
-                          self.nativeSubtitleReapplyOrdinal == nil,
-                          let selected = reading.option else { return }
+                    var reading: NativeMediaSelectionReader.Snapshot?
+                    repeat {
+                        let revision = self.nativeLegibleReselectionRevision
+                        reading = await NativeMediaSelectionReader.shared.read(item: pinned, group: group)
+                        guard !Task.isCancelled, self.nativeLegibleDeselectPinItem === pinned,
+                              self.currentAVPlayer?.currentItem === pinned,
+                              self.nativeSubtitleReapplyOrdinal == nil else { return }
+                        guard reading != nil else { return }
+                        if revision == self.nativeLegibleReselectionRevision { break }
+                    } while true
+                    guard let selected = reading?.option else { return }
                     guard self.nativeLegibleDeselectPinBurst.admit(now: Date().timeIntervalSinceReferenceDate) else {
                         EngineLog.emit(
                             "[AetherEngine] Sodalite#65: the system keeps re-selecting legible option "
