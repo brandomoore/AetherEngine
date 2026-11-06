@@ -517,8 +517,8 @@ extension HLSVideoEngine {
                 colorMatrix: codecpar.pointee.color_space
             ) {
                 // The base layer on its own, on every display: plain hvc1, the record stripped so no
-                // dvcC reaches the sample entry, no SUPPLEMENTAL, and no P7 conversion (its RPU is
-                // dropped with the record). The RPU NAL units stay in the samples and are ignored, the
+                // dvcC reaches the sample entry, no SUPPLEMENTAL, and no P7 conversion.
+                // The RPU NAL units stay in the samples and are ignored, the
                 // route a Profile 7 already takes on a display without Dolby Vision. The range is the
                 // base layer's: PQ for 7 / 8.1 and a relabelled 5, HLG for 8.4, the VUI's for 8.2.
                 let baseRange: HLSVideoRange
@@ -529,7 +529,7 @@ extension HLSVideoEngine {
                 }
                 EngineLog.emit(
                     "[HLSVideoEngine] DV Profile \(recordProfile) compat=\(recordCompat): presenting the "
-                    + "\(baseRange.rawValue) base layer only (dolbyVisionHandling=baseLayerOnly), plain hvc1, "
+                    + "\(baseRange.rawValue) base layer only (dolbyVisionHandling=\(dolbyVisionHandling.rawValue)), plain hvc1, "
                     + "dvcC stripped, no SUPPLEMENTAL-CODECS"
                     + (dvVariant == .profile7 ? ", no P7 -> P8.1 conversion" : ""),
                     category: .session

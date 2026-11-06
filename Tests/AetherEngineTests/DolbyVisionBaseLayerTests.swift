@@ -101,6 +101,106 @@ struct DolbyVisionBaseLayerTests {
 
     // MARK: - The route, HEVC
 
+    @Test("Profile 7-only handling strips DV signaling on either display, even with forced DV",
+          arguments: [false, true], [false, true])
+    func profile7OnlyRoute(dvDisplay: Bool, forceDV: Bool) throws {
+        let route = try Self.route(
+            DVCodecpar(profile: 7, blCompatibilityID: 6),
+            dvDisplay: dvDisplay, handling: .profile7BaseLayer, forceDV: forceDV)
+        #expect(route.codecTagOverride == "hvc1")
+        #expect(route.videoRange == .pq)
+        #expect(route.doviConfig == .strip)
+        #expect(route.supplementalCodecs == nil)
+        #expect(!route.convertP7ToProfile81)
+        #expect(route.dvVariant == .profile7)
+    }
+
+    @Test("Profile 7-only handling preserves other source routes", arguments: [false, true])
+    func profile7OnlyPreservesOtherProfiles(dvDisplay: Bool) throws {
+        let sources = [
+            Self.genuineProfile5(),
+            DVCodecpar(profile: 8, blCompatibilityID: 1),
+            DVCodecpar(profile: 8, blCompatibilityID: 4, trc: AVCOL_TRC_ARIB_STD_B67),
+            DVCodecpar(profile: 8, blCompatibilityID: 2, trc: AVCOL_TRC_BT709),
+            DVCodecpar(codecID: AV_CODEC_ID_AV1, profile: 10, blCompatibilityID: 0,
+                       trc: AVCOL_TRC_UNSPECIFIED, matrix: AVCOL_SPC_UNSPECIFIED),
+            DVCodecpar(codecID: AV_CODEC_ID_AV1, profile: 10, blCompatibilityID: 1),
+            DVCodecpar(codecID: AV_CODEC_ID_AV1, profile: 10, blCompatibilityID: 4,
+                       trc: AVCOL_TRC_ARIB_STD_B67)
+        ]
+        for source in sources {
+            let automatic = try Self.route(source, dvDisplay: dvDisplay, handling: .automatic)
+            let scoped = try Self.route(source, dvDisplay: dvDisplay, handling: .profile7BaseLayer)
+            #expect(scoped.codecTagOverride == automatic.codecTagOverride)
+            #expect(scoped.primaryCodecs == automatic.primaryCodecs)
+            #expect(scoped.supplementalCodecs == automatic.supplementalCodecs)
+            #expect(scoped.doviConfig == automatic.doviConfig)
+            #expect(scoped.videoRange == automatic.videoRange)
+            #expect(scoped.convertP7ToProfile81 == automatic.convertP7ToProfile81)
+        }
+    }
+
+    @Test("Profile 7-only policy follows verified corrections, not a mislabeled Profile 5 record")
+    func correctedProfile7UsesBaseLayer() throws {
+        let engine = HLSVideoEngine(
+            url: URL(fileURLWithPath: "/dev/null"), dvModeAvailable: true,
+            dolbyVisionHandling: .profile7BaseLayer, dolbyVisionRPUProfile: 7)
+        let source = Self.relabelledProfile5()
+        let route = try engine.resolveCodecRoute(codecpar: UnsafePointer(source.ptr))
+        #expect(route.dvVariant == .profile7)
+        #expect(route.doviConfig == .strip)
+        #expect(route.codecTagOverride == "hvc1")
+        #expect(route.videoRange == .pq)
+        #expect(route.supplementalCodecs == nil)
+        #expect(!route.convertP7ToProfile81)
+    }
+
+    @Test("Profile 7-only policy leaves recordless HDR10 untouched")
+    func profile7OnlyPreservesHDR10() throws {
+        let source = DVCodecpar(profile: 7, blCompatibilityID: 6)
+        MP4SegmentMuxer.stripDolbyVisionSideData(source.ptr)
+        let route = try Self.route(source, handling: .profile7BaseLayer)
+        #expect(route.dvVariant == .none)
+        #expect(route.videoRange == .pq)
+        #expect(route.doviConfig == .keep)
+        #expect(!route.convertP7ToProfile81)
+    }
+
+    @Test("MEL, FEL and unknown enhancement types never request reconstruction",
+          arguments: ["MEL", "FEL", "unknown"])
+    func profile7OnlyNeverReconstructs(elType: String) {
+        #expect(!VideoRoutingPolicy.requiresSoftwarePath(
+            codecID: AV_CODEC_ID_HEVC, fieldOrder: AV_FIELD_PROGRESSIVE, av1Available: true,
+            dvProfile: 7, dolbyVisionHandling: .profile7BaseLayer,
+            preferDualLayerDolbyVision: true, canHardwareDecode: { true }, elType: elType))
+        #expect(!VideoRoutingPolicy.dualLayerRouteIsWanted(
+            codecID: AV_CODEC_ID_HEVC, dvProfile: 7, dolbyVisionHandling: .profile7BaseLayer,
+            preferDualLayerDolbyVision: true, canHardwareDecode: { true }))
+    }
+
+    @Test("Profile 7-only format clamp and reload predicate are source scoped")
+    func profile7OnlyPredicate() {
+        for profile in [nil, 5, 7, 8, 10] as [Int?] {
+            let presentsBase = VideoRoutingPolicy.presentsDolbyVisionBaseLayer(
+                handling: .profile7BaseLayer, codecID: AV_CODEC_ID_HEVC,
+                dvProfile: profile, dvBlCompatID: 1,
+                colorTransfer: AVCOL_TRC_SMPTE2084, colorMatrix: AVCOL_SPC_BT2020_NCL)
+            #expect(presentsBase == (profile == 7))
+            let display = DisplayCapabilities(
+                supportsHDR: true, supportsDolbyVision: true, supportsHDR10: true, supportsHLG: true)
+            let format = AetherEngine.effectiveVideoFormat(
+                detected: .dolbyVision, baseTransfer: AVCOL_TRC_SMPTE2084,
+                capabilities: presentsBase ? display.withoutDolbyVision() : display)
+            #expect(format == (profile == 7 ? .hdr10 : .dolbyVision))
+        }
+        #expect(!VideoRoutingPolicy.requestsDolbyVisionBaseLayer(
+            handling: .profile7BaseLayer, codecID: AV_CODEC_ID_AV1, dvProfile: 7))
+        var proposed = LoadOptions()
+        proposed.dolbyVisionHandling = .profile7BaseLayer
+        #expect(SessionOptionCorrection.refusedFields(from: LoadOptions(), to: proposed).isEmpty)
+        #expect(SessionOptionCorrection.changedFields(from: LoadOptions(), to: proposed) == ["dolbyVisionHandling"])
+    }
+
     @Test("Profile 8.1 on a Dolby Vision display is served as its HDR10 base layer")
     func profile81BaseLayer() throws {
         let r = try Self.route(DVCodecpar(profile: 8, blCompatibilityID: 1), handling: .baseLayerOnly)

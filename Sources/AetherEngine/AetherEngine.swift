@@ -4812,8 +4812,6 @@ public final class AetherEngine: ObservableObject {
                     dvBlCompatID: detectedDVBLCompatIDNum,
                     colorTransfer: stream.pointee.codecpar.pointee.color_trc,
                     colorMatrix: stream.pointee.codecpar.pointee.color_space)
-                presentsDolbyVisionBaseLayer = options.dolbyVisionHandling == .baseLayerOnly
-                    && detectedDVBaseLayerPresentable
                 // AE#532: a Profile 5 record over a VUI that contradicts it is the one claim in a
                 // container worth checking against the bitstream, because a Profile 5 RPU cannot carry a
                 // residual or an NLQ and the RPU is therefore proof rather than a guess. Gated on that
@@ -4840,11 +4838,19 @@ public final class AetherEngine: ObservableObject {
                               + "; the record stands"),
                         category: .engine)
                 }
-                if options.dolbyVisionHandling == .baseLayerOnly, detectedFormat == .dolbyVision {
+                presentsDolbyVisionBaseLayer = VideoRoutingPolicy.presentsDolbyVisionBaseLayer(
+                    handling: options.dolbyVisionHandling,
+                    codecID: detectedCodecID,
+                    dvProfile: correctedDVProfile ?? detectedDVProfileNum,
+                    dvBlCompatID: detectedDVBLCompatIDNum,
+                    colorTransfer: stream.pointee.codecpar.pointee.color_trc,
+                    colorMatrix: stream.pointee.codecpar.pointee.color_space)
+                if detectedFormat == .dolbyVision,
+                   presentsDolbyVisionBaseLayer || options.dolbyVisionHandling == .baseLayerOnly {
                     EngineLog.emit(
                         presentsDolbyVisionBaseLayer
-                            ? "[AetherEngine] dolbyVisionHandling=baseLayerOnly: DV Profile "
-                              + "\(detectedDVProfileNum ?? 0) presents its base layer; the format clamp and the "
+                            ? "[AetherEngine] dolbyVisionHandling=\(options.dolbyVisionHandling.rawValue): DV Profile "
+                              + "\(correctedDVProfile ?? detectedDVProfileNum ?? 0) presents its base layer; the format clamp and the "
                               + "criteria request leave Dolby Vision unclaimed"
                             : "[AetherEngine] dolbyVisionHandling=baseLayerOnly ignored: DV Profile "
                               + "\(detectedDVProfileNum ?? 0) compat=\(detectedDVBLCompatIDNum ?? 0) has no base "

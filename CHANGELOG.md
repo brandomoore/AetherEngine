@@ -37,6 +37,12 @@ the public-API contract.
 
 ## [Unreleased]
 
+- **Allow Profile 7-only HDR10 fallback without disabling other Dolby Vision profiles.**
+  `DolbyVisionHandling.profile7BaseLayer` serves both MEL and FEL as the authored
+  HDR10 base, with no P7-to-8.1 conversion or dual-layer reconstruction. The engine
+  classifies the demuxed source, including verified record corrections, and preserves
+  automatic handling for other profiles. The default remains `.automatic`.
+
 - **Keep media-selection reads off the UI thread during a media-service stall.**
   Subtitle pinning, native track selection and audio readback use a bounded
   background reader. A timeout is not a confirmed empty selection, and a late

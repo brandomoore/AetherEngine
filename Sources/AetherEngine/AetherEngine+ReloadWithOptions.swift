@@ -102,8 +102,11 @@ extension AetherEngine {
             // The proposal's handling against the loaded source's base layer: a correction that turns
             // the base layer on and moves to software in one step is honoured, one that keeps the
             // Dolby Vision on a Profile 5 record is refused as before.
-            presentsDolbyVisionBaseLayer: proposed.dolbyVisionHandling == .baseLayerOnly
-                && sourceDolbyVisionBaseLayerPresentable,
+            presentsDolbyVisionBaseLayer: VideoRoutingPolicy.requestsDolbyVisionBaseLayer(
+                handling: proposed.dolbyVisionHandling, codecID: lastDetectedVideoCodec,
+                dvProfile: DolbyVisionRecordAudit.correctedProfile(
+                    record: sourceDVProfile, rpu: sourceDolbyVisionRPUProfile) ?? sourceDVProfile
+            ) && sourceDolbyVisionBaseLayerPresentable,
             isLive: loadedOptions.isLive,
             hasCompanionAudioReader: (customReader as? LiveIngestSourceInfo)?.companionAudioReader != nil
         ) {
