@@ -1004,8 +1004,9 @@ final class NativeAVPlayerHost {
                 + "live=\(contract.isLive))",
                 category: .engine)
             // Load-time seek (not a user scrub): no seekInFlight needed; the async seek(to:) carries #37/#38 semantics for user seeks.
-            avPlayer.seek(to: CMTime(seconds: startPosition ?? 0,
-                                    preferredTimescale: authoredPlaybackRange == nil ? 600 : 90_000),
+            avPlayer.seek(to: authoredPlaybackRange == nil
+                            ? CMTime(seconds: startPosition ?? 0, preferredTimescale: 600)
+                            : Self.authoredTime(startPosition ?? 0),
                           toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
                 guard finished else { return }
                 Task { @MainActor in
@@ -1031,11 +1032,26 @@ final class NativeAVPlayerHost {
 
     func applyAuthoredPlaybackRange(to item: AVPlayerItem) {
         item.reversePlaybackEndTime = authoredPlaybackRange.map {
-            CMTime(seconds: $0.lowerBound, preferredTimescale: 90_000)
+            Self.authoredTime($0.lowerBound)
         } ?? .invalid
-        item.forwardPlaybackEndTime = authoredPlaybackRange.map {
-            CMTime(seconds: $0.upperBound, preferredTimescale: 90_000)
+        item.forwardPlaybackEndTime = Self.authoredForwardEndTime(
+            authoredPlaybackRange, duration: item.duration)
+    }
+
+    nonisolated static func authoredForwardEndTime(_ range: Range<Double>?, duration: CMTime) -> CMTime {
+        let end = range.map {
+            authoredTime($0.upperBound)
         } ?? .invalid
+        // A measured HLS placement can move the source boundary past the finite item.
+        // Scheduling that endpoint makes AVFoundation reject playback (-17227).
+        // Natural EOF is already renderer-owned and cannot exceed the authored range.
+        if duration.isNumeric, duration > .zero, end >= duration { return .invalid }
+        return end
+    }
+
+    nonisolated static func authoredTime(_ seconds: Double) -> CMTime {
+        guard let ticks = SourceTimestampBounds.roundedTicks(seconds * 90_000) else { return .invalid }
+        return CMTime(value: ticks, timescale: 90_000)
     }
 
     /// Retire the outgoing session before the engine subscribes for its successor, without
@@ -2052,7 +2068,9 @@ final class NativeAVPlayerHost {
     /// engine reconcile a clock that would otherwise stay latched at an unreachable optimistic target.
     @discardableResult
     func seek(to seconds: Double, deadlineSeconds: Double?) async -> Bool {
-        let target = CMTime(seconds: seconds, preferredTimescale: authoredPlaybackRange == nil ? 600 : 90_000)
+        let target = authoredPlaybackRange == nil
+            ? CMTime(seconds: seconds, preferredTimescale: 600)
+            : Self.authoredTime(seconds)
         seekGeneration &+= 1
         let gen = seekGeneration
         seekInFlight = true

@@ -10,6 +10,13 @@
 
 ## Unreleased: authored native playback intervals
 
+- **Keep disc clips playing when their mapped endpoint reaches natural EOF.**
+  A measured HLS timeline correction could place an authored endpoint beyond the
+  finite AVPlayer item and fail playback with CoreMedia error -17227. Use the
+  item's natural renderer-owned EOF in that case, while retaining exact earlier
+  endpoints, timeline rebasing and held final frames. Round authored endpoints
+  and seeks to the nearest 90 kHz tick instead of losing a tick through floating
+  point truncation.
 - Add `LoadOptions.nativeSourcePlaybackRange` for a single seekable video source,
   expressed in raw source PTS. Native loopback playback uses the presentation-axis
   map and AVPlayer's renderer-owned endpoint, retaining the final frame without
