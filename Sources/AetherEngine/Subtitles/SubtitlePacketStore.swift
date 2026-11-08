@@ -148,6 +148,13 @@ final class SubtitlePacketStore: @unchecked Sendable {
         coverage.noteAnchor(writer, at: seconds)
     }
 
+    /// #941: that reader repositioned and cannot say where it landed. See
+    /// `SubtitleHarvestCoverage.noteLostPosition`.
+    func noteHarvestPositionLost(_ writer: Writer) {
+        lock.lock(); defer { lock.unlock() }
+        coverage.noteLostPosition(writer)
+    }
+
     /// #416: that reader's current run has read one step further, through `seconds`.
     func noteHarvestProgress(_ writer: Writer, through seconds: Double) {
         lock.lock(); defer { lock.unlock() }
@@ -170,6 +177,15 @@ final class SubtitlePacketStore: @unchecked Sendable {
     func hasReadSpan(from: Double, through: Double) -> Bool {
         lock.lock(); defer { lock.unlock() }
         return coverage.isEmpty || coverage.covers(from: from, through: through)
+    }
+
+    /// #941: `hasReadSpan` as a snapshot, for a drain tick that asks once per stored pair and
+    /// should not take the lock for each. Same answer on a silent ledger: everything reads as read.
+    func harvestReadCheck() -> @Sendable (Double, Double) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !coverage.isEmpty else { return { _, _ in true } }
+        let spans = coverage.sortedSpans()
+        return { SubtitleHarvestCoverage.covers(spans, from: $0, through: $1) }
     }
 
     /// Introspection for tests and diagnostics.

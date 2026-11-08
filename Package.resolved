@@ -1,13 +1,13 @@
 {
-  "originHash" : "96be7e601b68c875ae199b0637c34463a625fa27074d5575f0306f6e89cdda17",
+  "originHash" : "cd0165c9dd39fe8938c1881eb9a3ac280e9151ef98a63c3e15c45fdfd33e0445",
   "pins" : [
     {
       "identity" : "ffmpegbuild",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/superuser404notfound/FFmpegBuild",
       "state" : {
-        "revision" : "6b5d084664234649c258248d16111dbac64684be",
-        "version" : "3.11.1"
+        "revision" : "9282e592b81d9aa1d699dcc70d46cf6b4d66b55f",
+        "version" : "3.13.0"
       }
     },
     {
@@ -15,17 +15,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/superuser404notfound/LibDovi",
       "state" : {
-        "revision" : "0d7cce1d6836a30d13a3a2326e50a153af53f014",
-        "version" : "2.1.0"
-      }
-    },
-    {
-      "identity" : "libtruehd",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/superuser404notfound/LibTrueHD",
-      "state" : {
-        "revision" : "73bee84d7ac7b8619db570e36490b92761fe91a6",
-        "version" : "3.1.0"
+        "revision" : "caff700968700467c089a3f38c8b4180620518b5",
+        "version" : "2.2.0"
       }
     },
     {

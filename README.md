@@ -71,6 +71,10 @@ replace those declarations. Verify the manifests in the final app/archive.
 - [LillyPlayer](https://lillyplayer.com): The all-in-one IPTV and media player for Apple TV, iPhone and iPad (live TV, EPG, replay, Jellyfin, Plex, SMB...).
 - [Plozz](https://plozz.app): Free forever open source native app for iPhone, iPad, and Apple TV. Supports Jellyfin, Plex, Emby, Silo, IPTV, SMB, WebDAV and more.
 - [Crivid IPTV Player](https://apps.apple.com/app/id6783083716): IPTV player for M3U and Xtream on Apple TV.
+- [HipTV](https://hiptv.app): A cross-platform, synchronized IPTV player.
+- [ZeoPlayer](https://apps.apple.com/app/id6792761598): Modern media player for iPhone, iPad, Mac, Apple TV and Apple Vision Pro with HDR, Dolby Vision, spatial audio and SMB support.
+- [Theamo](https://theamo.app): IPTV player and TV guide for iPhone, iPad and Apple TV.
+- [Lume](https://github.com/bilipp/Lume/): SwiftUI native open source IPTV and media player for iOS, tvOS and macOS.
 <!-- used-by:end -->
 
 Shipping something on AetherEngine? [Submit it](https://github.com/superuser404notfound/AetherEngine/issues/new?template=used-by-submission.yml) to get listed here and on [aetherengine.superuser404.de](https://aetherengine.superuser404.de).
@@ -86,14 +90,14 @@ A scannable summary; the depth for each row lives in **[docs/formats.md](docs/fo
 | Disc | DVD-Video and Blu-ray ISO (decrypted): selectable titles and chapters, demuxed through the normal path |
 | Video (HW) | H.264, HEVC, HEVC Main10 via VideoToolbox; AV1 Main profile where HW AV1 exists |
 | Video (SW) | AV1 (dav1d) without HW, and AV1 High / Professional (4:4:4, 4:2:2, 12-bit) everywhere, VP9 (VideoToolbox hardware when supported, otherwise libavcodec) / VP8, MPEG-4 Part 2 / MPEG-2 / VC-1, QuickTime RLE, the Flash tail (Sorenson Spark, On2 VP6), RealVideo 1-4, H.263, Theora and anything else the FFmpeg build carries a decoder for (software is the default route; only HEVC, H.264 and HW-decodable AV1 go native), H.264 High 4:2:2 / 4:4:4 / 10 and HEVC Rext where VideoToolbox has no HW decoder (Intel Macs, older chips), interlaced H.264 (AVPlayer does not deinterlace; on VOD the declared field order is verified against decoded frames, so progressive-in-interlaced-carriage keeps hardware decode); GPU deinterlace (yadif_videotoolbox, Metal, field-rate by default) with a CPU bwdif fallback |
-| HDR | HDR10, HDR10+ (per-frame ST 2094-40), Dolby Vision (P5, P7 on the native route as single-layer 8.1 (HDR10 base layer on a display without Dolby Vision), or composed dual-layer on Metal with per-frame DV metadata for FEL when `preferDualLayerDolbyVision` is set, the `DualLayerDolbyVision` trait is on and VideoToolbox decodes HEVC in hardware, P8.1, P8.4, AV1 P10.x), HLG (declared, or named by an alternative transfer SEI as broadcast HLG is), HDR Vivid (played on its HLG / PQ base, CUVA metadata reported by `probe`) |
+| HDR | HDR10, HDR10+ (per-frame ST 2094-40), Dolby Vision (P5, P7 on the native route as single-layer 8.1 (HDR10 base layer on a display without Dolby Vision; with the `DolbyVisionFelCurves` trait a FEL source keeps its mapping and has its enhancement layer folded into the luma curve per scene), or composed dual-layer on Metal with per-frame DV metadata for FEL when `preferDualLayerDolbyVision` is set, the `DualLayerDolbyVision` trait is on and VideoToolbox decodes HEVC in hardware, P8.1, P8.4, AV1 P10.x), HLG (declared, or named by an alternative transfer SEI as broadcast HLG is), HDR Vivid (played on its HLG / PQ base, CUVA metadata reported by `probe`) |
 | Audio | AAC, AC3, EAC3, FLAC, ALAC stream-copy lossless; TrueHD / MLP / DTS / DTS-HD MA / MP3 / MP2 / Opus / Vorbis / LPCM (incl. Blu-ray, G.711) / WMA (Standard, Pro, Lossless, Voice) / Nellymoser / ADPCM-SWF / Speex / RealAudio (Cook, ATRAC3, Sipro, Lossless, 14.4 / 28.8) / AMR-NB / AMR-WB / DVD LPCM bridge to EAC3 5.1 (default) or lossless FLAC |
 | Dolby Atmos | EAC3+JOC stream-copied on every route (HDMI MAT 2.0, AirPods spatial, BT downmix) except the opt-in Profile 7 FEL dual-layer route (`preferDualLayerDolbyVision`, `DualLayerDolbyVision` trait), which runs on the software host and plays an E-AC-3 JOC track as its 5.1 / 7.1 bed without the objects unless `LoadOptions.objectAudioRendering` is set (then the objects are kept: compressed JOC to the renderer, TrueHD and DTS:X object audio as a rendered bed, in a build with the object-audio traits). No container reliably declares JOC pre-decode, so an honest `TrackInfo.isAtmos` needs a bounded decode: `AetherEngine.probeDetectingAtmos(url:/source:)` answers for a details screen without starting playback, and `LoadOptions.confirmAtmos` has the running session confirm its own tracks in the background and republish `audioTracks`. Both are opt-in and neither sits on the playback-start path. TrueHD Atmos keeps its heights too, opt-in through `LoadOptions.objectAudioRendering` in a build with the `TrueHDObjectAudio` trait ([Optional components](#optional-components)): the engine decodes the Atmos objects, renders them into a speaker bed and delivers Apple Positional Audio, which tvOS sends to an Atmos receiver as Dolby MAT and iOS plays as Spatial Audio ([details](docs/formats.md#truehd-atmos-with-heights)). DTS:X takes the same route with the `DTSXObjectAudio` trait, its four heights unfolded from the compatible 7.1 into 7.1.4 or 9.1.6 ([details](docs/formats.md#dtsx-with-heights)) |
-| Height channels | TrueHD and DTS:X object audio rendered into a speaker bed (5.1.2 up to 9.1.6) and delivered as lossless 24-bit PCM, or APAC when the route plays over AirPlay (`objectAudioRendering`, optional components) |
+| Height channels | TrueHD Atmos and DTS:X built into a speaker bed from the stream's own lossless 7.1, steered by its objects or heights (TrueHD 5.1.2 up to 9.1.6, DTS:X 7.1.4 and 9.1.6), delivered as lossless 24-bit PCM, or APAC when the route plays over AirPlay (`objectAudioRendering`, optional components) |
 | Surround | 5.1 / 7.1 with correct `AudioChannelLayout` |
 | Audio-only | `LoadOptions.audioOnly`: lean pipeline, no video machinery, system Now-Playing on tvOS / iOS |
 | Background audio | Audio keeps playing when the app backgrounds on iOS: native AVPlayer stays alive, the software path drops video and keeps decoding audio (`backgroundPlaybackEnabled` / `pictureInPictureActive`); a paused session survives quick app switches for a grace window (`backgroundTeardownGraceSeconds`, default 15 s) before the wedge-safe teardown runs. tvOS tears down immediately (wedge-safe) unless a PiP window is active, which keeps the pipeline and loopback server alive; with PiP the software path keeps decoding video too (the window needs frames). Hosts gate corrective actions on the published `isSessionReady` |
-| Picture in Picture | Native path: hosts build `AVPictureInPictureController` around `currentAVPlayer`, or around the session's own `nativePlayerLayer` when they render through `bind(view:)` rather than AVKit; while `pictureInPictureActive` a native->native load hands the AVPlayerItem over in place so the window survives next-episode transitions. Software path: published `softwarePiPSource` carries the `AVSampleBufferDisplayLayer` plus transport answers on the enqueued frames' PTS axis for sample-buffer PiP. While PiP is active the software path also composites active subtitle cues (text and PGS/DVB bitmaps) into the decoded frames, so the window shows subtitles the host overlay cannot reach. On the native path, a selected bitmap track's compositions are OCR-recognized into its WebVTT rendition, so PGS subtitles render in the PiP window there as well. iOS renders sample-buffer PiP; tvOS AVKit does not evaluate sample-buffer content sources (Apple FB9751461, verified through tvOS 26) |
+| Picture in Picture | Native path: hosts build `AVPictureInPictureController` around `currentAVPlayer`, or around the session's own `nativePlayerLayer` when they render through `bind(view:)` rather than AVKit; while `pictureInPictureActive` a native->native load hands the AVPlayerItem over in place so the window survives next-episode transitions. Software path: published `softwarePiPSource` carries the `AVSampleBufferDisplayLayer` plus transport answers on the enqueued frames' PTS axis for sample-buffer PiP; `makePictureInPictureController()` builds the controller with a `SoftwarePiPPlaybackDelegate` over the engine's play, pause, skip and time range. While PiP is active the software path also composites active subtitle cues (text and PGS/DVB bitmaps) into the decoded frames, so the window shows subtitles the host overlay cannot reach. While PiP is active a bound `AetherPlayerView` shapes the software layer like the picture (aspect-fit, or aspect-fill clipped by the view) so the window mirrors it without offset or crop; a host mounting `softwarePiPSource.layer` itself sizes it the same way. On macOS the layer is laid out at the size of the system PiP window (found through public AppKit, followed on resize; the picture-shaped layout is kept when no window is found), and the system draws an opaque bar over the top of that window that no public API removes (Apple FB22411168). Ending the session closes the helper controller's window, and a load on the software path ends PiP (no hand-over as on the native path). On the native path, a selected bitmap track's compositions are OCR-recognized into its WebVTT rendition, so PGS subtitles render in the PiP window there as well. iOS renders sample-buffer PiP; tvOS AVKit does not evaluate sample-buffer content sources (Apple FB9751461, verified through tvOS 26) |
 | Subtitles | Text (SRT / ASS / SSA / VTT / mov_text) inline, bitmap (PGS / DVB / DVD, plus local VobSub `.idx` + `.sub` sidecars) as `CGImage`, in-band CEA-608 closed captions (field-1, from an `eia_608`/`c608` demuxable track or extracted from A53 `cc_data` embedded in the video bitstream: H.264/HEVC SEI on the native path, decoded-frame side data such as MPEG-2 on the software path, with the caption track surfacing lazily on first real caption data), DVB teletext decoded to text cues with broadcaster colour preserved and a selectable caption page (libzvbi, `LoadOptions.teletextPage` at load, `setTeletextPage(_:)` while the channel plays), external files as first-class tracks (registered, listed, selected like embedded streams), a live channel's own HLS `SUBTITLES` renditions surfaced as tracks and fetched only once one is selected, opt-in raw ASS markup + fonts; embedded-text cues harvested from the producer's own read (instant enable, no side-channel bandwidth); opt-in native WebVTT renditions (one per text track incl. load-declared external files, language-tagged) so subtitles survive PiP / AirPlay / external display (`LoadOptions.prepareNativeSubtitles`); bitmap tracks (PGS / DVB / DVD, embedded and external .sup) join as OCR-fed renditions: on-device Vision text recognition runs while the track is selected and fills a language-tagged text rendition, so bitmap subtitles survive PiP / AirPlay / external display on the native path too (lossy by design; fullscreen keeps the pixel-accurate overlay) |
 | Frames | Off-playback `FrameExtractor`: `thumbnail` (scrub preview) + `snapshot` (frame-accurate). Infrequent analysis: `latestSoftwareVideoFrame()` borrows the newest read-only enqueued buffer without another decoder or display readback. Recheck `softwareVideoFrameGeneration` after asynchronous work. Native hosts can scope an `AVPlayerItemVideoOutput` to `currentAVPlayer`. |
 | Audio tap | Opt-in `installAudioTap()`: decoded playback audio as mono Float32 48 kHz PCM with source-PTS timestamps, off the render path (live transcription, ShazamKit); delivers on the loopback, remote-HLS (VOD + live), and software paths. The stream is bound to its session, so a session-preserving reload (audio / subtitle / disc-title switch, `reloadAtCurrentPosition`) finishes it and the host re-installs on stream end |
@@ -117,7 +121,7 @@ On Apple platforms the real choice is between AVPlayer, with deep OS integration
 | **Hardware decode** | VideoToolbox, dav1d SW fallback | VideoToolbox, FFmpeg SW fallback | VideoToolbox | VideoToolbox plus software | VideoToolbox plus software |
 | **Dolby Vision** | P5, P7 as 8.1 (or opt-in FEL dual-layer), P8.1, P8.4, AV1 P10.x, real display switch | P5, P8 via AVPlayer; their matrix lists P5 HDR display without overheating as paid LGPL | P5 and P8.1 only | Tone-maps, no DV display | Tone-maps, no DV display |
 | **Dolby Atmos** | EAC3+JOC stream-copied (HDMI MAT, spatial) | EAC3+JOC via AVPlayer | EAC3+JOC passthrough | Decodes to PCM, no object passthrough | No Atmos passthrough on Apple |
-| **TrueHD / DTS:X heights** | Objects and height channels rendered into a speaker bed (up to 9.1.6), delivered as lossless 24-bit PCM, APAC on AirPlay (optional components) | 7.1 core (FFmpeg decode) | Not played | 7.1 core | 7.1 core |
+| **TrueHD / DTS:X heights** | Speaker bed up to 9.1.6 built from the stream's lossless 7.1, steered by its objects or heights, delivered as lossless 24-bit PCM, APAC on AirPlay (optional components) | 7.1 core (FFmpeg decode) | Not played | 7.1 core | 7.1 core |
 | **HDR on tvOS** | Native Match Content switch | Native Match Content on AVPlayer path, else Metal tone-map | Native Match Content | Software tone-mapping | Software tone-mapping |
 | **Rendering & UI** | OS-native, you ship SwiftUI | Own Metal renderer, bundled controls | OS-native, you ship UI | Own renderer, bundled controls | Own renderer, bundled OSC |
 | **Apple TV / App Store** | Yes, LGPL plus store exception | Free build GPL, paid LGPL tier for AV1 hardware decode and the full decoder set | Yes | Yes, LGPL | Not practical, GPL, no tvOS |
@@ -409,7 +413,7 @@ Subtitle cues land in raw source PTS; render the overlay against `player.sourceT
 Install via Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.53.1")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.61.0")
 ```
 
 Three samples ship in `Examples/`:
@@ -474,9 +478,9 @@ Known limitation: SMBClient negotiates only SMB 2.0.2 and 2.1, so there is no SM
 try await player.load(url: streamURL, options: LoadOptions(isLive: true))
 try await player.load(url: streamURL, options: LoadOptions(isLive: true, dvrWindowSeconds: 1800))
 
-// IPTV channel zapping: join in ~3-6s instead of 10-18s on strict-realtime origins by letting
-// TARGETDURATION (and the live-edge holdback derived from it) track the source keyframe cadence:
-try await player.load(url: streamURL, options: LoadOptions(isLive: true, liveJoinProfile: .fastZap))
+// Lean-back live that may wait for the full 3 x TARGETDURATION holdback before the first picture
+// (the default .fastZap join tracks the source keyframe cadence and bounds that wait):
+try await player.load(url: streamURL, options: LoadOptions(isLive: true, liveJoinProfile: .standard))
 
 // Drive a scrubber from the live-edge fields (they tick, so they live on player.clock):
 player.clock.$seekableLiveRange   // ClosedRange<Double>?, session-relative; nil when DVR off
@@ -502,7 +506,7 @@ player.$recordingState            // .idle / .recording / .ended / .failed
 
 `startRecording(to:)` (AetherEngine#560) writes the live source to an MPEG-TS file fed from the connection the session already holds. That is the point of it rather than a detail: an IPTV plan commonly caps an account at 1 to 3 simultaneous connections, so a host that opens its own connection to record either fails outright or knocks the viewer off the channel. It is a stream copy of the source packets taken before any audio bridging, so a TrueHD or DTS channel records its original audio while playback listens to the bridged rendition, and a file cut short by a crash is still playable up to the cut. Recording follows the source rather than the playhead, so pausing or scrubbing back inside the DVR window does not interrupt it, and a `liveSourceReset` ends it cleanly rather than writing past a seam the codecs may not survive. The one route that cannot record is `nativeRemoteHLS` (`.remoteBypass`), where AVFoundation holds the source connection and the engine never sees a byte; `startRecording` throws `.unsupportedRoute` there instead of producing an empty file. Full contract in [docs/api.md](docs/api.md#recording-a-live-stream).
 
-`liveJoinProfile: .fastZap` (AetherEngine#195/#208) cuts live segments at every keyframe past 0.5 s instead of the standard ~4 s, so the served `TARGETDURATION` collapses to 1.5 x the source GOP length (1 s GOPs serve 2, and so do segments up to 1.666 s; the headroom covers a broadcast's irregular GOPs, AetherEngine#670) and its live-edge holdback (`HOLD-BACK` = 3 x `TARGETDURATION`, the RFC 8216bis floor; AetherEngine#189) shrinks with it. The first manifest still prefers the full holdback. After two finalized segments, a strict-realtime source gets one observed-segment grace clamped to 0.5...2.0 s, then a shallow first window may be served so startup stays bounded. This can produce one early `-16832` or a short rebuffer. `.standard` retains the full-holdback guarantee. The smaller `TARGETDURATION` also tightens AVPlayer's unchanged-playlist patience and live-edge buffer, so origins that stall or burst mid-stream rebuffer more readily; opt in for zapping UX, keep `.standard` for lean-back viewing.
+`liveJoinProfile` defaults to `.fastZap` (AetherEngine#195/#208), which cuts live segments at every keyframe past 0.5 s instead of the standard ~4 s, so the served `TARGETDURATION` collapses to 1.5 x the source GOP length (1 s GOPs serve 2, and so do segments up to 1.666 s; the headroom covers a broadcast's irregular GOPs, AetherEngine#670) and its live-edge holdback (`HOLD-BACK` = 3 x `TARGETDURATION`, the RFC 8216bis floor; AetherEngine#189) shrinks with it. The first manifest still prefers the full holdback. After two finalized segments, a strict-realtime source gets one observed-segment grace clamped to 0.5...2.0 s, then a shallow first window may be served so startup stays bounded. This can produce one early `-16832` or a short rebuffer. `.standard` retains the full-holdback guarantee. The smaller `TARGETDURATION` also tightens AVPlayer's unchanged-playlist patience and live-edge buffer, so origins that stall or burst mid-stream rebuffer more readily; choose `.standard` for lean-back viewing that can afford the full wait.
 
 `liveSourceReset` is live's counterpart to a terminal `state = .error`, and a host that plays live has to subscribe to it. It fires where the session cannot be revived from inside the engine and only a new URL can: a source that restarted from byte 0 (a Jellyfin transcode respawn), a playlist still frozen after the stall ladder's last reload rung (#65), or an in-engine reopen transport whose budget is spent (#199). Each of those halts production first, so a dead provider stops advertising blocking reloads behind the host's back. Answer it by negotiating a fresh URL and calling `load` again, and guard that answer (one retune in flight, a minimum spacing, a bounded count per session) or a permanently dead upstream turns into a retune loop. Spend that bound out loud: a retune ladder that ends on a silent `return` leaves the same dead channel behind a counter, so surface the exhaustion the way a terminal `.error` would be surfaced.
 
@@ -543,8 +547,10 @@ no byte-offset reconnects and no tail read, the demuxer's pb is non-seekable, an
 connection surfaces as a read error rather than end-of-media so the host can re-request. Such a
 source keeps the native path instead of being forced to software, and the session serves an
 append-only `EVENT` playlist carrying the durations actually muxed, completed with `ENDLIST` at
-true source EOF. Every producer reposition is refused by construction, so **seeking is
-unavailable**: re-request the archive with a shifted start timestamp instead. `aetherctl play`
+true source EOF. Every producer reposition is refused by construction, so a seek lands only
+inside what the session already holds (the resident span that reaches the producer's frontier,
+on the native path); for any other target, and for an audio track switch, re-request the archive
+with a shifted start timestamp, passing `audioSourceStreamIndex` for the chosen track (AE#958). `aetherctl play`
 gains `--sequential-origin` / `--declared-duration` for reproducing one from macOS.
 
 ## Host setup on tvOS
@@ -662,10 +668,10 @@ Browse all of this as a searchable site at **[aetherengine.superuser404.de](http
 AetherEngine uses [Semantic Versioning](https://semver.org). The public API surface, every `public` declaration in `Sources/AetherEngine/`, is the stability contract. **Major** removes / renames public symbols or breaks adopters; **Minor** adds public API or codec / format support; **Patch** fixes bugs with no public API change. `internal` types are not part of the contract.
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.53.1")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.61.0")
 ```
 
-Pin to `.upToNextMinor(from: "7.53.1")` for stricter teams that prefer to opt into minor bumps explicitly.
+Pin to `.upToNextMinor(from: "7.61.0")` for stricter teams that prefer to opt into minor bumps explicitly.
 
 ## Requirements
 
@@ -679,7 +685,9 @@ Pin to `.upToNextMinor(from: "7.53.1")` for stricter teams that prefer to opt in
 | Xcode | 27.0 |
 
 The Swift and Xcode rows are the supported toolchain CI builds and tests with (GitHub's
-`xcode-27` image). Older toolchains are not supported; the deployment floor above
+`xcode-27` image): every change runs the tests on macOS and builds the test target for the iOS and
+tvOS Simulator, and a nightly job (`ci-extended.yml`, also run before each release) builds Release,
+visionOS and the device SDKs with every optional component. Older toolchains are not supported; the deployment floor above
 stays iOS / tvOS 18 and macOS 15, with newer calls behind `#available`. A weekly best-effort job
 (`xcode26-compat.yml`, also run before each release) builds the package for tvOS and iOS with
 Xcode 26.3 (Swift 6.2), so a break there is known before a release ships, but it does not block one.
@@ -698,23 +706,26 @@ The 7.x line raised the floor from iOS 16, tvOS 17 and macOS 14. A project that 
 
 ### Optional components
 
-Four components are compiled only when a host asks for them, each behind a package trait that is **off by default**:
+Five components are compiled only when a host asks for them, each behind a package trait that is **off by default**:
 
 | Trait | Compiles and links | Without it |
 | --- | --- | --- |
-| `TrueHDObjectAudio` | [LibTrueHD](https://github.com/superuser404notfound/LibTrueHD) and the object renderer | TrueHD Atmos keeps the channel bridge whatever `objectAudioRendering` asks |
-| `DTSXObjectAudio` | the DTS:X decoder (FFmpeg's `dca` with FFmpegBuild's height patch, no extra library) and the object renderer | DTS:X keeps the channel bridge whatever `objectAudioRendering` asks |
-| `DualLayerDolbyVision` | the Profile 7 FEL dual-layer composer (`DualLayerVideoDecoder`, its Metal composer and the per-frame display metadata) | a Profile 7 source keeps the native route whatever `preferDualLayerDolbyVision` asks |
+| `TrueHDObjectAudio` | [LibTrueHD](https://github.com/superuser404notfound/LibTrueHD) and the bed regression | TrueHD Atmos keeps the channel bridge whatever `objectAudioRendering` asks |
+| `DTSXObjectAudio` | the DTS:X decoder (FFmpeg's `dca` with FFmpegBuild's height patch, no extra library) and the bed regression that builds the layout from its 7.1 bed | DTS:X keeps the channel bridge whatever `objectAudioRendering` asks |
+| `DualLayerDolbyVision` | the Profile 7 FEL dual-layer composer (`DualLayerVideoDecoder`, its Metal composer and the per-frame display metadata); not recommended for distributed apps, see below | a Profile 7 source keeps the native route whatever `preferDualLayerDolbyVision` asks |
 | `DolbyVisionStillReshaping` | the reshaping that turns a Dolby Vision Profile 5 / AV1 Profile 10.0 frame into a still | such a source has no scrub stills, I-frame stills or held picture (`supportsCacheBackedStills` is false); playback is unaffected |
+| `DolbyVisionFelCurves` | the fold of a Profile 7 FEL enhancement layer into the Profile 8.1 RPU on the native route (the stream's mapping kept, the luma residual added to its luma curve per scene) ([Dolby Vision FEL › Curve fold](docs/dolby-vision-fel.md#7-curve-fold-on-the-native-route)) | the native route's Profile 8.1 conversion drops the enhancement layer, as before |
 
 Without its trait a component is not in the binary: its code is not compiled, and a library behind it is neither linked nor resolved (it drops out of the host's `Package.resolved`). The options that ask for it stay in the API, so a host compiles the same either way; they change nothing, and the session log says why (`TrueHD Atmos rendering requested but not built in (TrueHDObjectAudio trait off)`, `DV P7 dual-layer route: not taken (built without the DualLayerDolbyVision trait)`). A host that wants to hide a setting its build cannot honour asks `AetherEngine.OptionalComponent`, for example `AetherEngine.OptionalComponent.dualLayerDolbyVision.isBuiltIn`.
 
 These components may be subject to third-party patent licensing. Integrators who enable them are responsible for their own licensing.
 
+**Profile 7 FEL: prefer `DolbyVisionFelCurves` over `DualLayerDolbyVision`.** Both bring a FEL source's enhancement layer back, in different ways. `DualLayerDolbyVision` composes the picture in the engine: the composer reconstructs the picture itself, which evaluates the RPU's MMR chroma prediction and the enhancement layer on every pixel, steps covered by live Dolby patents (the MMR family runs to 2032). A host without a Dolby Vision licence should build `DolbyVisionFelCurves` instead, which leaves every evaluation of the stream's mapping to the platform's licensed decoder. The curve fold keeps the disc's own mapping in the Profile 8.1 RPU and adds only the enhancement layer's luma residual to the luma curve, per scene, so the engine never applies a mapping to a pixel and never forms a composed picture. It runs on the native route with everything that route keeps (Picture in Picture, AirPlay, scrub stills, subtitles), and on three UHD Blu-ray samples it brings the picture to within 0.8 to 2.1 Delta E ITP of the composed FEL picture (2.5 to 8.9 without it). What it cannot carry is the enhancement layer's local detail (12-bit refinement, grain). See [Dolby Vision FEL › Curve fold](docs/dolby-vision-fel.md#7-curve-fold-on-the-native-route).
+
 To enable them, list the traits on the package dependency:
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.53.1",
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.61.0",
          traits: ["TrueHDObjectAudio", "DTSXObjectAudio", "DualLayerDolbyVision", "DolbyVisionStillReshaping"])
 ```
 

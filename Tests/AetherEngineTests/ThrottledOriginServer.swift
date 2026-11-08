@@ -33,9 +33,18 @@ final class ThrottledOriginServer: @unchecked Sendable {
         /// Audit DMX-5: a 206 that starts `start` rather than where it was asked, the way an edge
         /// that aligns ranges to its own chunk boundary answers. The body is that range's.
         case serve206From(start: Int64)
+        /// AE#958: a 206 whose headers state exactly the range asked for while the body is the bytes
+        /// from `bodyFrom`, the way a timeshift origin answers on its own chunk boundary. Nothing in
+        /// the response gives it away.
+        case serve206Fabricated(bodyFrom: Int64)
         /// Audit DMX-101: a server that cannot address bytes. Whatever range was asked for, the
         /// answer is a 200 with the whole source from byte 0 and its full Content-Length.
         case serve200
+        /// AE#986: a refusal whose body never finishes. The status line, `Content-Type` (nil sends
+        /// none) and a `Content-Length` far past the body go out at once, then `body` bytes, then
+        /// the connection is held open without a FIN, the way a proxy passes on an upstream error
+        /// that ended short of its length.
+        case statusWithHeldBody(Int, contentType: String?, body: Int)
     }
 
     let port: UInt16
@@ -58,6 +67,30 @@ final class ThrottledOriginServer: @unchecked Sendable {
     /// between runs, so a shifted or reordered read cannot match by accident.
     static func patternByte(at offset: Int64) -> UInt8 {
         UInt8(truncatingIfNeeded: offset ^ (offset >> 8) ^ (offset >> 16) ^ (offset >> 24))
+    }
+
+    /// Inside an aligned 256-byte run the pattern is `i ^ c`, with `c` fixed by the run's upper bits,
+    /// so every run is one of these 256 rows. A body copied from them costs a memcpy per run; mapping
+    /// `patternByte` over it cost a closure call per byte, which a debug build ran at ~10 MB/s and a
+    /// loaded runner pushed the 72-128 MB origins past their time limits with.
+    private static let patternRows: [UInt8] = (0..<65536).map { UInt8(truncatingIfNeeded: ($0 & 0xFF) ^ ($0 >> 8)) }
+
+    /// `count` bytes of the pattern from `offset`, equal to `patternByte(at:)` byte for byte.
+    static func patternBytes(at offset: Int64, count: Int) -> [UInt8] {
+        [UInt8](unsafeUninitializedCapacity: count) { out, initialized in
+            patternRows.withUnsafeBufferPointer { rows in
+                var written = 0
+                while written < count {
+                    let position = offset + Int64(written)
+                    let row = Int(UInt8(truncatingIfNeeded: (position >> 8) ^ (position >> 16) ^ (position >> 24)))
+                    let column = Int(position & 0xFF)
+                    let n = min(256 - column, count - written)
+                    (out.baseAddress! + written).update(from: rows.baseAddress! + row * 256 + column, count: n)
+                    written += n
+                }
+            }
+            initialized = count
+        }
     }
     private let chunkBytes: Int
     private let throttleUs: useconds_t
@@ -283,6 +316,7 @@ final class ThrottledOriginServer: @unchecked Sendable {
         var silentAfter: Int64? = nil
         var dropAfter: Int64? = nil
         var answersWholeSource = false
+        var bodyShift: Int64 = 0
         switch respond(requestIndex, offset, path) {
         case .serve206:
             break
@@ -291,6 +325,8 @@ final class ThrottledOriginServer: @unchecked Sendable {
             offset = 0
         case .serve206From(let start):
             offset = max(0, min(start, totalSize - 1))
+        case .serve206Fabricated(let bodyFrom):
+            bodyShift = max(0, min(bodyFrom, totalSize - 1)) - offset
         case .serveThenGoSilent(let afterBytes):
             silentAfter = max(0, afterBytes)
         case .serveThenDrop(let afterBytes):
@@ -301,6 +337,15 @@ final class ThrottledOriginServer: @unchecked Sendable {
                 + "Content-Length: 0\r\n"
                 + "Connection: keep-alive\r\n\r\n"
             return writeFully(fd, Array(header.utf8))
+        case .statusWithHeldBody(let code, let contentType, let body):
+            let header = "HTTP/1.1 \(code) Status\r\n"
+                + (contentType.map { "Content-Type: \($0)\r\n" } ?? "")
+                + "Content-Length: 41382012\r\n\r\n"
+            guard writeFully(fd, Array(header.utf8) + Array(repeating: UInt8(ascii: "E"), count: body)) else {
+                return false
+            }
+            while !stopped { usleep(200_000) }
+            return false
         case .redirect(let location):
             let header = "HTTP/1.1 302 Found\r\n"
                 + "Location: \(location)\r\n"
@@ -364,7 +409,7 @@ final class ThrottledOriginServer: @unchecked Sendable {
             if let silentAfter { n = Int(min(Int64(n), silentAfter - served)) }
             if let dropAfter { n = Int(min(Int64(n), dropAfter - served)) }
             let body = patternedBody
-                ? (0..<n).map { Self.patternByte(at: offset + served + Int64($0)) }
+                ? Self.patternBytes(at: offset + bodyShift + served, count: n)
                 : Array(chunk[0..<n])
             guard writeBody(fd, body) else { return false }
             served += Int64(n)

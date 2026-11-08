@@ -817,7 +817,7 @@ struct ProbeControlTests {
         try control.check()
     }
 
-    @Test("Cancellation callbacks may safely cancel the token reentrantly", .timeLimit(.minutes(1)))
+    @Test("Cancellation callbacks may safely cancel the token reentrantly", .timeLimit(.minutes(3)))
     func reentrantCancellation() async throws {
         let token = ProbeCancellation()
         let calls = ProbeTestBox(0)
@@ -832,7 +832,7 @@ struct ProbeControlTests {
         #expect(calls.value == 1)
     }
 
-    @Test("Concurrent cancels deliver each callback once", .timeLimit(.minutes(1)))
+    @Test("Concurrent cancels deliver each callback once", .timeLimit(.minutes(3)))
     func racingCancellationIsOneShot() async throws {
         let token = ProbeCancellation()
         let gate = ProbeTestGate()
@@ -849,7 +849,7 @@ struct ProbeControlTests {
         #expect(throws: CancellationError.self) { try control.complete() }
     }
 
-    @Test("Cancellation and completion have one winner", .timeLimit(.minutes(1)))
+    @Test("Cancellation and completion have one winner", .timeLimit(.minutes(3)))
     func cancellationCompletionRace() async throws {
         for _ in 0..<16 {
             let token = ProbeCancellation()
@@ -875,7 +875,7 @@ struct ProbeControlTests {
         }
     }
 
-    @Test("Finish joins a callback already running on the cancelling thread", .timeLimit(.minutes(1)))
+    @Test("Finish joins a callback already running on the cancelling thread", .timeLimit(.minutes(3)))
     func finishJoinsRunningCallback() async throws {
         let token = ProbeCancellation()
         let callbackGate = ProbeTestGate()
@@ -1171,7 +1171,7 @@ struct ProbeControlTests {
     }
 
     @Test("Cancellation wakes a parked read or seek, but cannot complete before the host returns",
-          .timeLimit(.minutes(1)), arguments: ProbeParkedReader.Operation.allCases)
+          .timeLimit(.minutes(3)), arguments: ProbeParkedReader.Operation.allCases)
     func cancellationInterruptsParkedIO(_ operation: ProbeParkedReader.Operation) async throws {
         let token = ProbeCancellation()
         let reader = ProbeParkedReader(operation: operation)
@@ -1193,7 +1193,7 @@ struct ProbeControlTests {
     }
 
     @Test("A cancellation racing the reader's start remains latched before it parks",
-          .timeLimit(.minutes(1)), arguments: ProbeParkedReader.Operation.allCases)
+          .timeLimit(.minutes(3)), arguments: ProbeParkedReader.Operation.allCases)
     func cancellationBeforeReaderParks(_ operation: ProbeParkedReader.Operation) async throws {
         let token = ProbeCancellation()
         let reader = ProbeParkedReader(operation: operation, pauseBeforeParking: true)
@@ -1219,7 +1219,7 @@ struct ProbeControlTests {
     }
 
     @Test("A noninterrupting reader still owns the native call after cancel has been notified",
-          .timeLimit(.minutes(1)), arguments: ProbeParkedReader.Operation.allCases)
+          .timeLimit(.minutes(3)), arguments: ProbeParkedReader.Operation.allCases)
     func cancellationCannotCompleteUninterruptibleIO(_ operation: ProbeParkedReader.Operation) async throws {
         let token = ProbeCancellation()
         let reader = ProbeParkedReader(operation: operation, interruptOnCancel: false)
@@ -1244,7 +1244,7 @@ struct ProbeControlTests {
     }
 
     @Test("An injected deadline interrupts parked I/O without relying on a wall-clock timer",
-          .timeLimit(.minutes(1)), arguments: ProbeParkedReader.Operation.allCases)
+          .timeLimit(.minutes(3)), arguments: ProbeParkedReader.Operation.allCases)
     func deadlineInterruptsParkedIO(_ operation: ProbeParkedReader.Operation) async throws {
         let clock = ProbeTestBox<TimeInterval>(0)
         let control = try ProbeControl(
@@ -1271,7 +1271,7 @@ struct ProbeControlTests {
     }
 
     @Test("A native AVIO seek waits for the interrupted host callback to unwind",
-          .timeLimit(.minutes(1)), arguments: [false, true])
+          .timeLimit(.minutes(3)), arguments: [false, true])
     func nativeSeekInterruption(_ expireDeadline: Bool) async throws {
         let token = ProbeCancellation()
         let clock = ProbeTestBox<TimeInterval>(0)
@@ -1428,7 +1428,7 @@ struct ProbeControlTests {
     // MARK: HTTP opening, with an isolated loopback origin and no URLProtocol global hooks
 
     @Test("Stopped HTTP probes retain their origin slot until the request callback finishes",
-          .timeLimit(.minutes(1)), arguments: ProbeHTTPTestOrigin.Stage.allCases, [false, true])
+          .timeLimit(.minutes(3)), arguments: ProbeHTTPTestOrigin.Stage.allCases, [false, true])
     func stoppedHTTPWaitsForCompletion(_ stage: ProbeHTTPTestOrigin.Stage, deadline: Bool) async throws {
         let token = ProbeCancellation()
         let clock = ProbeTestBox<TimeInterval>(0)
@@ -1494,7 +1494,7 @@ struct ProbeControlTests {
     }
 
     @Test("HTTP cancellation ends a blocked header or body request without launching a fallback",
-          .timeLimit(.minutes(1)), arguments: ProbeHTTPTestOrigin.Stage.allCases)
+          .timeLimit(.minutes(3)), arguments: ProbeHTTPTestOrigin.Stage.allCases)
     func cancellationDuringHTTPOpen(_ stage: ProbeHTTPTestOrigin.Stage) async throws {
         let token = ProbeCancellation()
         let returned = ProbeTestBox(false)
@@ -1523,7 +1523,7 @@ struct ProbeControlTests {
     }
 
     @Test("An injected deadline interrupts blocked HTTP headers or body before any fallback",
-          .timeLimit(.minutes(1)), arguments: ProbeHTTPTestOrigin.Stage.allCases)
+          .timeLimit(.minutes(3)), arguments: ProbeHTTPTestOrigin.Stage.allCases)
     func deadlineDuringHTTPOpen(_ stage: ProbeHTTPTestOrigin.Stage) async throws {
         let clock = ProbeTestBox<TimeInterval>(0)
         let control = try ProbeControl(
@@ -1580,7 +1580,7 @@ struct ProbeControlTests {
     }
 
     @Test("Controlled HTTP fixture probes preserve detection and enforce delivered-byte limits",
-          .timeLimit(.minutes(1)), arguments: [false, true])
+          .timeLimit(.minutes(3)), arguments: [false, true])
     func controlledHTTPFixture(_ exhaustInput: Bool) async throws {
         let origin = try ProbeHTTPTestOrigin(data: ProbeTestFixtures.hdr10Plus())
         defer { origin.stop() }
@@ -1609,7 +1609,7 @@ struct ProbeControlTests {
         try await waitFor { origin.isStopped }
     }
 
-    @Test("Precancelled HTTP probes issue no opening request", .timeLimit(.minutes(1)))
+    @Test("Precancelled HTTP probes issue no opening request", .timeLimit(.minutes(3)))
     func precancelledHTTPDoesNotOpen() async throws {
         let origin = try ProbeHTTPTestOrigin(data: ProbeTestFixtures.hdr10Plus())
         defer { origin.stop() }

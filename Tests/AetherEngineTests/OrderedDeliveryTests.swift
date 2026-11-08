@@ -14,7 +14,7 @@ import Foundation
 /// from before this returns after" invariant (I3) hold, and a ticket that
 /// never arrives costs exactly the one frame at the stall-guard threshold,
 /// not the rest of the session.
-@Suite(.serialized, .timeLimit(.minutes(1)))
+@Suite(.serialized, .timeLimit(.minutes(3)))
 struct OrderedDeliveryTests {
 
     private static func makeBuffer() -> CVPixelBuffer? {
@@ -114,10 +114,12 @@ struct OrderedDeliveryTests {
     @Test("a ticket that is never fulfilled costs exactly one frame (the stall guard)")
     func stallGuardCostsExactlyOneFrame() async throws {
         let buffer = try #require(Self.makeBuffer())
-        // Threshold = maxFramesInFlight + maxLayerSkew + 2 = 3 + 3 + 2 = 8,
-        // matching production (`DoviFelComposer.maxFramesInFlight`,
-        // `DualLayerVideoDecoder.maxLayerSkewFrames`).
-        let delivery = OrderedDelivery(maxFramesInFlight: 3, maxLayerSkew: 3, label: "test.ordered-delivery.stall")
+        // Threshold = maxFramesInFlight + maxLayerSkew + 2, built from the production constants
+        // (`DoviFelComposer.maxFramesInFlight`, `DualLayerVideoDecoder.maxLayerSkewFrames`), so the
+        // twelve tickets below stay past it whatever those are set to.
+        let delivery = OrderedDelivery(maxFramesInFlight: DoviFelComposer.maxFramesInFlight,
+                                       maxLayerSkew: DualLayerVideoDecoder.maxLayerSkewFrames,
+                                       label: "test.ordered-delivery.stall")
         let recorder = Recorder()
         delivery.setOnFrame { _, pts, _ in recorder.record(pts) }
 

@@ -267,8 +267,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// False for a Dolby Vision Profile 5 / 10.0 source in a build without the
     /// `DolbyVisionStillReshaping` trait: none of its frames can become a correct still.
     private(set) var yieldsStills = true
-    /// Dolby Vision without a displayable base layer (Profile 5, AV1 Profile 10.0): only the system
-    /// compositor shows it in colour, so scrub previews go through `compositorPreviewFile`.
+    /// Dolby Vision without a displayable base layer (Profile 5, AV1 Profile 10.0) in a build without
+    /// the `DolbyVisionStillReshaping` trait: only the system compositor shows it in colour, so scrub
+    /// previews go through `compositorPreviewFile`. With the trait those sources take the still path.
     private(set) var previewNeedsCompositor = false
     private let compositorPreviewLock = NSLock()
     private var compositorPreviewFiles: [(identity: String, file: CompositorPreviewFile)] = []
@@ -286,6 +287,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// rule (keyframe-aligned plan, a reopenable URL, no serial or held origin, no disc), decided at
     /// start. A Profile 5 / 10.0 session never serves that rendition, so this is asked separately.
     private var previewReadsSource = false
+    /// Configured before start; only controls the elective sparse still ladder.
+    var generatesBackgroundScrubPreviews = true
+
     /// Sparse stills for what nothing resident covers (`KeyframeStillLadder`). Eligibility is the
     /// I-frame rule minus the serial-origin exclusion, because the ladder reads only while the origin
     /// has nothing in flight. Guarded by `restartLock`, like the reader and builder below.
@@ -326,6 +330,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
     public var initialStartSeconds: Double?
     /// Resolved in start() from `initialStartSeconds` once the segment plan exists.
     private(set) var initialProducerBaseIndex: Int = 0
+    /// #941: the segment the running pump opened at, so a restart can tell whether it continues that
+    /// run. restartLock.
+    private var pumpRunStartIndex: Int?
     /// Set once the main demuxer sits at the initial producer's start (step 8's seek ran early).
     var demuxerAtInitialProducerStart = false
 
@@ -362,6 +369,22 @@ public final class HLSVideoEngine: @unchecked Sendable {
         frameTimeObserverLock.lock()
         _nativeVideoFrameTimeObserver = observer
         frameTimeObserverLock.unlock()
+    }
+
+    /// The enhancement-route tap (`LoadOptions.dualLayerRoute == .avPlayerOutput`). Wired onto every
+    /// producer the session builds, so a restart or a seek keeps feeding it under a new epoch.
+    private let videoPacketTapLock = NSLock()
+    private var _videoPacketTap: VideoPacketTap?
+
+    func setVideoPacketTap(_ tap: VideoPacketTap?) {
+        videoPacketTapLock.lock()
+        _videoPacketTap = tap
+        videoPacketTapLock.unlock()
+    }
+
+    private func videoPacketTapSnapshot() -> VideoPacketTap? {
+        videoPacketTapLock.lock(); defer { videoPacketTapLock.unlock() }
+        return _videoPacketTap
     }
 
     private func nativeVideoFrameTimeObserverSnapshot() -> NativeVideoFrameTimeObserver? {
@@ -613,10 +636,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// The audio is TrueHD Atmos or DTS:X rendered into a speaker bed (`objectAudioRendering`), as APAC or
     /// PCM, which on tvOS some sinks only show as Atmos with `AtmosOutputActivator` beside the player.
     var audioIsRenderedBed = false
-
-    /// The rendered bed is TrueHD Atmos, not DTS:X: only then does `AtmosOutputActivator` bring the
-    /// receiver to Dolby Atmos, which a DTS programme is not.
-    var audioBedIsFromDolbyAtmos = false
 
     /// The DTS:X decoder confirmed the playing track as DTS:X (#744), whatever FFmpeg's profile label said. The
     /// engine folds it into the published track's `isDTSX`.
@@ -1157,6 +1176,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         sourceReopenableByURL: Bool = true,
         customSourceReopenFactory: CustomSourceReopenFactory? = nil,
         companionAudioReader: IOReader? = nil,
+        liveSourceAnnouncesDiscontinuities: Bool = false,
         probesize: Int64? = nil,
         maxAnalyzeDuration: Int64? = nil,
         sequentialOrigin: Bool = false,
@@ -1179,6 +1199,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             probesize: probesize, maxAnalyzeDuration: maxAnalyzeDuration)
             .withSequentialOrigin(sequentialOrigin, declaredDuration: declaredDurationSeconds)
             .withHeldSourceConnection(heldSourceConnection)
+            .skippingAttachments()
             .withSourceOpenPolicy(sourceOpenPolicy)
             .withDiagnosticContext(diagnosticContext)
         self.dvModeAvailable = dvModeAvailable
@@ -1230,6 +1251,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         self.sourceReopenableByURL = sourceReopenableByURL
         self.customSourceReopenFactory = customSourceReopenFactory
         self.companionAudioReader = companionAudioReader
+        self.liveSourceAnnouncesDiscontinuities = liveSourceAnnouncesDiscontinuities
         self.forwardWindowSegments = Self.clampedForwardWindow(forwardBufferSegments)
         self.requestedSessionCacheBudgetBytes = sessionCacheByteBudget.map { max(0, $0) }
     }
@@ -1292,6 +1314,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// URL sources and host-provided custom readers.
     public typealias CustomSourceReopenFactory = @Sendable () -> (reader: IOReader, formatHint: String?)?
     let customSourceReopenFactory: CustomSourceReopenFactory?
+
+    /// AE#996: the live source is segmented ingest (EXT-X-DISCONTINUITY may restart its clock), so a
+    /// clock restart to near zero is a seam and not, on its own, a sign of a replayed source.
+    let liveSourceAnnouncesDiscontinuities: Bool
 
     /// #199: the reader vended by `customSourceReopenFactory` that the CURRENT demuxer reads from.
     /// Guarded by `restartLock`. The original load's reader stays engine-owned (AetherEngine closes it
@@ -1703,7 +1729,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // negotiation state didn't match (Vincent test 2026-05-26, HDR10 panel).
         let hdcpLevel: String? = nil
 
-        // 5. Normalize the HEVC config record shipped in init.mp4:
+        // 5. Normalize the HEVC / H.264 config record shipped in init.mp4 (H.264 only takes a), #938):
         //    a) numOfArrays=0 (DV P5 MP4 encoders shipping VPS/SPS/PPS per-IRAP, #19 Wandering Earth 2):
         //       rebuild the hvcC from in-band parameter sets, else the dvh1 sample entry fails CME -4.
         //    b) numOfArrays>0 but carrying non-parameter-set arrays (libx265's user-data SEI_PREFIX, AE#187):
@@ -1731,19 +1757,31 @@ public final class HLSVideoEngine: @unchecked Sendable {
             containerStereo: StereoVideoSignal.containerStereo(codecpar),
             systemPresentsStereo: stereoOnAnySystem || StereoVideoSignal.systemPresentsStereo
         )
-        let hevcExtradataOverride: [UInt8]?
+        let videoExtradataOverride: [UInt8]?
         if let normalized = framingNormalization.extradataOverride {
-            hevcExtradataOverride = normalized
+            videoExtradataOverride = normalized
         } else if let rebuilt = rebuildHEVCExtradataWithInBandParameterSets(
             demuxer: dem,
             videoStreamIndex: videoIndex,
             codecpar: codecpar,
             rewindBeforeScan: !isLiveSession
         ) {
-            hevcExtradataOverride = rebuilt
+            videoExtradataOverride = rebuilt
             EngineLog.emit(
                 "[HLSVideoEngine] rebuilt hvcC with in-band parameter sets: "
                 + "\(codecpar.pointee.extradata_size) B → \(rebuilt.count) B",
+                category: .session
+            )
+        } else if let rebuilt = rebuildH264ExtradataWithInBandParameterSets(
+            demuxer: dem,
+            videoStreamIndex: videoIndex,
+            codecpar: codecpar,
+            rewindBeforeScan: !isLiveSession
+        ) {
+            videoExtradataOverride = rebuilt
+            EngineLog.emit(
+                "[HLSVideoEngine] rebuilt avcC with in-band parameter sets: "
+                + "\(codecpar.pointee.extradata_size) B → \(rebuilt.count) B (#938)",
                 category: .session
             )
         } else if codecpar.pointee.codec_id == AV_CODEC_ID_HEVC,
@@ -1752,14 +1790,14 @@ public final class HLSVideoEngine: @unchecked Sendable {
                   let canonical = Self.canonicalizeHEVCConfigRecord(
                       source, keepingSEIPayloadTypes: stereo.signal == .multiview
                           ? [Self.stereoReferenceDisplaysSEIPayloadType] : []) {
-            hevcExtradataOverride = canonical
+            videoExtradataOverride = canonical
             EngineLog.emit(
                 "[HLSVideoEngine] canonicalized hvcC (stripped non-parameter-set NAL arrays): "
                 + "\(source.count) B → \(canonical.count) B (AE#187)",
                 category: .session
             )
         } else {
-            hevcExtradataOverride = nil
+            videoExtradataOverride = nil
         }
 
         // 6. Reset demuxer cursor to 0 (cue prewarm moved it mid-file). Skipped for live
@@ -1925,7 +1963,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             doviConfig: doviConfig,
             convertP7ToProfile81: convertP7ToProfile81,
             colorOverride: p5ColorOverride,
-            extradataOverride: hevcExtradataOverride,
+            extradataOverride: videoExtradataOverride,
             nalFramingOverride: measuredVideoNALFraming,
             convertsAnnexBSamples: framingNormalization.convertsAnnexBSamples,
             nalFramingLatch: NALFramingLatch(confirmed: framingMeasuredLengthPrefixed),
@@ -2445,6 +2483,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
             let tb = savedVideoConfig?.timeBase ?? AVRational(num: 1, den: 1000)
             subtitlePacketStore.noteHarvestAnchor(
                 .pump, at: Double(plan[openIndex].startPts) * Double(tb.num) / Double(tb.den))
+            restartLock.lock()
+            pumpRunStartIndex = openIndex
+            restartLock.unlock()
         }
         prod.start()
         preparedServe = PreparedServe(
@@ -2497,7 +2538,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let stillsAvailable = FrameDecodeContext.yieldsStill(
             dolbyVisionNoBaseLayer: FrameDecodeContext.isDVNoBaseLayer(codecpar: codecpar))
         yieldsStills = stillsAvailable
-        previewNeedsCompositor = FrameDecodeContext.isDVNoBaseLayer(codecpar: codecpar)
+        previewNeedsCompositor = !stillsAvailable
         if !stillsAvailable {
             EngineLog.emit("[HLSVideoEngine] Dolby Vision Profile 5 / 10.0 stills are not built in "
                            + "(DolbyVisionStillReshaping trait off): no scrub thumbnails or I-frame stills; "
@@ -2505,14 +2546,15 @@ public final class HLSVideoEngine: @unchecked Sendable {
         }
         // AE#682: decided before the routing below, because an I-frame rendition is one of the
         // reasons to serve a master at all.
+        let originIsSerial = sourceReopenableByURL
+            && OriginRequestBudget.shared.requiresSerialRequests(sourceURL)
         let iFrameCandidate = IFrameRenditionEligibility.candidate(.init(
             requested: iFramePlaylistRequested,
             isLive: isLiveSession,
             planBoundariesClaimRandomAccess: planBoundariesClaimRandomAccess,
             sequentialOrigin: sequentialOrigin,
             heldSourceConnection: openProfile.avioHeldConnection,
-            originIsSerial: sourceReopenableByURL
-                && OriginRequestBudget.shared.requiresSerialRequests(sourceURL),
+            originIsSerial: originIsSerial,
             isDiscSource: dem.isDiscSource,
             secondReaderAvailable: sourceReopenableByURL || customIFrameReader != nil,
             stillsUnavailable: !stillsAvailable))
@@ -2523,18 +2565,19 @@ public final class HLSVideoEngine: @unchecked Sendable {
             planBoundariesClaimRandomAccess: planBoundariesClaimRandomAccess,
             sequentialOrigin: sequentialOrigin,
             heldSourceConnection: openProfile.avioHeldConnection,
-            originIsSerial: sourceReopenableByURL
-                && OriginRequestBudget.shared.requiresSerialRequests(sourceURL),
+            originIsSerial: originIsSerial,
             isDiscSource: dem.isDiscSource,
             secondReaderAvailable: sourceReopenableByURL)) == .served
-        stillLadderEligible = !previewNeedsCompositor && stillsAvailable
+        // AE#937: an idle gap on a one-request origin is still a second reader's open and its ranges,
+        // and a rung read overcommits once the pump queues behind it.
+        stillLadderEligible = generatesBackgroundScrubPreviews && !previewNeedsCompositor && stillsAvailable
             && IFrameRenditionEligibility.candidate(.init(
                 requested: true,
                 isLive: isLiveSession,
                 planBoundariesClaimRandomAccess: planBoundariesClaimRandomAccess,
                 sequentialOrigin: sequentialOrigin,
                 heldSourceConnection: openProfile.avioHeldConnection,
-                originIsSerial: false,
+                originIsSerial: originIsSerial,
                 isDiscSource: dem.isDiscSource,
                 secondReaderAvailable: sourceReopenableByURL)) == .served
         stillLadderLock.lock()
@@ -2853,8 +2896,14 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let live = isLiveSession
         let cacheRef = cache
         let plan = segmentPlan
+        let sequentialProvider = sequentialOriginPinsProducerToZero ? provider : nil
         restartLock.unlock()
         guard !live, let cacheRef, !plan.isEmpty else { return [] }
+        // AE#958: a sequential session's items carry the muxed durations, not the plan's.
+        if let ranges = sequentialProvider?.sequentialResidentItemRanges(
+            residentIndexes: cacheRef.residentIndexRanges()) {
+            return ranges
+        }
         return cacheRef.residentIndexRanges().compactMap { indexes in
             guard indexes.lowerBound >= 0, indexes.upperBound < plan.count else { return nil }
             let lower = plan[indexes.lowerBound].startSeconds
@@ -3258,6 +3307,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             originInflight: origin?.inflight ?? 0,
             originWaiting: origin?.waiting ?? 0,
             originPaced: origin?.paced ?? false,
+            originSerial: OriginRequestBudget.shared.requiresSerialRequests(sourceURL),
             secondsSinceOriginRefusal: origin?.secondsSinceLastRefusal,
             secondsSinceSessionStart: Self.seconds(from: started, to: now),
             secondsSinceLastRung: sinceLast)
@@ -3341,7 +3391,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
     /// The ladder's own side reader and builder, made on the first rung. Its reads are gated on the
     /// origin having nothing in flight, checked again right before each one.
-    private func makeStillLadderSource(plan: [Segment])
+    func makeStillLadderSource(plan: [Segment])
         -> (keyframes: IFrameRendition, builder: PreviewKeyframeBuilder)? {
         restartLock.lock()
         defer { restartLock.unlock() }
@@ -3374,12 +3424,20 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 let origin = OriginRequestBudget.shared.snapshot(for: url)
                 return (origin?.inflight ?? 0) == 0 && (origin?.waiting ?? 0) == 0
                     && !(origin?.paced ?? false)
+                    && !OriginRequestBudget.shared.requiresSerialRequests(url)
             })
         let made = (keyframes, builder)
         stillLadderSource = made
         EngineLog.emit("[StillLadder] side reader ready (segments=\(plan.count), serial origin="
                        + "\(OriginRequestBudget.shared.requiresSerialRequests(url)))", category: .session)
         return made
+    }
+
+    /// AE#937: whether a restart replacing a wedged demuxer aborts the stuck read before the fresh
+    /// open instead of after it. Only a one-request origin pays for the overlap; elsewhere opening first
+    /// keeps the old demuxer usable when the reopen fails.
+    nonisolated static func abortsWedgedReadBeforeReopen(oldPumpExited: Bool, originSerial: Bool) -> Bool {
+        !oldPumpExited && originSerial
     }
 
     private nonisolated static func seconds(from earlier: DispatchTime, to later: DispatchTime) -> Double {
@@ -3774,6 +3832,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // a gap where nobody claims the link.
         prod.sideReaderLinkGate = sideReaderLinkGate
         prod.playedMediaLedger = playedMediaLedger
+        prod.sourceAnnouncesDiscontinuities = liveSourceAnnouncesDiscontinuities
         prod.onFirstHDR10PlusDetected = { [weak self] in
             self?.notifyHDR10PlusOnce()
         }
@@ -3812,6 +3871,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
         prod.nativeVideoFrameTimeObserverProvider = { [weak self] in
             self?.nativeVideoFrameTimeObserverSnapshot()
         }
+        prod.videoPacketTapProvider = { [weak self] in
+            self?.videoPacketTapSnapshot()
+        }
         // Sodalite#32: build the tap routes lazily on the first producer that has stores + stream
         // indices (the host sets both before start()), then wire the tap onto every producer.
         subtitleTapLock.lock()
@@ -3843,6 +3905,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
             }
             prod.onLiveSegmentSound = { [weak prov] index, first, last in
                 prov?.noteLiveSegmentSound(index: index, firstSeconds: first, lastSeconds: last)
+            }
+            prod.onLiveReadHead = { [weak prov] ptsSeconds in
+                prov?.noteLiveReadHead(ptsSeconds: ptsSeconds)
             }
             // AE#443: the runaway park has to sit above the window this session actually serves, or it
             // bounds the window instead of backstopping it, and its enforcement (a sleeping read
@@ -5060,6 +5125,14 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// re-anchor the producer on AVPlayer's real position after a backpressure wedge (#65). Thread-safe.
     func segmentIndexForPlaylistTime(_ seconds: Double) -> Int {
         restartLock.lock()
+        let sequentialProvider = sequentialOriginPinsProducerToZero ? provider : nil
+        restartLock.unlock()
+        // AE#958: a sequential session's playlist axis is the muxed durations, which drift from the
+        // plan by seconds, so the plan names the wrong segment for a time inside what was cut.
+        if let index = sequentialProvider?.sequentialSegmentIndex(forPlaylistTime: seconds) {
+            return index
+        }
+        restartLock.lock()
         defer { restartLock.unlock() }
         guard !segmentPlan.isEmpty else { return 0 }
         var lo = 0
@@ -5079,6 +5152,15 @@ public final class HLSVideoEngine: @unchecked Sendable {
     func producerCoversPlaylistTime(_ seconds: Double) -> Bool {
         guard let prov = provider else { return true }
         return prov.activeMarchCovers(segmentIndexForPlaylistTime(seconds))
+    }
+
+    /// #941: whether the pump being replaced had already read up to `restartIndex`: it opened at or
+    /// before it and has cut every segment in front of it. A pump writes its segments in order from
+    /// where it opened, so those two facts make the stretch contiguous.
+    nonisolated static func restartContinuesHarvestRun(runStartIndex: Int?, runHighestCaptured: Int,
+                                                       restartIndex: Int) -> Bool {
+        guard let runStartIndex, runHighestCaptured >= runStartIndex else { return false }
+        return runStartIndex <= restartIndex && runHighestCaptured >= restartIndex - 1
     }
 
     /// #93 restart latency: phase split for the "restart took" line, so a slow restart names the
@@ -5131,6 +5213,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // connection.
         let demuxerSuspectDead = mainDemuxerSuspectDead
         mainDemuxerSuspectDead = false
+        let outgoingRunStart = pumpRunStartIndex
         restartLock.unlock()
 
         // AE#443: off `restartLock`, and before `old.stop()` releases the muxer its byte total is read
@@ -5170,6 +5253,13 @@ public final class HLSVideoEngine: @unchecked Sendable {
             // of seeking the demuxer that just failed.
             if !isLiveSession, sideAudioDemuxer == nil, let fresh = registerRestartReopenDemuxer(epoch: epoch) {
                 let reopenStart = DispatchTime.now()
+                // AE#937: on a one-request origin the wedged read holds the only slot, so the fresh
+                // open would wait it out and then overcommit. Abort it first; a failed reopen then
+                // leaves a closed demuxer, whose first read fails into the next #169 revive.
+                let abortedFirst = Self.abortsWedgedReadBeforeReopen(
+                    oldPumpExited: oldPumpExited,
+                    originSerial: OriginRequestBudget.shared.requiresSerialRequests(sourceURL))
+                if abortedFirst { dem.markClosed() }
                 do {
                     // .restartReopen: bounded find_stream_info budget; the FULL playback budget was
                     // the bulk of a 44 s wedge-reopen over WAN (#93 residual). The pass itself must
@@ -5197,7 +5287,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     EngineLog.emit(
                         "[HLSVideoEngine] restart at idx=\(idx): "
                         + (oldPumpExited ? "#169 suspect-dead demuxer" : "old producer wedged")
-                        + "; reopen failed (\(error)), reusing the demuxer",
+                        + "; reopen failed (\(error)), "
+                        + (abortedFirst ? "the aborted demuxer stays (one-request origin)" : "reusing the demuxer"),
                         category: .session
                     )
                 }
@@ -5277,12 +5368,28 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // #416: the outgoing pump's run ends where it got to and the new one begins here. Whatever
         // lies between the two was skipped, and a subtitle set stranded on the near side of that
         // gap can no longer be read as the line still on screen at the landing.
+        // #941: unless this restart only continues the outgoing run (the pump cut every segment up
+        // to the one it now opens at, the out-of-range fetch of the next segment). That run read
+        // through this anchor, not just to its last harvested subtitle packet, and without the claim
+        // the stretch between the two reads as a hole nobody will ever fill: the drain holds at it
+        // until its budget runs out and then decodes across before the new run has harvested the set
+        // that sits there.
+        let continuesRun = Self.restartContinuesHarvestRun(
+            runStartIndex: outgoingRunStart, runHighestCaptured: old?.epochHighestCaptured ?? Int.min,
+            restartIndex: idx)
+        if continuesRun {
+            subtitlePacketStore.noteHarvestReach(.pump, through: absoluteTargetSeconds)
+        }
         subtitlePacketStore.noteHarvestAnchor(.pump, at: absoluteTargetSeconds)
+        restartLock.lock()
+        pumpRunStartIndex = idx
+        restartLock.unlock()
         // build = everything after the seek (re-validation, muxer/producer construction, start).
         let buildMs = max(0, elapsedMs - stopWaitMs - (reopenMs ?? 0) - seekMs)
         EngineLog.emit(
             "[HLSVideoEngine] producer restarted at idx=\(idx) (seek=\(String(format: "%.2f", absoluteTargetSeconds))s [absolute source-PTS], restart took \(String(format: "%.0f", elapsedMs))ms; "
-            + Self.restartPhaseSummary(stopWaitMs: stopWaitMs, reopenMs: reopenMs, seekMs: seekMs, buildMs: buildMs) + ")",
+            + Self.restartPhaseSummary(stopWaitMs: stopWaitMs, reopenMs: reopenMs, seekMs: seekMs, buildMs: buildMs)
+            + (continuesRun ? "; continues run" : "") + ")",
             category: .session
         )
     }

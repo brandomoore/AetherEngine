@@ -105,9 +105,9 @@ struct SWDemuxReadGateTests {
                 // Readiness changes only after the drain above refused the parked packet.
                 if !parked.isEmpty { waitingWithParkedVideo.update { $0 = true } }
                 do {
-                    let next = try source.read(until: wait.map { Date(timeIntervalSinceNow: $0) })
+                    let next = try source.read(maximumWait: wait)
                     parked.append(try #require(next, "a service wake must not masquerade as EOF"))
-                } catch SoftwarePacketReadAhead.ReadError.serviceDue {
+                } catch SoftwarePacketReadAhead.ReadError.idle {
                     serviceWakes.update { $0 += 1 }
                 }
             }
