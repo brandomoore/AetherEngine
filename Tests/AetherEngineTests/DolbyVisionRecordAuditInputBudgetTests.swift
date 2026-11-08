@@ -40,6 +40,23 @@ struct DolbyVisionRecordAuditInputBudgetTests {
         }
     }
 
+    @Test("selective MEL inspection refuses a parser interrupted by the input ceiling")
+    func selectiveMELInputCapFailsPreparation() throws {
+        let data = try TailHeavyMatroska.make(foreignBytes: Self.junkBytes, junkTail: true)
+        try ProbeTestFixtures.withFile(data) { url in
+            let reader = CountingReader(try #require(FileIOReader(url: url)))
+            let demuxer = Demuxer()
+            defer { demuxer.close() }
+            try open(demuxer, url, reader: reader)
+            let atOpen = reader.bytesRead
+            #expect(throws: DolbyVisionRecordAudit.EnhancementLayerInspectionError.inputBudgetExhausted) {
+                try DolbyVisionRecordAudit.peekEnhancementLayerType(
+                    demuxer: demuxer, streamIndex: demuxer.videoStreamIndex, byteBudget: Self.budget)
+            }
+            #expect(reader.bytesRead - atOpen <= Self.budget)
+        }
+    }
+
     @Test("a junk tail stops the walk at its byte budget on a custom reader")
     func junkTailStopsOnTheBudgetOnACustomReader() throws {
         let data = try TailHeavyMatroska.make(foreignBytes: Self.junkBytes, junkTail: true)

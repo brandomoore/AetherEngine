@@ -298,6 +298,13 @@ AV1+DV emits a bare `dav1.10.<dvLevel>` primary for Profile 10.0 (DV-only, no ba
 
 **AV1 Profile 10.1 on the software host** gets its Dolby Vision from the engine rather than from AVFoundation, which ignores the RPU an AV1 stream carries in its ITU-T T.35 metadata OBU and shows the HDR10 base layer. The RPU of a 10.1 stream is the RPU of an HEVC 8.1 stream in another wrapper: the decoder reads it out of each temporal unit, libdovi rewraps it into the `unspec62` form VideoToolbox attaches to an HEVC 8.1 frame, and the decoded frame carries it under the same two keys, on the buffer and on its IOSurface (`DoviDisplayMetadata`), which the system's Dolby Vision display management applies. dav1d attaches it where AV1 has no hardware decode (every Apple TV, M1 / M2 Macs, pre-A17-Pro iPhones), which is where AV1 plays on the software host anyway. Where VideoToolbox decodes AV1 and the host loads with `LoadOptions.preferredDecodePath = .software`, `HardwareVideoDecoder` decodes it and hands out each frame as a copy in a pool of its own: on VideoToolbox's own output buffer the attachment never reached the panel. Measured with a pulse clip, constant pixels under an RPU that alternates, which pulses on an Apple TV 4K (3rd generation, tvOS 27) into an LG CX and on macOS 27 (M5 Pro), where it composites to within 0.0001 PQ of the same RPU played as HEVC 8.1 through AVPlayer; a null-RPU clip stays steady. Profile 10.0 (no base layer) and 10.4 (its HLG base is unmeasured) keep the plain path.
 
+With **`LoadOptions.dolbyVisionHandling = .profile7MELOnly`**, confirmed HEVC P7
+MEL keeps the existing P8.1 conversion and native playback path, while FEL and
+unclassified P7 use the authored HDR10 base. Classification reads the actual RPU,
+not provider labels or the per-frame residual-disable flag. It needs no optional
+FEL component; live P7 remains HDR10. Other profiles are unchanged. Conversion
+telemetry describes the served P8.1 stream; source diagnostics continue to identify P7.
+
 With **`LoadOptions.dolbyVisionHandling = .profile7BaseLayer`**, both Profile 7 MEL
 and FEL use the authored HDR10 base on every display. No RPU conversion or enhancement
 layer reconstruction runs. The native route serves plain `hvc1`, strips the Dolby

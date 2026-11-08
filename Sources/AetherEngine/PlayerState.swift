@@ -406,6 +406,12 @@ public enum DolbyVisionHandling: String, Sendable, Equatable, CaseIterable {
     /// handling. Classification uses the demuxed source, including verified record corrections,
     /// not host/provider metadata. Takes precedence over `preferDualLayerDolbyVision`.
     case profile7BaseLayer
+    /// Convert confirmed HEVC Profile 7 MEL to single-layer 8.1 on the native route;
+    /// present FEL and unclassified Profile 7 as the authored HDR10 base. A bounded,
+    /// non-consuming RPU inspection runs for demuxed on-demand sources before output
+    /// configuration. Live sources remain unclassified. Other profiles stay automatic.
+    /// Does not enable FEL reconstruction, even when `preferDualLayerDolbyVision` is true.
+    case profile7MELOnly
     /// Present the HDR10 / HLG base layer and leave the Dolby Vision out of the container: `hvc1` /
     /// `av01` sample entry, `dvcC` stripped, no `SUPPLEMENTAL-CODECS`, HDR10 / HLG display criteria.
     /// The RPU NAL units stay in the bitstream and are ignored, the way a Profile 7 already plays on a

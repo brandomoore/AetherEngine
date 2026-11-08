@@ -75,6 +75,16 @@ struct ForwardOnlyHeadIsKeptTests {
         return out
     }
 
+    @Test("MEL policy inspection leaves the forward-only source head intact on an unknown RPU")
+    func enhancementInspectionKeepsHead() throws {
+        let expected = try firstPackets(12)
+        let demuxer = try openForwardOnly()
+        defer { demuxer.close() }
+        #expect(try DolbyVisionRecordAudit.peekEnhancementLayerType(
+            demuxer: demuxer, streamIndex: demuxer.videoStreamIndex, packetBudget: 4) == nil)
+        #expect(try readSome(demuxer, 12) == expected)
+    }
+
     @Test("packets peeked on a forward-only source are read again, in order, from the first")
     func peekedPacketsAreReadAgain() throws {
         let expected = try firstPackets(12)

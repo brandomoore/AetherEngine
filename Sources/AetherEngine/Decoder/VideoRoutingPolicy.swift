@@ -350,13 +350,26 @@ enum VideoRoutingPolicy {
         return hdrTransfer && ycbcrMatrix
     }
 
+    /// Resolve the selective host policy before choosing display criteria or configuring a muxer.
+    /// Only a positively identified MEL opts into conversion; missing evidence never means MEL.
+    static func resolvedDolbyVisionHandling(
+        _ handling: DolbyVisionHandling, codecID: AVCodecID, dvProfile: Int?,
+        enhancementLayerType: String?
+    ) -> DolbyVisionHandling {
+        guard handling == .profile7MELOnly else { return handling }
+        // Keep the P7-only fallback when the outer probe has no source identity: a later
+        // native open may discover P7, and must not turn missing evidence into conversion.
+        return codecID == AV_CODEC_ID_HEVC && dvProfile == 7 && enhancementLayerType == "MEL"
+            ? .automatic : .profile7BaseLayer
+    }
+
     static func requestsDolbyVisionBaseLayer(
         handling: DolbyVisionHandling, codecID: AVCodecID, dvProfile: Int?
     ) -> Bool {
         switch handling {
         case .automatic: return false
         case .baseLayerOnly: return true
-        case .profile7BaseLayer: return codecID == AV_CODEC_ID_HEVC && dvProfile == 7
+        case .profile7BaseLayer, .profile7MELOnly: return codecID == AV_CODEC_ID_HEVC && dvProfile == 7
         }
     }
 

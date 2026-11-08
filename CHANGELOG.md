@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased: selective Profile 7 MEL conversion
+
+- Add `DolbyVisionHandling.profile7MELOnly`: use the existing native P8.1 conversion
+  for confirmed HEVC P7 MEL; keep FEL and unknown P7 on the authored HDR10 base.
+  Inspect bounded on-demand packets without consuming them, before output setup.
+  Live P7 stays HDR10. Other profiles and the default automatic policy are unchanged.
+  No optional FEL reconstruction component is required or enabled.
+
 ## Unreleased: native dependency visibility
 
 - **Keep Rust implementation symbols private to the dynamic engine.** Exported

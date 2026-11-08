@@ -2074,7 +2074,7 @@ extension AetherEngine {
             sessionPlan: sourceUpscalePlan, optionOn: loadedOptions.upscalesLowResolutionVideo,
             disabled: sourceUpscaleDisabled)
         host.configuredDVProfile = sourceDVProfile
-        host.dolbyVisionHandling = loadedOptions.dolbyVisionHandling
+        host.dolbyVisionHandling = resolvedDolbyVisionHandling(loadedOptions.dolbyVisionHandling)
         host.preferDualLayerDolbyVision = loadedOptions.preferDualLayerDolbyVision
         host.upscalePlan = upscaleRebuild.plan
         host.elType = elType ?? sourceElType
@@ -2719,6 +2719,32 @@ extension AetherEngine {
             }
         }
 
+        // A reopened custom source may select another authored title or follow a background
+        // teardown. Inspect its own head before output setup; never borrow a previous MEL verdict.
+        if loadedOptions.dolbyVisionHandling == .profile7MELOnly, let pre = customPreopened {
+            sourceDolbyVisionEnhancementLayerType = nil
+            do {
+                let live = loadedOptions.isLive
+                let type = try await BlockingWork.detached(priority: .userInitiated) {
+                    guard !live, let stream = pre.stream(at: pre.videoStreamIndex),
+                          stream.pointee.codecpar.pointee.codec_id == AV_CODEC_ID_HEVC,
+                          Self.dvConfig(stream: stream)?.profile == 7 else { return String?.none }
+                    return try DolbyVisionRecordAudit.peekEnhancementLayerType(
+                        demuxer: pre, streamIndex: pre.videoStreamIndex)
+                }.value
+                try checkLoadCurrent(gen)
+                sourceDolbyVisionEnhancementLayerType = type
+            } catch {
+                pre.markClosed()
+                BlockingWork.detached { pre.close() }
+                guard loadGeneration == gen, !Task.isCancelled else { return nil }
+                releaseHeldPicture(reason: "MEL inspection failed during rebuild")
+                activeAudioTrackIndex = previousAudioIndex
+                publishError(.audioTrackSwitchFailed, "Source inspection failed during rebuild", underlying: error)
+                return error
+            }
+        }
+
         // Capture the reopened title's disc + track metadata before the backend consumes the demuxer
         // (start() nils preopenedDemuxer). Republished after the reload succeeds so a title switch updates
         // the picker; an audio switch / non-disc reload re-publishes identical values, a harmless no-op (#67).
@@ -2842,7 +2868,7 @@ extension AetherEngine {
                     audioSourceStreamIndex: audioStreamIndex,
                     keepDvh1TagWithoutDV: loadedOptions.keepDvh1TagWithoutDV,
                     forceDolbyVisionOnNonDVDisplay: loadedOptions.forceDolbyVisionOnNonDVDisplay,
-                    dolbyVisionHandling: loadedOptions.dolbyVisionHandling,
+                    dolbyVisionHandling: resolvedDolbyVisionHandling(loadedOptions.dolbyVisionHandling),
                     // AE#532: the verdict the load reached, not a second audit: the source has not
                     // changed and the probe that could answer it is gone.
                     dolbyVisionRPUProfile: sourceDolbyVisionRPUProfile,

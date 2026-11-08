@@ -685,6 +685,20 @@ public final class AetherEngine: ObservableObject {
     /// source after the probe that measured it is gone.
     var sourceDolbyVisionRPUProfile: Int? = nil
 
+    // Session-local evidence for the selective MEL policy; retained for internal item rebuilds.
+    var sourceDolbyVisionEnhancementLayerType: String? = nil
+
+    func resolvedDolbyVisionHandling(_ handling: DolbyVisionHandling) -> DolbyVisionHandling {
+        VideoRoutingPolicy.resolvedDolbyVisionHandling(
+            // Non-nil evidence was obtained only after verifying HEVC Profile 7. That identity
+            // survives a background teardown, unlike lastDetectedVideoCodec's decoder cache.
+            handling, codecID: sourceDolbyVisionEnhancementLayerType != nil ? AV_CODEC_ID_HEVC : lastDetectedVideoCodec,
+            dvProfile: sourceDolbyVisionEnhancementLayerType != nil ? 7 : (
+                DolbyVisionRecordAudit.correctedProfile(
+                    record: sourceDVProfile, rpu: sourceDolbyVisionRPUProfile) ?? sourceDVProfile),
+            enhancementLayerType: sourceDolbyVisionEnhancementLayerType)
+    }
+
     /// AE#541: the two load-time terms of the HDR route that a reload cannot take again. The criteria
     /// readout is only an answer around the handshake, and an in-place rebuild runs none, so an audio
     /// pick that routed from the raw `panelIsInHDRMode` alone dropped an HDR title from the master to
@@ -4640,6 +4654,7 @@ public final class AetherEngine: ObservableObject {
         sourceDVBLCompatID = nil
         sourceDolbyVisionBaseLayerPresentable = false
         sourceDolbyVisionRPUProfile = nil
+        sourceDolbyVisionEnhancementLayerType = nil
         sessionPanelHDRReadout = nil
         sessionObservedDisplayCaps = nil
         sourceVideoFrameRate = nil
@@ -4718,6 +4733,7 @@ public final class AetherEngine: ObservableObject {
         // AE#532: what this source's own RPU says, and the profile the route should believe instead of
         // the record. Both stay nil for every source but a Profile 5 record over a BT.2020 YCbCr HDR VUI.
         var detectedDVRPUProfile: Int? = nil
+        var detectedEnhancementLayerType: String? = nil
         var correctedDVProfile: Int? = nil
         var detectedCodecID: AVCodecID = AV_CODEC_ID_NONE
         var detectedFieldOrder: AVFieldOrder = AV_FIELD_UNKNOWN
@@ -4784,6 +4800,7 @@ public final class AetherEngine: ObservableObject {
         }
         var probeOpened = false
         var probeFailure: Error?
+        var enhancementInspectionFailed = false
         do {
             // Detach avformat_open_input + find_stream_info off @MainActor (~6 s on a slow CDN).
             // AetherEngine#10: a @MainActor async body without a suspension point blocks the main thread
@@ -4854,6 +4871,34 @@ public final class AetherEngine: ObservableObject {
                               + "; the record stands"),
                         category: .engine)
                 }
+                if options.dolbyVisionHandling == .profile7MELOnly {
+                    if detectedCodecID == AV_CODEC_ID_HEVC,
+                       (correctedDVProfile ?? detectedDVProfileNum) == 7, !options.isLive {
+                        do {
+                            detectedEnhancementLayerType = try await BlockingWork.detached(priority: .userInitiated) { [probe] in
+                                try DolbyVisionRecordAudit.peekEnhancementLayerType(
+                                    demuxer: probe, streamIndex: videoIdx)
+                            }.value
+                        } catch {
+                            enhancementInspectionFailed = true
+                            throw error
+                        }
+                        // This inspection suspends before the format/criteria decision. A superseded
+                        // load must not publish its evidence or use a successor's session state.
+                        try checkLoadCurrent(gen)
+                    }
+                    options.dolbyVisionHandling = VideoRoutingPolicy.resolvedDolbyVisionHandling(
+                        options.dolbyVisionHandling, codecID: detectedCodecID,
+                        dvProfile: correctedDVProfile ?? detectedDVProfileNum,
+                        enhancementLayerType: detectedEnhancementLayerType)
+                    // The selective policy never requests the experimental composer, even if a
+                    // caller combined it with the reconstruction preference.
+                    options.preferDualLayerDolbyVision = false
+                    EngineLog.emit(
+                        "[AetherEngine] profile7MELOnly: enhancement layer "
+                        + "\(detectedEnhancementLayerType ?? "unknown"); handling=\(options.dolbyVisionHandling.rawValue)",
+                        category: .engine)
+                }
                 presentsDolbyVisionBaseLayer = VideoRoutingPolicy.presentsDolbyVisionBaseLayer(
                     handling: options.dolbyVisionHandling,
                     codecID: detectedCodecID,
@@ -4914,6 +4959,13 @@ public final class AetherEngine: ObservableObject {
                 BlockingWork.detached { [probe] in probe.close() }
             }
             try checkLoadCurrent(gen)
+        }
+        if enhancementInspectionFailed, let failure = probeFailure {
+            // Never hand a possibly interrupted parser to a playback host or reopen it silently.
+            probe.markClosed()
+            BlockingWork.detached { [probe] in probe.close() }
+            publishLoadFailure(failure)
+            throw failure
         }
         if let probedGeometry {
             sourceVideoWidth = probedGeometry.width
@@ -5062,6 +5114,7 @@ public final class AetherEngine: ObservableObject {
         sourceDVBLCompatID = detectedDVBLCompatIDNum
         sourceDolbyVisionBaseLayerPresentable = detectedDVBaseLayerPresentable
         sourceDolbyVisionRPUProfile = detectedDVRPUProfile
+        sourceDolbyVisionEnhancementLayerType = detectedEnhancementLayerType
         sourceVideoFrameRate = detectedRate
         sourceVideoBitrate = detectedVideoBitrate
         sourceVideoStreamFormat = detectedVideoStreamFormat
@@ -7149,6 +7202,7 @@ public final class AetherEngine: ObservableObject {
         sourceDVBLCompatID = nil
         sourceDolbyVisionBaseLayerPresentable = false
         sourceDolbyVisionRPUProfile = nil
+        sourceDolbyVisionEnhancementLayerType = nil
         sessionPanelHDRReadout = nil
         sessionObservedDisplayCaps = nil
         sourceVideoFrameRate = nil

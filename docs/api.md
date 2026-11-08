@@ -1597,6 +1597,22 @@ The served container and display criteria omit Dolby Vision, while source diagno
 retain the original profile. Like the existing handling option, it survives internal
 reloads and is correctable through `reloadAtCurrentPosition(applying:)`.
 
+`DolbyVisionHandling.profile7MELOnly` converts only confirmed HEVC Profile 7 MEL
+through the existing native P8.1 route. FEL and unclassified P7 retain the authored
+HDR10 base; other profiles keep automatic handling. A bounded RPU inspection peeks
+at the session demuxer's head before format, display criteria and muxer selection,
+retaining inspected packets for playback. It neither decodes an enhancement layer
+nor requires the `DualLayerDolbyVision` trait. Live sources are not inspected and
+retain the P7 HDR10 fallback. `preferDualLayerDolbyVision` cannot enable reconstruction
+under this policy. Direct remote HLS bypass remains controlled by the delivered stream.
+The original requested policy is retained across reloads: a fresh source load
+classifies again, while internal item rebuilds reuse this session's evidence; reopened custom sources
+are inspected again so a different authored title cannot borrow a MEL verdict.
+Unavailable or malformed RPU data never opts into conversion. An inspection read
+failure or raw-input ceiling aborts preparation instead of reusing an interrupted
+parser; complete-packet budget exhaustion safely selects HDR10. This is a playback
+policy, not a claim about patent licensing or verified display output.
+
 All flags default to safe values; the table is the full set. Depth for the media-shaped ones is in [formats.md](formats.md).
 
 | Option | Default | What it does |
