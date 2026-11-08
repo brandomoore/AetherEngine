@@ -48,7 +48,9 @@ enum RemoteHLSMediaSelection {
     /// that is the only stable handle on a rendition the engine declared itself (#316).
     static let playlistNameIdentifier = AVMetadataIdentifier(rawValue: "m3u8/NAME")
 
-    static func playlistName(of option: AVMediaSelectionOption) async -> String? {
+    static func playlistName(
+        of option: AVMediaSelectionOption, isolation: isolated (any Actor)? = #isolation
+    ) async -> String? {
         for item in option.commonMetadata where item.identifier == playlistNameIdentifier {
             if let value = try? await item.load(.stringValue) { return value }
         }

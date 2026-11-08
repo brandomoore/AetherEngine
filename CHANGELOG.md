@@ -67,6 +67,18 @@ the public-API contract.
   of the FFmpeg track index. Other containers and synthetic/native tracks leave
   it nil so disc-navigation hosts never infer a PID from list order.
 
+- **Allow Profile 7-only HDR10 fallback without disabling other Dolby Vision profiles.**
+  `DolbyVisionHandling.profile7BaseLayer` serves both MEL and FEL as the authored
+  HDR10 base, with no P7-to-8.1 conversion or dual-layer reconstruction. The engine
+  classifies the demuxed source, including verified record corrections, and preserves
+  automatic handling for other profiles. The default remains `.automatic`.
+
+- **Keep media-selection reads off the UI thread during a media-service stall.**
+  Subtitle pinning, native track selection and audio readback use a bounded
+  background reader. A timeout is not a confirmed empty selection, and a late
+  result cannot change a replaced item or superseded selection. Timed-out
+  readers retain their admission slot until the native getter actually returns.
+
 - Add `updateDisplayMatching(enabled:)` for ready SDR preview/fullscreen
   transitions without reopening media, including forward-only live streams.
   HDR and AVKit/shared-secondary pipelines keep the explicit reload path.

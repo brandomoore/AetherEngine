@@ -401,6 +401,11 @@ public enum DecodePath: String, Sendable, Equatable, CaseIterable {
 public enum DolbyVisionHandling: String, Sendable, Equatable, CaseIterable {
     /// Dolby Vision wherever the profile and the display allow it. A Profile 7 source takes the native route (converted to single-layer 8.1 where the display takes Dolby Vision, the HDR10 base layer where it does not); its FEL is reconstructed (dual-layer Metal) instead only when `LoadOptions.preferDualLayerDolbyVision` is true, which defaults to false. The default.
     case automatic
+    /// Present only HEVC Profile 7 (MEL or FEL) as its authored HDR10 base, without
+    /// RPU conversion or enhancement-layer reconstruction. Other profiles keep automatic
+    /// handling. Classification uses the demuxed source, including verified record corrections,
+    /// not host/provider metadata. Takes precedence over `preferDualLayerDolbyVision`.
+    case profile7BaseLayer
     /// Present the HDR10 / HLG base layer and leave the Dolby Vision out of the container: `hvc1` /
     /// `av01` sample entry, `dvcC` stripped, no `SUPPLEMENTAL-CODECS`, HDR10 / HLG display criteria.
     /// The RPU NAL units stay in the bitstream and are ignored, the way a Profile 7 already plays on a

@@ -1587,6 +1587,16 @@ session log says so once per session. Playback itself is unaffected.
 
 ## LoadOptions
 
+`DolbyVisionHandling.profile7BaseLayer` is a selective alternative to `.baseLayerOnly`.
+It presents HEVC Profile 7 (MEL and FEL) as its authored HDR10 base, without RPU
+conversion or enhancement-layer reconstruction, regardless of display capability.
+It takes precedence over `preferDualLayerDolbyVision` and forced DV signaling.
+Other profiles retain automatic handling. The demuxed record, including verified
+RPU-based record corrections, determines the policy; host metadata is not consulted.
+The served container and display criteria omit Dolby Vision, while source diagnostics
+retain the original profile. Like the existing handling option, it survives internal
+reloads and is correctable through `reloadAtCurrentPosition(applying:)`.
+
 All flags default to safe values; the table is the full set. Depth for the media-shaped ones is in [formats.md](formats.md).
 
 | Option | Default | What it does |

@@ -2702,6 +2702,7 @@ public final class AetherEngine: ObservableObject {
     /// so the reload re-applies this to keep an active rendition (PiP) rendering. Cleared with
     /// the track table on load/stop so a new session never inherits a stale selection.
     var nativeSubtitleReapplyOrdinal: Int?
+    var nativeSubtitleSelectionGeneration = UUID()
 
     /// Whole-file decode tasks filling native stores for load-declared external tracks (#88).
     var externalNativeStoreFillTask: Task<Void, Never>? = nil
@@ -2745,6 +2746,8 @@ public final class AetherEngine: ObservableObject {
     /// the pin from spinning if the system re-selects after every deselect. Session-scoped, all four
     /// dropped together by `cancelNativeLegibleDeselectPin()`.
     var nativeLegibleDeselectPinTask: Task<Void, Never>? = nil
+    var nativeLegibleReselectionTask: Task<Void, Never>? = nil
+    var nativeLegibleReselectionRevision: UInt64 = 0
     var nativeLegibleDeselectPinObserver: NSObjectProtocol? = nil
     var nativeLegibleDeselectPinItem: AVPlayerItem? = nil
     var nativeLegibleDeselectPinGroup: AVMediaSelectionGroup? = nil
@@ -4825,8 +4828,6 @@ public final class AetherEngine: ObservableObject {
                     dvBlCompatID: detectedDVBLCompatIDNum,
                     colorTransfer: stream.pointee.codecpar.pointee.color_trc,
                     colorMatrix: stream.pointee.codecpar.pointee.color_space)
-                presentsDolbyVisionBaseLayer = options.dolbyVisionHandling == .baseLayerOnly
-                    && detectedDVBaseLayerPresentable
                 // AE#532: a Profile 5 record over a VUI that contradicts it is the one claim in a
                 // container worth checking against the bitstream, because a Profile 5 RPU cannot carry a
                 // residual or an NLQ and the RPU is therefore proof rather than a guess. Gated on that
@@ -4853,11 +4854,19 @@ public final class AetherEngine: ObservableObject {
                               + "; the record stands"),
                         category: .engine)
                 }
-                if options.dolbyVisionHandling == .baseLayerOnly, detectedFormat == .dolbyVision {
+                presentsDolbyVisionBaseLayer = VideoRoutingPolicy.presentsDolbyVisionBaseLayer(
+                    handling: options.dolbyVisionHandling,
+                    codecID: detectedCodecID,
+                    dvProfile: correctedDVProfile ?? detectedDVProfileNum,
+                    dvBlCompatID: detectedDVBLCompatIDNum,
+                    colorTransfer: stream.pointee.codecpar.pointee.color_trc,
+                    colorMatrix: stream.pointee.codecpar.pointee.color_space)
+                if detectedFormat == .dolbyVision,
+                   presentsDolbyVisionBaseLayer || options.dolbyVisionHandling == .baseLayerOnly {
                     EngineLog.emit(
                         presentsDolbyVisionBaseLayer
-                            ? "[AetherEngine] dolbyVisionHandling=baseLayerOnly: DV Profile "
-                              + "\(detectedDVProfileNum ?? 0) presents its base layer; the format clamp and the "
+                            ? "[AetherEngine] dolbyVisionHandling=\(options.dolbyVisionHandling.rawValue): DV Profile "
+                              + "\(correctedDVProfile ?? detectedDVProfileNum ?? 0) presents its base layer; the format clamp and the "
                               + "criteria request leave Dolby Vision unclaimed"
                             : "[AetherEngine] dolbyVisionHandling=baseLayerOnly ignored: DV Profile "
                               + "\(detectedDVProfileNum ?? 0) compat=\(detectedDVBLCompatIDNum ?? 0) has no base "

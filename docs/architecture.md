@@ -60,6 +60,12 @@ available, and two stranded lanes defer diagnostics rather than spawn more threa
 diagnostic stalls, not an underlying media-server failure, and does not claim to make every other
 AVPlayer operation nonblocking. Telemetry retains its existing separate, serial read path.
 
+Media-selection getters use `NativeMediaSelectionReader` rather than the UI actor.
+Its process-wide limit is two native reads and its waiter deadline is 0.5 seconds.
+Timing out or cancelling a waiter does not release a still-running reader.
+An unavailable snapshot is not an empty selection; consumers retain their current
+intent and recheck item, cancellation and selection ownership after each await.
+
 Same-session item swaps fold the outgoing item's last observed transferred-byte/dropped-frame totals
 without a getter at the handover, then reconcile only the delta from its final background read.
 Telemetry readings also refresh that cache, so an older diagnostic snapshot cannot move it backwards

@@ -350,6 +350,16 @@ enum VideoRoutingPolicy {
         return hdrTransfer && ycbcrMatrix
     }
 
+    static func requestsDolbyVisionBaseLayer(
+        handling: DolbyVisionHandling, codecID: AVCodecID, dvProfile: Int?
+    ) -> Bool {
+        switch handling {
+        case .automatic: return false
+        case .baseLayerOnly: return true
+        case .profile7BaseLayer: return codecID == AV_CODEC_ID_HEVC && dvProfile == 7
+        }
+    }
+
     /// `LoadOptions.dolbyVisionHandling` resolved against the source: true when the host asked for the
     /// base layer AND the source has one to present. Both halves are here so the format clamp, the
     /// criteria request, the codec route and the software-path guard read one answer.
@@ -361,7 +371,9 @@ enum VideoRoutingPolicy {
         colorTransfer: AVColorTransferCharacteristic,
         colorMatrix: AVColorSpace
     ) -> Bool {
-        guard handling == .baseLayerOnly else { return false }
+        guard requestsDolbyVisionBaseLayer(
+            handling: handling, codecID: codecID, dvProfile: dvProfile
+        ) else { return false }
         return dolbyVisionBaseLayerIsPresentable(
             codecID: codecID, dvProfile: dvProfile, dvBlCompatID: dvBlCompatID,
             colorTransfer: colorTransfer, colorMatrix: colorMatrix)
