@@ -271,6 +271,51 @@ public enum DolbyVisionRecordAudit {
         return nil
     }
 
+    /// The selective MEL policy inspects the session's head without consuming it. The demuxer's
+    /// peek queue preserves every inspected audio/video packet, including on forward-only readers.
+    /// No second connection or rewind is needed. Complete-packet limits yield unknown. A read/input
+    /// ceiling failure throws: a parser interrupted mid-packet cannot safely be reused for playback.
+    enum EnhancementLayerInspectionError: Error { case inputBudgetExhausted }
+
+    static func peekEnhancementLayerType(
+        demuxer: Demuxer, streamIndex: Int32, packetBudget: Int = auditPacketBudget,
+        byteBudget: Int64 = Int64(walkByteBudget)
+    ) throws -> String? {
+        guard packetBudget > 0, byteBudget > 0,
+              let stream = demuxer.stream(at: streamIndex) else { return nil }
+        let cp = stream.pointee.codecpar
+        let framing = A53SEIParser.nalFraming(
+            codec: .hevc, extradata: cp?.pointee.extradata,
+            size: Int(cp?.pointee.extradata_size ?? 0))
+        let (totalPacketBudget, overflow) = packetBudget.multipliedReportingOverflow(
+            by: foreignPacketFuseMultiplier)
+        guard !overflow else { return nil }
+        var videoPackets = 0
+        var packetBytes: Int64 = 0
+        var result: String?
+        demuxer.beginInputByteBudget(byteBudget)
+        defer { demuxer.endInputByteBudget() }
+        do {
+            try demuxer.peekPackets(maxPackets: totalPacketBudget) { packet in
+                packetBytes += Int64(max(packet.pointee.size, 0))
+                if packet.pointee.stream_index == streamIndex {
+                    videoPackets += 1
+                    result = DoviRpuConverter.enhancementLayerType(packet, framing: framing)
+                }
+                return result != nil || videoPackets >= packetBudget || packetBytes >= byteBudget
+            }
+        } catch {
+            if demuxer.inputByteBudgetExhausted {
+                throw EnhancementLayerInspectionError.inputBudgetExhausted
+            }
+            throw error
+        }
+        guard !demuxer.inputByteBudgetExhausted else {
+            throw EnhancementLayerInspectionError.inputBudgetExhausted
+        }
+        return result
+    }
+
     /// Audit BIT-2: the walk counted only video packets, so a source that stops delivering video after
     /// its head made every open read the rest of the file. Every packet counts against these instead.
     /// No AVDISCARD_ALL on the other streams: the demuxer would then skip them inside one read, where

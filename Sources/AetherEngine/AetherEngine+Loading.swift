@@ -2074,7 +2074,7 @@ extension AetherEngine {
             sessionPlan: sourceUpscalePlan, optionOn: loadedOptions.upscalesLowResolutionVideo,
             disabled: sourceUpscaleDisabled)
         host.configuredDVProfile = sourceDVProfile
-        host.dolbyVisionHandling = loadedOptions.dolbyVisionHandling
+        host.dolbyVisionHandling = resolvedDolbyVisionHandling(loadedOptions.dolbyVisionHandling)
         host.preferDualLayerDolbyVision = loadedOptions.preferDualLayerDolbyVision
         host.upscalePlan = upscaleRebuild.plan
         host.elType = elType ?? sourceElType
@@ -2646,6 +2646,8 @@ extension AetherEngine {
         loadedURL = url
         lastDetectedVideoCodec = preservedVideoCodec
         lastRequiresDeinterlaceWarmup = preservedRequiresDeinterlaceWarmup
+        await drainReopenedSourceInspection()
+        guard loadGeneration == gen, !Task.isCancelled else { return nil }
 
         // Custom sources: no URL to reopen; rebuild on the retained reader. Demuxer opens at byte 0; loadSoftware/loadNative seek to startPosition.
         // Preserve the caller's probe budget (#68) across the reopen so an audio/title switch doesn't re-incur the full find_stream_info cost the caller paid to avoid.
@@ -2716,6 +2718,39 @@ extension AetherEngine {
                 }
                 EngineLog.emit("[AetherEngine] reload superseded after disc URL reopen; unwinding", category: .engine)
                 return nil
+            }
+        }
+
+        // A reopened custom source may select another authored title or follow a background
+        // teardown. Inspect its own head before output setup; never borrow a previous MEL verdict.
+        if loadedOptions.dolbyVisionHandling == .profile7MELOnly, let pre = customPreopened {
+            sourceDolbyVisionEnhancementLayerType = nil
+            let live = loadedOptions.isLive
+            let inspection = ReopenedSourceInspection(
+                demuxer: pre,
+                task: BlockingWork.detached(priority: .userInitiated) {
+                    guard !live, let stream = pre.stream(at: pre.videoStreamIndex),
+                          stream.pointee.codecpar.pointee.codec_id == AV_CODEC_ID_HEVC,
+                          Self.dvConfig(stream: stream)?.profile == 7 else { return String?.none }
+                    return try DolbyVisionRecordAudit.peekEnhancementLayerType(
+                        demuxer: pre, streamIndex: pre.videoStreamIndex)
+                })
+            reopenedSourceInspection = inspection
+            defer {
+                if reopenedSourceInspection === inspection { reopenedSourceInspection = nil }
+            }
+            do {
+                let type = try await inspection.task.value
+                try checkLoadCurrent(gen)
+                sourceDolbyVisionEnhancementLayerType = type
+                try await refreshReopenedVideoPresentation(pre, options: loadedOptions, generation: gen)
+            } catch {
+                await inspection.cancel().value
+                guard loadGeneration == gen, !Task.isCancelled else { return nil }
+                releaseHeldPicture(reason: "MEL inspection failed during rebuild")
+                activeAudioTrackIndex = previousAudioIndex
+                publishError(.audioTrackSwitchFailed, "Source inspection failed during rebuild", underlying: error)
+                return error
             }
         }
 
@@ -2842,7 +2877,7 @@ extension AetherEngine {
                     audioSourceStreamIndex: audioStreamIndex,
                     keepDvh1TagWithoutDV: loadedOptions.keepDvh1TagWithoutDV,
                     forceDolbyVisionOnNonDVDisplay: loadedOptions.forceDolbyVisionOnNonDVDisplay,
-                    dolbyVisionHandling: loadedOptions.dolbyVisionHandling,
+                    dolbyVisionHandling: resolvedDolbyVisionHandling(loadedOptions.dolbyVisionHandling),
                     // AE#532: the verdict the load reached, not a second audit: the source has not
                     // changed and the probe that could answer it is gone.
                     dolbyVisionRPUProfile: sourceDolbyVisionRPUProfile,
@@ -2871,9 +2906,8 @@ extension AetherEngine {
                 activeAudioDecoder = nativeVideoSession?.audioPipelineDescription
                 presentCurrentLayer()
                 // Wait for pending AVKit display-criteria handshake before resuming (first frame must not hit a mid-transition panel).
-                // #274: this reload preserved the criteria (resetDisplayCriteria: false) and re-applies none,
-                // so only a sole-writer host's re-write on the swapped item can still switch anything; the
-                // published (panel-clamped) format decides whether that can be a dynamic-range switch.
+                // Ordinary reloads preserve criteria. Selective MEL reinspection may have refreshed
+                // them for a different title; a sole-writer host may also rewrite them on item swap.
                 await displayCriteria.waitForSwitch(
                     startGrace: Self.playGateGrace(
                         criteriaUnchanged: false,

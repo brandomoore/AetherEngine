@@ -88,6 +88,160 @@ struct DolbyVisionBaseLayerTests {
         return try engine.resolveCodecRoute(codecpar: UnsafePointer(par.ptr))
     }
 
+    @Test("Selective P7 policy converts only confirmed MEL", arguments: ["MEL", "FEL", "unknown", ""])
+    func selectiveMELRoute(elType: String) throws {
+        let handling = VideoRoutingPolicy.resolvedDolbyVisionHandling(
+            .profile7MELOnly, codecID: AV_CODEC_ID_HEVC, dvProfile: 7,
+            enhancementLayerType: elType.isEmpty ? nil : elType)
+        for dvDisplay in [false, true] {
+            for forceDV in [false, true] {
+                let route = try Self.route(
+                    DVCodecpar(profile: 7, blCompatibilityID: 6),
+                    dvDisplay: dvDisplay, handling: handling, forceDV: forceDV)
+                #expect(route.convertP7ToProfile81 == (elType == "MEL"))
+                #expect((route.doviConfig == .strip) == (elType != "MEL"))
+                #expect((route.supplementalCodecs != nil || route.codecTagOverride == "dvh1") == (elType == "MEL"))
+                #expect(route.dvVariant == .profile7)
+            }
+        }
+    }
+
+    @Test("Demuxed MEL/FEL RPUs select the intended route without consuming their packets", arguments: [false, true])
+    func demuxedSelectiveRoute(fel: Bool) throws {
+        let rpu = DoviRpuGuardTests.craft(
+            pieces: [[.polynomial], [.mmr], [.mmr]], residual: fel ? .fel : .mel)
+        let data = try TailHeavyMatroska.make(foreignBytes: 0, rpuNAL: rpu)
+        try ProbeTestFixtures.withFile(data) { url in
+            let demuxer = Demuxer()
+            defer { demuxer.close() }
+            try demuxer.open(url: url, profile: .dolbyVisionRecordAuditDemuxer(
+                callerProbesize: nil, callerMaxAnalyzeDuration: nil))
+            let type = try DolbyVisionRecordAudit.peekEnhancementLayerType(
+                demuxer: demuxer, streamIndex: demuxer.videoStreamIndex)
+            #expect(type == (fel ? "FEL" : "MEL"))
+            let packet = try #require(try demuxer.readPacket())
+            defer { var p: UnsafeMutablePointer<AVPacket>? = packet; trackedPacketFree(&p) }
+            #expect(DoviRpuConverter.enhancementLayerType(packet) == type,
+                    "The first inspected packet must still be available to playback")
+            let handling = VideoRoutingPolicy.resolvedDolbyVisionHandling(
+                .profile7MELOnly, codecID: AV_CODEC_ID_HEVC, dvProfile: 7, enhancementLayerType: type)
+            let route = try Self.route(DVCodecpar(profile: 7, blCompatibilityID: 6), handling: handling)
+            #expect(route.convertP7ToProfile81 == !fel)
+            #expect((route.doviConfig == .strip) == fel)
+        }
+    }
+
+    @Test("Missing outer probe identity retains the conservative P7-only fallback")
+    func selectiveMELUnknownSource() throws {
+        let handling = VideoRoutingPolicy.resolvedDolbyVisionHandling(
+            .profile7MELOnly, codecID: AV_CODEC_ID_NONE, dvProfile: nil,
+            enhancementLayerType: nil)
+        #expect(handling == .profile7BaseLayer)
+        let route = try Self.route(DVCodecpar(profile: 7, blCompatibilityID: 6), handling: handling)
+        #expect(!route.convertP7ToProfile81)
+        #expect(route.doviConfig == .strip)
+    }
+
+    @Test("Reopened MEL and FEL titles refresh the presented format in both directions")
+    @MainActor
+    func reopenedTitlePresentation() async throws {
+        let reader = ProbeRecordingReader(data: try TailHeavyMatroska.make(foreignBytes: 0))
+        let demuxer = Demuxer()
+        defer { demuxer.close() }
+        try demuxer.open(reader: reader, formatHint: "matroska", profile: .playback)
+        let stream = try #require(demuxer.stream(at: demuxer.videoStreamIndex))
+        let parameters = DVCodecpar(profile: 7, blCompatibilityID: 6)
+        #expect(avcodec_parameters_copy(stream.pointee.codecpar, parameters.ptr) == 0)
+        let engine = try AetherEngine()
+        defer { engine.stop() }
+        var options = LoadOptions()
+        options.dolbyVisionHandling = .profile7MELOnly
+        options.panelIsInHDRMode = true
+        engine.sessionObservedDisplayCaps = DisplayCapabilities(
+            supportsHDR: true, supportsDolbyVision: true, supportsHDR10: true, supportsHLG: true)
+        for type in ["FEL", "MEL", "FEL", "MEL"] {
+            engine.sourceDolbyVisionEnhancementLayerType = type
+            try await engine.refreshReopenedVideoPresentation(
+                demuxer, options: options, generation: engine.loadGeneration)
+            #expect(engine.videoFormat == (type == "MEL" ? .dolbyVision : .hdr10))
+            #expect(engine.sourceVideoFormat == .dolbyVision)
+            #expect(engine.sourceDVProfile == 7)
+            #expect(engine.sourceDVBLCompatID == 6)
+        }
+    }
+
+    @Test("Superseded source inspection drains before reader reuse and cancels only once")
+    @MainActor
+    func supersededInspectionDrains() async throws {
+        let reader = ProbeRecordingReader(data: try TailHeavyMatroska.make(foreignBytes: 0))
+        let demuxer = Demuxer()
+        try demuxer.open(reader: reader, formatHint: "matroska", profile: .playback)
+        let gate = ProbeTestGate()
+        defer { gate.open() }
+        let inspection = AetherEngine.ReopenedSourceInspection(
+            demuxer: demuxer, task: BlockingWork.detached {
+                gate.wait()
+                return "MEL"
+            })
+        let engine = try AetherEngine()
+        engine.reopenedSourceInspection = inspection
+        try await waitFor { gate.entered }
+        engine.stop()
+        #expect(reader.cancelCount == 1)
+        let drainingStarted = ProbeTestBox(false)
+        let drained = ProbeTestBox(false)
+        let drain = Task {
+            drainingStarted.update { $0 = true }
+            await engine.drainReopenedSourceInspection()
+            drained.update { $0 = true }
+        }
+        try await waitFor { drainingStarted.value }
+        #expect(!drained.value)
+        gate.open()
+        await drain.value
+        #expect(engine.reopenedSourceInspection == nil)
+        let successor = Demuxer()
+        defer { successor.close() }
+        try successor.open(reader: reader, formatHint: "matroska", profile: .playback)
+        await inspection.cancel().value
+        #expect(reader.cancelCount == 1)
+        let packet = try #require(try successor.readPacket())
+        var ownedPacket: UnsafeMutablePointer<AVPacket>? = packet
+        trackedPacketFree(&ownedPacket)
+    }
+
+    @Test("Selective policy does not enable reconstruction even when requested")
+    func selectiveMELNeverReconstructsFEL() {
+        #expect(DualLayerRouteDecision.blockingReasonBeforeProbe(
+            codecID: AV_CODEC_ID_HEVC, dvProfile: 7, dolbyVisionHandling: .profile7MELOnly,
+            preferDualLayerDolbyVision: true, isLive: false, isSourceSeekable: true,
+            canHardwareDecode: { true }) != nil)
+        #expect(!SoftwarePlaybackHost.shouldUseDualLayerDecoder(
+            dvProfile: 7, elType: "FEL", preferDualLayerDolbyVision: true,
+            dolbyVisionHandling: .profile7MELOnly))
+    }
+
+    @Test("Selective policy survives session rebuild resolution and stays source-scoped")
+    @MainActor
+    func selectiveMELSessionEvidence() throws {
+        let engine = try AetherEngine()
+        engine.lastDetectedVideoCodec = AV_CODEC_ID_HEVC
+        engine.sourceDVProfile = 7
+        engine.sourceDolbyVisionEnhancementLayerType = "MEL"
+        #expect(engine.resolvedDolbyVisionHandling(.profile7MELOnly) == .automatic)
+        engine.lastDetectedVideoCodec = AV_CODEC_ID_NONE // background teardown clears the decoder cache
+        #expect(engine.resolvedDolbyVisionHandling(.profile7MELOnly) == .automatic)
+        engine.sourceDolbyVisionEnhancementLayerType = "FEL" // newly inspected authored title
+        #expect(engine.resolvedDolbyVisionHandling(.profile7MELOnly) == .profile7BaseLayer)
+        engine.sourceDVProfile = 5
+        engine.sourceDolbyVisionRPUProfile = 7
+        engine.sourceDolbyVisionEnhancementLayerType = "MEL"
+        #expect(engine.resolvedDolbyVisionHandling(.profile7MELOnly) == .automatic)
+        engine.stop()
+        #expect(engine.sourceDolbyVisionEnhancementLayerType == nil)
+        #expect(engine.resolvedDolbyVisionHandling(.profile7MELOnly) == .profile7BaseLayer)
+    }
+
     /// The reported shape: a Profile 5 record over an HDR10 VUI.
     private static func relabelledProfile5() -> DVCodecpar {
         DVCodecpar(profile: 5, blCompatibilityID: 0)
@@ -131,6 +285,13 @@ struct DolbyVisionBaseLayerTests {
         for source in sources {
             let automatic = try Self.route(source, dvDisplay: dvDisplay, handling: .automatic)
             let scoped = try Self.route(source, dvDisplay: dvDisplay, handling: .profile7BaseLayer)
+            let selective = try Self.route(source, dvDisplay: dvDisplay, handling: .profile7MELOnly)
+            #expect(selective.codecTagOverride == scoped.codecTagOverride)
+            #expect(selective.primaryCodecs == scoped.primaryCodecs)
+            #expect(selective.supplementalCodecs == scoped.supplementalCodecs)
+            #expect(selective.doviConfig == scoped.doviConfig)
+            #expect(selective.videoRange == scoped.videoRange)
+            #expect(selective.convertP7ToProfile81 == scoped.convertP7ToProfile81)
             #expect(scoped.codecTagOverride == automatic.codecTagOverride)
             #expect(scoped.primaryCodecs == automatic.primaryCodecs)
             #expect(scoped.supplementalCodecs == automatic.supplementalCodecs)

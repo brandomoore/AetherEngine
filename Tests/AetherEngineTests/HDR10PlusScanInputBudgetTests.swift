@@ -58,10 +58,16 @@ enum TailHeavyMatroska {
 
     /// `bareRecord` leaves the hvcC as its 22-byte header with no parameter-set arrays, the record of a
     /// source whose parameter sets are in-band.
-    static func make(foreignBytes: Int, junkTail: Bool = false, bareRecord: Bool = false) throws -> Data {
+    static func make(foreignBytes: Int, junkTail: Bool = false, bareRecord: Bool = false,
+                     rpuNAL: [UInt8]? = nil) throws -> Data {
         let mp4 = try ProbeTestFixtures.decode(HDR10PlusProbeIntegrationTests.hdr10Base64)
         var (hvcC, frames) = try hevcTrack(mp4)
         if bareRecord { hvcC = Array(hvcC.prefix(22)) + [0] }
+        if let rpuNAL {
+            let n = UInt32(rpuNAL.count)
+            let framed = [UInt8(n >> 24), UInt8((n >> 16) & 255), UInt8((n >> 8) & 255), UInt8(n & 255)] + rpuNAL
+            for index in frames.indices { frames[index] += framed }
+        }
 
         var out = Data()
         out += element([0x1A, 0x45, 0xDF, 0xA3],

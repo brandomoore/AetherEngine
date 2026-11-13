@@ -685,6 +685,20 @@ public final class AetherEngine: ObservableObject {
     /// source after the probe that measured it is gone.
     var sourceDolbyVisionRPUProfile: Int? = nil
 
+    // Session-local evidence for the selective MEL policy; retained for internal item rebuilds.
+    var sourceDolbyVisionEnhancementLayerType: String? = nil
+
+    func resolvedDolbyVisionHandling(_ handling: DolbyVisionHandling) -> DolbyVisionHandling {
+        VideoRoutingPolicy.resolvedDolbyVisionHandling(
+            // Non-nil evidence was obtained only after verifying HEVC Profile 7. That identity
+            // survives a background teardown, unlike lastDetectedVideoCodec's decoder cache.
+            handling, codecID: sourceDolbyVisionEnhancementLayerType != nil ? AV_CODEC_ID_HEVC : lastDetectedVideoCodec,
+            dvProfile: sourceDolbyVisionEnhancementLayerType != nil ? 7 : (
+                DolbyVisionRecordAudit.correctedProfile(
+                    record: sourceDVProfile, rpu: sourceDolbyVisionRPUProfile) ?? sourceDVProfile),
+            enhancementLayerType: sourceDolbyVisionEnhancementLayerType)
+    }
+
     /// AE#541: the two load-time terms of the HDR route that a reload cannot take again. The criteria
     /// readout is only an answer around the handshake, and an in-place rebuild runs none, so an audio
     /// pick that routed from the raw `panelIsInHDRMode` alone dropped an HDR title from the master to
@@ -2660,6 +2674,94 @@ public final class AetherEngine: ObservableObject {
     /// without this, player dismissal/channel zapping left the probe reconnecting through subsequent sessions.
     private var inFlightProbeDemuxer: Demuxer?
 
+    // A replacement may reuse this reader only after the inspection and its close have joined.
+    @MainActor
+    final class ReopenedSourceInspection {
+        let demuxer: Demuxer
+        let task: Task<String?, Error>
+        private var teardown: Task<Void, Never>?
+
+        init(demuxer: Demuxer, task: Task<String?, Error>) {
+            self.demuxer = demuxer
+            self.task = task
+        }
+
+        @discardableResult
+        func cancel() -> Task<Void, Never> {
+            if let teardown { return teardown }
+            demuxer.markClosed()
+            task.cancel()
+            let demuxer = demuxer, task = task
+            let teardown = BlockingWork.detached {
+                _ = await task.result
+                demuxer.close()
+            }
+            self.teardown = teardown
+            return teardown
+        }
+    }
+
+    var reopenedSourceInspection: ReopenedSourceInspection?
+
+    func drainReopenedSourceInspection() async {
+        guard let inspection = reopenedSourceInspection else { return }
+        await inspection.cancel().value
+        if reopenedSourceInspection === inspection { reopenedSourceInspection = nil }
+    }
+
+    func refreshReopenedVideoPresentation(
+        _ demuxer: Demuxer, options: LoadOptions, generation: UInt64
+    ) async throws {
+        guard let stream = demuxer.stream(at: demuxer.videoStreamIndex) else { return }
+        let codecpar = stream.pointee.codecpar.pointee
+        let config = Self.dvConfig(stream: stream)
+        sourceDVProfile = config?.profile
+        sourceDVBLCompatID = config?.blCompatID
+        sourceDolbyVisionRPUProfile = nil
+        lastDetectedVideoCodec = codecpar.codec_id
+        sourceVideoFormat = Self.detectVideoFormat(stream: stream)
+        sourceDolbyVisionBaseLayerPresentable = VideoRoutingPolicy.dolbyVisionBaseLayerIsPresentable(
+            codecID: codecpar.codec_id, dvProfile: config?.profile, dvBlCompatID: config?.blCompatID,
+            colorTransfer: codecpar.color_trc, colorMatrix: codecpar.color_space)
+        let baseLayer = VideoRoutingPolicy.presentsDolbyVisionBaseLayer(
+            handling: resolvedDolbyVisionHandling(options.dolbyVisionHandling),
+            codecID: codecpar.codec_id, dvProfile: config?.profile, dvBlCompatID: config?.blCompatID,
+            colorTransfer: codecpar.color_trc, colorMatrix: codecpar.color_space)
+        let capabilities = Self.reloadDisplayCapabilities(
+            observedAtLoad: sessionObservedDisplayCaps,
+            hostAssertsDolbyVision: options.panelPresentsDolbyVision,
+            readNow: { Self.displayCapabilities })
+        let format = Self.effectiveVideoFormat(
+            detected: sourceVideoFormat, stream: stream,
+            capabilities: baseLayer ? capabilities.withoutDolbyVision() : capabilities)
+        if options.engineWritesDisplayCriteria {
+            let result = displayCriteria.apply(
+                format: format, frameRate: FrameRateSnap.snap(Self.detectFrameRate(stream: stream) ?? 0),
+                codecTag: sourceVideoFormat == .dolbyVision && !baseLayer ? 0x64766831 : nil,
+                omitColorExtensions: options.omitCriteriaColorExtensions)
+            switch result {
+            case .willSwitch:
+                await displayCriteria.waitForSwitch(
+                    consumesRecord: false, isCurrent: { self.loadGeneration == generation })
+                try checkLoadCurrent(generation)
+                sessionPanelHDRReadout = displayCriteria.currentPanelIsHDR()
+            case .applied:
+                sessionPanelHDRReadout = displayCriteria.currentPanelIsHDR()
+            case .unchanged:
+                break
+            }
+        }
+        #if os(iOS) || os(macOS)
+        videoFormat = format
+        #else
+        videoFormat = Self.presentedVideoFormat(
+            effectiveFormat: format,
+            panelPresentsHDR: Self.sessionPanelPresentsHDR(
+                hostAsserts: options.panelIsInHDRMode, criteriaReadout: sessionPanelHDRReadout),
+            sourceCarriesHDR10Plus: sourceCarriesHDR10PlusMetadata)
+        #endif
+    }
+
     /// One entry per native mov_text track in muxer-declaration order (#55). Built at load from the merged
     /// subtitleTracks (probed non-bitmap streams + load-declared external tracks, #88). sourceStreamIndex is
     /// nil for external entries, whose synthetic id lives in externalID; language is ISO 639-2. Ordinal =
@@ -4506,6 +4608,8 @@ public final class AetherEngine: ObservableObject {
         // Audit LIF-101: an owed background decision is settled from here, not from a waypoint.
         beginLoadInFlight(gen)
         defer { endLoadInFlight(gen) }
+        await drainReopenedSourceInspection()
+        try checkLoadCurrent(gen)
         // #361: open the host-visible startup sequence. A reroute re-entering load() continues the
         // one already running rather than starting a second.
         let startupGen = beginStartupProgress()
@@ -4640,6 +4744,7 @@ public final class AetherEngine: ObservableObject {
         sourceDVBLCompatID = nil
         sourceDolbyVisionBaseLayerPresentable = false
         sourceDolbyVisionRPUProfile = nil
+        sourceDolbyVisionEnhancementLayerType = nil
         sessionPanelHDRReadout = nil
         sessionObservedDisplayCaps = nil
         sourceVideoFrameRate = nil
@@ -4718,6 +4823,7 @@ public final class AetherEngine: ObservableObject {
         // AE#532: what this source's own RPU says, and the profile the route should believe instead of
         // the record. Both stay nil for every source but a Profile 5 record over a BT.2020 YCbCr HDR VUI.
         var detectedDVRPUProfile: Int? = nil
+        var detectedEnhancementLayerType: String? = nil
         var correctedDVProfile: Int? = nil
         var detectedCodecID: AVCodecID = AV_CODEC_ID_NONE
         var detectedFieldOrder: AVFieldOrder = AV_FIELD_UNKNOWN
@@ -4784,6 +4890,7 @@ public final class AetherEngine: ObservableObject {
         }
         var probeOpened = false
         var probeFailure: Error?
+        var enhancementInspectionFailed = false
         do {
             // Detach avformat_open_input + find_stream_info off @MainActor (~6 s on a slow CDN).
             // AetherEngine#10: a @MainActor async body without a suspension point blocks the main thread
@@ -4854,6 +4961,34 @@ public final class AetherEngine: ObservableObject {
                               + "; the record stands"),
                         category: .engine)
                 }
+                if options.dolbyVisionHandling == .profile7MELOnly {
+                    if detectedCodecID == AV_CODEC_ID_HEVC,
+                       (correctedDVProfile ?? detectedDVProfileNum) == 7, !options.isLive {
+                        do {
+                            detectedEnhancementLayerType = try await BlockingWork.detached(priority: .userInitiated) { [probe] in
+                                try DolbyVisionRecordAudit.peekEnhancementLayerType(
+                                    demuxer: probe, streamIndex: videoIdx)
+                            }.value
+                        } catch {
+                            enhancementInspectionFailed = true
+                            throw error
+                        }
+                        // This inspection suspends before the format/criteria decision. A superseded
+                        // load must not publish its evidence or use a successor's session state.
+                        try checkLoadCurrent(gen)
+                    }
+                    options.dolbyVisionHandling = VideoRoutingPolicy.resolvedDolbyVisionHandling(
+                        options.dolbyVisionHandling, codecID: detectedCodecID,
+                        dvProfile: correctedDVProfile ?? detectedDVProfileNum,
+                        enhancementLayerType: detectedEnhancementLayerType)
+                    // The selective policy never requests the experimental composer, even if a
+                    // caller combined it with the reconstruction preference.
+                    options.preferDualLayerDolbyVision = false
+                    EngineLog.emit(
+                        "[AetherEngine] profile7MELOnly: enhancement layer "
+                        + "\(detectedEnhancementLayerType ?? "unknown"); handling=\(options.dolbyVisionHandling.rawValue)",
+                        category: .engine)
+                }
                 presentsDolbyVisionBaseLayer = VideoRoutingPolicy.presentsDolbyVisionBaseLayer(
                     handling: options.dolbyVisionHandling,
                     codecID: detectedCodecID,
@@ -4914,6 +5049,13 @@ public final class AetherEngine: ObservableObject {
                 BlockingWork.detached { [probe] in probe.close() }
             }
             try checkLoadCurrent(gen)
+        }
+        if enhancementInspectionFailed, let failure = probeFailure {
+            // Never hand a possibly interrupted parser to a playback host or reopen it silently.
+            probe.markClosed()
+            BlockingWork.detached { [probe] in probe.close() }
+            publishLoadFailure(failure)
+            throw failure
         }
         if let probedGeometry {
             sourceVideoWidth = probedGeometry.width
@@ -5062,6 +5204,7 @@ public final class AetherEngine: ObservableObject {
         sourceDVBLCompatID = detectedDVBLCompatIDNum
         sourceDolbyVisionBaseLayerPresentable = detectedDVBaseLayerPresentable
         sourceDolbyVisionRPUProfile = detectedDVRPUProfile
+        sourceDolbyVisionEnhancementLayerType = detectedEnhancementLayerType
         sourceVideoFrameRate = detectedRate
         sourceVideoBitrate = detectedVideoBitrate
         sourceVideoStreamFormat = detectedVideoStreamFormat
@@ -7149,6 +7292,7 @@ public final class AetherEngine: ObservableObject {
         sourceDVBLCompatID = nil
         sourceDolbyVisionBaseLayerPresentable = false
         sourceDolbyVisionRPUProfile = nil
+        sourceDolbyVisionEnhancementLayerType = nil
         sessionPanelHDRReadout = nil
         sessionObservedDisplayCaps = nil
         sourceVideoFrameRate = nil
@@ -8222,6 +8366,7 @@ public final class AetherEngine: ObservableObject {
         cancelAtmosConfirmation()
         // markClosed() aborts a probe blocked in avformat_open_input/find_stream_info (lock-free, idempotent).
         inFlightProbeDemuxer?.markClosed()
+        reopenedSourceInspection?.cancel()
         liveTelemetrySampler?.stop()
         liveTelemetrySampler = nil
         diagnostics.liveTelemetry = nil

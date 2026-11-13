@@ -139,6 +139,25 @@ struct DoviRpuConverterTests {
         #expect(nalTypes(pkt) == [1, 62])
     }
 
+    @Test("MEL classification and P8.1 conversion work independently of the FEL build trait",
+          arguments: [false, true])
+    func selectiveMELClassification(annexB: Bool) {
+        let framing: VideoNALFraming = annexB ? .annexB : .lengthPrefixed(size: 4)
+        for (residual, expected) in [(DoviRpuGuardTests.Residual.mel, "MEL"), (.fel, "FEL")] {
+            let rpu = DoviRpuGuardTests.craft(pieces: [[.polynomial], [.mmr], [.mmr]], residual: residual)
+            let input = framed([hevcNAL(type: 1, payload: [0xAA, 0xBB]), rpu,
+                                hevcNAL(type: 63, payload: [0xCC])], framing)
+            let pkt = packet(from: input)
+            defer { free(pkt) }
+            #expect(DoviRpuConverter.enhancementLayerType(pkt, framing: framing) == expected)
+            #expect(packetBytes(pkt) == input, "Classification must not rewrite the input")
+            if expected == "MEL" {
+                #expect(DoviRpuConverter.convertPacketToProfile81(pkt, framing: framing))
+                #expect(packetBytes(pkt) != input)
+            }
+        }
+    }
+
     @Test("A non-DV packet is left untouched")
     func leavesNonDVUntouched() {
         let bl = hevcNAL(type: 1, payload: [0xAA, 0xBB])
