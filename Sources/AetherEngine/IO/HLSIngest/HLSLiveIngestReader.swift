@@ -3,7 +3,7 @@ import CommonCrypto
 
 /// Live HLS ingest as a forward-only `IOReader`. Resolves master -> highest-BANDWIDTH variant, polls the media playlist, fetches MPEG-TS segments through a bounded prefetch pipeline (#177: up to `maxConcurrentSegmentFetches` in flight, committed in playlist order), and exposes a single TS byte stream for `AetherEngine.load(source: .custom(reader, formatHint: "mpegts"), options: <isLive>)`.
 ///
-/// Phase-1: unencrypted TS on the MAIN variant only. Encrypted (EXT-X-KEY), fMP4 (EXT-X-MAP), unreachable, and stalled streams all go terminal with `HLSIngestError`; host falls back to the Jellyfin-mediated route.
+/// MPEG-TS segments on the main variant, clear or AES-128 clear-key (decrypted by `HLSSegmentDecryptor`). SAMPLE-AES, fMP4 (EXT-X-MAP), unreachable and stalled streams go terminal with `HLSIngestError`, and the host falls back to another route.
 ///
 /// Demuxed-audio (ARD-style video-only variants + separate EXT-X-MEDIA:TYPE=AUDIO,URI=...): the resolver spins up a companion `HLSLiveIngestReader` on the rendition playlist and exposes it as `companionAudioReader`. The companion accepts TS and Apple packed audio (ADTS AAC with ID3v2 PRIV program-clock timestamp; ARD masteraudio1 style). `resolveSegmentFormatHint` blocks until the first segment is classified so the engine picks the right FFmpeg demuxer. `packedAudioTimestampOffset90k` anchors the synthesized side-audio clock.
 ///
@@ -798,7 +798,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     /// origin is (audit NET-7), and a segment's sub-range when it has one. Internal for the
     /// header-contract tests.
     func makeRequest(_ url: URL, byteRange: HLSByteRange? = nil) -> URLRequest {
-        var request = URLRequest(url: url)
+        var request = URLRequest(engineURL: url)
         for (field, value) in RedirectHeaderPolicy.scoped(
             httpHeaders, grantedFor: credentialOrigin, sentTo: url) {
             request.setValue(value, forHTTPHeaderField: field)

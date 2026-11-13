@@ -508,7 +508,7 @@ final class AudioBridge: @unchecked Sendable {
         }
         if self.shaping.isActive {
             AudioShapingMatrix.apply(to: swrAllocated, input: &inLayout, output: &enc.pointee.ch_layout,
-                                     dialogueGain: self.shaping.dialogueGain)
+                                     dialogueGain: self.shaping.dialogueGain, lfeMixLevel: self.shaping.lfeMixLevel)
         }
         let initRet = initializeResampler(swrCtx, outputRate: sampleRate)
         guard initRet >= 0 else {
@@ -1100,7 +1100,7 @@ final class AudioBridge: @unchecked Sendable {
         )
         if setRet >= 0, let scratchCtx = scratch, shaping.isActive {
             AudioShapingMatrix.apply(to: scratchCtx, input: &sf.pointee.ch_layout, output: &enc.pointee.ch_layout,
-                                     dialogueGain: shaping.dialogueGain)
+                                     dialogueGain: shaping.dialogueGain, lfeMixLevel: shaping.lfeMixLevel)
         }
         let initRet = setRet >= 0 && scratch != nil
             ? initializeResampler(scratch, outputRate: enc.pointee.sample_rate) : setRet

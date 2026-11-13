@@ -56,6 +56,7 @@ struct HTTPDiscIOReaderTests {
     // MARK: - Read / seek over a mock range server
 
     private func makeReader(_ bytes: [UInt8], base: Int = 4096, maxChunk: Int = 4096,
+                            streamRange: Int = 64 * 1024 * 1024,
                             failFirst: Int = 0) -> HTTPDiscIOReader? {
         let url = URL(string: "http://disc.test/test.iso")!
         MockRangeURLProtocol.reset()
@@ -64,7 +65,136 @@ struct HTTPDiscIOReaderTests {
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = [MockRangeURLProtocol.self]
         return HTTPDiscIOReader(url: url, baseChunkSize: base, maxChunkSize: maxChunk,
+                                streamRangeSize: streamRange,
                                 requestTimeout: 5, sessionConfiguration: config)
+    }
+
+    // MARK: - #1007 progressive sequential ranges
+
+    /// Runs `read` on its own thread, so a read that blocks on the network fails the test instead
+    /// of hanging it (a Swift Testing time limit cannot stop a blocked thread).
+    private func readOffThread(_ r: HTTPDiscIOReader, size: Int,
+                               within seconds: Double) -> (n: Int32, bytes: [UInt8])? {
+        let done = DispatchSemaphore(value: 0)
+        let box = ReadBox()
+        Thread.detachNewThread {
+            var out = [UInt8](repeating: 0, count: size)
+            let n = out.withUnsafeMutableBufferPointer { r.read($0.baseAddress, size: Int32(size)) }
+            box.set(n, out)
+            done.signal()
+        }
+        guard done.wait(timeout: .now() + seconds) == .success else { return nil }
+        return box.get()
+    }
+
+    private func readAll(_ r: HTTPDiscIOReader, count: Int) -> [UInt8] {
+        var got: [UInt8] = []
+        var out = [UInt8](repeating: 0, count: 50_000)
+        while got.count < count {
+            let n = out.withUnsafeMutableBufferPointer { r.read($0.baseAddress, size: 50_000) }
+            guard n > 0 else { break }
+            got += out[0..<Int(n)]
+        }
+        return got
+    }
+
+    private static let streamStart = 64 * 1024
+
+    @Test("#1007: a sequential read is served from the bytes that arrived, not the response tail")
+    func progressiveReadDoesNotWaitForTheTail() throws {
+        let src = (0..<(1 << 20)).map { UInt8(truncatingIfNeeded: $0 &* 7) }
+        let r = try #require(makeReader(src, streamRange: 256 * 1024))
+        defer { r.cancel() }
+        MockRangeURLProtocol.stallFromOffset = Self.streamStart
+        MockRangeURLProtocol.stallAfterBytes = 32 * 1024
+        #expect(readOffThread(r, size: Self.streamStart, within: 5)?.n == Int32(Self.streamStart))
+        let second = try #require(readOffThread(r, size: 4096, within: 3),
+                                  "the read waited on a response tail that never came")
+        #expect(second.n == 4096)
+        #expect(second.bytes == Array(src[Self.streamStart..<(Self.streamStart + 4096)]))
+    }
+
+    @Test("#1007: a short body resumes at the next unread byte")
+    func shortBodyResumesAtTheFrontier() throws {
+        let src = (0..<(1 << 20)).map { UInt8(truncatingIfNeeded: $0 &* 13) }
+        let r = try #require(makeReader(src, streamRange: 256 * 1024))
+        MockRangeURLProtocol.shortBodyOnceFromOffset = Self.streamStart
+        MockRangeURLProtocol.shortBodyBytes = 32 * 1024
+        #expect(readAll(r, count: src.count) == src)
+        let resumed = "bytes=\(Self.streamStart + 32 * 1024)-"
+        #expect(MockRangeURLProtocol.requestedRanges.contains { $0.hasPrefix(resumed) })
+    }
+
+    @Test("#1007: sequential playback chains bounded ranges and still seeks")
+    func streamChainsRangesAndSeeks() throws {
+        let src = (0..<(1 << 20)).map { UInt8(truncatingIfNeeded: $0 &* 31) }
+        let r = try #require(makeReader(src, streamRange: 192 * 1024))
+        #expect(readAll(r, count: src.count) == src)
+        let streamRequests = MockRangeURLProtocol.requestedRanges.filter {
+            !$0.hasPrefix("bytes=0-")
+        }
+        #expect(streamRequests.count >= 5)
+        #expect(r.seek(offset: 100, whence: SEEK_SET) == 100)
+        let back = try #require(readOffThread(r, size: 100, within: 3))
+        #expect(back.bytes == Array(src[100..<200]))
+    }
+
+    @Test("#1007: once playback streamed, any sequential continuation streams; discovery still ramps")
+    func playbackStreamsEveryContinuation() {
+        // Discovery: a continuation below the top of the window keeps ramping.
+        #expect(!HTTPDiscIOReader.streams(position: 8192, lastFetchEnd: 8192, nextChunk: 8192,
+                                          maxChunk: 65536, streamRange: 262_144))
+        #expect(HTTPDiscIOReader.streams(position: 8192, lastFetchEnd: 8192, nextChunk: 8192,
+                                         maxChunk: 65536, streamRange: 262_144, playback: true))
+        // A jump is never a continuation, playback or not: the first read after a seek stays small.
+        #expect(!HTTPDiscIOReader.streams(position: 900_000, lastFetchEnd: 8192, nextChunk: 4096,
+                                          maxChunk: 65536, streamRange: 262_144, playback: true))
+    }
+
+    @Test("#1007: after a seek in playback, the continuation streams instead of re-ramping")
+    func seekInPlaybackRestreams() throws {
+        // The reader floors its base window at 64 KiB, so the ramp is 64, 128, 256, 512 KiB.
+        let base = 64 * 1024, range = 1024 * 1024
+        let src = (0..<(4 << 20)).map { UInt8(truncatingIfNeeded: $0 &* 11) }
+        let r = try #require(makeReader(src, base: base, maxChunk: 512 * 1024, streamRange: range))
+        defer { r.cancel() }
+        let played = readAll(r, count: 2 * 1024 * 1024)
+        #expect(played == Array(src[0..<played.count]))
+        // Backwards, so the target is outside what the stream holds (the mock ignores suspend and
+        // buffers ahead to EOF).
+        let target = 128 * 1024
+        #expect(r.seek(offset: Int64(target), whence: SEEK_SET) == Int64(target))
+        let first = try #require(readOffThread(r, size: base, within: 3))
+        #expect(first.bytes == Array(src[target..<(target + base)]))
+        let next = try #require(readOffThread(r, size: 4096, within: 3))
+        #expect(next.bytes == Array(src[(target + base)..<(target + base + 4096)]))
+        let ranges = MockRangeURLProtocol.requestedRanges
+        #expect(ranges.contains("bytes=\(target)-\(target + base - 1)"), "\(ranges)")
+        let streamed = ranges.last { $0.hasPrefix("bytes=\(target + base)-") }
+        #expect(streamed == "bytes=\(target + base)-\(target + base + range - 1)",
+                "the continuation re-ramped instead of streaming: \(ranges)")
+    }
+
+    @Test("#1007: a streamed range that starts elsewhere is refused")
+    func misplacedStreamRangeIsRefused() throws {
+        let src = (0..<(1 << 20)).map { UInt8(truncatingIfNeeded: $0) }
+        let r = try #require(makeReader(src, streamRange: 256 * 1024))
+        #expect(readOffThread(r, size: Self.streamStart, within: 5)?.n == Int32(Self.streamStart))
+        MockRangeURLProtocol.misrangedFor.insert("http://disc.test/test.iso")
+        let next = try #require(readOffThread(r, size: 4096, within: 10))
+        #expect(next.n == -1)
+    }
+
+    @Test("#1007: cancel wakes a read parked on a stalled stream")
+    func cancelWakesAStalledStream() throws {
+        let src = (0..<(1 << 20)).map { UInt8(truncatingIfNeeded: $0) }
+        let r = try #require(makeReader(src, streamRange: 256 * 1024))
+        MockRangeURLProtocol.stallFromOffset = Self.streamStart
+        MockRangeURLProtocol.stallAfterBytes = 0
+        #expect(readOffThread(r, size: Self.streamStart, within: 5)?.n == Int32(Self.streamStart))
+        Thread.detachNewThread { Thread.sleep(forTimeInterval: 0.3); r.cancel() }
+        let parked = try #require(readOffThread(r, size: 4096, within: 3), "cancel did not wake the read")
+        #expect(parked.n == -1)
     }
 
     @Test("AVSEEK_SIZE returns the total size from the range probe")
@@ -222,9 +352,24 @@ final class MockRangeURLProtocol: URLProtocol, @unchecked Sendable {
     /// Range-ignoring proxy or a cache-miss fallback), body starting at byte 0 of the source.
     nonisolated(unsafe) static var plain200AfterProbeFor: Set<String> = []
 
+    /// #1007: a request starting at or past this offset sends its head and `stallAfterBytes` of
+    /// body, then holds the connection open until it is cancelled.
+    nonisolated(unsafe) static var stallFromOffset: Int?
+    nonisolated(unsafe) static var stallAfterBytes = 0
+    /// #1007: the first request starting at or past this offset ends cleanly after
+    /// `shortBodyBytes`, short of the range it announced.
+    nonisolated(unsafe) static var shortBodyOnceFromOffset: Int?
+    nonisolated(unsafe) static var shortBodyBytes = 0
+    /// Every `Range` header received, in order.
+    nonisolated(unsafe) static var requestedRanges: [String] = []
+    private static let recordLock = NSLock()
+
     static func reset() {
         bytesByURL = [:]; disableRangeFor = []; failFirstForURL = [:]
         misrangedFor = []; plain200AfterProbeFor = []
+        stallFromOffset = nil; stallAfterBytes = 0
+        shortBodyOnceFromOffset = nil; shortBodyBytes = 0
+        recordLock.lock(); requestedRanges = []; recordLock.unlock()
     }
 
     override class func canInit(with request: URLRequest) -> Bool { true }
@@ -232,6 +377,9 @@ final class MockRangeURLProtocol: URLProtocol, @unchecked Sendable {
     override func stopLoading() {}
 
     override func startLoading() {
+        if let rv = request.value(forHTTPHeaderField: "Range") {
+            Self.recordLock.lock(); Self.requestedRanges.append(rv); Self.recordLock.unlock()
+        }
         guard let url = request.url, let data = Self.bytesByURL[url.absoluteString] else {
             client?.urlProtocol(self, didFailWithError: URLError(.fileDoesNotExist))
             return
@@ -272,7 +420,24 @@ final class MockRangeURLProtocol: URLProtocol, @unchecked Sendable {
         headers["Content-Length"] = String(slice.count)
         let resp = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: headers)!
         client?.urlProtocol(self, didReceive: resp, cacheStoragePolicy: .notAllowed)
+        if status == 206, let stall = Self.stallFromOffset, lower >= stall {
+            if Self.stallAfterBytes > 0 { client?.urlProtocol(self, didLoad: slice.prefix(Self.stallAfterBytes)) }
+            return
+        }
+        if status == 206, let short = Self.shortBodyOnceFromOffset, lower >= short {
+            Self.shortBodyOnceFromOffset = nil
+            client?.urlProtocol(self, didLoad: slice.prefix(Self.shortBodyBytes))
+            client?.urlProtocolDidFinishLoading(self)
+            return
+        }
         client?.urlProtocol(self, didLoad: slice)
         client?.urlProtocolDidFinishLoading(self)
     }
+}
+
+private final class ReadBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: (Int32, [UInt8]) = (0, [])
+    func set(_ n: Int32, _ bytes: [UInt8]) { lock.lock(); value = (n, bytes); lock.unlock() }
+    func get() -> (n: Int32, bytes: [UInt8]) { lock.lock(); defer { lock.unlock() }; return value }
 }

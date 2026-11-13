@@ -21,7 +21,7 @@ final class AudioAVPlayerHost {
     @Published private(set) var timeControlStatus: AVPlayer.TimeControlStatus = .paused
     /// The item has played and is now starved: AVPlayer is `waitingToPlayAtSpecifiedRate`, or it posted
     /// `AVPlayerItemPlaybackStalled` and has not resumed since. The engine folds this into `isBuffering`,
-    /// so `playbackPhase` reads `.rebuffering` on this path too (architecture.md promised that; the flag
+    /// so `playbackPhase` reads `.rebuffering` on this path too (the architecture docs promised that; the flag
     /// never existed). Startup spin-up before the first `.playing` is not a rebuffer, and a paused player
     /// is never one. See `rebufferingFlag(hasStartedPlaying:status:waitingReason:stalledSinceLastPlaying:)`.
     @Published private(set) var isRebuffering: Bool = false
@@ -34,7 +34,7 @@ final class AudioAVPlayerHost {
     /// Created once, reused across replaceCurrentItem swaps for the host's lifetime.
     let avPlayer = AVPlayer()
 
-    #if os(tvOS) || os(iOS)
+    #if os(iOS) || os(tvOS) || os(visionOS)
     /// Now-Playing session bound to THIS player. The SHARED MPRemoteCommandCenter / MPNowPlayingInfoCenter aren't
     /// reliably bound to a bare AVPlayer: on background pause (rate 0) the app is dropped as active Now-Playing app
     /// and the shared center stops receiving ANY command (play button never returns). Binding a session keeps
@@ -84,7 +84,7 @@ final class AudioAVPlayerHost {
     /// Per-item Now-Playing dictionary (MPMediaItemProperty keys + the host's force-decoded, @Sendable-wrapped
     /// MPMediaItemArtwork) that the auto-publishing MPNowPlayingSession reads from AVPlayerItem.nowPlayingInfo.
     /// Stashed so a back-to-back item swap (replaceCurrentItem) replays it onto the new item.
-    #if os(iOS) || os(tvOS)
+    #if os(iOS) || os(tvOS) || os(visionOS)
     private var pendingNowPlayingInfo: [String: Any] = [:]
     #endif
 
@@ -96,7 +96,7 @@ final class AudioAVPlayerHost {
         self.ownsNowPlaying = ownsNowPlaying
         self.diagnosticPool = diagnosticPool
         self.diagnosticRead = diagnosticRead
-        #if os(tvOS) || os(iOS)
+        #if os(iOS) || os(tvOS) || os(visionOS)
         nowPlayingSession = MPNowPlayingSession(players: [avPlayer])
         // Apple's documented path for a bare AVPlayer (WWDC22 110338, MPNowPlayingSession.h): the session
         // auto-publishes Now-Playing from the player (elapsed/rate/state/duration) merged with the per-item
@@ -113,7 +113,7 @@ final class AudioAVPlayerHost {
     /// Re-assert this session as active Now-Playing app on track start, reclaiming ownership if lost (keeps the
     /// Home overlay + remote commands alive across a background pause).
     func becomeActiveNowPlaying() {
-        #if os(tvOS) || os(iOS)
+        #if os(iOS) || os(tvOS) || os(visionOS)
         guard ownsNowPlaying else { return }
         nowPlayingSession.becomeActiveIfPossible(completion: { _ in })
         #endif
@@ -138,7 +138,7 @@ final class AudioAVPlayerHost {
         item.externalMetadata = pendingExternalMetadata
         #endif
         // Stamp the per-item Now-Playing dict the auto-publishing session reads (iOS/tvOS 16+). Replays across swaps.
-        #if os(iOS) || os(tvOS)
+        #if os(iOS) || os(tvOS) || os(visionOS)
         item.nowPlayingInfo = pendingNowPlayingInfo.isEmpty ? nil : pendingNowPlayingInfo
         #endif
         playerItem = item
@@ -180,7 +180,7 @@ final class AudioAVPlayerHost {
 
         // Status KVO: readyToPlay publishes duration + isReady and performs the pending seek; failed publishes the
         // error. Observer hops to its own queue, so round-trip back to MainActor.
-        statusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
+        statusObservation = item.observe(\.status, options: []) { [weak self] item, _ in
             switch item.status {
             case .readyToPlay:
                 Task { @MainActor [weak self] in
@@ -221,7 +221,7 @@ final class AudioAVPlayerHost {
         }
 
         // Mirror player rate into published `rate`. timeControlStatus and rate move together; rate is simplest.
-        rateObservation = avPlayer.observe(\.rate, options: [.new]) { [weak self] player, _ in
+        rateObservation = avPlayer.observe(\.rate, options: []) { [weak self] player, _ in
             let r = player.rate
             Task { @MainActor [weak self] in
                 self?.rate = r
@@ -230,7 +230,7 @@ final class AudioAVPlayerHost {
 
         // Mirror timeControlStatus so the engine reconciles transport on system-driven play/pause, and fold
         // it into the rebuffer flag: the first `.playing` opens the window in which a wait is a stall.
-        timeControlObservation = avPlayer.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
+        timeControlObservation = avPlayer.observe(\.timeControlStatus, options: []) { [weak self] player, _ in
             let status = player.timeControlStatus
             let reason = player.reasonForWaitingToPlay?.rawValue
             Task { @MainActor [weak self] in
@@ -244,7 +244,7 @@ final class AudioAVPlayerHost {
                 self.refreshRebuffering()
             }
         }
-        waitingReasonObservation = avPlayer.observe(\.reasonForWaitingToPlay, options: [.new]) { [weak self] player, _ in
+        waitingReasonObservation = avPlayer.observe(\.reasonForWaitingToPlay, options: []) { [weak self] player, _ in
             // A cleared reason arrives just ahead of the status that ends the wait; that edge settles it.
             guard let reason = player.reasonForWaitingToPlay?.rawValue else { return }
             Task { @MainActor [weak self] in
@@ -353,7 +353,7 @@ final class AudioAVPlayerHost {
     /// Stage the per-item Now-Playing dictionary (current and subsequent items). The auto-publishing session merges
     /// these keys with the player's elapsed/rate/duration. Pass an empty dict to clear. Writing the per-item
     /// AVPlayerItem.nowPlayingInfo property is the documented, queue-safe channel (no MPNowPlayingInfoCenter write).
-    #if os(iOS) || os(tvOS)
+    #if os(iOS) || os(tvOS) || os(visionOS)
     func setNowPlayingInfo(_ info: [String: Any]) {
         pendingNowPlayingInfo = info
         playerItem?.nowPlayingInfo = info.isEmpty ? nil : info
@@ -413,7 +413,7 @@ final class AudioAVPlayerHost {
         isRebuffering = false
         // Clear the staged dict so the next track starts clean; the auto-publishing session drops the Now-Playing
         // entry when the player has no current item.
-        #if os(iOS) || os(tvOS)
+        #if os(iOS) || os(tvOS) || os(visionOS)
         pendingNowPlayingInfo = [:]
         #endif
         // Host is persistent across tracks; clear terminal flags so the next load's subscriptions (wired before

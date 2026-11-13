@@ -14,12 +14,14 @@ struct UpscaleRouteDecisionTests {
         sdr: Bool = true, dv: Bool = false, eightBit: Bool = true,
         display: CGSize = CGSize(width: 3840, height: 2160),
         airPlay: Bool = false, demuxedLive: Bool = false,
-        factors: (Int, Int) -> [Float] = UpscaleRouteDecisionTests.defaultFactors
+        factors: (Int, Int) -> [Float] = UpscaleRouteDecisionTests.defaultFactors,
+        failedEarlier: (UpscalePlan) -> Bool = { _ in false }
     ) -> UpscaleRouteDecision {
         UpscaleRouteDecision.decide(
             preference: preference, osSupportsStage: os, metalFXSupported: metalFX,
             source: source, isSDR: sdr, isDolbyVision: dv, isEightBit420: eightBit, display: display,
-            airPlayVideoReceiver: airPlay, demuxedAudioLive: demuxedLive, mlScaleFactors: factors)
+            wirelessAirPlayRoute: airPlay, demuxedAudioLive: demuxedLive, mlScaleFactors: factors,
+            stageFailedEarlier: failedEarlier)
     }
 
     private func geo(_ w: Int, _ h: Int, _ n: Int = 1, _ d: Int = 1) -> SourceGeometry {
@@ -122,10 +124,27 @@ struct UpscaleRouteDecisionTests {
 
     @Test func exitsInOrder() {
         #expect(decide(os: false, sdr: false) == .notTaken(.unsupportedOS))
-        #expect(decide(metalFX: false, sdr: false) == .notTaken(.metalFXUnsupported))
+        #expect(decide(metalFX: false, sdr: false) == .notTaken(.hdrOrDolbyVision))
+        #expect(decide(metalFX: false, airPlay: true, factors: { _, _ in [] }) == .notTaken(.metalFXUnsupported))
         #expect(decide(source: geo(0, 0), sdr: false) == .notTaken(.hdrOrDolbyVision))
         #expect(decide(source: geo(0, 0), airPlay: true) == .notTaken(.geometryUnknown))
         #expect(decide(source: geo(1920, 1080), display: CGSize(width: 100, height: 100)) == .notTaken(.notBelow1080p))
+    }
+
+    /// Without MetalFX the ML pass is the next best: the route is taken and the stage starts ML only.
+    /// Only a plan that would need MetalFX and has no ML pass is refused.
+    @Test func withoutMetalFXTheMLPassStillRuns() throws {
+        let plan = try #require(decide(metalFX: false).plan)
+        #expect(plan.mlScale == 1.5 && plan.needsMetalFX)
+        #if !targetEnvironment(simulator)
+        if #available(macOS 26, iOS 26, tvOS 26, visionOS 26, *) {
+            #expect(FrameUpscaler.startsMLOnly(plan, metalFXAvailable: false))
+            #expect(!FrameUpscaler.startsMLOnly(plan, metalFXAvailable: true))
+        }
+        #endif
+        #expect(decide(metalFX: false, factors: { _, _ in [] }) == .notTaken(.metalFXUnsupported))
+        // ML landing on the target needs no MetalFX at all.
+        #expect(decide(metalFX: false, display: CGSize(width: 1920, height: 1080)).plan != nil)
     }
 
     @Test func zeroGeometryIsUnknown() {
@@ -139,8 +158,59 @@ struct UpscaleRouteDecisionTests {
     }
 
     @Test func airPlayAndDemuxedLiveRefuse() {
-        #expect(decide(airPlay: true) == .notTaken(.airPlayVideoReceiver))
+        #expect(decide(airPlay: true) == .notTaken(.wirelessAirPlayRoute))
         #expect(decide(demuxedLive: true) == .notTaken(.demuxedAudioLive))
+    }
+
+    /// AirPlay speakers with the picture on HDMI: the route would move a natively playable SD episode onto
+    /// the software path, whose seek lost the sound on the speakers (7.53.1, tvOS 27.2).
+    @Test func audioOnlyAirPlayRefusesLikeAVideoReceiver() {
+        let sd = geo(720, 556)
+        #expect(decide(source: sd).plan != nil)
+        #expect(decide(source: sd, airPlay: true) == .notTaken(.wirelessAirPlayRoute))
+    }
+
+    @Test func aPlanWhoseStageFailedIsNotTakenAgain() throws {
+        let plan = try #require(decide().plan)
+        #expect(decide(failedEarlier: { $0 == plan }) == .notTaken(.stageFailedEarlier))
+        #expect(decide(source: geo(720, 480), failedEarlier: { $0 == plan }).plan != nil)
+    }
+
+    @Test func failureMemoryRemembersPlansAtTheirRate() throws {
+        UpscaleFailureMemory.reset()
+        defer { UpscaleFailureMemory.reset() }
+        let plan = try #require(decide().plan)
+        let other = try #require(decide(source: geo(720, 480)).plan)
+        #expect(!UpscaleFailureMemory.contains(plan, frameRate: 50))
+        UpscaleFailureMemory.record(plan, frameRate: 50)
+        #expect(UpscaleFailureMemory.contains(plan, frameRate: 50))
+        #expect(UpscaleFailureMemory.contains(plan, frameRate: 59.94))
+        #expect(UpscaleFailureMemory.contains(plan, frameRate: nil))
+        #expect(!UpscaleFailureMemory.contains(plan, frameRate: 25))
+        #expect(!UpscaleFailureMemory.contains(other, frameRate: 50))
+        UpscaleFailureMemory.record(plan, frameRate: 24)
+        #expect(UpscaleFailureMemory.contains(plan, frameRate: 23.976))
+        #expect(decide(failedEarlier: { UpscaleFailureMemory.contains($0, frameRate: 25) })
+                == .notTaken(.stageFailedEarlier))
+    }
+
+    /// The owed return is dropped once the session moved on, and waits while nothing plays.
+    @Test @MainActor func owedNativeReturnClearsOnANewGenerationAndWaitsOtherwise() throws {
+        let engine = try AetherEngine()
+        engine.upscaleNativeReturnOwed = engine.loadGeneration &+ 1
+        engine.settleOwedUpscaleNativeReturn()
+        #expect(engine.upscaleNativeReturnOwed == nil)
+        engine.upscaleNativeReturnOwed = engine.loadGeneration
+        engine.settleOwedUpscaleNativeReturn()
+        #expect(engine.state == .idle)
+        #expect(engine.upscaleNativeReturnOwed == engine.loadGeneration)
+    }
+
+    @Test func disabledStageReturnsOnlyAURLVODSessionItAloneMovedToNative() {
+        #expect(AetherEngine.upscaleDisableReturnsToNative(softwareOnlyForUpscale: true, isCustomSource: false, isLive: false))
+        #expect(!AetherEngine.upscaleDisableReturnsToNative(softwareOnlyForUpscale: false, isCustomSource: false, isLive: false))
+        #expect(!AetherEngine.upscaleDisableReturnsToNative(softwareOnlyForUpscale: true, isCustomSource: true, isLive: false))
+        #expect(!AetherEngine.upscaleDisableReturnsToNative(softwareOnlyForUpscale: true, isCustomSource: false, isLive: true))
     }
 
     @Test func makePlanIsExposed() throws {

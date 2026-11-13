@@ -17,6 +17,32 @@ enum PausedFirstFrame {
         loopsStarted && framesEnqueued == 0
     }
 
+    /// AE#973: whether a pause starts loops that never ran. Only `play()` started them, so a host that
+    /// was loaded and then only paused (a session rebuilt at the playhead while paused, a paused
+    /// mount) never decoded a frame and stayed black until the viewer pressed play. A host still
+    /// loading leaves them to whichever transport call follows the load.
+    static func startsLoopsForFirstFrame(loaded: Bool, loopsStarted: Bool) -> Bool {
+        loaded && !loopsStarted
+    }
+
+    /// AE#1023: whether a seek that lands paused runs the loops under this same hold until the frame at
+    /// the landing is in. The flush keeps the pre-seek frame on screen (#90) and the loops park under a
+    /// pause, so a host that had already shown a frame showed that one until `play()`, while the native
+    /// route presents the landed frame. Loops that never started are `pause()`'s case (AE#973), and a
+    /// host without a picture (audio only, or video discarded in the background) has nothing to wait for.
+    static func holdsAfterPausedLanding(loopsStarted: Bool, hasVideo: Bool) -> Bool {
+        loopsStarted && hasVideo
+    }
+
+    /// AE#1024: whether an end of file the loops just reached waits for `play()` instead of ending the
+    /// session. Under a host pause the loops only read for the picture, and a paused rebuild in the last
+    /// half second reads to the end before that picture is in. `.ended` is terminal and means a running
+    /// clock got there (#164 settles a seek landing on the end to `.paused` for the same reason), so the
+    /// end is owed to the next `play()`.
+    static func endOfMediaWaitsForPlay(transportPlaying: Bool, pausedByHost: Bool) -> Bool {
+        pausedByHost && !transportPlaying
+    }
+
     /// Whether the loops may read and decode.
     static func loopsMayRun(isPlaying: Bool, pausedBeforeFirstFrame: Bool) -> Bool {
         isPlaying || pausedBeforeFirstFrame

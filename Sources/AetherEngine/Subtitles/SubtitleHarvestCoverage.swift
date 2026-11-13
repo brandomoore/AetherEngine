@@ -60,6 +60,15 @@ struct SubtitleHarvestCoverage: Sendable, Equatable {
         open[writer] = Span(from: seconds, through: seconds)
     }
 
+    /// #941: this reader has moved and does not know where it now sits. Its run so far stands, and
+    /// nothing new is anchored: the next `noteProgress` opens a run at the first position the reader
+    /// actually observes. A side reader whose bounded seek timed out or fell back to a byte estimate
+    /// is the case: anchoring it on the position it ASKED for let the first step from where it really
+    /// sat, under 30 s further on, claim the whole stretch in between as read.
+    mutating func noteLostPosition(_ writer: SubtitlePacketStore.Writer) {
+        closeRun(writer)
+    }
+
     /// One step of a reader working its way forwards: its loop has read through `seconds`.
     ///
     /// A step larger than `maxUnannouncedAdvanceSeconds` is not treated as reading but as a
@@ -112,9 +121,15 @@ struct SubtitleHarvestCoverage: Sendable, Equatable {
     /// Was every second between `from` and `through` read by some run? An empty or inverted span is
     /// trivially covered: there is nothing in it to have missed.
     func covers(from: Double, through: Double) -> Bool {
+        Self.covers(sortedSpans(), from: from, through: through)
+    }
+
+    /// `covers` over spans already sorted by start, for a caller asking many questions of one
+    /// snapshot (#941: one drain tick asks once per stored pair).
+    static func covers(_ spans: [Span], from: Double, through: Double) -> Bool {
         guard from.isFinite, through.isFinite, through > from else { return true }
         var cursor = from
-        for span in sortedSpans() {
+        for span in spans {
             guard span.from <= cursor + Self.seamSeconds else { return false }
             cursor = max(cursor, span.through)
             if cursor >= through { return true }

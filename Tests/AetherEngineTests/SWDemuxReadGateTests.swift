@@ -59,18 +59,6 @@ struct SWDemuxReadGateTests {
             lastAudioPts: 104, clockSeconds: .nan) == false)
     }
 
-    @Test("Only parked foreground video bounds an otherwise open packet read")
-    func parkedWorkNeedsConsumerService() {
-        #expect(SoftwarePlaybackHost.parkedVideoReadWaitSeconds(
-            decoupleAudio: true, parkedCount: 1, backgroundAudioOnly: false) == 0.020)
-        #expect(SoftwarePlaybackHost.parkedVideoReadWaitSeconds(
-            decoupleAudio: true, parkedCount: 0, backgroundAudioOnly: false) == nil)
-        #expect(SoftwarePlaybackHost.parkedVideoReadWaitSeconds(
-            decoupleAudio: false, parkedCount: 1, backgroundAudioOnly: false) == nil)
-        #expect(SoftwarePlaybackHost.parkedVideoReadWaitSeconds(
-            decoupleAudio: true, parkedCount: 1, backgroundAudioOnly: true) == nil)
-    }
-
     @Test("Already parked video reaches a newly ready consumer before blocked source I/O completes",
           .timeLimit(.minutes(1)))
     func parkedVideoIsServicedDuringSourceIO() async throws {
@@ -100,14 +88,13 @@ struct SWDemuxReadGateTests {
             var parked: [SoftwareStoredPacket] = []
             while true {
                 if ready.value, !parked.isEmpty { return parked.removeFirst() }
-                let wait = SoftwarePlaybackHost.parkedVideoReadWaitSeconds(
-                    decoupleAudio: true, parkedCount: parked.count, backgroundAudioOnly: false)
+                let wait = parked.isEmpty ? nil : SoftwarePlaybackHost.parkedVideoReadWaitSeconds
                 // Readiness changes only after the drain above refused the parked packet.
                 if !parked.isEmpty { waitingWithParkedVideo.update { $0 = true } }
                 do {
-                    let next = try source.read(until: wait.map { Date(timeIntervalSinceNow: $0) })
+                    let next = try source.read(maximumWait: wait)
                     parked.append(try #require(next, "a service wake must not masquerade as EOF"))
-                } catch SoftwarePacketReadAhead.ReadError.serviceDue {
+                } catch SoftwarePacketReadAhead.ReadError.idle {
                     serviceWakes.update { $0 += 1 }
                 }
             }

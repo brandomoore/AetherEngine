@@ -39,10 +39,16 @@ struct ExternalSubtitleSelectionTests {
     }
 
     @Test("secondary channel routes external ids")
-    func secondaryExternal() throws {
+    func secondaryExternal() async throws {
+        let url = try MultiSubtitleContainerFixture.write()
+        defer { try? FileManager.default.removeItem(at: url) }
         let engine = try AetherEngine()
-        let info = engine.addExternalSubtitleTrack(makeTrack())
+        defer { engine.stop() }
+        let info = engine.addExternalSubtitleTrack(.init(url: url,
+            sourceStreamIndex: MultiSubtitleContainerFixture.spanishStreamIndex))
         engine.selectSecondarySubtitleTrack(index: info.id)
+        #expect(engine.activeSecondaryExternalSubtitleTrackID == nil)
+        await engine.secondarySidecarTask?.value
         #expect(engine.isSecondarySubtitleActive)
         #expect(engine.activeSecondaryExternalSubtitleTrackID == info.id)
         #expect(engine.activeSecondaryEmbeddedSubtitleStreamIndex == -1)
@@ -69,12 +75,12 @@ struct ExternalSubtitleSelectionTests {
 }
 
 extension ExternalSubtitleSelectionTests {
-    @Test("Internal teardown clears active identity but preserves the rebuild registry", .timeLimit(.minutes(1)))
+    @Test("Internal teardown clears active identity but preserves the rebuild registry", .timeLimit(.minutes(3)))
     func teardownIdentity() throws {
         let engine = try AetherEngine()
         let url = URL(fileURLWithPath: "/nonexistent/subtitle.srt")
         let track = engine.addExternalSubtitleTrack(.init(url: url, name: "external"))
-        engine.activeSecondaryExternalSubtitleTrackID = track.id
+        engine.setSecondarySubtitleIdentity(external: track.id)
         engine.isSecondarySubtitleActive = true
         engine.stopInternal(resetDisplayCriteria: false)
         #expect(engine.activeSecondaryExternalSubtitleTrackID == nil)
@@ -83,7 +89,7 @@ extension ExternalSubtitleSelectionTests {
         engine.stop()
     }
 
-    @Test("Embedded selection removes the old one-shot sidecar URL", .timeLimit(.minutes(1)))
+    @Test("Embedded selection removes the old one-shot sidecar URL", .timeLimit(.minutes(3)))
     func embeddedSelectionClearsSidecar() throws {
         let engine = try AetherEngine()
         defer { engine.stop() }
@@ -94,7 +100,7 @@ extension ExternalSubtitleSelectionTests {
         #expect(engine.activeSecondaryEmbeddedSubtitleStreamIndex == 3)
     }
 
-    @Test("A rebuilt external companion retains its selected container stream", .timeLimit(.minutes(1)))
+    @Test("A rebuilt external companion retains its selected container stream", .timeLimit(.minutes(3)))
     func registryStreamRestoration() async throws {
         let url = try MultiSubtitleContainerFixture.write()
         defer { try? FileManager.default.removeItem(at: url) }
@@ -122,7 +128,7 @@ extension ExternalSubtitleSelectionTests {
 }
 
 extension ExternalSubtitleSelectionTests {
-    @Test("A prior load's decode cannot change current cues or loading state", .timeLimit(.minutes(1)))
+    @Test("A prior load's decode cannot change current cues or loading state", .timeLimit(.minutes(3)))
     func staleDecodeDoesNotPublish() async throws {
         let url = try MultiSubtitleContainerFixture.write()
         defer { try? FileManager.default.removeItem(at: url) }
@@ -143,7 +149,7 @@ extension ExternalSubtitleSelectionTests {
 }
 
 extension ExternalSubtitleSelectionTests {
-    @Test("The same registered track remains selectable in both channels", .timeLimit(.minutes(1)))
+    @Test("The same registered track remains selectable in both channels", .timeLimit(.minutes(3)))
     func noDownstreamExclusivityRule() async throws {
         let url = try MultiSubtitleContainerFixture.write()
         defer { try? FileManager.default.removeItem(at: url) }

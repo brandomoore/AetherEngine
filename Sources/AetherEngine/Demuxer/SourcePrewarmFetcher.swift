@@ -179,7 +179,7 @@ enum RangeFetch {
         guard let ticket = OriginRequestBudget.shared.tryAcquire(for: url, label: label) else {
             throw PrewarmDecline(reason: "no origin request slot free (#377)")
         }
-        var request = URLRequest(url: url)
+        var request = URLRequest(engineURL: url)
         request.setValue("bytes=\(requestedStart)-\(requestedStart + Int64(requestedLength) - 1)",
                          forHTTPHeaderField: "Range")
         for (k, v) in extraHeaders { request.setValue(v, forHTTPHeaderField: k) }
@@ -272,15 +272,16 @@ private final class RangeFetchDelegate: NSObject, URLSessionDataDelegate, @unche
                     willPerformHTTPRedirection response: HTTPURLResponse,
                     newRequest request: URLRequest,
                     completionHandler: @escaping (URLRequest?) -> Void) {
-        if let from = task.originalRequest?.url, let to = request.url {
-            OriginRequestBudget.shared.noteRedirect(from: from, to: to)
-        }
         // Credential headers do not follow a redirect to another host (#126 cross-origin replay).
-        completionHandler(RedirectHeaderPolicy.redirectRequest(
+        let next = RedirectHeaderPolicy.redirectRequest(
             request,
             originalURL: task.originalRequest?.url,
             originalRange: task.originalRequest?.value(forHTTPHeaderField: "Range"),
-            extraHeaders: extraHeaders))
+            extraHeaders: extraHeaders)
+        if let from = task.originalRequest?.url, let to = next.url {
+            OriginRequestBudget.shared.noteRedirect(from: from, to: to)
+        }
+        completionHandler(next)
     }
 
     func urlSession(_ session: URLSession,

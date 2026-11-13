@@ -28,9 +28,10 @@ public enum PlaybackBackend: String, Sendable, Equatable {
     case none
     /// Removed in 1.0.0; reserved for hosts that still switch on it.
     case aether
-    /// HLS-fMP4 over loopback to AVPlayer + AVPlayerLayer. Default for HEVC / H.264 / VP9.
+    /// HLS-fMP4 over loopback to AVPlayer + AVPlayerLayer. Default for HEVC, H.264 and hardware-decodable AV1.
     case native
-    /// FFmpeg / dav1d + AVSampleBufferDisplayLayer. Used for AV1 on tvOS (no HW decoder).
+    /// FFmpeg / dav1d + AVSampleBufferDisplayLayer. Every codec or shape the native route does not carry
+    /// (AV1 without a hardware decoder, VP9, MPEG-2, VC-1, interlaced H.264, FEL dual layer, ...).
     case software
     /// FFmpeg audio + AVSampleBufferAudioRenderer. No video pipeline.
     case audio
@@ -116,7 +117,9 @@ public enum AudioDelivery: String, Sendable, Equatable, CaseIterable {
     /// a TrueHD-MAT or JOC bitstream does not survive its PCM intermediate; under
     /// `LoadOptions.objectAudioRendering`, in a build with the `TrueHDObjectAudio` / `DTSXObjectAudio`
     /// traits (off by default), TrueHD Atmos and DTS:X are rendered with their objects and heights into a
-    /// speaker bed and encoded as APAC instead, on the loopback route and on the software host alike.
+    /// speaker bed instead, delivered as linear PCM or, over AirPlay (or when forced), as APAC, on the
+    /// loopback route and on the software host alike. On tvOS the software host also decodes an E-AC-3
+    /// JOC track to a PCM bed through the system's Atmos decoder (AE#995) and reports this case.
     case bridged
     /// libavcodec decodes the audio to PCM and the engine renders it itself (the software path without an
     /// object-audio route, and the software audio-only host).
@@ -367,28 +370,41 @@ public enum DeinterlaceFieldRate: String, Sendable, Equatable {
 
 /// Live-join latency profile for loopback live sessions (`LoadOptions.liveJoinProfile`, AetherEngine#195).
 public enum LiveJoinProfile: Sendable, Equatable {
-    /// Historical behavior: ~4s segment cut target, served TARGETDURATION >= 6, live-edge holdback
+    /// The pre-default behavior: ~4s segment cut target, served TARGETDURATION >= 6, live-edge holdback
     /// (and with it the first-manifest startup cushion, AE#189) >= 18s. The first playlist always
     /// waits for the full advertised holdback.
     case standard
-    /// Channel-zapping profile: cut live segments at every keyframe past 0.5s, so TARGETDURATION and
+    /// The default. Channel-zapping profile: cut live segments at every keyframe past 0.5s, so TARGETDURATION and
     /// holdback collapse to the source keyframe cadence. The first playlist prefers the full holdback,
     /// but after two finalized segments a strict-realtime source gets one observed-segment grace,
-    /// clamped to 0.5...2.0s, before a shallow first window is served. That bounded start can produce
-    /// one early -16832 warning or a short rebuffer.
+    /// clamped to 0.5...2.0s, before a shallow first window is served. The grace ends early once the
+    /// source reads at 1x and the open segment cannot reach its keyframe within it (AE#936). That
+    /// bounded start can produce one early -16832 warning or a short rebuffer.
     case fastZap
 }
 
 /// Options for `AetherEngine.load(url:options:)`. All flags default to safe values.
-/// Which playback host serves a session's video (#461). See `LoadOptions.preferredDecodePath`.
+/// Which playback host serves a session's video (#461), or an audio-only session's audio. See
+/// `LoadOptions.preferredDecodePath`.
 public enum DecodePath: String, Sendable, Equatable, CaseIterable {
     /// The engine routes: codec support, the VideoToolbox capability probe, declared interlace,
     /// source seekability. The default, and right for every session that does not have evidence
     /// the engine cannot have.
     case automatic
-    /// Serve this source through `SoftwarePlaybackHost`, whatever the routing concluded. Scoped to
-    /// the session; it does not touch any other session on the shared engine.
+    /// Serve this source through `SoftwarePlaybackHost` (`AudioPlaybackHost` on an `audioOnly`
+    /// session), whatever the routing concluded. Scoped to the session; it does not touch any other
+    /// session on the shared engine.
     case software
+}
+
+/// The route that composes a Profile 7 FEL picture, see `LoadOptions.dualLayerRoute`.
+public enum DualLayerRoute: String, Sendable, Hashable, CaseIterable {
+    /// The software host decodes both layers and presents the composed picture (the default).
+    case softwareHost
+    /// AVPlayer decodes and times the base layer and the audio; the engine composes the enhancement layer
+    /// onto its frames and presents them in a display layer on the item's timebase. Selectable on macOS,
+    /// iOS and tvOS; only the Mac has run it.
+    case avPlayerOutput
 }
 
 /// Which layer of a Dolby Vision source a session presents. See `LoadOptions.dolbyVisionHandling`.
@@ -524,6 +540,42 @@ public struct LoadOptions: Sendable, Equatable {
     /// which also decodes it and loses the objects. Not engineered around.
     public var preferDualLayerDolbyVision: Bool = false
 
+    /// Which route composes the Profile 7 FEL picture once `preferDualLayerDolbyVision` has chosen the
+    /// dual-layer route. Default `.softwareHost`, the route described above. `.avPlayerOutput` is the
+    /// second route: AVPlayer plays the base layer and the audio from the engine's loopback HLS
+    /// stream and owns the clock, the engine composes the enhancement layer onto AVPlayer's decoded
+    /// frames with the same composer and presents the result in a display layer that follows the item's
+    /// timebase. It changes nothing unless `preferDualLayerDolbyVision` is on and the route decision takes
+    /// the dual-layer route; anywhere else (a MEL or non-Profile 7 source, a build without the
+    /// `DualLayerDolbyVision` trait, a source that is not hvcC-framed or whose frame rate is unknown) the
+    /// session loads as it would with `.softwareHost`. It is built for macOS, iOS and tvOS; only the Mac has
+    /// run it, and the tvOS and iOS builds have not played a Profile 7 title on a device. The picture is a
+    /// layer of the bound `AetherPlayerView`, so a host that shows `currentAVPlayer` in its own player
+    /// view controller gets no picture from it. While another screen holds the picture (AirPlay, an
+    /// external display) the route stops and AVPlayer shows the 8.1 base layer; Picture in Picture is
+    /// unavailable on it (`AetherEngine.nativePlayerLayer` is nil). Audio is AVPlayer's on this route, so
+    /// the Atmos trade-off above does not apply.
+    /// A tuning field, with the same fresh-load rule for a custom source as `preferDualLayerDolbyVision`.
+    public var dualLayerRoute: DualLayerRoute = .softwareHost
+
+    /// Whether a Profile 7 FEL source on the native route gets its enhancement-layer luma residual folded
+    /// into the Profile 8.1 RPU's luma curve per scene (AE#988, the `DolbyVisionFelCurves` package trait).
+    /// Default true, which is the behaviour of every build with the trait. False keeps the plain mode 2
+    /// conversion: no GOP held back between demuxer and segmenter, no base- and enhancement-layer decode
+    /// per scene, so a start or a seek is as fast as on a build without the trait (AE#1018 measured a
+    /// resume 0.5 to 4 s faster on an Apple TV 4K). Use it to turn the fold off for a title a viewer
+    /// reports, or to compare the two on one build.
+    ///
+    /// Independent of this field, the fold pauses on its own where its RPU cannot reach the picture: on tvOS,
+    /// at a display without Dolby Vision whose panel presents HDR10 (predicted at load, see AE#1018), off the
+    /// `forceDolbyVisionOnNonDVDisplay` route (measured: tvOS hands such a panel the base layer). A Mac, a
+    /// panel in SDR and the Profile 5 route all apply the RPU, so the fold stays on there.
+    ///
+    /// Without the `DolbyVisionFelCurves` trait this field is ignored, like `preferDualLayerDolbyVision`
+    /// without `DualLayerDolbyVision`. A tuning field: `reloadAtCurrentPosition(applying:)` carries a
+    /// change, and every producer the session builds afterwards (seek, revive) reads the new value.
+    public var foldsDolbyVisionFEL: Bool = true
+
     /// Opt in to upscaling SDR video below 1080p (coded width under 1920 and height under 1080) to the
     /// display's native pixel size (#846). Such a source routes through `SoftwarePlaybackHost`, where every
     /// decoded frame runs VideoToolbox low-latency super resolution where the device and frame size allow
@@ -538,6 +590,13 @@ public struct LoadOptions: Sendable, Equatable {
     /// re-runs `load()` and re-decides the route. On a custom `IOReader` source turning it off is honoured
     /// in place, and turning it on is refused with `SessionReloadRefusal.upscaleRouteNeedsFreshLoad`.
     public var upscalesLowResolutionVideo: Bool = false
+
+    /// Which scaler the upscale stage runs when `upscalesLowResolutionVideo` is on (AE#1039). `.automatic`
+    /// (the default) is the route described there. `.lineArt` replaces it with a 2x line-art network
+    /// (Anime4K Upscale CNN S) made for animation, and widens the route to 1080p sources and 10-bit SDR.
+    /// It suits drawn content only, so a host sets it per title (from the genre, or a per-show switch).
+    /// Ignored while `upscalesLowResolutionVideo` is off. A tuning field like it.
+    public var upscaleScaler: UpscaleScaler = .automatic
 
     /// Mirror of `AVDisplayManager.isDisplayCriteriaMatchingEnabled`. Default `true`. When `false`, engine routes HDR sources through the media playlist (auto-tonemap path) because AVKit cannot switch the panel.
     public var matchContentEnabled: Bool
@@ -643,6 +702,13 @@ public struct LoadOptions: Sendable, Equatable {
     /// Nil preserves the default spool behavior.
     public var softwareDVRRetention: SoftwareDVRRetentionOptions? = nil
 
+    /// Disk budget in bytes for the software live DVR ring. Nil keeps the default (a quarter of the free
+    /// space, at most 2 GiB). An explicit value replaces the 2 GiB cap and is still clamped to a quarter of
+    /// the free space the other sessions have not claimed, with the 64 MiB playback floor. For a window
+    /// that has to hold hours of broadcast: 2 GiB is about 50 minutes of 5.7 Mbps MPEG-2. Ignored unless
+    /// `isLive` and `dvrWindowSeconds` are set and the session routes to software.
+    public var liveDVRByteBudget: Int? = nil
+
     /// LL-HLS blocking-reload (`#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD`) override for live loopback sessions.
     /// nil (default) = auto: for a `LiveIngestSourceInfo` custom reader the engine derives eligibility from
     /// the OBSERVED upstream arrival cadence (off until sustained discipline is proven, permanently off once
@@ -653,23 +719,22 @@ public struct LoadOptions: Sendable, Equatable {
     /// Default nil (AetherEngine#167).
     public var liveBlockingReload: Bool? = nil
 
-    /// Live-join latency profile for loopback live sessions (raw TS over HTTP, live ingest). `.standard`
-    /// (default) cuts ~4s segments, so the served TARGETDURATION lands at >= 6 and the spec-mandated
-    /// live-edge holdback (`HOLD-BACK` >= 3 x TARGETDURATION, RFC 8216bis) the first manifest is gated on
-    /// (AE#189) becomes >= 18s, which a strict-realtime origin can only fill in wall-clock time (10-18s of
-    /// black on an IPTV zap). `.fastZap` cuts at every keyframe past 0.5s instead: segments quantize to the
-    /// source keyframe cadence, TARGETDURATION follows the real GOP length with 1.5x headroom over the
-    /// longest GOP seen before the seal (a broadcast's GOPs are irregular and each segment is one whole
-    /// GOP, AE#670), and the holdback shrinks with it: 1 s GOPs serve TARGETDURATION 2, a 6 s holdback.
-    /// The first serve still prefers the full holdback, but after two finalized segments a
-    /// strict-realtime source gets one observed-segment grace clamped to 0.5...2.0s, then may serve a
-    /// shallow first window. This bounds black-screen startup but may produce one early `-16832` or a
-    /// short rebuffer. `.standard` retains the full-holdback guarantee. A smaller TARGETDURATION also
+    /// Live-join latency profile for loopback live sessions (raw TS over HTTP, live ingest). `.fastZap`
+    /// (the default) cuts at every keyframe past 0.5s: segments quantize to the source keyframe
+    /// cadence, TARGETDURATION follows the real GOP length with 1.5x headroom over the longest GOP seen
+    /// before the seal (a broadcast's GOPs are irregular and each segment is one whole GOP, AE#670), and
+    /// the holdback shrinks with it: 1 s GOPs serve TARGETDURATION 2, a 6 s holdback. The first serve
+    /// still prefers the full holdback, but after two finalized segments a strict-realtime source gets
+    /// one observed-segment grace clamped to 0.5...2.0s, then may serve a shallow first window, and the
+    /// grace ends early when the next keyframe cannot arrive inside it (AE#936). This bounds black-screen
+    /// startup but may produce one early `-16832` or a short rebuffer. A smaller TARGETDURATION also
     /// tightens AVPlayer's unchanged-playlist patience and live-edge buffer, so an origin that stalls or
-    /// bursts mid-stream is likelier to rebuffer or error; opt in for zapping UX, keep `.standard` for
-    /// lean-back viewing. Ignored for `nativeRemoteHLS` and VOD. Default `.standard`
-    /// (AetherEngine#195/#208).
-    public var liveJoinProfile: LiveJoinProfile = .standard
+    /// bursts mid-stream is likelier to rebuffer. `.standard` cuts ~4s segments, so the served
+    /// TARGETDURATION lands at >= 6 and the first manifest waits for the full `3 x TARGETDURATION`
+    /// holdback (AE#189): >= 18 s, and 30 s on a 10 s GOP, which a strict-realtime origin can only fill in
+    /// wall-clock time. Choose it for lean-back viewing where the join may take that long. Ignored for
+    /// `nativeRemoteHLS` and VOD (AetherEngine#195/#208).
+    public var liveJoinProfile: LiveJoinProfile = .fastZap
 
     /// HTTP VOD opening budgets. Applied to the initial playback reader and its reopens;
     /// live, sequential-only sources and disposable frame probes retain their own policies.
@@ -803,8 +868,17 @@ public struct LoadOptions: Sendable, Equatable {
     /// Start the native WebVTT subtitle readers eagerly at load (instead of lazily on `setNativeSubtitleSelected`), so the `/subs_N_M.vtt` segments are already populated when AVKit fetches them under a host-independent selection (e.g. an `EXT-X-MEDIA ... DEFAULT=YES` rendition that AVKit auto-selects). Equivalent to a fully-populated static VOD subtitle file. Only meaningful with `prepareNativeSubtitles`. Default `false` (Sodalite#32 probe).
     public var eagerNativeSubtitleReaders: Bool = false
 
+    /// List every audio track of the source in the master's audio group, so a stock `AVPlayerViewController` offers all of them in its audio menu (AE#1049). Only the active track is muxed into the variant; the others are entries without a URI. When the viewer picks one, the engine switches to it through `selectAudioTrack(index:)`, which is a reload with a brief hold on the last frame. Off by default because a host with its own track picker gains nothing and the master changes shape. Applies to the loopback route only, and only where `selectAudioTrack` can switch (not live forward-only sources or a sequential origin). A tuning field: correctable through `reloadAtCurrentPosition(applying:)`.
+    public var nativeAudioTrackMenu: Bool = false
+
     /// Serve an I-frame rendition (`EXT-X-I-FRAME-STREAM-INF`) next to the master, so a stock `AVPlayerViewController` shows its own scrub thumbnails and can scan on I-frames, with no host code (AE#682). One still per served segment: the source's own keyframe at full resolution for SDR, and for HDR10, HLG and Dolby Vision a tone-mapped SDR Motion JPEG 640 pixels wide, since AVKit shows no scrub thumbnail from a PQ or Dolby Vision keyframe. Costs a second reader on the source for the whole session, opened shortly after load because AVKit asks for the first keyframe before anyone scrubs. Silently absent, with one log line naming the reason, when the session cannot answer every listed keyframe: live, a source without a trustworthy keyframe index (MPEG-TS), `sequentialOrigin`, `heldSourceConnection`, an origin limited to one request, a disc source, a custom reader that cannot clone, or media-playlist routing. A host with its own transport bar wants `scrubThumbnail` instead. A tuning field: correctable through `reloadAtCurrentPosition(applying:)`. Default `false`.
     public var serveIFramePlaylist: Bool = false
+
+    /// Pre-generate the sparse scrub-still ladder while the source is idle. Default `true`.
+    /// Set to `false` when the host does not consume scrub previews to avoid this optional
+    /// side reader. Independent of `serveIFramePlaylist`, on-demand snapshots and item-swap
+    /// held pictures, including Dolby Vision compositor/reshaping. Correctable by reload.
+    public var generatesBackgroundScrubPreviews: Bool = true
 
     /// Confirm E-AC-3 JOC (Dolby Atmos) on this session's audio tracks, so `audioTracks` carries an honest
     /// `TrackInfo.isAtmos` for a badge instead of the pre-decode guess. No container reliably declares JOC, so
@@ -823,7 +897,10 @@ public struct LoadOptions: Sendable, Equatable {
     /// chunk boundary rather than byte X (IPTV timeshift/catch-up archives are the motivating
     /// case; a device trace showed ~1.9 s of content lost at every 32 MB range rotation, heard
     /// as a once-a-minute audio desync). Headers cannot expose the lie, so this is a caller
-    /// declaration, not a probe. Only byte 0 is addressable: the reader runs its forward-only
+    /// declaration. Undeclared, the bytes expose it: the first ranged reconnect that starts inside
+    /// bytes the reader holds re-reads 4 KB of them, and a mismatch fails the session as
+    /// `PlaybackErrorKind.sourceFabricatesRanges`, which asks for a load with this set (AE#958).
+    /// Only byte 0 is addressable: the reader runs its forward-only
     /// streaming mode on one long-lived unranged GET - no bounded-range windowing, no
     /// suffix/tail probes, no detour fills, no byte-offset reconnects - and the demuxer's pb is
     /// non-seekable, so byte seeking is unavailable and a dropped connection surfaces as a read
@@ -908,6 +985,20 @@ public struct LoadOptions: Sendable, Equatable {
     /// Caller-bounded demux probe budget in microseconds, mapped to `AVFormatContext.max_analyze_duration` for the main playback open. nil keeps the engine default (60 s). Pass a positive value to set an explicit cap; do NOT pass `0` expecting "no cap": FFmpeg maps `0` to a container-dependent heuristic (~5-7 s for MPEG-TS, longer elsewhere) that is SHORTER than the engine's 60 s default. Same scope and fail-open trade-off as `probesize`. Default nil (#68).
     public var maxAnalyzeDuration: Int64?
 
+    /// Open a Matroska source without reading its attached files (AE#956). Matroska carries the fonts
+    /// of its ASS subtitles as attachments, tens of megabytes on anime releases, and the demuxer reads
+    /// every byte of them while the file opens, before the first packet; over a slow origin that is
+    /// most of the startup. With this on the open passes over them: `fontAttachments` stays empty and
+    /// a Matroska cover image is not reported in `metadata`. Tracks, their indices and every packet
+    /// are unchanged. For a host that renders text subtitles itself or does without the embedded
+    /// fonts; one that renders ASS with them leaves it off. Other containers are unaffected.
+    /// Default false.
+    ///
+    /// Only the session's first open reads attachments either way: the engine's side readers
+    /// (embedded subtitles, scrub stills, I-frames, the Atmos and Dolby Vision passes) and its
+    /// reopens of the same source always pass over them, since nothing reads them there.
+    public var skipsContainerAttachments: Bool = false
+
     /// Ordered audio-language preference (ISO 639-1 / 639-2 codes or English names, e.g. `["en", "de"]`). When non-empty and no explicit `audioSourceStreamIndex` is passed to `load`, the engine resolves the first-frame audio track from its single internal probe: the first track whose language matches an entry (preferences scanned in order, case-insensitive, ISO 639-1/2 B+T and English-name synonyms), falling back to the container default when none match. This lets a host honor a saved language preference on the first frame from one open, instead of probing separately or reloading via `selectAudioTrack` after load (#72). An explicit `audioSourceStreamIndex` still wins. Default empty.
     public var preferredAudioLanguages: [String]
 
@@ -966,6 +1057,10 @@ public struct LoadOptions: Sendable, Equatable {
 
     /// Optional temporary session-cache budget. Nil retains automatic sizing; zero keeps only the working window.
     public var sessionCacheByteBudget: Int? = nil
+    /// Opt-in hard total for resident AND in-flight fMP4 bytes. Unlike retention, this is not raised to the old hard window.
+    public var sessionCacheHardLimitBytes: Int? = nil
+    /// Free volume headroom preserved before every admitted disk write.
+    public var sessionCacheFreeReserveBytes: Int = 0
     /// Compressed-packet storage for seekable software VOD; automatic retains platform defaults.
     public var softwarePacketCacheStorage: SoftwarePacketCacheStorage = .automatic
 
@@ -1053,6 +1148,9 @@ public struct LoadOptions: Sendable, Equatable {
     /// green/purple, and a demuxed-audio live source still fails rather than playing silent.
     /// `nativeRemoteHLS` is a different route entirely (AVPlayer plays the remote playlist, nothing
     /// is demuxed), so this has nothing to act on there and the engine says so in the log.
+    ///
+    /// On an `audioOnly` session `.software` sends a codec AVPlayer could play to the FFmpeg host
+    /// (`AudioPlaybackHost`) instead of `AudioAVPlayerHost`.
     public var preferredDecodePath: DecodePath = .automatic
 
     /// Whether a native session AVPlayer refuses on its merits may be rebuilt on the software path
@@ -1081,6 +1179,13 @@ public struct LoadOptions: Sendable, Equatable {
     /// host's subtitle authority flag carries over. Consumed by the load; never persisted.
     var subtitleSessionCarryover: SubtitleSessionCarryover? = nil
 
+    /// ENGINE-INTERNAL: the engine read this URL's body and found an HLS playlist (the AE#154 / AE#246
+    /// reroute), which is why the session runs on the `nativeRemoteHLS` bypass. Not settable from the
+    /// public initializer. The bypass then declares the HLS MIME type on the asset, because AVFoundation
+    /// types a URL by its path extension and `Content-Type` and never by its body. Rides `loadedOptions`,
+    /// so every rebuild of a rerouted session keeps the declaration.
+    var hlsPlaylistProvenByBody: Bool = false
+
     public init(
         omitCriteriaColorExtensions: Bool = false,
         suppressDisplayCriteria: Bool = false,
@@ -1090,7 +1195,10 @@ public struct LoadOptions: Sendable, Equatable {
         forceDolbyVisionOnNonDVDisplay: Bool = false,
         dolbyVisionHandling: DolbyVisionHandling = .automatic,
         preferDualLayerDolbyVision: Bool = false,
+        dualLayerRoute: DualLayerRoute = .softwareHost,
+        foldsDolbyVisionFEL: Bool = true,
         upscalesLowResolutionVideo: Bool = false,
+        upscaleScaler: UpscaleScaler = .automatic,
         matchContentEnabled: Bool = true,
         panelIsInHDRMode: Bool = false,
         attemptsHDRMasterOnUnprovenPanel: Bool = true,
@@ -1102,7 +1210,7 @@ public struct LoadOptions: Sendable, Equatable {
         audioOnly: Bool = false,
         dvrWindowSeconds: Double? = nil,
         liveBlockingReload: Bool? = nil,
-        liveJoinProfile: LiveJoinProfile = .standard,
+        liveJoinProfile: LiveJoinProfile = .fastZap,
         sourceOpenPolicy: SourceOpenPolicy = .init(),
         liveStartupGraceSeconds: Double? = nil,
         liveStartupSingleSegmentMinimumSeconds: Double? = nil,
@@ -1114,7 +1222,9 @@ public struct LoadOptions: Sendable, Equatable {
         preserveASSMarkup: Bool = false,
         prepareNativeSubtitles: Bool = false,
         eagerNativeSubtitleReaders: Bool = false,
+        nativeAudioTrackMenu: Bool = false,
         serveIFramePlaylist: Bool = false,
+        generatesBackgroundScrubPreviews: Bool = true,
         confirmAtmos: Bool = false,
         nativeSubtitlePreferredLanguages: [String] = [],
         sequentialOrigin: Bool = false,
@@ -1123,12 +1233,15 @@ public struct LoadOptions: Sendable, Equatable {
         declaredDurationSeconds: Double? = nil,
         probesize: Int64? = nil,
         maxAnalyzeDuration: Int64? = nil,
+        skipsContainerAttachments: Bool = false,
         preferredAudioLanguages: [String] = [],
         preferredSubtitleLanguages: [String] = [],
         externalSubtitles: [ExternalSubtitleTrack] = [],
         initialSubtitleTrackID: Int? = nil,
         forwardBufferSegments: Int? = nil,
         sessionCacheByteBudget: Int? = nil,
+        sessionCacheHardLimitBytes: Int? = nil,
+        sessionCacheFreeReserveBytes: Int = 0,
         softwarePacketCacheStorage: SoftwarePacketCacheStorage = .automatic,
         progressiveSegmentDelivery: Bool = false,
         autoplay: Bool = true,
@@ -1152,7 +1265,10 @@ public struct LoadOptions: Sendable, Equatable {
         self.forceDolbyVisionOnNonDVDisplay = forceDolbyVisionOnNonDVDisplay
         self.dolbyVisionHandling = dolbyVisionHandling
         self.preferDualLayerDolbyVision = preferDualLayerDolbyVision
+        self.dualLayerRoute = dualLayerRoute
+        self.foldsDolbyVisionFEL = foldsDolbyVisionFEL
         self.upscalesLowResolutionVideo = upscalesLowResolutionVideo
+        self.upscaleScaler = upscaleScaler
         self.matchContentEnabled = matchContentEnabled
         self.panelIsInHDRMode = panelIsInHDRMode
         self.attemptsHDRMasterOnUnprovenPanel = attemptsHDRMasterOnUnprovenPanel
@@ -1176,7 +1292,9 @@ public struct LoadOptions: Sendable, Equatable {
         self.preserveASSMarkup = preserveASSMarkup
         self.prepareNativeSubtitles = prepareNativeSubtitles
         self.eagerNativeSubtitleReaders = eagerNativeSubtitleReaders
+        self.nativeAudioTrackMenu = nativeAudioTrackMenu
         self.serveIFramePlaylist = serveIFramePlaylist
+        self.generatesBackgroundScrubPreviews = generatesBackgroundScrubPreviews
         self.confirmAtmos = confirmAtmos
         self.nativeSubtitlePreferredLanguages = nativeSubtitlePreferredLanguages
         self.sequentialOrigin = sequentialOrigin
@@ -1185,12 +1303,15 @@ public struct LoadOptions: Sendable, Equatable {
         self.declaredDurationSeconds = declaredDurationSeconds
         self.probesize = probesize
         self.maxAnalyzeDuration = maxAnalyzeDuration
+        self.skipsContainerAttachments = skipsContainerAttachments
         self.preferredAudioLanguages = preferredAudioLanguages
         self.preferredSubtitleLanguages = preferredSubtitleLanguages
         self.externalSubtitles = externalSubtitles
         self.initialSubtitleTrackID = initialSubtitleTrackID
         self.forwardBufferSegments = forwardBufferSegments
         self.sessionCacheByteBudget = sessionCacheByteBudget
+        self.sessionCacheHardLimitBytes = sessionCacheHardLimitBytes
+        self.sessionCacheFreeReserveBytes = max(0, sessionCacheFreeReserveBytes)
         self.softwarePacketCacheStorage = softwarePacketCacheStorage
         self.progressiveSegmentDelivery = progressiveSegmentDelivery
         self.autoplay = autoplay
@@ -1249,6 +1370,18 @@ public struct SourceProbe: Sendable {
     public let isDolbyVision: Bool
     /// Dolby Vision profile number (5, 7, 8, 10) read from the dvcC/dvvC configuration record; nil when not DV.
     public let dvProfile: Int?
+    /// Base-layer signal compatibility id from the same dvcC/dvvC record as `dvProfile` (AE#1032): 1 = HDR10
+    /// base, 2 = SDR, 4 = HLG, 6 = Blu-ray HDR10 (Profile 7), 0 = no compatible base layer. nil without a
+    /// record. The same value a loaded session publishes as `sourceDVBLCompatID`.
+    public let dvBLCompatID: Int?
+    /// Container libavformat opened ("matroska,webm", "mov,mp4,m4a,3gp,3g2,mj2", "mpegts"), read from what
+    /// the bytes are, not from the file extension (AE#1032). The same string a loaded session publishes as
+    /// `sourceContainerFormat`. nil when libavformat reports no name.
+    public let containerFormat: String?
+    /// Selectable titles of a disc image or disc folder, longest first so id 0 is the main feature
+    /// (AE#1032). Empty for a source that is no disc. The same list a loaded session publishes as
+    /// `discTitles`, so an id from here is valid for `load(..., discTitleID:)`.
+    public let discTitles: [TitleInfo]
     /// AE#658: pixel format, bit depth, colour description and profile of the video stream; nil when
     /// the source has no video.
     public let videoStreamFormat: VideoStreamFormat?
@@ -1269,6 +1402,12 @@ public struct SourceProbe: Sendable {
     /// `.hlg` / `.hdr10`. Apple platforms do not apply the dynamic metadata; the flag exists so a host can
     /// label the source.
     public internal(set) var carriesHDRVividMetadata: Bool
+    /// The enhancement layer of a single-track Dolby Vision Profile 7 source, read from its first RPU
+    /// (AE#1030). Always nil unless the probe was asked for `.dolbyVisionEnhancementLayer`, and nil also
+    /// when `dvProfile` is not 7 or no RPU turned up inside the scan budget, so nil never means "MEL" or
+    /// "no enhancement layer". An enhancement layer on its own track or PID is out of scope, as it is
+    /// for `AetherEngine.probeDolbyVisionEnhancementLayer(url:options:)`.
+    public internal(set) var dolbyVisionEnhancementLayer: DolbyVisionEnhancementLayer?
     /// Settable inside the module so `probeDetectingAtmos` can enrich one track without rebuilding the struct field by field.
     public internal(set) var audioTracks: [TrackInfo]
     /// Includes both text and bitmap (PGS / DVB) variants.
@@ -1288,8 +1427,12 @@ public struct SourceProbe: Sendable {
         videoFrameRate: Double?,
         isDolbyVision: Bool,
         dvProfile: Int? = nil,
+        dvBLCompatID: Int? = nil,
+        containerFormat: String? = nil,
+        discTitles: [TitleInfo] = [],
         carriesHDR10PlusMetadata: Bool = false,
         carriesHDRVividMetadata: Bool = false,
+        dolbyVisionEnhancementLayer: DolbyVisionEnhancementLayer? = nil,
         audioTracks: [TrackInfo],
         subtitleTracks: [TrackInfo],
         metadata: MediaMetadata = MediaMetadata(title: nil, artist: nil, album: nil, artworkData: nil),
@@ -1307,8 +1450,12 @@ public struct SourceProbe: Sendable {
         self.videoFrameRate = videoFrameRate
         self.isDolbyVision = isDolbyVision
         self.dvProfile = dvProfile
+        self.dvBLCompatID = dvBLCompatID
+        self.containerFormat = containerFormat
+        self.discTitles = discTitles
         self.carriesHDR10PlusMetadata = carriesHDR10PlusMetadata
         self.carriesHDRVividMetadata = carriesHDRVividMetadata
+        self.dolbyVisionEnhancementLayer = dolbyVisionEnhancementLayer
         self.audioTracks = audioTracks
         self.subtitleTracks = subtitleTracks
         self.metadata = metadata
@@ -1377,6 +1524,18 @@ public struct SoftwareDecodeProbeResult: Sendable {
 }
 
 /// Audio or subtitle track metadata.
+/// AE#1035: a probe's answer to "is this TrueHD track Atmos", read from the track's own major sync rather
+/// than from libavcodec's profile, which stays unknown for a track the header probe never decoded.
+public enum TrueHDAtmosVerdict: Sendable, Equatable {
+    /// The major sync declares the Atmos presentation (four substreams, the 16-channel presentation bit).
+    case atmos
+    /// A major sync was read and declares no Atmos presentation.
+    case noAtmos
+    /// No major sync of the track turned up within `AtmosDetectionOptions`, or the source could not be read
+    /// there. Says nothing either way.
+    case unsettled
+}
+
 public struct TrackInfo: Identifiable, Sendable, Equatable {
     /// FFmpeg AVStream index.
     public let id: Int
@@ -1435,7 +1594,17 @@ public struct TrackInfo: Identifiable, Sendable, Equatable {
     public let channelLayout: String?
     /// AE#658: codec profile as libavcodec names it ("LC", "DTS-HD MA + DTS:X", "Dolby TrueHD + Dolby Atmos"),
     /// nil when undeclared. This is where DTS:X and TrueHD Atmos show up; `isAtmos` covers E-AC-3 JOC only.
-    public let profile: String?
+    /// Settable inside the module so a probe's `.atmos` pass can name TrueHD Atmos it read from the major sync.
+    public internal(set) var profile: String?
+
+    /// AE#1035, TrueHD only: what a probe's `.atmos` pass read from the track's first major sync. nil when
+    /// that pass did not run for this track (not requested, not the targeted track, not TrueHD, or a session's
+    /// track list). `.atmos` also sets `profile` to "Dolby TrueHD + Dolby Atmos".
+    public internal(set) var trueHDAtmos: TrueHDAtmosVerdict?
+
+    /// AE#1050: the title the container or the host gave the track, nil when `name` is the engine's own
+    /// fallback ("ENG (subrip)", "Track 3 (subrip)"). Native subtitle renditions name themselves from it.
+    var sourceTitle: String? = nil
 
     public init(id: Int, name: String, codec: String, language: String?, channels: Int = 0, bitrate: Int64 = 0, isDefault: Bool, isForced: Bool = false, isHearingImpaired: Bool = false, isCommentary: Bool = false, isVisualImpaired: Bool = false, isAtmos: Bool = false, assHeader: String? = nil, isExternal: Bool = false, isNativelyRenderedSubtitle: Bool = false, sampleRate: Int = 0, bitsPerSample: Int = 0, sampleFormat: String? = nil, channelLayout: String? = nil, profile: String? = nil, isDTSX: Bool = false, mpegTSPID: Int? = nil) {
         self.sampleRate = sampleRate
@@ -1703,6 +1872,15 @@ public struct SubtitleImage: @unchecked Sendable {
     /// than the coded video; hosts map the canvas width-aligned and center-anchored onto
     /// the video rect so cues land where the disc authored them (incl. the lower bar).
     /// .zero when unknown (pre-canvas cues): hosts fall back to treating canvas == video.
+    /// DVB reports the video frame here (AE#971): its display covers the whole picture, and a
+    /// 720x576 plane on HD video has non-square pixels, so `position` is normalized against the
+    /// plane while this carries the shape to map onto. DVD does the same on a rescaled encode
+    /// (AE#993, a 720x480 plane on 1280x720 video), and reports the 16:9 frame at the video's width
+    /// when the video is wider than 16:9 (cropped before scaling).
+    /// The size is in the video's CODED pixels. On anamorphic video (1440x1080, or 720x576 at 16:9)
+    /// the displayed picture is wider than the coded frame, so map the canvas onto the coded frame
+    /// first (width-aligned, center-anchored), then scale that rect onto the displayed picture rect
+    /// per axis. Mapping width-aligned onto the displayed rect directly makes the canvas too tall.
     public let canvasSize: CGSize
     /// AV_SUBTITLE_FLAG_FORCED from the decoded rect (#146): the disc authored this object as a
     /// forced caption (sign / foreign-dialogue overlay shown even with subtitles off).
@@ -1767,6 +1945,16 @@ func makeResamplerOutputLayout(_ channels: Int32, into layout: inout AVChannelLa
     av_channel_layout_default(&layout, channels)
 }
 
+/// The scaler the upscale stage runs (`LoadOptions.upscaleScaler`, AE#1039).
+public enum UpscaleScaler: Sendable, Hashable {
+    /// VideoToolbox low-latency super resolution where the device and frame size allow it, then MetalFX
+    /// spatial scaling to the target. SDR 8-bit below 1080p.
+    case automatic
+    /// A 2x line-art network for animation (Anime4K Upscale CNN S, half precision), then a bilinear
+    /// resample to the target where 2x does not land on it. SDR 8 or 10-bit 4:2:0 up to 1920x1080.
+    case lineArt
+}
+
 /// What the low-resolution upscale stage is doing for the current session (#846), published as
 /// `AetherEngine.activeUpscale` once the first upscaled frame is delivered, nil otherwise.
 public struct UpscaleStatus: Sendable, Equatable {
@@ -1782,9 +1970,12 @@ public struct UpscaleStatus: Sendable, Equatable {
     /// True once a sustained overrun made the stage drop MetalFX and deliver the VideoToolbox output at
     /// its own size (`targetSize`, carrying the source's pixel aspect). Kept when it later disables.
     public let degraded: Bool
+    /// The scaler the stage runs (`LoadOptions.upscaleScaler`).
+    public let scaler: UpscaleScaler
 
     init(plan: UpscalePlan, degraded: Bool = false, disabledReason: String? = nil) {
         sourceSize = CGSize(width: plan.sourceWidth, height: plan.sourceHeight)
+        scaler = plan.scaler
         mlScale = plan.mlScale
         targetSize = CGSize(width: plan.targetWidth, height: plan.targetHeight)
         self.degraded = degraded
@@ -1804,11 +1995,14 @@ public struct UpscaleStatus: Sendable, Equatable {
                       mlScale: current.map(\.mlScale) ?? plan.mlScale,
                       targetSize: current?.targetSize ?? CGSize(width: plan.targetWidth, height: plan.targetHeight),
                       degraded: current?.degraded ?? false,
+                      scaler: current?.scaler ?? plan.scaler,
                       disabledReason: reason)
     }
 
-    private init(sourceSize: CGSize, mlScale: Float?, targetSize: CGSize, degraded: Bool, disabledReason: String?) {
+    private init(sourceSize: CGSize, mlScale: Float?, targetSize: CGSize, degraded: Bool, scaler: UpscaleScaler,
+                 disabledReason: String?) {
         self.sourceSize = sourceSize
+        self.scaler = scaler
         self.mlScale = mlScale
         self.targetSize = targetSize
         self.degraded = degraded

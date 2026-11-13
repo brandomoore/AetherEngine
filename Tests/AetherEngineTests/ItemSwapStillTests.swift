@@ -4,7 +4,7 @@ import AVFoundation
 @testable import AetherEngine
 
 @Suite("AE#711 follow-up: the native picture held across an in-place item swap", .serialized,
-       .timeLimit(.minutes(1)))
+       .timeLimit(.minutes(3)))
 @MainActor
 struct ItemSwapStillTests {
 
@@ -144,6 +144,9 @@ struct ItemSwapStillTests {
         let host = try #require(engine.nativeHost)
         try await waitFor { host.isVideoReadyForDisplay }
         #expect(engine.state == .playing)
+        // A quarter speed stretches the 4 s clip to 16 s of wall clock: a starved CI run (132 s for
+        // this test) reached `.ended` before the read, which then had no item to vend from.
+        engine.setRate(0.25)
         // A playing item needs ~300 ms before a fresh output sees a frame (measured here); the
         // rebuild pauses first for that reason, but the playing read still has to work. The timeout
         // only has to catch an output that never vends: 2 s ran out once in a starved CI run (this
@@ -186,7 +189,7 @@ struct ItemSwapStillTests {
         let watcher = Task { @MainActor in
             while !Task.isCancelled {
                 if view.isHoldingStill { held = true }
-                try? await Task.sleep(for: .milliseconds(2))
+                do { try await Task.sleep(for: .milliseconds(2)) } catch { return }
             }
         }
         let failure = await engine.reloadWithAudioOverride(
@@ -240,7 +243,7 @@ struct ItemSwapStillTests {
         let watcher = Task { @MainActor in
             while !Task.isCancelled {
                 if still.isHoldingStill { held = true }
-                try? await Task.sleep(for: .milliseconds(2))
+                do { try await Task.sleep(for: .milliseconds(2)) } catch { return }
             }
         }
         let failure = await engine.reloadWithAudioOverride(
@@ -346,7 +349,7 @@ struct ItemSwapStillTests {
         let watcher = Task { @MainActor in
             while !Task.isCancelled {
                 if view.isHoldingStill { held = true }
-                try? await Task.sleep(for: .milliseconds(2))
+                do { try await Task.sleep(for: .milliseconds(2)) } catch { return }
             }
         }
         let failure = await engine.reloadWithAudioOverride(
@@ -355,7 +358,7 @@ struct ItemSwapStillTests {
         try await waitFor { !view.isHoldingStill }
         watcher.cancel()
 
-        #expect(held)
+        #expect(held, "skipped: \(engine.heldPictureLastSkip ?? "no skip recorded")")
         #expect(engine.heldPictureLastRoute == "software renderer")
         #expect(engine.heldPictureLastRelease == "first frame of the next host")
         #expect(engine.softwareHost !== host)
@@ -384,6 +387,10 @@ struct ItemSwapStillTests {
         try await waitFor { host.isVideoReadyForDisplay }
         try await Task.sleep(for: .seconds(1))
         engine.pause()
+        // Scrubbing takes the reshaped still path, not the compositor preview.
+        #expect(engine.supportsCacheBackedStills)
+        #expect(!engine.scrubPreviewDrawsInView)
+        #expect(await engine.scrubThumbnail(atSeconds: 0.5, maxWidth: 160) != nil)
         let started = ContinuousClock.now
         await engine.holdPictureAcrossItemSwap()
         #expect(ContinuousClock.now - started < .seconds(AetherEngine.heldPictureDolbyVisionBudgetSeconds))

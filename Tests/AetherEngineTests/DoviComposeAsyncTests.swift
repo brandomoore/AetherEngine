@@ -84,7 +84,7 @@ struct DoviComposeAsyncTests {
     }
 
     @Test("after releaseOutputPool a composition is refused, its slot is returned and no pool is rebuilt",
-          .timeLimit(.minutes(1)))
+          .timeLimit(.minutes(3)))
     func composeAfterTeardownIsRefused() async throws {
         let composer = try #require(DoviFelComposer())
         let bl = try #require(Self.makeBuffer(width: 256, height: 256, fill: 0x8000))
@@ -108,7 +108,7 @@ struct DoviComposeAsyncTests {
         #expect(composer.allocatedPoolBuffers == 0, "a pool was rebuilt after teardown")
     }
 
-    @Test("pool creation is refused once torn down, whatever the caller saw before", .timeLimit(.minutes(1)))
+    @Test("pool creation is refused once torn down, whatever the caller saw before", .timeLimit(.minutes(3)))
     func poolCreationAfterTeardownIsRefused() throws {
         let composer = try #require(DoviFelComposer())
         #expect(composer.ensurePoolForTesting(width: 256, height: 256) != nil)
@@ -119,7 +119,7 @@ struct DoviComposeAsyncTests {
         #expect(composer.allocatedPoolBuffers == 0)
     }
 
-    @Test("the blocking compose waits for an in-flight slot like composeAsync does", .timeLimit(.minutes(1)))
+    @Test("the blocking compose waits for an in-flight slot like composeAsync does", .timeLimit(.minutes(3)))
     func blockingComposeTakesAnInFlightSlot() throws {
         final class Box: @unchecked Sendable { let done = DispatchSemaphore(value: 0); var result: Bool? }
         let composer = try #require(DoviFelComposer())
@@ -138,6 +138,21 @@ struct DoviComposeAsyncTests {
         #expect(box.done.wait(timeout: .now() + 10) == .success)
         #expect(box.result == true)
         for _ in 1..<DoviFelComposer.maxFramesInFlight { composer.releaseSlot() }
+    }
+
+    @Test("a timed slot wait gives up with nothing taken, and succeeds once a slot is released")
+    func timedSlotWaitGivesUpWithoutSideEffect() throws {
+        let composer = try #require(DoviFelComposer())
+        for _ in 0..<DoviFelComposer.maxFramesInFlight { composer.acquireSlot() }
+        let peak = composer.takePeakSlotsInUse()
+        #expect(peak == DoviFelComposer.maxFramesInFlight)
+
+        #expect(composer.acquireSlot(timeout: .now() + 0.05) == false)
+        #expect(composer.takePeakSlotsInUse() == DoviFelComposer.maxFramesInFlight, "a timed-out wait changed the slot count")
+
+        composer.releaseSlot()
+        #expect(composer.acquireSlot(timeout: .now() + 5) == true)
+        for _ in 0..<DoviFelComposer.maxFramesInFlight { composer.releaseSlot() }
     }
 
     @Test("composeAsync matches the blocking compose bit for bit")
@@ -164,7 +179,7 @@ struct DoviComposeAsyncTests {
     }
 
     @Test("every composeAsync call completes exactly once, and no more than maxFramesInFlight are outstanding",
-          .timeLimit(.minutes(1)))
+          .timeLimit(.minutes(3)))
     func completionsAreExactlyOnceAndBounded() async throws {
         let composer = try #require(DoviFelComposer())
         guard let bl = Self.makeBuffer(width: 256, height: 256, fill: 0x8000),
@@ -214,7 +229,7 @@ struct DoviComposeAsyncTests {
     /// and a `composeAsync` that waits for its completion while the caller holds
     /// the lock deadlocks regardless of timing.
     @Test("composeAsync makes progress while the caller holds a lock the completion also needs",
-          .timeLimit(.minutes(1)))
+          .timeLimit(.minutes(3)))
     func doesNotDeadlockAgainstTheCallersLock() async throws {
         let composer = try #require(DoviFelComposer())
         guard let bl = Self.makeBuffer(width: 256, height: 256, fill: 0x8000),
@@ -228,9 +243,9 @@ struct DoviComposeAsyncTests {
         // async context, a lock held across the call is the whole point here, and a deadlock must
         // park that thread rather than the test's, so the `.timeLimit` trait can report it.
         let buffers = Buffers(bl: bl, el: el)
-        // At most three compositions outstanding, as the decoder's own in-flight limit does: it keeps
+        // At most `DoviFelComposer.maxFramesInFlight` compositions outstanding, as the decoder's own in-flight limit does: it keeps
         // the output pool from running dry (a nil output) without pacing by the wall clock.
-        let inFlight = DispatchSemaphore(value: 3)
+        let inFlight = DispatchSemaphore(value: DoviFelComposer.maxFramesInFlight)
         @Sendable func issueUnderLock() {
             for i in 0..<frames {
                 inFlight.wait()

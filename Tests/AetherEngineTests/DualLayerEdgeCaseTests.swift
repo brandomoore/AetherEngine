@@ -12,7 +12,7 @@ import AetherLibavformat
 /// layers, the pixel-rate budget at its boundary, 1001-based timebases, and seeks that land on 0, on a
 /// replayed range, or in a burst. Everything is synthetic: tagged pixel buffers into the frame handlers,
 /// a recording composer, no media and no GPU.
-@Suite(.serialized, .offCooperativePool, .timeLimit(.minutes(1)))
+@Suite(.serialized, .offCooperativePool, .timeLimit(.minutes(3)))
 struct DualLayerEdgeCaseTests {
 
     // MARK: - Fixtures
@@ -50,6 +50,7 @@ struct DualLayerEdgeCaseTests {
         var pairs: [Pair] { lock.lock(); defer { lock.unlock() }; return _pairs }
         var flushCount: Int { lock.lock(); defer { lock.unlock() }; return _flushes }
         func acquireSlot() {}
+        func acquireSlot(timeout: DispatchTime) -> Bool { true }
         func releaseSlot() {}
         func flush() { lock.lock(); _flushes += 1; lock.unlock() }
         func composeAsync(baseBuffer: CVPixelBuffer, enhancementBuffer: CVPixelBuffer, params: DoviMetalParams,

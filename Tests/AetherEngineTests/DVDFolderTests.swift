@@ -32,6 +32,8 @@ struct DVDFolderTests {
         let info = try #require(try DiscReader.wrap(folder))
         #expect(info.formatHint == "mpeg")
         #expect(info.titles.map(\.dvdVTSN) == [1, 2])
+        #expect(info.titles.map { $0.titleInfo().titleSet } == [1, 2])  // #1034
+        #expect(info.titles.allSatisfy { $0.titleInfo().playlist == nil })
         #expect(BluRayFolderTests.readToEnd(info.reader) == Self.bytes(5, 7000) + Self.bytes(6, 4000))
         #expect(info.reader.seek(offset: 0, whence: 65536) == 11000)
         // The menu VOBs are never opened, and no Blu-ray path is tried.
@@ -46,8 +48,8 @@ struct DVDFolderTests {
         let ifo = DVDCellTimelineTests.vtsIFO(pgcs: [DVDCellTimelineTests.pgc(DVDCellTimelineTests.threeCells)],
                                               timeMaps: [(unit: 4, sectors: [10, 20])])
         let info = try #require(try DiscReader.wrap(Self.folder(vts1IFO: ifo)))
-        #expect(info.clipTimeline.map(\.concatByteStart) == [0, 1000 * 2048, 3000 * 2048])
-        #expect(info.dvdTimeMap?.byteOffsets == [10 * 2048, 20 * 2048])
+        #expect(info.clipTimeline.map(\.concatByteStart) == [0, 1000 * 2048, 3000 * 2048] as [Int64])
+        #expect(info.dvdTimeMap?.byteOffsets == [10 * 2048, 20 * 2048] as [Int64])
         #expect(info.titles.first?.durationTicks == UInt64(2100 * discTickRate))
     }
 

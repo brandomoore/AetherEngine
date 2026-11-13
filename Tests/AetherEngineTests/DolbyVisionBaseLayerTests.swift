@@ -161,8 +161,15 @@ struct DolbyVisionBaseLayerTests {
             supportsHDR: true, supportsDolbyVision: true, supportsHDR10: true, supportsHLG: true)
         for type in ["FEL", "MEL", "FEL", "MEL"] {
             engine.sourceDolbyVisionEnhancementLayerType = type
+            engine.sourceMeasuredFrameRate = AVRational(num: 25, den: 1)
             try await engine.refreshReopenedVideoPresentation(
-                demuxer, options: options, generation: engine.loadGeneration)
+                demuxer, options: options, generation: engine.loadGeneration,
+                preservingMeasuredFrameRate: true)
+            #expect(engine.sourceMeasuredFrameRate?.num == 25)
+            try await engine.refreshReopenedVideoPresentation(
+                demuxer, options: options, generation: engine.loadGeneration,
+                preservingMeasuredFrameRate: false)
+            #expect(engine.sourceMeasuredFrameRate == nil)
             #expect(engine.videoFormat == (type == "MEL" ? .dolbyVision : .hdr10))
             #expect(engine.sourceVideoFormat == .dolbyVision)
             #expect(engine.sourceDVProfile == 7)

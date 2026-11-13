@@ -62,19 +62,22 @@ final class EmbeddedSubtitleDecoder {
     /// for SRT, WebVTT or teletext uses the default 384x288 instead.
     private let assPlayRes: CGSize
 
+    /// AE#1006: a PGS track of a PQ source carries a PQ palette, converted to sRGB per display set.
+    private let pqPalette: Bool
+
     /// Open the subtitle decoder for `stream`. Returns `nil` if the codec couldn't be opened.
-    convenience init?(stream: UnsafeMutablePointer<AVStream>, sourceVideoWidth: Int32, sourceVideoHeight: Int32, preserveASSMarkup: Bool = false, teletextPage: Int? = nil) {
+    convenience init?(stream: UnsafeMutablePointer<AVStream>, sourceVideoWidth: Int32, sourceVideoHeight: Int32, sourceIsPQ: Bool = false, preserveASSMarkup: Bool = false, teletextPage: Int? = nil) {
         guard let codecpar = stream.pointee.codecpar else { return nil }
         self.init(codecpar: codecpar, sourceVideoWidth: sourceVideoWidth,
-                  sourceVideoHeight: sourceVideoHeight, preserveASSMarkup: preserveASSMarkup,
-                  teletextPage: teletextPage)
+                  sourceVideoHeight: sourceVideoHeight, sourceIsPQ: sourceIsPQ,
+                  preserveASSMarkup: preserveASSMarkup, teletextPage: teletextPage)
         // Some demuxers default to AVDISCARD_DEFAULT and swallow packets; force NONE so everything reaches av_read_frame.
         stream.pointee.discard = AVDISCARD_NONE
     }
 
     /// Open the subtitle decoder for a stream's parameters alone. #921: a bitmap sidecar keeps a
     /// copy of its parameters after its container is closed, and builds its drain decoders from it.
-    init?(codecpar: UnsafePointer<AVCodecParameters>, sourceVideoWidth: Int32, sourceVideoHeight: Int32, preserveASSMarkup: Bool = false, teletextPage: Int? = nil) {
+    init?(codecpar: UnsafePointer<AVCodecParameters>, sourceVideoWidth: Int32, sourceVideoHeight: Int32, sourceIsPQ: Bool = false, preserveASSMarkup: Bool = false, teletextPage: Int? = nil) {
         guard codecpar.pointee.codec_type == AVMEDIA_TYPE_SUBTITLE else { return nil }
         let id = codecpar.pointee.codec_id
         guard let codec = avcodec_find_decoder(id),
@@ -88,7 +91,9 @@ final class EmbeddedSubtitleDecoder {
         }
 
         // Seed bitmap canvas from video dims; PCS overwrites once it arrives (probe can't always determine them upfront).
-        if Self.isBitmapCodec(id) {
+        // AE#971: not DVB. dvbsubdec takes its canvas from the DDS, or the EN 300 743 default of 720x576
+        // without one, only while the context has no size, so a seed overrode both.
+        if Self.isBitmapCodec(id), id != AV_CODEC_ID_DVB_SUBTITLE {
             if ctx.pointee.width == 0 { ctx.pointee.width = sourceVideoWidth }
             if ctx.pointee.height == 0 { ctx.pointee.height = sourceVideoHeight }
         }
@@ -113,6 +118,7 @@ final class EmbeddedSubtitleDecoder {
         self.emitsRawASSLines = preserveASSMarkup
             && (id == AV_CODEC_ID_ASS || id == AV_CODEC_ID_SSA)
         self.teletextPage = teletextPage
+        self.pqPalette = sourceIsPQ && id == AV_CODEC_ID_HDMV_PGS_SUBTITLE
 
         var playRes = SubtitleRectText.defaultASSPlayRes
         if let extra = codecpar.pointee.extradata, codecpar.pointee.extradata_size > 0 {
@@ -210,6 +216,21 @@ final class EmbeddedSubtitleDecoder {
         // PCS-reported canvas; fall back to source video dims if missing.
         let canvasW = ctx.pointee.width > 0 ? ctx.pointee.width : sourceVideoWidth
         let canvasH = ctx.pointee.height > 0 ? ctx.pointee.height : sourceVideoHeight
+        // AE#971: a DVB display covers the whole picture whatever its pixel grid (720x576 SD pixels are not
+        // square on HD video), so hosts get the video frame as the canvas and stretch onto it, while the
+        // position stays normalized against the decoder's own canvas.
+        let reportedCanvas: CGSize?
+        switch ctx.pointee.codec_id {
+        case AV_CODEC_ID_DVB_SUBTITLE:
+            reportedCanvas = sourceVideoWidth > 0 && sourceVideoHeight > 0
+                ? CGSize(width: Int(sourceVideoWidth), height: Int(sourceVideoHeight)) : nil
+        case AV_CODEC_ID_DVD_SUBTITLE:
+            reportedCanvas = Self.dvdReportedCanvas(
+                canvas: CGSize(width: Int(canvasW), height: Int(canvasH)),
+                video: CGSize(width: Int(sourceVideoWidth), height: Int(sourceVideoHeight)))
+        default:
+            reportedCanvas = nil
+        }
 
         var bodies: [SubtitleCue.Body] = []
         var textLines: [String] = []
@@ -247,7 +268,9 @@ final class EmbeddedSubtitleDecoder {
                 } else if let image = Self.imageForSubtitleRect(
                     rect,
                     videoWidth: Int(canvasW),
-                    videoHeight: Int(canvasH)
+                    videoHeight: Int(canvasH),
+                    reportedCanvas: reportedCanvas,
+                    pqPalette: pqPalette
                 ) {
                     bodies.append(.image(image))
                 }
@@ -625,15 +648,41 @@ final class EmbeddedSubtitleDecoder {
         }
     }
 
+    /// AE#993: a DVD subpicture covers the whole display, like DVB, but its 720x480 / 720x576 plane
+    /// has non-square pixels, so on a rescaled encode (1280x720) the width-aligned mapping made the
+    /// canvas 853 lines tall and pushed bottom cues up to 67 px down and off the picture. A canvas
+    /// as wide as the coded video is the video's own pixel grid (an uncropped or a cropped-only rip),
+    /// where width-aligned is right, so nil keeps it. Otherwise the video was rescaled, and the plane
+    /// is a 4:3 or 16:9 display: a picture of that shape is the whole display, so the canvas is the
+    /// video frame; a wider one was cropped out of a 16:9 display before scaling (1280x544 from a
+    /// scope DVD), so the canvas is the 16:9 frame at the video's width, centre-anchored over it.
+    /// Covering there would squash every glyph by the crop ratio. Square video pixels are assumed:
+    /// a re-encode that changed the width is almost always square-pixel.
+    static func dvdReportedCanvas(canvas: CGSize, video: CGSize) -> CGSize? {
+        guard canvas.width > 0, canvas.height > 0, video.width > 0, video.height > 0,
+              canvas.width != video.width else { return nil }
+        let aspect = video.width / video.height
+        let widescreen: CGFloat = 16.0 / 9.0
+        let tolerance: CGFloat = 0.02
+        if aspect > widescreen * (1 + tolerance) {
+            return CGSize(width: video.width, height: (video.width / widescreen).rounded())
+        }
+        return video
+    }
+
     // MARK: - Rect → text / image
 
     /// Render a PGS/DVB/HDMV bitmap rect into a CGImage with normalised position.
     /// Palette from libavcodec is 32-bit with alpha in the high byte and BGR below ([B,G,R,A] on little-endian);
     /// rewritten to RGBA for CGImage's premultipliedLast. Internal for unit tests (#146).
+    /// `reportedCanvas` replaces `canvasSize` when the plane's shape differs from its pixel grid (AE#971 DVB,
+    /// AE#993 DVD). `pqPalette` converts a PQ palette to sRGB first (AE#1006).
     static func imageForSubtitleRect(
         _ rect: UnsafeMutablePointer<AVSubtitleRect>,
         videoWidth: Int,
-        videoHeight: Int
+        videoHeight: Int,
+        reportedCanvas: CGSize? = nil,
+        pqPalette: Bool = false
     ) -> SubtitleImage? {
         let r = rect.pointee
         guard r.type == SUBTITLE_BITMAP,
@@ -657,10 +706,14 @@ final class EmbeddedSubtitleDecoder {
         var visible = [Bool](repeating: false, count: 256)
         var premultiplied = [UInt32](repeating: 0, count: 256)
         for i in 0..<256 {
-            let b = UInt32(palettePtr[i * 4 + 0])
-            let g = UInt32(palettePtr[i * 4 + 1])
-            let red = UInt32(palettePtr[i * 4 + 2])
+            var b = UInt32(palettePtr[i * 4 + 0])
+            var g = UInt32(palettePtr[i * 4 + 1])
+            var red = UInt32(palettePtr[i * 4 + 2])
             let a = UInt32(palettePtr[i * 4 + 3])
+            if pqPalette, a > 0 {
+                let rgb = PQSubtitlePalette.sRGB(fromPQ: UInt8(red), UInt8(g), UInt8(b))
+                (red, g, b) = (UInt32(rgb.r), UInt32(rgb.g), UInt32(rgb.b))
+            }
             visible[i] = palettePtr[i * 4 + 3] >= alphaThreshold
             premultiplied[i] = ((red * a + 127) / 255)
                 | (((g * a + 127) / 255) << 8)
@@ -732,7 +785,7 @@ final class EmbeddedSubtitleDecoder {
         }
 
         return SubtitleImage(cgImage: cgImage, position: position,
-                             canvasSize: CGSize(width: Int(videoWidth), height: Int(videoHeight)),
+                             canvasSize: reportedCanvas ?? CGSize(width: Int(videoWidth), height: Int(videoHeight)),
                              isForced: (r.flags & AV_SUBTITLE_FLAG_FORCED) != 0)
     }
 }

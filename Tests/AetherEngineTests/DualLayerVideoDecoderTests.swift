@@ -413,6 +413,7 @@ extension HeavyDualLayerSuites {
                 return _flagsByBase[ObjectIdentifier(base)]
             }
             func acquireSlot() {}
+            func acquireSlot(timeout: DispatchTime) -> Bool { true }
             func releaseSlot() {}
             func flush() {}
             func composeAsync(baseBuffer: CVPixelBuffer, enhancementBuffer: CVPixelBuffer, params: DoviMetalParams,
@@ -1073,6 +1074,7 @@ extension HeavyDualLayerSuites {
         /// `OrderedDelivery`'s own queue (`waitFor`/`settle`).
         private final class ImmediateFakeComposer: FelComposing, @unchecked Sendable {
             func acquireSlot() {}
+            func acquireSlot(timeout: DispatchTime) -> Bool { true }
             func releaseSlot() {}
             func flush() {}
             func composeAsync(
@@ -1181,7 +1183,7 @@ extension HeavyDualLayerSuites {
             let group = DispatchGroup()
             for i in 0..<frames {
                 group.enter()
-                DispatchQueue.global().async {
+                DispatchQueue.global().async { // hygiene: allow non-blocking fan-out, real parallelism is the point
                     // Alternate arrival order per pair to hit both pairing paths.
                     if i % 2 == 0 {
                         decoder.handleBaseLayerFrame(baseBuffer: bl[i].value, pts: Self.pts(Int64(i)), hdr10Data: nil)
@@ -1194,7 +1196,7 @@ extension HeavyDualLayerSuites {
                 }
                 // Control-plane churn on the same shared state the VT threads touch.
                 group.enter()
-                DispatchQueue.global().async {
+                DispatchQueue.global().async { // hygiene: allow non-blocking fan-out, real parallelism is the point
                     decoder.skipUntilPTS = Self.pts(Int64(i))
                     _ = decoder.skipUntilPTS
                     _ = decoder.streamClassificationForTesting
@@ -1235,10 +1237,21 @@ extension HeavyDualLayerSuites {
                     nudgeIDs.insert(ObjectIdentifier(nudge))
                     decoder.handleBaseLayerFrame(baseBuffer: nudge, pts: Self.pts(Int64(900 + i)), hdr10Data: nil)
                 }
-                try await waitFor {
-                    deliveries.snapshot.filter { sentIDs.contains(ObjectIdentifier($0.buffer)) }.count >= frames
+                // A frame can also be given up by `OrderedDelivery`'s stall guard: a thread preempted
+                // between taking its ticket and `fulfil` while more than the threshold of later frames
+                // land is indistinguishable from a lost ticket, and its late `fulfil` is dropped. The
+                // unthrottled fan-out above does that on a loaded runner (CI 2026-11-08: 63 of 64,
+                // every ticket through the sent frames resolved, nothing pending). It costs exactly
+                // that frame, by design, so it is counted here instead of waited for.
+                let allResolved = try await waitFor(upTo: .seconds(200)) {
+                    let delivered = deliveries.snapshot.filter { sentIDs.contains(ObjectIdentifier($0.buffer)) }.count
+                    return delivered + Int(decoder.stateSnapshotForTesting.deliveryStallSkippedTickets) >= frames
                 }
+                let deliveredCount = deliveries.snapshot.filter { sentIDs.contains(ObjectIdentifier($0.buffer)) }.count
+                try #require(allResolved, "\(deliveredCount) of \(frames) delivered; \(decoder.stateSnapshotForTesting)")
             }
+            let stallSkipped = Int(decoder.stateSnapshotForTesting.deliveryStallSkippedTickets)
+            #expect(stallSkipped <= 2, "the stall guard gives up a preempted frame, not a run of them")
             // `allSatisfy`, not a `filter`: an enhancement-layer buffer (or
             // anything else) delivered on its own is what this catches; sent
             // base-layer frames and the nudges above are the only buffers ever
@@ -1247,15 +1260,15 @@ extension HeavyDualLayerSuites {
             #expect(deliveries.snapshot.allSatisfy { allowed.contains(ObjectIdentifier($0.buffer)) },
                     "only sent base-layer frames or the nudges that age out stranded ones may ever be delivered")
             let got = deliveries.snapshot.filter { sentIDs.contains(ObjectIdentifier($0.buffer)) }
-            #expect(got.count == frames)
-            #expect(Set(got.map { ObjectIdentifier($0.buffer) }).count == frames)
+            #expect(got.count == frames - stallSkipped)
+            #expect(Set(got.map { ObjectIdentifier($0.buffer) }).count == got.count)
 
             // Teardown under load: arrivals racing close() are either delivered
             // before it or dropped after it; nothing lands past the marker.
             let teardown = DispatchGroup()
             for i in frames..<(frames + 8) {
                 teardown.enter()
-                DispatchQueue.global().async {
+                DispatchQueue.global().async { // hygiene: allow non-blocking fan-out, real parallelism is the point
                     if let b = Self.baseLayer(), let e = Self.enhancementLayer() {
                         decoder.handleBaseLayerFrame(baseBuffer: b, pts: Self.pts(Int64(i)), hdr10Data: nil)
                         decoder.handleEnhancementLayerFrame(elBuffer: e, pts: Self.pts(Int64(i)))
@@ -1264,7 +1277,7 @@ extension HeavyDualLayerSuites {
                 }
             }
             teardown.enter()
-            DispatchQueue.global().async {
+            DispatchQueue.global().async { // hygiene: allow non-blocking teardown racing the fan-out
                 decoder.flush()
                 decoder.close()
                 teardown.leave()
@@ -1284,6 +1297,7 @@ extension HeavyDualLayerSuites {
         /// Fake composer whose every composition fails (completes with nil), as a GPU error does.
         private final class FailingFakeComposer: FelComposing, @unchecked Sendable {
             func acquireSlot() {}
+            func acquireSlot(timeout: DispatchTime) -> Bool { true }
             func releaseSlot() {}
             func flush() {}
             func composeAsync(
@@ -1316,6 +1330,7 @@ extension HeavyDualLayerSuites {
             private var calls = 0
             init(dropOnCall: Int) { self.dropOnCall = dropOnCall }
             func acquireSlot() {}
+            func acquireSlot(timeout: DispatchTime) -> Bool { true }
             func releaseSlot() {}
             func flush() {}
             func composeAsync(
@@ -1795,10 +1810,44 @@ extension HeavyDualLayerSuites {
 
         // MARK: - Known defects
 
-        @Test("a pruned base-layer frame cannot be delivered after a newer composed frame", .enabled(if: Self.metalAvailable, "needs a Metal device"))
+        /// Completes every composition a little later on a queue of its own, so frame 1 retires after
+        /// frame 0 has been pruned: the race this test is about, with no GPU in it. On the real composer
+        /// a command buffer that fails in place drops the frame by design, and the wait below for frame 1
+        /// then ran to the suite's five-minute limit (CI 2026-11-03 and 2026-11-04; reproduced with
+        /// `forcedCommandBufferFailure`).
+        private final class LateFakeComposer: FelComposing, @unchecked Sendable {
+            private let queue = DispatchQueue(label: "test.dovi.late-compose")
+            func acquireSlot() {}
+            func acquireSlot(timeout: DispatchTime) -> Bool { true }
+            func releaseSlot() {}
+            func flush() {}
+            func composeAsync(
+                baseBuffer: CVPixelBuffer,
+                enhancementBuffer: CVPixelBuffer,
+                params: DoviMetalParams,
+                frameIndex: UInt32,
+                completion: @escaping @Sendable (CVPixelBuffer?) -> Void
+            ) {
+                composeAsyncWithAcquiredSlot(baseBuffer: baseBuffer, enhancementBuffer: enhancementBuffer, params: params, frameIndex: frameIndex, completion: completion)
+            }
+            func composeAsyncWithAcquiredSlot(
+                baseBuffer: CVPixelBuffer,
+                enhancementBuffer: CVPixelBuffer,
+                params: DoviMetalParams,
+                frameIndex: UInt32,
+                completion: @escaping @Sendable (CVPixelBuffer?) -> Void
+            ) {
+                let buffer = SendableFrameBuffer(value: baseBuffer)
+                queue.asyncAfter(deadline: .now() + 0.05) { completion(buffer.value) }
+            }
+        }
+
+        @Test("a pruned base-layer frame cannot be delivered after a newer composed frame")
         func prunedFrameDoesNotOvertakeNewerFrames() async throws {
             let deliveries = Deliveries()
-            let decoder = Self.decoder(recordingInto: deliveries, enhancementLayer: true)
+            let decoder = DualLayerVideoDecoder(composer: LateFakeComposer())
+            decoder.onFrame = { buffer, pts, hdr10 in deliveries.record(buffer, pts, hdr10) }
+            decoder.primeForTesting(enhancementLayer: true)
             defer { decoder.close() }
 
             // Frame 0's enhancement layer is lost, so it waits in the base-layer queue.
@@ -2469,6 +2518,8 @@ extension HeavyDualLayerSuites {
 
             // Enhancement layer arrives at t = 10.0: pairs and composes
             decoder.handleEnhancementLayerFrame(elBuffer: elBuf, pts: Self.pts(1))
+            // The composition runs on the compose queue: let it finish before the summary counts it.
+            decoder.quiesceForTesting()
 
             // Advance by 0.5s to 10.5: interval (1.0s) has not elapsed yet
             currentTime = 10.5
@@ -2544,6 +2595,7 @@ extension HeavyDualLayerSuites {
             decoder.seedRPUForTesting(pts: Self.pts(1), params: Self.params(), displayMetadataNAL: nil)
             decoder.handleBaseLayerFrame(baseBuffer: baseBuf, pts: Self.pts(1), hdr10Data: nil)
             decoder.handleEnhancementLayerFrame(elBuffer: elBuf, pts: Self.pts(1))
+            decoder.quiesceForTesting()
 
             currentTime = 31.1
             decoder.maybeEmitSummary()
@@ -2579,6 +2631,8 @@ extension HeavyDualLayerSuites {
                 decoder.seedRPUForTesting(pts: Self.pts(n), params: Self.params(), displayMetadataNAL: nil)
                 decoder.handleBaseLayerFrame(baseBuffer: baseBuf, pts: Self.pts(n), hdr10Data: nil)
                 decoder.handleEnhancementLayerFrame(elBuffer: elBuf, pts: Self.pts(n))
+                // The composition runs on the compose queue: the counters move once it has.
+                decoder.quiesceForTesting()
             }
             func count() -> Int {
                 logLock.lock()
@@ -2639,6 +2693,7 @@ extension HeavyDualLayerSuites {
             decoder.handleEnhancementLayerFrame(elBuffer: elBuf, pts: Self.pts(1))
 
             // The frame is composed but no summary has run yet: a seek arrives first.
+            decoder.quiesceForTesting()
             decoder.flush()
 
             // The first call after the flush only records the baseline, the next one emits.

@@ -29,6 +29,7 @@ struct VideoPrerollTests {
     @MainActor
     func singleLayerGate() {
         let renderer = SampleBufferRenderer()
+        renderer.readyForMoreMediaDataForTesting = { true }  // a layer with room, as on a device
         renderer.setReorderDepth(SampleBufferRenderer.presentationOrderReorderDepth)
         let pixels = Self.makePixelBuffer()
         #expect(renderer.prerollSatisfied(clock: 0, live: false) == false, "nothing handed over yet")
@@ -40,10 +41,30 @@ struct VideoPrerollTests {
         #expect(renderer.prerollSatisfied(clock: Self.time(2).seconds, live: false) == false)
     }
 
+    @Test("A full renderer opens the gate: nothing more can arrive until the clock runs")
+    @MainActor
+    func fullRendererOpensGate() {
+        // A rebuffer resume: the clock stopped with the layer full and the frames handed over sitting
+        // at or behind it. The decoder may not hand over more until the clock drains the layer, so a
+        // closed gate held the clock for the whole prerollTimeout after every rebuffer.
+        let renderer = SampleBufferRenderer()
+        renderer.readyForMoreMediaDataForTesting = { true }  // a layer with room, as on a device
+        renderer.setReorderDepth(SampleBufferRenderer.presentationOrderReorderDepth)
+        let pixels = Self.makePixelBuffer()
+        for i in 0...4 { renderer.enqueue(pixelBuffer: pixels, pts: Self.time(i)) }
+        let clock = Self.time(3).seconds
+        #expect(renderer.prerollSatisfied(clock: clock, live: false) == false, "room left: wait for more")
+        renderer.readyForMoreMediaDataForTesting = { false }
+        #expect(renderer.prerollSatisfied(clock: clock, live: false) == true)
+        renderer.setFELLookahead(enabled: true, frameRate: 24)
+        #expect(renderer.prerollSatisfied(clock: clock, live: false) == true, "the FEL route too")
+    }
+
     @Test("Off the FEL path a live stream does not preroll")
     @MainActor
     func singleLayerLiveHasNoGate() {
         let renderer = SampleBufferRenderer()
+        renderer.readyForMoreMediaDataForTesting = { true }  // a layer with room, as on a device
         #expect(renderer.prerollSatisfied(clock: 0, live: true) == nil)
         renderer.setFELLookahead(enabled: true, frameRate: 24)
         #expect(renderer.prerollSatisfied(clock: 0, live: true) == false, "the FEL route still does")
@@ -53,6 +74,7 @@ struct VideoPrerollTests {
     @MainActor
     func singleLayerGateAfterAResume() {
         let renderer = SampleBufferRenderer()
+        renderer.readyForMoreMediaDataForTesting = { true }  // a layer with room, as on a device
         renderer.setReorderDepth(SampleBufferRenderer.presentationOrderReorderDepth)
         let pixels = Self.makePixelBuffer()
         // #800: the keyframe sits 3 s before the target; everything up to it is decoded and skipped.
@@ -68,6 +90,7 @@ struct VideoPrerollTests {
     @MainActor
     func gateCountsContiguousFrames() {
         let renderer = SampleBufferRenderer()
+        renderer.readyForMoreMediaDataForTesting = { true }  // a layer with room, as on a device
         renderer.setFELLookahead(enabled: true, frameRate: 24)
         renderer.setArrivalOrderHandover(frameRate: 24)
         let pixels = Self.makePixelBuffer()
@@ -88,6 +111,7 @@ struct VideoPrerollTests {
     @MainActor
     func gateRestartsAtTheSeekTarget() {
         let renderer = SampleBufferRenderer()
+        renderer.readyForMoreMediaDataForTesting = { true }  // a layer with room, as on a device
         renderer.setFELLookahead(enabled: true, frameRate: 24)
         renderer.setArrivalOrderHandover(frameRate: 24)
         let pixels = Self.makePixelBuffer()
@@ -105,6 +129,7 @@ struct VideoPrerollTests {
     @MainActor
     func gateOpensAfterAnOffGridSeek(phase: Double) {
         let renderer = SampleBufferRenderer()
+        renderer.readyForMoreMediaDataForTesting = { true }  // a layer with room, as on a device
         renderer.setFELLookahead(enabled: true, frameRate: 24)
         renderer.setArrivalOrderHandover(frameRate: 24)
         let pixels = Self.makePixelBuffer()
@@ -122,6 +147,7 @@ struct VideoPrerollTests {
     @MainActor
     func prerollFitsTheLookaheadAt60() {
         let renderer = SampleBufferRenderer()
+        renderer.readyForMoreMediaDataForTesting = { true }  // a layer with room, as on a device
         renderer.setFELLookahead(enabled: true, frameRate: 60)
         renderer.setArrivalOrderHandover(frameRate: 60)
         let pixels = Self.makePixelBuffer()
@@ -145,7 +171,7 @@ struct VideoPrerollTests {
         var isOpen: Bool { open.withLock { $0 } }
     }
 
-    @Test("Without a gate seekClock starts the clock at once", .timeLimit(.minutes(1)))
+    @Test("Without a gate seekClock starts the clock at once", .timeLimit(.minutes(3)))
     func startsAtOnceWithoutAGate() {
         let output = AudioOutput()
         output.seekClock(to: CMTime(seconds: 5, preferredTimescale: 90000), rate: 1)
@@ -153,7 +179,7 @@ struct VideoPrerollTests {
     }
 
     @Test("A closed gate holds the clock at rate 0 and the start follows when it opens",
-          .timeLimit(.minutes(1)))
+          .timeLimit(.minutes(3)))
     func holdsUntilTheGateOpens() async throws {
         let output = AudioOutput()
         let gate = Gate()
@@ -171,7 +197,46 @@ struct VideoPrerollTests {
         #expect(output.synchronizer.currentTime().seconds <= 5 + ran + 0.02)
     }
 
-    @Test("A rate set while the preroll waits is the rate it starts at", .timeLimit(.minutes(1)))
+    @Test("A buffered route starts the clock unscheduled, a direct one on the host clock")
+    func highLatencyRouteStartsUnscheduled() {
+        #expect(AudioOutput.prerollStartsAtHostTime(outputLatency: 0.080), "HDMI")
+        #expect(AudioOutput.prerollStartsAtHostTime(outputLatency: AudioOutput.prerollStartLead))
+        #expect(!AudioOutput.prerollStartsAtHostTime(outputLatency: 2.0), "AirPlay")
+    }
+
+    @Test("On a buffered route the opened gate starts the clock without the lead", .timeLimit(.minutes(3)))
+    func highLatencyRouteSkipsTheLead() async throws {
+        let output = AudioOutput(outputLatency: { 2.0 })
+        output.videoPrerollSatisfied = { _ in true }
+        output.seekClock(to: CMTime(seconds: 5, preferredTimescale: 90000), rate: 1)
+        #expect(output.synchronizer.rate == 1)
+        // A start scheduled `prerollStartLead` out would still stand at 5 here.
+        try await Task.sleep(for: .milliseconds(150))
+        #expect(output.synchronizer.currentTime().seconds > 5.05)
+    }
+
+    @Test("A host repeating the rate after play leaves the scheduled start alone")
+    func repeatedRateAfterScheduledStartIsNoOp() {
+        let output = AudioOutput(outputLatency: { 0.08 })
+        output.videoPrerollSatisfied = { _ in true }
+        output.seekClock(to: CMTime(seconds: 5, preferredTimescale: 90000), rate: 1)
+        let revision = output.clockCommandRevision
+        output.setRate(1)
+        #expect(output.clockCommandRevision == revision, "no second start was issued")
+    }
+
+    @Test("A pause and play still restart the clock with the rate unchanged")
+    func pauseThenSameRateRestarts() {
+        let output = AudioOutput()
+        output.seekClock(to: CMTime(seconds: 5, preferredTimescale: 90000), rate: 1)
+        output.pause()
+        // Not `synchronizer.rate`: it reads back asynchronously and a starved runner still saw 1 here.
+        let revision = output.clockCommandRevision
+        output.setRate(1)
+        #expect(output.clockCommandRevision != revision, "the play after a pause is a start of its own")
+    }
+
+    @Test("A rate set while the preroll waits is the rate it starts at", .timeLimit(.minutes(3)))
     func setRateDuringPrerollIsTheStartRate() async throws {
         let output = AudioOutput()
         let gate = Gate()
@@ -183,7 +248,7 @@ struct VideoPrerollTests {
         try await waitFor { output.synchronizer.rate == 1.5 }
     }
 
-    @Test("A pause cancels the pending start", .timeLimit(.minutes(1)))
+    @Test("A pause cancels the pending start", .timeLimit(.minutes(3)))
     func pauseCancelsThePreroll() async throws {
         let output = AudioOutput()
         let gate = Gate()
@@ -195,7 +260,7 @@ struct VideoPrerollTests {
         #expect(!started)
     }
 
-    @Test("A play after a seek landed while paused starts through the preroll", .timeLimit(.minutes(1)))
+    @Test("A play after a seek landed while paused starts through the preroll", .timeLimit(.minutes(3)))
     func playAfterAPausedSeekPrerolls() async throws {
         let output = AudioOutput()
         let gate = Gate()
@@ -210,7 +275,7 @@ struct VideoPrerollTests {
         #expect(!output.prerollPending)
     }
 
-    @Test("A gate that never opens starts the clock after the timeout", .timeLimit(.minutes(1)))
+    @Test("A gate that never opens starts the clock after the timeout", .timeLimit(.minutes(3)))
     func timesOut() async throws {
         let output = AudioOutput()
         output.videoPrerollSatisfied = { _ in false }
@@ -220,7 +285,7 @@ struct VideoPrerollTests {
     }
 
     @Test("An explicit pause cancels a hold and refuses a stale positive seek or rebuffer release",
-          .timeLimit(.minutes(1)), arguments: [false, true])
+          .timeLimit(.minutes(3)), arguments: [false, true])
     func explicitPauseOwnsTheClock(gateReady: Bool) {
         let output = AudioOutput()
         defer { output.stop() }
@@ -239,7 +304,7 @@ struct VideoPrerollTests {
         #expect(transitions.events == [.began, .released(.cancelled)])
     }
 
-    @Test("Explicit play after a paused seek restores the normal preroll", .timeLimit(.minutes(1)))
+    @Test("Explicit play after a paused seek restores the normal preroll", .timeLimit(.minutes(3)))
     func explicitPlayRestoresPreroll() async throws {
         let output = AudioOutput()
         defer { output.stop() }
@@ -256,7 +321,7 @@ struct VideoPrerollTests {
         #expect(!output.prerollPending)
     }
 
-    @Test("Stopping a paused output retires its epoch without resetting the clock", .timeLimit(.minutes(1)))
+    @Test("Stopping a paused output retires its epoch without resetting the clock", .timeLimit(.minutes(3)))
     func stoppedPausedOutputKeepsItsAnchor() {
         let output = AudioOutput()
         output.seekClock(to: CMTime(seconds: 42, preferredTimescale: 90000), rate: 0)
@@ -294,7 +359,7 @@ struct VideoPrerollTests {
         var generations: [Int] { list.withLock { $0.map(\.generation) } }
     }
 
-    @Test("A decoder still producing frames holds the clock past the plain timeout", .timeLimit(.minutes(1)))
+    @Test("A decoder still producing frames holds the clock past the plain timeout", .timeLimit(.minutes(3)))
     func decoderProgressHoldsPastTheTimeout() async throws {
         let output = AudioOutput()
         let progress = Progress()
@@ -317,7 +382,7 @@ struct VideoPrerollTests {
         #expect(transitions.events.first == .began)
     }
 
-    @Test("A hold reports its start and a timed-out release", .timeLimit(.minutes(1)))
+    @Test("A hold reports its start and a timed-out release", .timeLimit(.minutes(3)))
     func reportsATimedOutHold() async throws {
         let output = AudioOutput()
         let transitions = Transitions()
@@ -333,7 +398,7 @@ struct VideoPrerollTests {
         }
     }
 
-    @Test("A newer seek and a pause release a waiting hold as cancelled", .timeLimit(.minutes(1)))
+    @Test("A newer seek and a pause release a waiting hold as cancelled", .timeLimit(.minutes(3)))
     func cancelledHoldsAreReported() {
         let output = AudioOutput()
         let transitions = Transitions()
@@ -348,7 +413,7 @@ struct VideoPrerollTests {
         #expect(gens.count == 4 && gens[0] == gens[1] && gens[2] == gens[3] && gens[2] > gens[0])
     }
 
-    @Test("A start whose frames are already queued does not report a hold", .timeLimit(.minutes(1)))
+    @Test("A start whose frames are already queued does not report a hold", .timeLimit(.minutes(3)))
     func readyStartIsNoHold() {
         let output = AudioOutput()
         let transitions = Transitions()

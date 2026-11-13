@@ -9,7 +9,7 @@ import Testing
 /// for `operations`; by the time it got the lock the seek had landed, its reader was current again,
 /// and it found the store empty and returned nil, which the host takes for the end of the media.
 /// Playback stopped at the landing (a DVD seek past the first cell: 7 of 8 runs).
-@Suite("Software read-ahead end of stream", .offCooperativePool, .timeLimit(.minutes(1)))
+@Suite("Software read-ahead end of stream", .offCooperativePool, .timeLimit(.minutes(3)))
 struct SoftwarePacketReadAheadEndOfStreamTests {
 
     /// A reader that is not current on its first check and current on every later one: the
@@ -59,9 +59,9 @@ struct SoftwarePacketReadAheadEndOfStreamTests {
     func emptyDeadlineYieldsForService() async throws {
         let source = Self.memorySource { _ in nil }
         defer { source.close() }
-        let read = ProbeTestJob { try source.read(until: .distantPast) }
+        let read = ProbeTestJob { try source.read(maximumWait: 0) }
         let outcome = try await read.outcome()
-        #expect(throws: SoftwarePacketReadAhead.ReadError.serviceDue) { try outcome.get() }
+        #expect(throws: SoftwarePacketReadAhead.ReadError.idle) { try outcome.get() }
         #expect(!source.snapshot.sourceEnded)
     }
 
@@ -79,7 +79,7 @@ struct SoftwarePacketReadAheadEndOfStreamTests {
         try await waitFor { source.snapshot.sourceEnded }
         let read = ProbeTestJob {
             var packets: [SoftwareStoredPacket] = []
-            while let packet = try source.read(until: .distantPast) { packets.append(packet) }
+            while let packet = try source.read(maximumWait: 0) { packets.append(packet) }
             return packets
         }
         let outcome = try await read.outcome()
@@ -102,8 +102,8 @@ struct SoftwarePacketReadAheadEndOfStreamTests {
         source.start()
         try await waitFor { source.producerParkedForTesting }
         let read = ProbeTestJob {
-            #expect(try source.read(until: .distantPast) == packet)
-            return try source.read(until: .distantPast)
+            #expect(try source.read(maximumWait: 0) == packet)
+            return try source.read(maximumWait: 0)
         }
         let outcome = try await read.outcome()
         #expect(throws: SourceFailure.unavailable) { try outcome.get() }
@@ -116,11 +116,11 @@ struct SoftwarePacketReadAheadEndOfStreamTests {
         defer { source.close() }
         let checks = ProbeTestBox(0)
         let read = ProbeTestJob {
-            try source.read(until: .distantPast) {
+            try source.read(isCurrent: {
                 var current = false
                 checks.update { current = $0 == 0; $0 += 1 }
                 return current
-            }
+            }, maximumWait: 0)
         }
         let outcome = try await read.outcome()
         #expect(throws: SoftwarePacketReadAhead.ReadError.interrupted) { try outcome.get() }
@@ -138,10 +138,10 @@ struct SoftwarePacketReadAheadEndOfStreamTests {
         source.start()
         let enteredRead = ProbeTestBox(false)
         let read = ProbeTestJob {
-            try source.read(until: Date(timeIntervalSinceNow: 3600)) {
+            try source.read(isCurrent: {
                 enteredRead.update { $0 = true }
                 return true
-            }
+            }, maximumWait: 3600)
         }
         try await waitFor { sourceIO.entered && enteredRead.value }
         switch stop {
@@ -168,7 +168,7 @@ struct SoftwarePacketReadAheadEndOfStreamTests {
         defer { source.close(); consumerGate.open() }
         source.start()
         try await waitFor { source.snapshot.sourceEnded }
-        let oldRead = ProbeTestJob { try source.read(until: .distantPast) }
+        let oldRead = ProbeTestJob { try source.read(maximumWait: 0) }
         try await waitFor { consumerGate.entered }
         let token = source.beginSeek(to: 0)
         let restore = ProbeTestJob { try source.prepareSeek(token, to: 0) }
@@ -179,7 +179,7 @@ struct SoftwarePacketReadAheadEndOfStreamTests {
         let stale = try await oldRead.outcome()
         #expect(throws: SoftwarePacketReadAhead.ReadError.interrupted) { try stale.get() }
         #expect(source.snapshot.packetCount == expected.count)
-        let currentRead = ProbeTestJob { try source.read(until: .distantPast) }
+        let currentRead = ProbeTestJob { try source.read(maximumWait: 0) }
         let current = try await currentRead.outcome()
         #expect(try current.get() == expected.first)
     }

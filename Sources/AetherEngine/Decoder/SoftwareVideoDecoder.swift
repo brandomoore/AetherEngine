@@ -34,6 +34,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         var pixelFormat: Int32
         var color: ColorDescription
         var pixelBufferType: OSType = 0
+        var deinterlace: VideoDeinterlace?
     }
 
     /// True when the source is >8-bit (HDR10, AV1 HDR).
@@ -122,6 +123,19 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// #544: decode on the calling thread with no frame-level threading. Set before `open`; the
     /// still extractor is the only caller, everything on a playback path wants the parallel default.
     var decodesSingleThreaded = false
+
+    /// Decode threads on a playback path: one per core, at most 16.
+    ///
+    /// Under frame threading every thread past the first holds one frame back until more packets
+    /// arrive, so the count is also output delay, and libavcodec warns above 16 ("Using a thread
+    /// count greater than 16 is not recommended"), where its own automatic choice stops. Uncapped on
+    /// an 18-core Mac (Mac17,6) the decoder held 17 frames: a 40-packet progressive H.264 delivered
+    /// 23, and a Live source whose reads stalled kept 17 frames it had already received off the
+    /// screen. Capped it holds at most 15, as a 16-core Mac already did; that remaining delay is
+    /// frame threading's own. Apple TV, iPhone and iPad have far fewer cores.
+    nonisolated static func playbackThreadCount(activeProcessorCount: Int) -> Int {
+        max(1, min(16, activeProcessorCount))
+    }
 
     /// The pixel buffer format this decoder hands the display layer, read off the decoded frame (audit
     /// DEC-107). The container's declaration alone missed two cases: `color_range` was never read, so a
@@ -250,7 +264,8 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             ctx.pointee.thread_count = 1
             ctx.pointee.thread_type = 0
         } else {
-            ctx.pointee.thread_count = Int32(ProcessInfo.processInfo.activeProcessorCount)
+            ctx.pointee.thread_count = Int32(Self.playbackThreadCount(
+                activeProcessorCount: ProcessInfo.processInfo.activeProcessorCount))
             ctx.pointee.thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE
         }
 
@@ -424,6 +439,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             if isInterlaced || deinterlacer.isActive {
                 if deinterlacer.ensureGraph(frame: f, timeBase: timeBase),
                    deinterlacer.push(f) >= 0 {
+                    decodedFormatKey?.deinterlace = deinterlacer.activeDeinterlace
                     if filtered == nil { filtered = av_frame_alloc() }
                     if let out = filtered {
                         while deinterlacer.pull(into: out) >= 0 {  // filter holds 1-2 frames lookahead; push can yield EAGAIN
@@ -551,6 +567,20 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         flush(resetFilterGraph: true)
     }
 
+    /// AE#1024: `flush()` discards what libavcodec still holds, which at the end of a file is the last
+    /// frames of the stream (frame threading plus B-frame reorder). A session paused in the last half
+    /// second then never got a picture at all. The empty packet puts the decoder into draining mode,
+    /// the receive loop hands those frames over, and the `flush()` the host makes next takes it out of
+    /// that mode again.
+    func drainForEndOfStream() {
+        lock.lock()
+        guard let ctx = codecContext else { lock.unlock(); return }
+        let ret = avcodec_send_packet(ctx, nil)
+        lock.unlock()
+        guard ret >= 0 else { return }
+        drainDecodedFrames()
+    }
+
     func flush(resetFilterGraph: Bool) {
         lock.lock()
         defer { lock.unlock() }
@@ -676,7 +706,8 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
                 color: key.color,
                 codecID: codecContext?.pointee.codec_id ?? AV_CODEC_ID_NONE,
                 profile: codecContext?.pointee.profile ?? AV_PROFILE_UNKNOWN),
-            pixelBufferFormat: DecodedVideoFormat.fourCC(key.pixelBufferType)))
+            pixelBufferFormat: DecodedVideoFormat.fourCC(key.pixelBufferType),
+            deinterlace: key.deinterlace))
     }
 
     // MARK: - AVFrame → CVPixelBuffer (sws_scale)
