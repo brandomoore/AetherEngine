@@ -210,6 +210,43 @@ struct ActivePictureTests {
             luma: pixels, width: 320, height: 180, blackThreshold: blackThreshold) == nil)
     }
 
+    @Test("Off-center dark full-frame evidence expands a crop and renews confidence", arguments: [8, 2])
+    func offCenterDarkFullFrame(blackThreshold: Int) throws {
+        let full = CGRect(x: 0, y: 0, width: 1, height: 1)
+        let crop = CGRect(x: 0, y: 0.15, width: 1, height: 0.7)
+        var tracker = ActivePictureStability()
+        for time in [0.0, 0.5, 1.0] { tracker.record(crop, at: time) }
+        #expect(tracker.rect(at: 1) == crop)
+        for frame in 0..<8 {
+            var pixels = [UInt8](repeating: 0, count: 320 * 180)
+            for y in 0..<180 {
+                for x in 0..<320 where x < 60 || x >= 260 {
+                    pixels[y * 320 + x] = UInt8(blackThreshold + 6 + (x + y + frame) % 6)
+                }
+            }
+            let rect = try #require(ActivePictureDetector.bounds(
+                luma: pixels, width: 320, height: 180, blackThreshold: blackThreshold))
+            #expect(rect == full)
+            let time = 1.5 + Double(frame) * 0.5
+            tracker.record(rect, at: time)
+            #expect(tracker.rect(at: time) == full)
+            #expect(tracker.evidenceTime == time)
+        }
+        #expect(tracker.rect(at: 7.01) == nil, "Missing evidence must still expire.")
+    }
+
+    @Test("Off-center dark content cannot establish an inward crop", arguments: [8, 2])
+    func offCenterDarkCropIsUnknown(blackThreshold: Int) {
+        var pixels = [UInt8](repeating: 0, count: 320 * 180)
+        for y in 18..<162 {
+            for x in 32..<288 where x < 96 || x >= 224 {
+                pixels[y * 320 + x] = UInt8(blackThreshold + 6 + (x + y) % 6)
+            }
+        }
+        #expect(ActivePictureDetector.bounds(
+            luma: pixels, width: 320, height: 180, blackThreshold: blackThreshold) == nil)
+    }
+
     @Test("Confirmation, duplicates, expiry without frames and expansion")
     func temporal() throws {
         let crop = CGRect(x: 0, y: 0.15, width: 1, height: 0.7)

@@ -49,6 +49,9 @@
 
 ## Unreleased: active-picture analysis
 
+- Keep full-frame confidence through dark, off-center foregrounds when fresh,
+  distributed picture evidence reaches all four edges. Do not relax inward-crop
+  confirmation, near-black noise rejection, or evidence expiry.
 - Accept broad, distinguishable dark picture content without waiting for a
   bright scene. Preserve near-black noise rejection and the existing temporal
   confirmation, cadence, and playback-start behavior.

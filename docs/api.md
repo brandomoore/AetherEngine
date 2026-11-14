@@ -1878,7 +1878,11 @@ Dark frames need not reach a fixed average brightness to establish a picture.
 They also qualify when at least half of the center samples exceed the
 format-specific black threshold by more than four normalized luma codes and
 the candidate spans at least half the frame area. Near-black noise and isolated
-dim objects remain insufficient evidence. Inward crops still require three
+dim objects remain insufficient evidence. A dark foreground may obscure the
+center without obscuring the full picture: when content reaches all four sampled
+edges and at least one quarter of all samples exceed the same noise margin,
+the detector can confirm full frame. This alternative cannot establish an
+inward crop or extend evidence expiry without new pixels. Inward crops still require three
 consistent samples spanning at least one second; no startup wait or extra
 sampling pass is added.
 

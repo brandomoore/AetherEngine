@@ -101,14 +101,17 @@ enum ActivePictureDetector {
         var centerSum = 0
         var centerCount = 0
         var centerContentCount = 0
+        var contentCount = 0
         var left = width, right = -1, top = height, bottom = -1
         for y in 0..<height {
             for x in 0..<width {
                 let value = Int(luma[y * width + x])
+                let distinguishesBlack = value > blackThreshold + 4
+                if distinguishesBlack { contentCount += 1 }
                 if x >= width / 4, x < width * 3 / 4, y >= height / 4, y < height * 3 / 4 {
                     centerSum += value
                     centerCount += 1
-                    if value > blackThreshold + 4 { centerContentCount += 1 }
+                    if distinguishesBlack { centerContentCount += 1 }
                 }
                 if value > blackThreshold {
                     left = min(left, x); right = max(right, x)
@@ -117,6 +120,12 @@ enum ActivePictureDetector {
             }
         }
         guard centerCount > 0, right >= left, bottom >= top else { return nil }
+        // A dark foreground can obscure the center. Broad evidence reaching all
+        // four edges can retain the full frame, but never authorize an inward crop.
+        if left == 0, right == width - 1, top == 0, bottom == height - 1,
+           contentCount * 4 >= width * height {
+            return CGRect(x: 0, y: 0, width: 1, height: 1)
+        }
         // Broad dark content can distinguish the picture from bars without a
         // bright center. Keep a noise margin and reject isolated dim objects.
         let darkPicture = centerContentCount * 2 >= centerCount
