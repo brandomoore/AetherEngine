@@ -104,7 +104,7 @@ extension AetherEngine {
             // the base layer on and moves to software in one step is honoured, one that keeps the
             // Dolby Vision on a Profile 5 record is refused as before.
             presentsDolbyVisionBaseLayer: VideoRoutingPolicy.requestsDolbyVisionBaseLayer(
-                handling: resolvedDolbyVisionHandling(proposed.dolbyVisionHandling), codecID: lastDetectedVideoCodec,
+                handling: resolvedDolbyVisionHandling(proposed.dolbyVisionHandling, foldsFEL: proposed.foldsDolbyVisionFEL), codecID: lastDetectedVideoCodec,
                 dvProfile: DolbyVisionRecordAudit.correctedProfile(
                     record: sourceDVProfile, rpu: sourceDolbyVisionRPUProfile) ?? sourceDVProfile
             ) && sourceDolbyVisionBaseLayerPresentable,

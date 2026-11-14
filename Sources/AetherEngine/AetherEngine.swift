@@ -692,9 +692,9 @@ public final class AetherEngine: ObservableObject {
     var sourceMeasuredFrameRate: AVRational? = nil
 
     // Session-local evidence for the selective MEL policy; retained for internal item rebuilds.
-    var sourceDolbyVisionEnhancementLayerType: String? = nil
+    public internal(set) var sourceDolbyVisionEnhancementLayerType: String? = nil
 
-    func resolvedDolbyVisionHandling(_ handling: DolbyVisionHandling) -> DolbyVisionHandling {
+    func resolvedDolbyVisionHandling(_ handling: DolbyVisionHandling, foldsFEL: Bool? = nil) -> DolbyVisionHandling {
         VideoRoutingPolicy.resolvedDolbyVisionHandling(
             // Non-nil evidence was obtained only after verifying HEVC Profile 7. That identity
             // survives a background teardown, unlike lastDetectedVideoCodec's decoder cache.
@@ -702,7 +702,8 @@ public final class AetherEngine: ObservableObject {
             dvProfile: sourceDolbyVisionEnhancementLayerType != nil ? 7 : (
                 DolbyVisionRecordAudit.correctedProfile(
                     record: sourceDVProfile, rpu: sourceDolbyVisionRPUProfile) ?? sourceDVProfile),
-            enhancementLayerType: sourceDolbyVisionEnhancementLayerType)
+            enhancementLayerType: sourceDolbyVisionEnhancementLayerType,
+            foldsFEL: foldsFEL ?? loadedOptions.foldsDolbyVisionFEL)
     }
 
     /// AE#541: the two load-time terms of the HDR route that a reload cannot take again. The criteria
@@ -2936,7 +2937,7 @@ public final class AetherEngine: ObservableObject {
             codecID: codecpar.codec_id, dvProfile: config?.profile, dvBlCompatID: config?.blCompatID,
             colorTransfer: codecpar.color_trc, colorMatrix: codecpar.color_space)
         let baseLayer = VideoRoutingPolicy.presentsDolbyVisionBaseLayer(
-            handling: resolvedDolbyVisionHandling(options.dolbyVisionHandling),
+            handling: resolvedDolbyVisionHandling(options.dolbyVisionHandling, foldsFEL: options.foldsDolbyVisionFEL),
             codecID: codecpar.codec_id, dvProfile: config?.profile, dvBlCompatID: config?.blCompatID,
             colorTransfer: codecpar.color_trc, colorMatrix: codecpar.color_space)
         let capabilities = Self.reloadDisplayCapabilities(
@@ -5376,7 +5377,10 @@ public final class AetherEngine: ObservableObject {
                               + "; the record stands"),
                         category: .engine)
                 }
-                if options.dolbyVisionHandling == .profile7MELOnly {
+                if options.dolbyVisionHandling.inspectsProfile7EnhancementLayer {
+                    if options.dolbyVisionHandling == .profile7KnownLayers && !options.foldsDolbyVisionFEL {
+                        options.dolbyVisionHandling = .profile7MELOnly
+                    }
                     if detectedCodecID == AV_CODEC_ID_HEVC,
                        (correctedDVProfile ?? detectedDVProfileNum) == 7, !options.isLive {
                         do {
@@ -5400,7 +5404,7 @@ public final class AetherEngine: ObservableObject {
                     // caller combined it with the reconstruction preference.
                     options.preferDualLayerDolbyVision = false
                     EngineLog.emit(
-                        "[AetherEngine] profile7MELOnly: enhancement layer "
+                        "[AetherEngine] selective Profile 7: enhancement layer "
                         + "\(detectedEnhancementLayerType ?? "unknown"); handling=\(options.dolbyVisionHandling.rawValue)",
                         category: .engine)
                 }

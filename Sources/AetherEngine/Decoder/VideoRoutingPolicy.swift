@@ -354,12 +354,16 @@ enum VideoRoutingPolicy {
     /// Only a positively identified MEL opts into conversion; missing evidence never means MEL.
     static func resolvedDolbyVisionHandling(
         _ handling: DolbyVisionHandling, codecID: AVCodecID, dvProfile: Int?,
-        enhancementLayerType: String?
+        enhancementLayerType: String?, foldsFEL: Bool = true
     ) -> DolbyVisionHandling {
-        guard handling == .profile7MELOnly else { return handling }
+        guard handling.inspectsProfile7EnhancementLayer else { return handling }
+        var acceptsFEL = false
+        #if DolbyVisionFelCurves
+        acceptsFEL = handling == .profile7KnownLayers && enhancementLayerType == "FEL" && foldsFEL
+        #endif
         // Keep the P7-only fallback when the outer probe has no source identity: a later
         // native open may discover P7, and must not turn missing evidence into conversion.
-        return codecID == AV_CODEC_ID_HEVC && dvProfile == 7 && enhancementLayerType == "MEL"
+        return codecID == AV_CODEC_ID_HEVC && dvProfile == 7 && (enhancementLayerType == "MEL" || acceptsFEL)
             ? .automatic : .profile7BaseLayer
     }
 
@@ -369,7 +373,7 @@ enum VideoRoutingPolicy {
         switch handling {
         case .automatic: return false
         case .baseLayerOnly: return true
-        case .profile7BaseLayer, .profile7MELOnly: return codecID == AV_CODEC_ID_HEVC && dvProfile == 7
+        case .profile7BaseLayer, .profile7MELOnly, .profile7KnownLayers: return codecID == AV_CODEC_ID_HEVC && dvProfile == 7
         }
     }
 

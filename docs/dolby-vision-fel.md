@@ -869,6 +869,12 @@ This is a list of known paths, not a proof. Tests:
 
 ## 7. Curve fold on the native route
 
+Hosts can choose `DolbyVisionHandling.profile7KnownLayers` to convert confirmed
+MEL and confirmed FEL only. FEL additionally requires the curve-fold trait and
+`foldsDolbyVisionFEL`; unknown and live P7 sources retain HDR10 fallback.
+`sourceDolbyVisionEnhancementLayerType` exposes the session's inspected type for
+host controls, including when that source is currently playing as HDR10.
+
 With the `DolbyVisionFelCurves` trait (off by default), a Profile 7 FEL source on the native route no longer loses its enhancement layer entirely in the Profile 8.1 conversion.
 
 - The conversion keeps the stream's own mapping (luma polynomial and MMR chroma, as the disc's encoder wrote them).

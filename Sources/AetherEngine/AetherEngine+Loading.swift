@@ -2794,7 +2794,7 @@ extension AetherEngine {
 
         // A reopened custom source may select another authored title or follow a background
         // teardown. Inspect its own head before output setup; never borrow a previous MEL verdict.
-        if loadedOptions.dolbyVisionHandling == .profile7MELOnly, let pre = customPreopened {
+        if loadedOptions.dolbyVisionHandling.inspectsProfile7EnhancementLayer, let pre = customPreopened {
             sourceDolbyVisionEnhancementLayerType = nil
             let live = loadedOptions.isLive
             let inspection = ReopenedSourceInspection(

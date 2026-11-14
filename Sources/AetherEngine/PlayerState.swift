@@ -428,6 +428,13 @@ public enum DolbyVisionHandling: String, Sendable, Equatable, CaseIterable {
     /// configuration. Live sources remain unclassified. Other profiles stay automatic.
     /// Does not enable FEL reconstruction, even when `preferDualLayerDolbyVision` is true.
     case profile7MELOnly
+    /// Convert confirmed MEL and, with the curve-fold trait and load option enabled,
+    /// confirmed FEL. Unidentified and live Profile 7 sources keep their HDR10 base layer.
+    case profile7KnownLayers
+
+    var inspectsProfile7EnhancementLayer: Bool {
+        self == .profile7MELOnly || self == .profile7KnownLayers
+    }
     /// Present the HDR10 / HLG base layer and leave the Dolby Vision out of the container: `hvc1` /
     /// `av01` sample entry, `dvcC` stripped, no `SUPPLEMENTAL-CODECS`, HDR10 / HLG display criteria.
     /// The RPU NAL units stay in the bitstream and are ignored, the way a Profile 7 already plays on a

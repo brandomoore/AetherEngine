@@ -131,6 +131,25 @@ struct DolbyVisionBaseLayerTests {
         }
     }
 
+    @Test("Known-layer conversion requires positive evidence and the fold trait")
+    func knownLayersRoute() throws {
+        #expect(VideoRoutingPolicy.resolvedDolbyVisionHandling(
+            .profile7KnownLayers, codecID: AV_CODEC_ID_HEVC, dvProfile: 7,
+            enhancementLayerType: "FEL", foldsFEL: false) == .profile7BaseLayer)
+        for type in ["MEL", "FEL", "unknown", ""] {
+            let handling = VideoRoutingPolicy.resolvedDolbyVisionHandling(
+                .profile7KnownLayers, codecID: AV_CODEC_ID_HEVC, dvProfile: 7,
+                enhancementLayerType: type.isEmpty ? nil : type)
+            var converts = type == "MEL"
+            #if DolbyVisionFelCurves
+            converts = converts || type == "FEL"
+            #endif
+            let route = try Self.route(DVCodecpar(profile: 7, blCompatibilityID: 6), handling: handling)
+            #expect(route.convertP7ToProfile81 == converts)
+            #expect((route.doviConfig == .strip) == !converts)
+        }
+    }
+
     @Test("Missing outer probe identity retains the conservative P7-only fallback")
     func selectiveMELUnknownSource() throws {
         let handling = VideoRoutingPolicy.resolvedDolbyVisionHandling(
