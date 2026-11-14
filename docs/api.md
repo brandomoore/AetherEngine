@@ -1874,6 +1874,14 @@ uses converted half-float RGB. Conversion runs within the existing 2 Hz/four-ses
 budget, not once per decoded frame. The borrowed source can remain full resolution;
 no extra decoder, stream, or displayed processing stage is introduced.
 
+Dark frames need not reach a fixed average brightness to establish a picture.
+They also qualify when at least half of the center samples exceed the
+format-specific black threshold by more than four normalized luma codes and
+the candidate spans at least half the frame area. Near-black noise and isolated
+dim objects remain insufficient evidence. Inward crops still require three
+consistent samples spanning at least one second; no startup wait or extra
+sampling pass is added.
+
 Stopping either analyzer detaches its output immediately on the main actor and
 invalidates pending results. Bounded in-flight sampling drains through the normal
 worker-admission and cancellation checks. Releasing an idle engine or native analyzer

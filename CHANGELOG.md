@@ -49,6 +49,9 @@
 
 ## Unreleased: active-picture analysis
 
+- Accept broad, distinguishable dark picture content without waiting for a
+  bright scene. Preserve near-black noise rejection and the existing temporal
+  confirmation, cadence, and playback-start behavior.
 - Isolate native analysis conversion from playback. A format-constrained
   AVPlayer output can permanently switch the displayed pixel format, affecting
   HDR/Dolby Vision presentation. Borrow the original native frame and perform

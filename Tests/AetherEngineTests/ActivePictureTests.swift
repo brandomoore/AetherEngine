@@ -169,6 +169,47 @@ struct ActivePictureTests {
         #expect(actual.maxY > 0.99)
     }
 
+    @Test("Dark textured pictures confirm without waiting for a bright scene", arguments: [8, 2])
+    func darkPicture(blackThreshold: Int) throws {
+        for expected in [
+            CGRect(x: 0, y: 0.15, width: 1, height: 0.7),
+            CGRect(x: 0.125, y: 0, width: 0.75, height: 1),
+            CGRect(x: 0.05, y: 0.1, width: 0.8, height: 0.7),
+        ] {
+            var tracker = ActivePictureStability()
+            for frame in 0..<3 {
+                var pixels = [UInt8](repeating: 0, count: 320 * 180)
+                for y in 0..<180 {
+                    for x in 0..<320 {
+                        if expected.contains(CGPoint(x: (Double(x) + 0.5) / 320, y: (Double(y) + 0.5) / 180)) {
+                            pixels[y * 320 + x] = UInt8(blackThreshold + 6 + (x + y + frame) % 6)
+                        }
+                    }
+                }
+                let rect = try #require(ActivePictureDetector.bounds(
+                    luma: pixels, width: 320, height: 180, blackThreshold: blackThreshold))
+                #expect(rect.contains(expected))
+                #expect(abs(rect.minY - expected.minY) < 0.02)
+                #expect(abs(rect.minX - expected.minX) < 0.02)
+                tracker.record(rect, at: Double(frame) * 0.5)
+                #expect((tracker.rect(at: Double(frame) * 0.5) != nil) == (frame == 2))
+            }
+        }
+    }
+
+    @Test("Dark-frame confidence rejects near-black noise and isolated dim objects", arguments: [8, 2])
+    func ambiguousDarkPicture(blackThreshold: Int) {
+        let noise = (0..<(320 * 180)).map { UInt8($0 % (blackThreshold + 5)) }
+        #expect(ActivePictureDetector.bounds(
+            luma: noise, width: 320, height: 180, blackThreshold: blackThreshold) == nil)
+        var pixels = [UInt8](repeating: 0, count: 320 * 180)
+        for y in 36..<144 {
+            for x in 64..<256 { pixels[y * 320 + x] = UInt8(blackThreshold + 8) }
+        }
+        #expect(ActivePictureDetector.bounds(
+            luma: pixels, width: 320, height: 180, blackThreshold: blackThreshold) == nil)
+    }
+
     @Test("Confirmation, duplicates, expiry without frames and expansion")
     func temporal() throws {
         let crop = CGRect(x: 0, y: 0.15, width: 1, height: 0.7)

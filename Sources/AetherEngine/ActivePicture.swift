@@ -100,6 +100,7 @@ enum ActivePictureDetector {
               luma.count == width * height else { return nil }
         var centerSum = 0
         var centerCount = 0
+        var centerContentCount = 0
         var left = width, right = -1, top = height, bottom = -1
         for y in 0..<height {
             for x in 0..<width {
@@ -107,6 +108,7 @@ enum ActivePictureDetector {
                 if x >= width / 4, x < width * 3 / 4, y >= height / 4, y < height * 3 / 4 {
                     centerSum += value
                     centerCount += 1
+                    if value > blackThreshold + 4 { centerContentCount += 1 }
                 }
                 if value > blackThreshold {
                     left = min(left, x); right = max(right, x)
@@ -114,7 +116,12 @@ enum ActivePictureDetector {
                 }
             }
         }
-        guard centerCount > 0, centerSum / centerCount >= 24, right >= left, bottom >= top else { return nil }
+        guard centerCount > 0, right >= left, bottom >= top else { return nil }
+        // Broad dark content can distinguish the picture from bars without a
+        // bright center. Keep a noise margin and reject isolated dim objects.
+        let darkPicture = centerContentCount * 2 >= centerCount
+            && (right - left + 1) * (bottom - top + 1) * 2 >= width * height
+        guard centerSum / centerCount >= 24 || darkPicture else { return nil }
         // Leave one sampled cell around the evidence, rather than cutting on it.
         left = max(0, left - 1); right = min(width, right + 2)
         top = max(0, top - 1); bottom = min(height, bottom + 2)
