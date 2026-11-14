@@ -1,5 +1,11 @@
 # Dolby Vision Profile 7 FEL
 
+**Plozz integration fork:** this branch explicitly compiles `DolbyVisionFelCurves`
+for Xcode hosts, whose transitive package trait selection does not emit the define.
+The host still controls use through `foldsDolbyVisionFEL` and the selective
+`profile7KnownLayers` policy. Other optional components remain disabled. The
+upstream default-build descriptions below do not describe this integration build.
+
 This is the design document for playing Dolby Vision Profile 7 dual-layer sources. It covers what the engine does with them, what has been proven on a device, and how the dual-layer route keeps CPU, GPU and memory bounded while staying correct.
 
 ## In one minute

@@ -106,6 +106,9 @@ let package = Package(
                 .copy("Resources/silent-atmos.mp4"),
                 .copy("Resources/PrivacyInfo.xcprivacy"),
             ],
+            // Plozz's Xcode package graph does not forward transitive trait defines.
+            // This integration fork compiles the curve fold; host load policy gates use.
+            swiftSettings: [.define("DolbyVisionFelCurves")],
             linkerSettings: [
                 // Rust's unstable implementation symbols are not the framework ABI.
                 // Keeping them exported retains unused std::process code on iOS/tvOS.
@@ -145,7 +148,8 @@ let package = Package(
         .testTarget(
             name: "AetherEngineTests",
             dependencies: ["AetherEngine"],
-            path: "Tests/AetherEngineTests"
+            path: "Tests/AetherEngineTests",
+            swiftSettings: [.define("DolbyVisionFelCurves")]
         ),
         .testTarget(
             name: "AetherEngineSMBTests",
