@@ -1865,7 +1865,14 @@ and `stop()`, sharing the same admission and temporal-stability limits without a
 player or decoder. Supply the source video format, not a panel-clamped format.
 Supported SDR/HDR pixels and upright transforms are analyzed conservatively; PiP,
 external playback, unsupported geometry and uninformative frames remain unknown.
-AVFoundation's conversion/materialization cost is separate from the bounded analysis work.
+The native tap requests neither a pixel format nor a size. Requiring converted
+pixels from AVPlayer can also change its displayed pixels, persisting after tap
+removal. The serial worker instead transfers each borrowed native frame into its
+own CPU-readable buffer, at most 320 x 180, without changing the source buffer or
+its attachments. SDR uses NV12, PQ/HLG uses P010, and Dolby Vision/unknown color
+uses converted half-float RGB. Conversion runs within the existing 2 Hz/four-session
+budget, not once per decoded frame. The borrowed source can remain full resolution;
+no extra decoder, stream, or displayed processing stage is introduced.
 
 Stopping either analyzer detaches its output immediately on the main actor and
 invalidates pending results. Bounded in-flight sampling drains through the normal

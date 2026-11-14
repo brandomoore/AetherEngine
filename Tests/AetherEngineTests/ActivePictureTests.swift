@@ -298,6 +298,63 @@ struct ActivePictureTests {
         #expect(ActivePictureWorker.sample(image).bounds?.minY ?? 0 > 0.15)
     }
 
+    @Test("Native conversion uses bounded private pixels without changing the source",
+          arguments: [
+            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+            kCVPixelFormatType_64RGBAHalf,
+          ], [false, true])
+    func privateNativeConversion(format: OSType, cleanAperture: Bool) async throws {
+        var buffer: CVPixelBuffer?
+        try #require(CVPixelBufferCreate(
+            kCFAllocatorDefault, 640, 360, kCVPixelFormatType_32BGRA,
+            [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &buffer) == kCVReturnSuccess)
+        let image = try #require(buffer)
+        CVBufferSetAttachment(image, kCVImageBufferCGColorSpaceKey,
+                              try #require(CGColorSpace(name: CGColorSpace.sRGB)), .shouldPropagate)
+        if cleanAperture {
+            CVBufferSetAttachment(image, kCVImageBufferCleanApertureKey, [
+                kCVImageBufferCleanApertureWidthKey: 640,
+                kCVImageBufferCleanApertureHeightKey: 300,
+                kCVImageBufferCleanApertureHorizontalOffsetKey: 0,
+                kCVImageBufferCleanApertureVerticalOffsetKey: 0,
+            ] as CFDictionary, .shouldPropagate)
+        }
+        try #require(CVPixelBufferLockBaseAddress(image, []) == kCVReturnSuccess)
+        let count = CVPixelBufferGetBytesPerRow(image) * 360
+        let base = try #require(CVPixelBufferGetBaseAddress(image))
+        memset(base, 0, count)
+        let bytes = base.assumingMemoryBound(to: UInt8.self)
+        for y in 0..<360 {
+            for x in 0..<640 {
+                let index = y * CVPixelBufferGetBytesPerRow(image) + x * 4
+                for channel in 0..<3 { bytes[index + channel] = (60..<300).contains(y) ? 160 : 0 }
+                bytes[index + 3] = 255
+            }
+        }
+        let original = Data(bytes: base, count: count)
+        CVPixelBufferUnlockBaseAddress(image, [])
+        let originalAttachments = CVBufferCopyAttachments(image, .shouldPropagate)
+        let originalBounds = try #require(ActivePictureWorker.sample(image).bounds)
+        let display = CGSize(width: 1024, height: 576)
+        let result = await ActivePictureWorker.shared.analyze(
+            ActivePictureFrame(buffer: image, time: 0, generation: 0,
+                               displaySize: display, nativePixelFormat: format))
+        #expect(result.failure == nil)
+        let geometry = try #require(result.geometry)
+        #expect(geometry.codedSize == CGSize(width: 320, height: 180))
+        #expect(geometry.displaySize == display)
+        #expect(geometry.format == format)
+        let rect = try #require(result.bounds)
+        #expect(abs(rect.minY - originalBounds.minY) < 0.02)
+        #expect(abs(rect.maxY - originalBounds.maxY) < 0.02)
+        #expect(CVPixelBufferGetPixelFormatType(image) == kCVPixelFormatType_32BGRA)
+        #expect(CFEqual(originalAttachments, CVBufferCopyAttachments(image, .shouldPropagate)))
+        try #require(CVPixelBufferLockBaseAddress(image, .readOnly) == kCVReturnSuccess)
+        defer { CVPixelBufferUnlockBaseAddress(image, .readOnly) }
+        #expect(Data(bytes: try #require(CVPixelBufferGetBaseAddress(image)), count: count) == original)
+    }
+
     @Test("Display rotation and mirroring map asymmetric bounds after sample aspect correction")
     func displayTransforms() {
         let geometry = ActivePictureGeometry(

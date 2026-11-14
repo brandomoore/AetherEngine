@@ -49,6 +49,10 @@
 
 ## Unreleased: active-picture analysis
 
+- Isolate native analysis conversion from playback. A format-constrained
+  AVPlayer output can permanently switch the displayed pixel format, affecting
+  HDR/Dolby Vision presentation. Borrow the original native frame and perform
+  sizing/color conversion in a private worker-owned buffer instead.
 - Add opt-in `sampleActivePicture()` and `stopActivePictureAnalysis()` for
   picture-relative subtitles and optional fitting. Measurements distinguish
   unavailable evidence from confirmed full frame and include presentation-clock
@@ -59,16 +63,15 @@
 - Add `NativeActivePictureAnalyzer` for existing host-owned AVPlayers, sharing
   the same admission, temporal stability, output ownership and invalidation.
 - Support 10-bit SDR, HDR10/HDR10+, HLG and converted Dolby Vision pixels.
-  Native SDR sampling requests CPU-readable 8-bit NV12, PQ/HLG uses P010,
-  and Dolby Vision/unknown color requests converted half-float RGB rather than
-  interpreting an IPT base layer as PQ. AVFoundation may
-  materialize or decompress that output from its preferred compressed surface;
-  the analysis limit is not a bound on that system-side cost.
-- Request a 320 x 180 native analysis output, retaining the original item's
+  The worker converts native SDR samples to CPU-readable 8-bit NV12, PQ/HLG
+  to P010, and Dolby Vision/unknown color to half-float RGB rather than
+  interpreting an IPT base layer as PQ. The native output retains the decoder's
+  preferred format; conversion happens only at the bounded analysis cadence.
+- Create a private analysis buffer no larger than 320 x 180, retaining the original item's
   upright display size separately so downscaling cannot replace aperture/SAR
   or rotation geometry. Presentation-size changes invalidate pending work.
 - Select native analysis color from the source, not the panel-clamped playback
-  badge, so Dolby Vision still requests converted RGB on an SDR display.
+  badge, so Dolby Vision still uses privately converted RGB on an SDR display.
 - Preserve playback pipelines. Native quarter turns and mirrors are mapped
   to upright display geometry. Unsupported transforms, PiP and external
   playback return unknown, as do missing or uninformative frames.

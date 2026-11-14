@@ -1,4 +1,5 @@
 import AVFoundation
+import VideoToolbox
 
 /// The buffer is borrowed read-only and released after one bounded worker call.
 struct ActivePictureFrame: @unchecked Sendable {
@@ -6,12 +7,15 @@ struct ActivePictureFrame: @unchecked Sendable {
     let time: Double
     let generation: UInt64
     let displaySize: CGSize?
+    let nativePixelFormat: OSType?
 
-    init(buffer: CVPixelBuffer, time: Double, generation: UInt64, displaySize: CGSize? = nil) {
+    init(buffer: CVPixelBuffer, time: Double, generation: UInt64, displaySize: CGSize? = nil,
+         nativePixelFormat: OSType? = nil) {
         self.buffer = buffer
         self.time = time
         self.generation = generation
         self.displaySize = displaySize
+        self.nativePixelFormat = nativePixelFormat
     }
 }
 
@@ -55,7 +59,38 @@ actor ActivePictureWorker {
     static let shared = ActivePictureWorker()
 
     func analyze(_ frame: ActivePictureFrame) -> ActivePicturePixels {
-        Self.sample(frame.buffer, displaySize: frame.displaySize)
+        guard !Task.isCancelled else {
+            return ActivePicturePixels(geometry: nil, bounds: nil, failure: .disabled)
+        }
+        guard let format = frame.nativePixelFormat else {
+            return Self.sample(frame.buffer, displaySize: frame.displaySize)
+        }
+        var transfer: VTPixelTransferSession?
+        let sessionStatus = VTPixelTransferSessionCreate(
+            allocator: kCFAllocatorDefault, pixelTransferSessionOut: &transfer)
+        guard sessionStatus == noErr, let transfer else {
+            EngineLog.emit("[AetherEngine] active picture: private transfer unavailable (\(sessionStatus))",
+                           category: .engine)
+            return ActivePicturePixels(geometry: nil, bounds: nil, failure: .unavailable)
+        }
+        defer { VTPixelTransferSessionInvalidate(transfer) }
+        var buffer: CVPixelBuffer?
+        let allocationStatus = CVPixelBufferCreate(
+            kCFAllocatorDefault, min(320, CVPixelBufferGetWidth(frame.buffer)),
+            min(180, CVPixelBufferGetHeight(frame.buffer)), format,
+            [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &buffer)
+        guard allocationStatus == kCVReturnSuccess, let buffer else {
+            EngineLog.emit("[AetherEngine] active picture: private buffer unavailable (\(allocationStatus))",
+                           category: .engine)
+            return ActivePicturePixels(geometry: nil, bounds: nil, failure: .unavailable)
+        }
+        let transferStatus = VTPixelTransferSessionTransferImage(transfer, from: frame.buffer, to: buffer)
+        guard transferStatus == noErr else {
+            EngineLog.emit("[AetherEngine] active picture: private conversion unsupported (\(transferStatus))",
+                           category: .engine)
+            return ActivePicturePixels(geometry: nil, bounds: nil, failure: .unsupportedColor)
+        }
+        return Self.sample(buffer, displaySize: frame.displaySize)
     }
 
     nonisolated static func sample(_ buffer: CVPixelBuffer, displaySize: CGSize? = nil) -> ActivePicturePixels {

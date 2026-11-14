@@ -284,14 +284,9 @@ final class ActivePictureAnalysis {
         if let player = source.player, let currentItem = player.currentItem {
             if nativeOutput?.item !== currentItem {
                 nativeOutput?.detach()
-                // Ask AVFoundation for display-referred, CPU-readable pixels.
-                // Wide color preserves HDR rather than forcing an SDR tap.
-                let newOutput = AVPlayerItemVideoOutput(outputSettings: [
-                    kCVPixelBufferPixelFormatTypeKey as String: source.nativePixelFormat,
-                    kCVPixelBufferWidthKey as String: 320,
-                    kCVPixelBufferHeightKey as String: 180,
-                    AVVideoAllowWideColorKey: true,
-                ])
+                // Output requirements also change AVPlayerLayer's decoded format,
+                // even after removal. Convert only the worker's private copy.
+                let newOutput = AVPlayerItemVideoOutput(outputSettings: nil)
                 newOutput.suppressesPlayerRendering = false
                 nativeOutput = ActivePictureNativeOutput(item: currentItem, output: newOutput) { [weak self] in
                     self?.reset()
@@ -335,11 +330,12 @@ final class ActivePictureAnalysis {
                 requested.seconds - displayed.seconds <= ActivePictureStability.maximumAge
             {
                 // AVPlayer's presentation size is already upright and includes
-                // aperture/SAR. The resized analysis buffer is not the canvas.
+                // aperture/SAR. The worker's analysis buffer is not the canvas.
                 let displaySize = CGRect(origin: .zero, size: currentItem.presentationSize)
                     .applying((nativeTransform ?? .identity).inverted()).size
                 frame = ActivePictureFrame(
-                    buffer: buffer, time: displayed.seconds, generation: frameGeneration, displaySize: displaySize)
+                    buffer: buffer, time: displayed.seconds, generation: frameGeneration,
+                    displaySize: displaySize, nativePixelFormat: source.nativePixelFormat)
             } else {
                 frame = nil
             }
