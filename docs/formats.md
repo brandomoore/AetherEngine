@@ -972,6 +972,7 @@ Decoding the object presentation and encoding APAC each take about one core (a P
 - The queue inherits the producer's QoS.
 - A pool of three chunk buffers holds the producer at most two chunks ahead of the encoder.
 - The producer waits for the queue (`settle()`) before a keyframe advances its segment cutter or a write cuts the open segment. So every packet is routed as the encode in series routed it, and every segment carries the same audio, byte for byte. Those waits cost about 0.1 s of the sample's overlap.
+- `APACEncodePipelineTests` checks that against a second encoder fed in series. It compares decoded audio (signal to error ratio above 60 dB), not bytes: two encoder instances do not always write the same packets for the same PCM. On an M6 under macOS 27.0.1 they never did, and on an M1 they always did (#1063).
 
 #### What the session log says
 
@@ -1006,7 +1007,11 @@ DTS:X's standard presentation is a 7.1 bed and four fixed heights (the top front
 
 **Latency.** The regression's 2048 frames, kept off the timeline.
 
-**Layouts.** Each of the twelve channels has its own speaker, so DTS:X is rendered into the two layouts that carry all twelve one to one, 7.1.4 and 9.1.6. Any other layout keeps the channel bridge.
+**Layouts.** Each of the twelve channels has its own speaker, so DTS:X is rendered into the two layouts that carry all twelve one to one, 7.1.4 and 9.1.6.
+
+A smaller layout (5.1.2, 5.1.4, 7.1.2) renders DTS:X as 7.1.4 instead. The host can set the layout to match the room, and the receiver maps the 7.1.4 bed onto its own speakers, the same as it does with tvOS's own Atmos. Nothing is panned, and a chain that cannot take twelve channels gets the 7.1 it would have had from the channel bridge, since tvOS folds the bed itself.
+
+A host that wants TrueHD Atmos in the small layout but DTS:X on the 7.1 channel bridge sets `LoadOptions.rendersDTSXObjectAudio = false` (#1060). That holds for every DTS track of the load, so a file with both tracks plays either one without a reload.
 
 #### The alternate presentations
 
@@ -1061,7 +1066,7 @@ Those runs predate the decoder in FFmpeg. The activator still runs for a rendere
   - `DTS:X in an alternate presentation without heights, which plays as its 7.1 bed` (a stream FFmpeg labels IMAX whose frames carry none)
   - `DTS:X in alternate presentation 0xd4, whose height fold is not known, which plays as its 7.1 bed`
 - A frame whose height channel set does not decode keeps the 7.1.4 layout with silent heights and the bed as coded, and libavcodec logs `DTS:X height channels not decoded, output silent heights`.
-- A layout other than 7.1.4 or 9.1.6 logs `DTS:X is rendered into 7.1.4 or 9.1.6 only`.
+- A layout other than 7.1.4 or 9.1.6 logs `DTS:X is rendered into 7.1.4 instead of 5.1.2, the smallest bed that carries its channels one to one`.
 - The `object configuration` and `bed levels` lines are the same as for TrueHD Atmos. So is the 1200-packet silence report: at 512 samples a DTS frame, that is 12.8 s of DTS, against a second of TrueHD.
 
 ## Subtitles
@@ -1381,7 +1386,7 @@ engine.$nativeSubtitleTracks               // @Published var [NativeSubtitleTrac
 
 // select a rendition by ordinal (nil deselects); language-tag match, positional fallback.
 // Re-asserts automatically if AVFoundation drops the selection during a stall recovery.
-engine.setNativeSubtitleSelected(track ordinal: Int?)
+engine.setNativeSubtitleSelected(track ordinal: Int?, markerOnly: Bool = false)
 
 // convenience for the enter/leave pattern below: true resolves the rendition matching the
 // currently-active overlay track and selects it, false deselects
@@ -1407,6 +1412,17 @@ The recommended host pattern for PiP / AirPlay:
 3. On leaving: call `setNativeSubtitleRendering(false)` and re-enable the host overlay.
 
 This avoids double subtitles during inline playback (where the host overlay is already painting them), and makes sure the user sees subtitles the moment the stream is mirrored or sent to PiP.
+
+#### Showing the host's pick in AVKit's menu (`markerOnly`)
+
+A host that draws a bitmap track itself inside a stock `AVPlayerViewController` would normally see AVKit's subtitle menu say "Off", because the engine keeps the legible group deselected while the overlay paints. `setNativeSubtitleSelected(track: n, markerOnly: true)` selects rendition `n` in that menu without drawing anything (AE#1052). The user sees their track ticked and can pick Off or another track from the menu.
+
+- The marker rendition is served as empty WebVTT segments, so AVKit shows no text and no caption box over the host's overlay. The host's text style rules are left alone.
+- No OCR runs for a marker. Bitmap recognition starts only when the rendition has to carry text.
+- `setNativeSubtitleRendering(true)` (PiP, AirPlay, external display) turns the marker into a full rendition: OCR arms, and the engine deselects and reselects so AVKit refetches the segments under the playhead with text. Measured on an iPhone with iOS 27, the first OCR cue showed up right after the reselect.
+- `setNativeSubtitleRendering(false)` goes back to the marker instead of deselecting.
+- Any plain `setNativeSubtitleSelected(track:)` call, nil included, replaces the marker. The marker survives the engine's own reloads (audio switch, recovery, AirPlay).
+- Scope is the VOD loopback, the same as bitmap renditions in general.
 
 ### Live HLS subtitle renditions (host overlay)
 

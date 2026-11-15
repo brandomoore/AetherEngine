@@ -99,6 +99,37 @@ A VideoToolbox decode callback can keep its output image buffer as a reference p
 
 The risk this accepts: later frames could decode from composed pixels, which would show as drift until the next IDR (the next full keyframe). It is verified on the Mac only. A long-GOP picture comparison on the Apple TV decoder is still open ([measurements.md](measurements.md#dual-layer-in-place-output-metadata)).
 
+**HDR10 static metadata (AE#957).** VideoToolbox attaches no mastering display colour volume or content light level to the frames it decodes, though the stream carries both. The hardware decoder finds the stream's values at `open()` and the normalizer adds them with the colour attachments, under the same policy. `HDR10StaticMetadataSEI` reads them for a PQ stream:
+
+- from the container first (`mdcv` / `clli` boxes, Matroska colour metadata, both arrive as `codecpar` side data);
+- then from the SEI in the `hvcC` (x265 writes it there), or the metadata OBUs in the `av1C`;
+- then from the first 3 key frames: the SEI for HEVC, the metadata OBUs (`HDR_MDCV`, `HDR_CLL`) for hardware AV1. This decoder opens no H.264, and VP9 has no in-band HDR10 metadata. Frames before the values are found go out without them.
+
+AV1's content light level has Core Video's layout. Its mastering display does not (red first, 0.16 fixed point chromaticity, 24.8 and 18.14 fixed point luminance), so it is converted.
+
+A key the frame already carries stays as it is. Only a missing key is filled, so a decoder that does attach its own values wins, and anything downstream of the decoder (a frame handler) can still set its own. The decoder clears its values at `close()`, and `open(parameterSets:)` (no stream to read them from) adds none.
+
+The SEI payloads are byte for byte what Core Video's attachments hold, so they are copied as they are. The television does read these attachments, see [measurements.md](measurements.md#hdr10-metadata-on-the-software-path-reaches-the-television-ae957).
+
+**The libavcodec decoder attaches the same keys (AE#957).** `SoftwareVideoDecoder` (dav1d AV1 without hardware decode, VP9 where VideoToolbox has none, H.264 High 10 / 4:2:2 / 4:4:4, interlaced H.264, HEVC Rext) builds its own buffers. On a PQ frame it attaches:
+
+- the values the latest decoded frame carried as side data (libavcodec exports them from the SEI, libdav1d from the metadata OBUs). They stay until a frame brings new ones, since HEVC carries them only on some frames;
+- otherwise the container's.
+
+Frames that are not PQ, or have no values, get both keys removed, because a pool buffer keeps what its last use left on it.
+
+**The decoder's format description carries the same values (AE#957).** The owned copy costs about 7 ms per 4K frame on an A12 Apple TV, so the normalizer should only ever need it as a fallback. For HEVC, AV1 and VP9 the description VideoToolbox decodes with names the stream's colour, and the HDR10 values known at `open()`. VideoToolbox then attaches both itself and the frames match as decoded. Without the colour keys it tagged a PQ BT.2020 HEVC clip as BT.709, and every frame was copied.
+
+Values found later, in a key frame, go into a new description and session at that key frame, before it decodes, the way a VP9 size change does. Many AV1 HDR10 encodes carry them in-band only.
+
+- Usually that is the stream's first key frame, with nothing decoded before it, so nothing is lost.
+- On a later key frame (the values were only in its SEI), its leading pictures can be lost once, as after a seek.
+- If VideoToolbox refuses the new session, the old one stays and those frames go on by copy.
+
+At `close()` the decoder logs how each frame went: `output metadata over N frames: A as decoded, B in place, C copied, D copy failed`. Copies on every frame mean the description and the normalizer disagree. Numbers: [measurements.md](measurements.md#per-frame-cost-of-the-software-path-ae957); to time it on a device, [`aetherctl bench`](cli.md#bench).
+
+**The renderer's format description follows the HDR10 values.** `SampleBufferRenderer` reuses one format description while the frames look the same. Its cache key includes the frame's mastering display and content light level bytes, so a change of those values at the same size and colour gets a new description (`FormatDescriptionFollowsHDR10MetadataTests`).
+
 **AV1 Dolby Vision RPU path.** (The RPU is the per-frame Dolby Vision metadata.) This path reuses that owned output, or makes its own copy, before changing buffer and IOSurface metadata. If copying fails, it delivers the original without setting or clearing RPU keys, including when RPU attachment is disabled.
 
 ### Clock and transport
@@ -241,6 +272,24 @@ With `LoadOptions.upscalesLowResolutionVideo` (#846, AE#1039), `load()` asks `Up
 
 `$activeUpscale` publishes what runs. See [api.md, `upscalesLowResolutionVideo`](api.md#upscaleslowresolutionvideo).
 
+**The frame chain** (`FrameChain`, AE#957) is what the line-art scaler runs on. It turns the 4:2:0 frame into a half-float RGB texture, runs its stages, and turns the result back into the input's format at the target size, all in one command buffer.
+
+- A chain whose stages all leave the picture alone (`FrameChainStage.isIdentity`, today `PassThroughStage`) at its own size runs as one kernel with no RGB texture. On an A12 Apple TV the RGB texture cost most of the 10 ms the two passes took per 4K frame. No playback path builds such a chain yet: line art changes the picture and the size, so it keeps the two passes. The one kernel is the fast path for chains that only convert, and the benchmark times it.
+- That kernel is `frameChainRoundTripWide` when the width and the picture's x origin are multiples of 4: it reads and writes four luma samples per texel and folds the colour arithmetic, 2.7 ms per 4K frame on the A12. Otherwise `frameChainRoundTrip`, one sample per access, 4.0 ms.
+- Every other chain keeps the two passes: a stage reads its neighbours from that texture.
+- Both paths give the same picture: luma unchanged, chroma within one code value.
+
+**Colour volume.** Each stage declares the colour volume of its output (`FrameChainStage.outputColorVolume`), and the chain writes the frames' HDR10 metadata from it. Without that, a stage that tone maps to the display's peak would still go out with the source's metadata, and the display would tone map a second time.
+
+| A stage declares | The output frame carries |
+|---|---|
+| `.unchanged` (the default) | the source's own mastering display and content light level, or none when the source has none |
+| `.hdr10(values)` | those values in both keys, over the source's |
+
+- The last stage that declares a volume sets the chain's. A dither or LUT stage after a tone mapper declares nothing and keeps the tone mapper's volume.
+- `FrameChain.attach(from:to:)` gives every output buffer its attachments: the source's, minus the geometry keys (the output is the picture region alone, so a clean aperture would crop it again), then the declared HDR10 metadata. The HDR10 probe calls it. `FrameUpscaler` runs the same step on every rung, with `.unchanged` when it built no chain.
+- Only `PassThroughStage` and `LineArtStage` exist today, and both declare nothing, so no frame changes yet.
+
 ### Dolby Vision Profile 7 FEL
 
 Profile 7 Dolby Vision (UHD Blu-ray) carries two video layers: a base layer, and an enhancement layer whose residual refines the picture. A FEL (full enhancement layer) carries real picture data in that residual.
@@ -266,6 +315,29 @@ See [dolby-vision-fel.md, section 7](dolby-vision-fel.md#7-curve-fold-on-the-nat
   - The route stands down when AirPlay or an external display takes the picture.
 
 See [dolby-vision-fel.md, 5.2 Routing](dolby-vision-fel.md#52-routing) and [5.2.4 The AVPlayer-output route](dolby-vision-fel.md#524-the-avplayer-output-route).
+
+### HDR10 pass-through probe
+
+A measurement switch for AE#957, not a feature. It checks whether HDR10 metadata the engine attaches to a frame of its own reaches the television. tvOS has no `CAEDRMetadata`, so the attachments on the buffer given to `AVSampleBufferDisplayLayer` are the only lever. Tone mapping to a panel's peak depends on the answer.
+
+It is off unless `AETHER_HDR10_PROBE` is set (`HDR10PassThroughProbe.swift`). The variable is read at every software-path load, so a test host can switch it between loads. It never runs with an upscale plan or on the dual-layer decoder.
+
+| `AETHER_HDR10_PROBE` | each decoded frame |
+|---|---|
+| `log` | unchanged; the first frame's colour tags and HDR10 metadata are logged |
+| `meta` | the decoder's buffer gets the probe's mastering display and content light level values |
+| `chain` | goes through the frame chain (`PassThroughStage`) into a buffer of the engine's own, attachments copied |
+| `chain+meta` | both: the engine's own buffer, with the probe's values |
+| `pulse` | as `meta`, but every 72 frames the values switch to a 4000 nit set (MaxCLL 4000, MaxFALL 1000) and back |
+| `chain+pulse` | as `chain+meta`, switching the same way |
+
+- `AETHER_HDR10_PROBE_META` sets the values, as `maxcll=345,maxfall=123,peak=777,min=0.005` (the default). They share no number with a real master, so an analyser shows whose metadata a television got, and a MaxCLL of 345 changes the television's tone mapping visibly (`Probes/HDR10PassThrough`). A value out of range turns the probe off with one `[HDR10Probe] ignored:` line.
+- `meta` changes the attachments of VideoToolbox's buffer in place. Attachments are not pixels, so reference frames decode the same, but it is a probe, not the output-metadata policy above.
+- The chain runs on OS 26 and later on a device. Elsewhere, and on a frame the chain cannot take, both chain modes deliver the frame unchanged, without the probe's values.
+- The pulse modes need no instrument. The pixels stay the same and only the metadata changes, so a television that reads it tone-maps the bright parts brighter and dimmer every 3 s at 23.976 fps. The first four switches are logged. The renderer makes a new format description for each switch ([VideoToolbox output metadata](#videotoolbox-output-metadata)).
+- The log lines start with `[HDR10Probe]`: the first frame before and after, the format description built from the output, and the GPU time over each 48-frame window (the first ten). Three chain failures in a row turn the probe off for the session.
+
+The device harness that plays every mode on an Apple TV is [`Probes/HDR10PassThrough`](../Probes/HDR10PassThrough/README.md).
 
 The 2:3 pulldown retimer is not an optional stage. It is part of the native route's frame grid, see [2:3 pulldown timing on 24p film](architecture-native.md#23-pulldown-timing-on-24p-film).
 
@@ -346,6 +418,18 @@ Each path's tap reader belongs to that path (native, remote HLS, software). The 
 ## Live sources on the software host
 
 The native stream-copy path's live recovery (reconnect overlap, the replay boundary, playlist renewal) is in [architecture-native.md, Live sources](architecture-native.md#live-sources). The software host reuses the same replay guard and adds the rules below.
+
+### Timestamp jumps (the discontinuity fold)
+
+Live sources, and VOD sources that cannot seek, jump their timestamps at programme boundaries, ad breaks and recording chunks. The software host folds each jump away, so decoders, renderers, the DVR ring and the live edge all see one continuous timeline. Both the DVR reader and the combined demux loop do this through `LiveTimelineFold`.
+
+- A jump is a step of 10 s or more between two packets of the same stream. The stream's offset moves by the jump, minus one packet's spacing.
+- **Video and audio each find their own jumps** (AE#1053). An MPEG-TS splice does not move both streams at the same byte, so a fold keyed on video alone put the audio packets read between the two seams a whole jump off the clock. On a +347 s spike that left AC-3 queued 347 s ahead of the clock and the session silent until a retune.
+- When the second stream reaches a jump the first one already crossed, it takes over that stream's offset exactly, so a splice keeps the two in sync to the tick. The test is closeness: its own estimate within 1 s of the other stream's offset.
+- Each jump logs one `[SWHost] PTS discontinuity #n (reader|demux, video|audio)` line, capped at 40 per session. `(adopted from the other stream)` marks the second stream of a splice.
+- The live read-ahead measures its reservoir on raw timestamps, upstream of the fold. A distance past any fill it could have built (forward window + 10 s) counts as a jump, not as a full reservoir, so a spike no longer parks the producer. The VOD cache keeps the old reading, because a cached seek back legitimately leaves more stored than the window.
+
+**Where the video decoder is flushed.** A video jump needs the decoder drained and flushed, after the pre-jump packets and before the first post-jump one. On the combined loop's parked route that first packet carries a mark, and the flush runs when it reaches the head of the parked queue. The loop keeps reading audio meanwhile. It used to wait on the spot for the whole parked queue (~3.5 s of video), read no audio, and lose most of a 4 s audio lead at every jump (down to 0.33 s, measured). With the mark, a spike and a +5000 s splice both keep the lead at its no-jump level (3.30 s and 3.09 s minimum against 3.37 s). The audio decoder is still flushed when the video jump is read.
 
 ### Software live replay admission and recovery
 

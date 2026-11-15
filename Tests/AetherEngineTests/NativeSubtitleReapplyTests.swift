@@ -16,9 +16,13 @@ struct NativeSubtitleReapplyTests {
         #expect(engine.nativeSubtitleReapplyOrdinal == nil)
         engine.setNativeSubtitleSelected(track: 2)
         #expect(engine.nativeSubtitleReapplyOrdinal == 2)
-        let earlierSelection = engine.nativeSubtitleSelectionGeneration
+        let earlierSelection = engine.nativeSubtitleSelectGeneration
         engine.setNativeSubtitleSelected(track: 2)
-        #expect(engine.nativeSubtitleSelectionGeneration != earlierSelection)
+        #expect(engine.nativeSubtitleSelectGeneration != earlierSelection)
+        let plainSelection = engine.nativeSubtitleSelectGeneration
+        engine.setNativeSubtitleSelected(track: 2, markerOnly: true)
+        #expect(engine.nativeSubtitleSelectGeneration != plainSelection)
+        #expect(engine.nativeSubtitleSelectionIsMarker)
         engine.setNativeSubtitleSelected(track: 0)
         #expect(engine.nativeSubtitleReapplyOrdinal == 0)
         engine.setNativeSubtitleSelected(track: nil)

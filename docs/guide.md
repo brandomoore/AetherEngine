@@ -238,7 +238,7 @@ try await player.load(url: videoURL, options: LoadOptions(
 try await player.load(url: videoURL, audioSourceStreamIndex: 2)   // an explicit pick wins over the languages
 ```
 
-**Pick the audio track at load, not right after it.** The first frame is packaged together with the chosen track, so a later `selectAudioTrack` costs a reload.
+**Pick the audio track at load, not right after it.** The first frame is packaged together with the chosen track, so a later `selectAudioTrack` costs a reload. A pick made while the load is still running waits for it to finish and then reloads, so it costs the whole load plus the reload.
 
 `initialSubtitleTrackID` selects a subtitle track by id the same way. Full list: [api.md › LoadOptions](api.md#loadoptions).
 
@@ -281,9 +281,12 @@ External files behave like any other track. They appear in `subtitleTracks` with
 ```swift
 player.$nativeSubtitleTracks               // [NativeSubtitleTrack]: ordinal, language, displayName
 player.setNativeSubtitleSelected(track: 2) // engage a rendition (for example on PiP entry); nil deselects
+player.setNativeSubtitleSelected(track: 2, markerOnly: true) // tick it in AVKit's menu, draw nothing
 ```
 
-Your own overlay cannot reach a Picture in Picture window, an AirPlay receiver or an external display. For those, the engine can hand AVPlayer the subtitles as WebVTT renditions that AVPlayer draws itself. Opt in with `LoadOptions.prepareNativeSubtitles`. Details in [formats.md](formats.md#native-subtitle-renditions-webvtt-for-pip-airplay-and-external-display).
+Your own overlay cannot reach a Picture in Picture window, an AirPlay receiver or an external display. For those, the engine can hand AVPlayer the subtitles as WebVTT renditions that AVPlayer draws itself. Opt in with `LoadOptions.prepareNativeSubtitles`.
+
+If you draw a bitmap track yourself inside `AVPlayerViewController`, `markerOnly: true` makes AVKit's subtitle menu show that track as selected without drawing it or running OCR. PiP and AirPlay still get the OCR text once you call `setNativeSubtitleRendering(true)`. Details in [formats.md](formats.md#native-subtitle-renditions-webvtt-for-pip-airplay-and-external-display).
 
 ### Captions the system turned on
 
@@ -903,6 +906,7 @@ Details in [formats.md › Audio shaping](formats.md#audio-shaping).
 | `skipsContainerAttachments` | Opens a Matroska file without reading its attached fonts, tens of MB on anime releases (AE#956). Leave it off if you render ASS with those fonts | false |
 | `audioBridgeMode` | `.lossless` sends FLAC up to 7.1 for a sink that takes multichannel PCM, instead of E-AC-3 | `.surroundCompat` |
 | `objectAudioRendering` | Keeps the heights of TrueHD Atmos and DTS:X. Needs the package traits ([installation.md](installation.md#optional-components)) | `.off` |
+| `rendersDTSXObjectAudio` | `false` keeps DTS:X on the channel bridge while TrueHD Atmos still renders | true |
 | `audioDelaySeconds` | Starts the session with a lip-sync offset; `setAudioDelay(_:)` changes it later | 0 |
 | `liveDVRByteBudget` | Lifts the software live DVR ring past 2 GiB, for hours of rewind | nil |
 | `foldsDolbyVisionFEL` | Turns the FEL curve fold off for one load, with the `DolbyVisionFelCurves` trait ([dolby-vision-fel.md](dolby-vision-fel.md#7-curve-fold-on-the-native-route)) | true |

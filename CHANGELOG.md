@@ -1,5 +1,14 @@
 # Changelog
 
+## Plozz integration: 7.67.1
+
+- Retain bounded off-main native selection reads and item/selection ownership
+  checks for the new subtitle menu marker. Share upstream's selection generation
+  with OCR prefill and ordinary subtitle selection.
+- Preserve active-picture video seam invalidation with upstream's per-stream
+  timestamp folding and deferred decoder flush. Keep the existing crop analysis,
+  authored intervals, custom-source preparation, dynamic linkage and FEL trait.
+
 ## Plozz integration: 7.66.0
 
 - Preserve selective MEL handling, authored native intervals, bounded source
@@ -148,6 +157,149 @@ the public-API contract.
 - Added `latestSoftwareVideoFrame()` and `softwareVideoFrameGeneration` for opt-in,
   infrequent analysis of an active software session's newest enqueued picture
   without another decoder, display readback, or an engine-owned sampling loop.
+
+## [7.67.1] - 2026-11-14
+
+### Changed
+
+- **A frame chain stage can declare the colour volume of its output (#957, #1065).** Internal groundwork for a
+  later tone map stage. The chain writes the frames' HDR10 metadata from the last stage that declares one, so
+  the display is told what it gets and does not tone map a second time. The two existing stages declare
+  nothing, so no frame changes today. Thanks to bdavid21wnec for the change.
+
+### Fixed
+
+- **The FEL curve fold no longer crashes on a GOP with undated packets (#1064).** With `DolbyVisionFelCurves`
+  on, a stream-copy cut of a Profile 7 FEL file can start with packets that carry neither a PTS nor a DTS.
+  Measuring the frame spacing then subtracted `AV_NOPTS_VALUE` and trapped on the overflow. Such a GOP now keeps
+  the stream's mapping, and the next GOP fits afresh. A span too wide to subtract between two valid timestamps
+  is caught the same way. Thanks to orut34iop for the fix and the byte-identical control runs.
+- **An audio pick during a load no longer drops the Dolby Vision route (#1061).** A `selectAudioTrack` made as
+  soon as `audioTracks` published landed inside the load's display handshake. Its rebuild replaced the load
+  before the load had stored its panel answers, so a DV or HDR title went to the media playlist (HDR10 base
+  layer, no DV signaling) and `videoFormat` stayed `.sdr`. The pick now waits for the load to return and then
+  rebuilds as any later pick does, and the host's `load()` returns normally instead of throwing
+  `CancellationError`. `selectTitle(id:)` waits the same way. A rebuild that still finds no load-time panel
+  answer says so in the log. Thanks to andreiborisov for the report and the code trace.
+- **The engine builds without warnings under Xcode 27.2 again (#1062).** Six diagnostics in five files: a
+  main actor-isolated notification key read from a Sendable closure, `String(cString:)` on an array,
+  `M_SQRT1_2`, the synchronous `AVMetadataItem.stringValue`, and a `weak var` that was never mutated. The audio
+  menu now loads a rendition's title asynchronously and drops an answer whose item or selection changed while
+  it waited. Thanks to YangHanqing for the report.
+- **The APAC tests no longer expect two encoders to write the same bytes (#1063).** On an M6 under macOS 27.0.1,
+  two encoders fed the same PCM wrote different packets on every run, while the decoded audio matched at a signal to error ratio of about
+  93 dB. Three tests compared the bytes and failed there. They now decode both runs and require a ratio above
+  60 dB; a swapped packet measures 12.7 dB and a repeated one 15.7 dB, so both still fail. Test
+  change only, the encoder settings are untouched. Thanks to YangHanqing for the report and the measurements.
+
+## [7.67.0] - 2026-11-14
+
+### Added
+
+- **`LoadOptions.rendersDTSXObjectAudio` keeps DTS:X on the channel bridge while TrueHD Atmos renders (#1060).**
+  Since 7.66.1 DTS:X asked into 5.1.2, 5.1.4 or 7.1.2 renders as 7.1.4, which left a host no way to put TrueHD
+  Atmos into a small bed and keep DTS:X on the 7.1 bridge in the same load. `false` does that for every DTS
+  track of the load, so switching between the two tracks needs no reload, and the automatic audio pick stops
+  preferring DTS:X. The default, `true`, changes nothing. `aetherctl play --no-dtsx-objects` sets it. Thanks to
+  Desima-AP for the request.
+- **AVKit's subtitle menu can show a track the host draws itself (#1052).** `setNativeSubtitleSelected(track:markerOnly:)`
+  with `markerOnly: true` ticks the track in the menu and offers Off, but serves it as empty segments and runs no
+  OCR, so nothing is drawn over the host's own bitmap overlay. `setNativeSubtitleRendering(true)` turns it into a
+  full rendition for PiP, AirPlay and external displays, and `false` goes back to the marker. Thanks to Anquietas
+  for the request.
+- **`aetherctl bench` and `AetherEngine.runPerFrameBenchmarks` time the software path's per-frame work (#957).**
+  Latency regressions there had no number to catch them. The benchmark times the output metadata normalizer,
+  the renderer's sample buffer, the frame chain and the HDR10 SEI scan on a 4K P010 frame, saves the report as
+  JSON and fails against a baseline when a median grows past a tolerance. Covered by
+  `PerFrameBenchmarkReportsEveryCaseTests`.
+
+### Fixed
+
+- **Scrubbing a 4K title no longer holds up to six still decoders open (#1059).** Each one costs 100 to 160 MB
+  on an Apple TV 4K, and a held fast-forward took the app from 180 MB to about 1.1 GB. The open decoders now
+  share a budget of six 1080p pictures, so a 4K title keeps one and the others close down to their cached
+  still. Resident decoders close after 3 s idle instead of 10 s, and the new `releaseScrubPreviewDecoders()`
+  closes them when the host's scrub ends. Covered by `Issue1059ScrubDecoderBudgetTests`. Thanks to samimt55
+  for the measurements.
+- **Profile 7 FEL no longer freezes the picture on an Apple TV 4K (A12) when a chroma curve is rejected (#1055).**
+  When the parser rejected one chroma curve (for example an MMR coefficient too large for the fixed-point
+  form) and the other chroma curve was MMR, the chroma kernel read the rejected curve's range with an
+  unclamped last-pivot index. The A12 executed that guarded load and read 4 GiB past the parameter buffer.
+  That is a GPU page fault, and from then on every frame was lost while the sound played on. Every pivot
+  index the kernels form is now bounded, so the frame composes with the rejected component as identity. A
+  Mac never showed it. Covered by `DoviCurveIndexBoundsTests`, see
+  [Dolby Vision FEL › Earlier fixes worth remembering](docs/dolby-vision-fel.md#44-earlier-fixes-worth-remembering).
+  Thanks to Desima-AP for the GPU restart reports, the address arithmetic and the patch.
+- **A GPU fault during FEL composition no longer costs every later frame (#1055 follow-up).** After the first
+  in-place frame that fails on the GPU, the dual-layer decoder composes into the output pool for the rest of
+  the session. A frame that fails there still shows its base layer. Before, tvOS refusing the process's GPU work
+  after a fault meant every frame was dropped while the sound played on. Suggested by Desima-AP.
+- **A short timestamp spike on a live software session no longer mutes the sound for good (#1053).** A Jellyfin
+  OTA channel (MPEG-2 + AC-3) sent a run of packets stamped 347 s ahead, then returned. The fold that hides
+  such jumps looked at video only and moved audio by read order, and the two streams cross a TS splice at
+  different bytes, so a few AC-3 frames reached the renderer 347 s ahead of the clock. Each stream now folds
+  its own jumps, and the second stream of a splice takes over the first one's offset to stay in sync. The
+  live read-ahead also stopped reading a spike as a full reservoir. Reproduced and verified with `aetherctl`
+  on a spiked TS served at real time. Thanks to l984-451 for the report and the full log.
+- **A timestamp jump no longer drains the audio lead on live software sessions without DVR (#1053 follow-up).**
+  At every video jump the combined loop waited for its whole parked video queue (~3.5 s) before flushing the
+  decoder and read no audio meanwhile, so a 4 s audio lead fell to 0.33 s. The flush now runs when the first
+  post-jump packet reaches the head of that queue, and audio keeps flowing (3.30 s minimum lead on the spike,
+  3.37 s with no jump at all).
+- **A PGS set decoded while a seek goes out is no longer drawn at the landing (AE#1022, round 3).** A drain
+  batch planned before the seek, or a tick planned while it was out, still decoded around the departure. It
+  published a set whose clear was unread as open after the seek had closed the open sets, and the clock drew
+  it at the landing until the landing's reset closed it (retest over a reader capped at 10x the bitrate: the
+  set of 22 s on screen for 0.37 s at a 63 s landing). Such a batch is now dropped, and no tick is planned
+  until the seek lands. Not reproduced on the Mac, where these seeks land in a few milliseconds; covered by
+  `Issue1022LandingWindowTests`. Thanks to Desima-AP for the retest.
+- **HDR10 on the software path now reaches the television with its static metadata (#957).** VideoToolbox
+  attaches no mastering display or content light level to the frames it decodes, so the software path sent
+  HDR10 with none, and the television tone-mapped without knowing the master. The decoder now reads the
+  stream's values (from the container, the `hvcC` / `av1C`, or the SEI or AV1 metadata OBUs of the first key
+  frames) and attaches them to every frame. A frame that already carries its own keeps them. The libavcodec
+  decoder (dav1d AV1, VP9, H.264 High 10 from x264, HEVC Rext) sent none either; it now attaches the values
+  its frames carry, or the container's. Covered by `SoftwarePathCarriesStreamHDR10MetadataTests` and
+  `HDR10MetadataFromAV1AndDecodedFramesTests`.
+- **HDR10 HEVC on the software path no longer copies every frame (#957).** VideoToolbox tagged a PQ BT.2020
+  HEVC clip's frames BT.709, so the engine copied each 4K frame to retag it, about 7 ms per frame on an A12
+  Apple TV. The format description now names the stream's colour and HDR10 values, VideoToolbox attaches
+  them itself, and no frame is copied. Values found only in a key frame (common for AV1) go into a new
+  description and session at that key frame, so those streams skip the copy too. Covered by
+  `DecoderFormatCarriesStreamColourAndHDR10Tests`.
+- **The software path's format description follows a change of HDR10 metadata (#957).** The renderer reused
+  its format description while size, pixel format and colour tags stayed the same, so mastering display
+  and content light level values that changed mid-stream never reached the display layer: it kept the
+  first frame's. The values are now part of the cache key. Covered by
+  `FormatDescriptionFollowsHDR10MetadataTests`.
+
+### Changed
+
+- **A frame chain of pass-through stages runs as one kernel (#957).** It turned each frame into a 66 MB RGB
+  texture and back, about 10 ms of GPU time per 4K frame on an A12 Apple TV. A chain whose stages all leave
+  the picture alone, at its own size, now runs as one kernel without that texture, moving four luma samples
+  per access with the colour arithmetic folded: 2.7 ms of GPU time and 4.0 ms in all, the same picture. No
+  playback path builds such a chain yet (line art changes the picture and the size, and keeps the two
+  passes); it is the fast path for chains that only convert, and the benchmark times it. Covered by
+  `FrameChainTests`.
+
+## [7.66.1] - 2026-11-13
+
+### Fixed
+
+- **DTS:X keeps its heights when a smaller bed is asked for.** With `objectAudioRendering` set to 5.1.2,
+  5.1.4 or 7.1.2, DTS:X fell back to the 7.1 channel bridge, so a host that sets the layout to match the
+  room lost DTS:X's heights and the receiver never switched to Atmos. It is now rendered as 7.1.4, the
+  smallest bed that carries its channels one to one, and the receiver maps that onto its speakers.
+  TrueHD Atmos still renders into the layout asked for. Thanks to vZone71 for the report. Covered by
+  `SoftwareAtmosRouteTests` and `DTSXObjectMetadataMappingTests`.
+
+- **`softwareNowPlayingActive` turns true only once the engine's command targets are registered (#1051).**
+  Since 7.64.0 the flag went true before the targets existed, so a host that swaps play, pause and toggle
+  for its own the moment the flag turns true removed nothing, and both answered every press (a toggle
+  cancelled itself). It also stayed true while the engine waited behind another one for the shared
+  surface. It now goes true after registration and false when another engine takes the surface. Thanks
+  to Desima-AP for the report and the measurement. Covered by `NowPlayingRoutingTests`.
 
 ## [7.66.0] - 2026-11-13
 

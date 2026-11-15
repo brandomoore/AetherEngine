@@ -70,6 +70,8 @@ func printUsage() {
       aetherctl serve [--no-dv] [--force-dv] [--dv-base-layer] [--start-position S] [--iframes] [--atmos-bed 7.1.4 [--bed-format apac|lpcm|auto]] [--audio-index N] [--stereo auto|mono|sbs|ou] <url>
       aetherctl validate [--no-dv] [--force-dv] [--dv-base-layer] <url>
       aetherctl swdecode [--frames N] <url>
+      aetherctl bench [--iterations N] [--json out.json] [--baseline base.json] [--tolerance PCT]
+      aetherctl bench --compare <base.json> <new.json> [--tolerance PCT]
       aetherctl play [--fel [--fel-output]] [--upscale [--line-art]] [--surface | --window] [--cycle-el SECONDS] [--dv-pin SPEC] [--seconds N] [--live] [--no-sw-escalation] [--standard-join] [--live-start-immediately] [--live-cushion SECONDS] [--dvr-window N] [--subs <codec-or-lang>]
                  [--assert-dv] [--dv-base-layer]
                  [--start-position S] [--switch-audio <index>[@ms]]
@@ -80,7 +82,7 @@ func printUsage() {
                  [--reload-applying <key>=<value>]... [--reload-applying-at <ms>]
                  [--drop-audio]
                  [--sequential-origin] [--declared-duration S]
-             [--max-concurrent-requests N] [--atmos-bed 7.1.4 [--bed-format apac|lpcm|auto]]
+             [--max-concurrent-requests N] [--atmos-bed 7.1.4 [--bed-format apac|lpcm|auto] [--no-dtsx-objects]]
                      [--audio-stats] [--host-calls play,extractor,setrate,pausestart,reloadlive,seekback,seekfar,pauseseek,pausereload,playreload,extplayreload,reloadnext,subsatload] <url>
                      (full load+play session smoke test; --fel opts into the Profile 7
                       FEL dual-layer route (off by default, as in the engine, and only in
@@ -335,6 +337,12 @@ private func objectAudioRendering(_ flag: String?, format: String? = nil) -> Obj
     }
     #if !(TrueHDObjectAudio || DTSXObjectAudio)
     print("[aetherctl] note: --atmos-bed renders nothing without the TrueHDObjectAudio / DTSXObjectAudio traits")
+    #endif
+    #if DEBUG
+    // A debug build renders the bed about 5x slower than real time (Unfold: 18.8 s against 2.0 s), so
+    // AVPlayer waits for audio and `play` ends in "clock did not advance". Not an engine defect.
+    print("[aetherctl] note: a debug build renders the object bed below real time, so play may stall; "
+        + "build with -c release to judge playback")
     #endif
     switch format {
     case nil, "apac": return .apac(layout)
@@ -648,6 +656,27 @@ if first == "felcurves" {
     exit(64)
 }
 #endif
+
+// Per-frame cost of the software path's frame work, against a baseline (AE#957).
+if first == "bench" {
+    var rest = Array(args.dropFirst(2))
+    let iterations = takeIntFlag("--iterations", in: 10...100_000, from: &rest) ?? 300
+    let jsonPath = takeStringFlag("--json", from: &rest)
+    let baseline = takeStringFlag("--baseline", from: &rest)
+    let tolerance = (takeDoubleFlag("--tolerance", in: 1...500, from: &rest) ?? 20) / 100
+    var compare: (String, String)?
+    if takeFlag("--compare", from: &rest) {
+        guard rest.count == 2 else {
+            print("Usage: aetherctl bench --compare <base.json> <new.json> [--tolerance PCT]")
+            exit(64)
+        }
+        compare = (rest[0], rest[1])
+        rest.removeAll()
+    }
+    rejectStrayFlags(rest, subcommand: "bench")
+    exit(runBench(iterations: iterations, jsonPath: jsonPath, baselinePath: baseline, tolerance: tolerance,
+                  compare: compare))
+}
 
 // FEL / MEL for many sources at once: `label<TAB>url` lines on stdin.
 if first == "eltype" {
@@ -970,6 +999,8 @@ if first == "play" {
     // #731: TrueHD Atmos or DTS:X rendered into a bed as APAC; the 1 Hz line then reports its objects.
     let playObjectAudio = objectAudioRendering(
         takeStringFlag("--atmos-bed", from: &rest), format: takeStringFlag("--bed-format", from: &rest))
+    // AE#1060: TrueHD Atmos renders, DTS keeps the 7.1 channel bridge.
+    let playRendersDTSX = !takeFlag("--no-dtsx-objects", from: &rest)
     let declaredDuration = takeDoubleFlag("--declared-duration", from: &rest)
     // #311: install the software frame-time observer and read the presentation timebase, so the
     // per-frame boundaries and the clock a host would pace an overlay against are both observable.
@@ -1208,6 +1239,7 @@ if first == "play" {
                  heldConnection: heldConnection,
                  progressiveSegments: progressiveSegments,
                  objectAudioRendering: playObjectAudio,
+                 rendersDTSX: playRendersDTSX,
                  declaredDuration: declaredDuration,
                  httpHeaders: playHeaders,
                  deinterlaceFieldRate: playFieldRate,

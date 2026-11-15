@@ -1305,7 +1305,11 @@ public final class AetherEngine: ObservableObject {
     /// Audit LIF-101: the generation of the `load()` or `reloadWithAudioOverride` still running. A
     /// load passes through `.paused` long before it returns (native readiness during the play gate),
     /// so its state cannot say whether it settled; this can.
-    private var loadInFlightGeneration: UInt64?
+    private var loadInFlightGeneration: UInt64? {
+        didSet { if loadInFlightGeneration != oldValue { resumeLoadSettleWaiters() } }
+    }
+    /// AE#1061: picks parked until the load in flight returns. See `awaitLoadInFlightSettled`.
+    private var loadSettleWaiters: [CheckedContinuation<Void, Never>] = []
     /// Test seam for the owed background decision on a platform without an app lifecycle.
     var owedBackgroundPolicyForTesting: (@MainActor (AetherEngine) async -> Void)?
     #if os(iOS)
@@ -1686,6 +1690,11 @@ public final class AetherEngine: ObservableObject {
     /// Scoped to the generation: a request from an earlier seek or the session start says nothing
     /// about where the reader is now.
     var subtitlePrefetchLandingRequestedAt: (seconds: Double, seekGeneration: UInt64)?
+    /// AE#1022 round 3: the seek generation whose software seek closed the open sets at its
+    /// departure. Until that seek lands, a drain tick would plan at the departure again (the clock
+    /// still reports the frame being left) and publish sets whose clear nobody read, open, after
+    /// the closing ran, and the clock then draws them at the landing.
+    var subtitleDepartureClosedSeekGeneration: UInt64?
     /// #496: why the last live prefetch session was cancelled. Set only when a task was actually
     /// running, so it names a real teardown rather than the many no-op cancels on the way through
     /// a selection. Mirrors the log line; kept as state so a test can assert the routing.
@@ -2595,7 +2604,11 @@ public final class AetherEngine: ObservableObject {
     /// every suspension point. Without it, a load suspended at the probe/criteria/session-start could resume
     /// after a newer load, orphan the successor's producer+loopback server, and resurrect playback after
     /// dismissal. A superseded load throws CancellationError at the first checkpoint.
-    var loadGeneration: UInt64 = 0
+    var loadGeneration: UInt64 = 0 {
+        // AE#1061: a stop() or newer load releases a pick parked on the load it replaced at once, not
+        // only when that load gets round to unwinding.
+        didSet { resumeLoadSettleWaiters() }
+    }
     let activePictureAnalysis = ActivePictureAnalysis()
 
     /// Separates cache lifecycle callbacks from superseding sessions.
@@ -3028,7 +3041,13 @@ public final class AetherEngine: ObservableObject {
     /// so the reload re-applies this to keep an active rendition (PiP) rendering. Cleared with
     /// the track table on load/stop so a new session never inherits a stale selection.
     var nativeSubtitleReapplyOrdinal: Int?
-    var nativeSubtitleSelectionGeneration = UUID()
+
+    /// AE#1052: the host's menu marker (`setNativeSubtitleSelected(track:markerOnly: true)`), the
+    /// selection that stands while the picture is in the app. Replaced by the host's next call.
+    var nativeSubtitleMarkerOrdinal: Int?
+
+    /// AE#1052: bumped by every native selection, so a pre-fill that outlived its request stops.
+    var nativeSubtitleSelectGeneration: UInt64 = 0
 
     /// Whole-file decode tasks filling native stores for load-declared external tracks (#88).
     var externalNativeStoreFillTask: Task<Void, Never>? = nil
@@ -3946,7 +3965,7 @@ public final class AetherEngine: ObservableObject {
             )
             // The select path's own stall-recovery retries (#32) cover the fresh item's
             // not-ready window; the stores are already filled, so the pre-fill returns fast.
-            setNativeSubtitleSelected(track: ordinal)
+            applyNativeSubtitleSelection(track: ordinal)
         }
     }
 
@@ -5116,6 +5135,7 @@ public final class AetherEngine: ObservableObject {
         setPendingRecoverySeekTarget(nil)
         nativeSubtitleTrackTable = []
         nativeSubtitleReapplyOrdinal = nil
+        nativeSubtitleMarkerOrdinal = nil
         nativeSubtitleTracks = []
         nativeSubtitleReaderParams = nil
         metadata = nil
@@ -5707,6 +5727,7 @@ public final class AetherEngine: ObservableObject {
             // and no heights, so the default track keeps its place there.
             prefersObjectAudio: options.objectAudioRendering != .off && ObjectAudioRendering.isAvailable
                 && !options.isLive && !options.audioOnly,
+            rendersDTSX: options.rendersDTSXObjectAudio,
             defaultIndex: probedDefaultAudioIndex
         ) ?? (probeOpened ? nil : audioSourceStreamIndex)
         let resolvedInitialAudio = selectedAudio ?? probedDefaultAudioIndex
@@ -8526,7 +8547,9 @@ public final class AetherEngine: ObservableObject {
     /// answers commands for. Read when a route starts.
     public var remoteSkipInterval: Double = 10
 
-    /// True while the engine is publishing Now-Playing for a software-host session.
+    /// True while the engine is publishing Now-Playing for a software-host session: it turns true once the
+    /// engine's command targets are registered, and false when they are removed (stop, or another engine
+    /// taking the shared surface).
     @Published public internal(set) var softwareNowPlayingActive: Bool = false
 
     /// Staged per-item Now-Playing identity for the video routes. Replayed at host creation and onto
@@ -8768,6 +8791,13 @@ public final class AetherEngine: ObservableObject {
             while let selected = self.pendingAudioSelection {
                 self.pendingAudioSelection = nil
                 guard !Task.isCancelled, self.audioSelectionEpoch == epoch else { return }
+                await self.awaitLoadInFlightSettled(pick: "selectAudioTrack(\(selected))")
+                // A load that failed has no session to rebuild; the next load owns the engine.
+                guard !Task.isCancelled, self.audioSelectionEpoch == epoch else { return }
+                if case .error = self.state { return }
+                // A pick that came in during the wait replaces this one.
+                let selected = self.pendingAudioSelection ?? selected
+                self.pendingAudioSelection = nil
                 if self.activeAudioTrackIndex == selected { continue }
                 let beforeReload = self.loadGeneration
                 let failure = await self.reloadWithAudioOverride(
@@ -8813,6 +8843,10 @@ public final class AetherEngine: ObservableObject {
         let custom = isCustomSource
         Task { @MainActor [weak self] in
             guard let self = self else { return }
+            // AE#1061: the custom branch rebuilds exactly as an audio pick does, the URL branch would
+            // unwind the host's load() with a CancellationError. Both wait for the load to return.
+            await self.awaitLoadInFlightSettled(pick: "selectTitle(\(id))")
+            if case .error = self.state { return }
             if custom {
                 // Custom readers (e.g. SMB ISO) have no URL to reopen; rebuild on the retained reader with the
                 // title override, restarting at the new title's head.
@@ -9290,6 +9324,7 @@ public final class AetherEngine: ObservableObject {
         isLoadingSubtitles = false
         nativeSubtitleTrackTable = []
         nativeSubtitleReapplyOrdinal = nil
+        nativeSubtitleMarkerOrdinal = nil
         nativeSubtitleTracks = []
         nativeSubtitleReaderParams = nil
         cancelNativeSubtitleReaders()
@@ -9501,6 +9536,36 @@ public final class AetherEngine: ObservableObject {
     }
 
     var loadInFlight: Bool { loadInFlightGeneration == loadGeneration }
+
+    /// AE#1061: a track or title pick that lands while a load is still running waits for that load to
+    /// return before it rebuilds. The load publishes `audioTracks` before its display handshake, and a
+    /// rebuild that superseded it there found none of the load's panel answers (they are stored only
+    /// once the handshake settles), so it routed a Dolby Vision title media-direct onto a panel that
+    /// was mid-switch into DV, and left `videoFormat` at `.sdr` for the session. It also unwound the
+    /// host's `load()` with a `CancellationError`, which a host reads as a supersede (LIF-101). Waiting
+    /// costs the pick the rest of the load; a host that knows its track up front passes it to `load`
+    /// as `audioSourceStreamIndex` and pays nothing.
+    ///
+    /// Returns as soon as the load the caller saw is no longer the one in flight: it returned, or a
+    /// stop() or newer load took over (both move the generation), which the caller's own generation
+    /// guard then turns away.
+    func awaitLoadInFlightSettled(pick: String) async {
+        guard loadInFlight else { return }
+        let generation = loadGeneration
+        EngineLog.emit(
+            "[AetherEngine] \(pick) waits for the load in flight to settle its route before it rebuilds (#1061)",
+            category: .engine)
+        while loadInFlightGeneration == generation, loadGeneration == generation, !Task.isCancelled {
+            await withCheckedContinuation { loadSettleWaiters.append($0) }
+        }
+    }
+
+    private func resumeLoadSettleWaiters() {
+        guard !loadSettleWaiters.isEmpty else { return }
+        let waiters = loadSettleWaiters
+        loadSettleWaiters = []
+        for waiter in waiters { waiter.resume() }
+    }
 
     func beginLoadInFlight(_ generation: UInt64) {
         loadInFlightGeneration = generation

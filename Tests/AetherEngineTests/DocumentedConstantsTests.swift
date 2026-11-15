@@ -212,6 +212,18 @@ final class DocumentedConstantsTests: XCTestCase {
         assertDocumented("stops holding the other back after 10 s of its media", docs)
     }
 
+    /// docs/architecture-software.md quotes how many key frames the HDR10 static metadata scan reads (AE#957).
+    func testHDR10KeyFrameScanMatchesDocumentation() throws {
+        XCTAssertEqual(HDR10StaticMetadataSEI.keyFramesToScan, 3)
+        assertDocumented("then from the first 3 key frames", try documentation())
+    }
+
+    /// docs/cli.md quotes the bench gate's floor (AE#957).
+    func testBenchRegressionFloorMatchesDocumentation() throws {
+        XCTAssertEqual(PerFrameBenchmarkReport.regressionFloorMicroseconds, 50)
+        assertDocumented("by more than the tolerance and by more than 50 us", try documentation())
+    }
+
     // MARK: - Documentation corpus
 
     private static var repoRoot: URL {

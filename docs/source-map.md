@@ -34,7 +34,7 @@ Which file owns what, folder by folder. Paths are relative to `Sources/AetherEng
 | `AetherEngine+SubtitleOCR.swift` | Arming, per-ordinal cursors and the MainActor tick of the bitmap-subtitle OCR worker. It fills a text rendition for PiP / AirPlay / external display while a PGS / DVB / DVD track's rendition is selected natively. |
 | `AetherEngine+AudioShaping.swift` | `setAudioShaping(_:)`: audio shaping as a live setting. Each change is a session-preserving rebuild, with presses folded into the one in flight (AE#923). |
 | `AetherEngine+TeletextPage.swift` | `setTeletextPage(_:)`: the teletext caption page as a live setting. Rebuilds the drain decoder of each channel showing a teletext track and leaves others alone, so a page libzvbi does not flag as a subtitle page can be fixed without leaving the channel (#364). |
-| `AetherEngine+ScrubThumbnail.swift` | Scrub still for the active native session, decoded from bytes already in `SegmentCache`. Single-connection sources (debrid / torrent links) that refuse the `FrameExtractor`'s second demuxer still get previews (#106). |
+| `AetherEngine+ScrubThumbnail.swift` | Scrub still for the active native session, decoded from bytes already in `SegmentCache`. Single-connection sources (debrid / torrent links) that refuse the `FrameExtractor`'s second demuxer still get previews (#106). Keeps the open still decoders inside a pixel budget and closes them on `releaseScrubPreviewDecoders()` (AE#1059). |
 | `AetherEngine+NowPlaying.swift` | Builds the Now-Playing publisher of the route that loaded, from the app's opt-ins (`ownsSoftwareNowPlaying`, `ownsAudioNowPlaying`, `ownsVideoNowPlayingSession` + `ownsVideoNowPlayingCommands`; primary role only): commands on the route's `MPNowPlayingSession`, or card and commands on the shared centers where none exists. Keeps the card through a load seam, and takes part in `NowPlayingArbiter` on the shared centers. |
 | `SeekEvent.swift` | One statement about a seek's lifecycle (outcome plus its target). `isSeeking` / `seekTarget` are a level, and a level cannot say why it fell (#38 follow-up). |
 | `StartupProgress.swift` | The nine-checkpoint startup ladder behind `$startupProgress` (#361). See note. |
@@ -182,7 +182,7 @@ Notes:
 | `VideoRoutingPolicy.swift` | Pure dispatch rule by codec and field order. See note. |
 | `HardwareVideoDecoder.swift` | Software path: VideoToolbox hardware decoder (HEVC, VP9, AV1 Dolby Vision) for sources routed away from AVPlayer. |
 | `DualLayerVideoDecoder.swift` | Software path: Dolby Vision Profile 7 FEL (`DualLayerDolbyVision` trait). See note. |
-| `SoftwareVideoDecoder.swift` | Software path: libavcodec/dav1d → `CVPixelBuffer` (NV12 / P010), HDR10+ side data. 10-bit AV1 reaches P010 through `GPUFrameConverter`. |
+| `SoftwareVideoDecoder.swift` | Software path: libavcodec/dav1d → `CVPixelBuffer` (NV12 / P010), HDR10+ side data, HDR10 static metadata. 10-bit AV1 reaches P010 through `GPUFrameConverter`. |
 | `GPUFrameConverter.swift` | Software path: converts a 10-bit AV1 frame to P010 in one Metal pass and applies its film grain there (dav1d exports the grain instead of applying it). `sws_scale` stays the fallback. |
 | `AV1FilmGrain.swift` | The per-frame grain tables (templates, scaling functions, block offsets), computed on the CPU the way dav1d computes them. |
 | `AV1FilmGrainShaderSource.swift` | The Metal kernels: dav1d's per-pixel grain and the P010 write. |
@@ -196,10 +196,12 @@ Notes:
 | `VideoToolboxVideoFormat.swift` | Builds the Core Media format description `HardwareVideoDecoder` needs, synthesizing VP9's `vpcC` from probed parameters. |
 | `VideoToolboxOutputMetadataNormalizer.swift` | Adds codec-declared colour metadata to VideoToolbox output that lacks it, through a pixel-transfer pool rather than mutating the frame. |
 | `ColorDescription.swift` | A stream's colour description merged from bitstream (VUI) and container (AE#499). |
+| `HDR10StaticMetadataSEI.swift` | AE#957: the stream's HDR10 static metadata (container side data, `hvcC` / `av1C`, key-frame SEI or AV1 metadata OBUs, a decoded frame's side data) in Core Video's byte layout. |
+| `HDR10StaticMetadata.swift` | AE#957: builds and describes the two HDR10 attachments (mastering display, content light level) in Core Video's byte layout. |
 | `AlternativeTransferSEI.swift` | AE#839: reads the `alternative_transfer_characteristics` SEI that names HLG behind a backward-compatible VUI. |
 | `AV1DolbyVisionRPU.swift` | The Dolby Vision RPU from an AV1 T.35 metadata OBU (Profile 10), attached to decoded frames for the system's DV display management. |
 | `DualLayerRouteDecision.swift` | Whether a Profile 7 load takes the dual-layer route or stays native, and why. Pure, logged once per source. |
-| `UpscalingFrameHandler.swift` | Runs the upscale stage (#846) on every decoded frame; a nil from the stage delivers the original. |
+| `UpscalingFrameHandler.swift` | Runs the upscale stage (#846), or the HDR10 pass-through probe (AE#957), on every decoded frame; a nil from the stage delivers the original. |
 
 Notes:
 
@@ -271,6 +273,7 @@ Notes:
 | `MallocBlockCensus.swift` | In-process census of live malloc blocks by size class (#220), so a step in resident memory can name the allocation instead of guessing it from a block count and a total. |
 | `MallocBlockCensusTrigger.swift` | Captures that census when memory jumps. Every recorded kill is flat and then steps inside a single 30 s memprobe sample, so a periodic sampler can never catch the allocation (#220). |
 | `ThreadCPUSampler.swift` | CPU time per thread group between two samples (consumed time, including ended threads): the `cpuprobe` line next to every memprobe. Public, so a host can profile its UI from a field log. |
+| `PerFrameBenchmark.swift` | `AetherEngine.runPerFrameBenchmarks` (AE#957): per-frame time of the software path's frame work. Backs `aetherctl bench`. |
 | `VMRegionCensus.swift` | Per-`user_tag` census of the dirty + swapped pages `phys_footprint` counts, as a delta against the session's first tick. Names the region a rising footprint rose in when every itemized bucket (heap census included) is flat, which is where AE#445 kept ending up. |
 | `SubtitleDeliveryStatement.swift` | Value and formatter for the #357 line. See note. |
 | `LogRedaction.swift` | Strips credentials (tokens in URL queries, auth headers) out of a line before `EngineLog` emits it. |
@@ -551,6 +554,7 @@ Notes:
 | `VideoConfigRecord+InBand.swift` | Rebuilds an `hvcC` with empty arrays from in-band parameter sets for consumers that need them in the record. |
 | `LivePacketReplayGuard.swift` | Removes packets a live origin resends after a reconnect, matched on timestamps and payload. |
 | `LiveReplayPacketReader.swift` | Demux-thread admission through that guard, before clock folding, recording and DVR storage. |
+| `LiveTimelineFold.swift` | AE#1053: the software path's timestamp-jump fold, per stream, with the second stream of a splice adopting the first one's offset. |
 | `LiveReadHead.swift` | AE#936: how far and how fast the cutter reads into the open live segment, for the fastZap grace. |
 | `LiveDVRLimits.swift` | `LiveDVRLimits`: caller-selected DVR retention (window, bytes, free-space floor), and its policy. |
 | `SoftwareDVRRetentionOptions.swift` | `SoftwareDVRRetentionOptions`: opt-in storage bounds for a software live spool. |
@@ -560,6 +564,7 @@ Notes:
 | `StereoVideoSignal.swift` | `StereoPresentation` (`LoadOptions.stereoPresentation`) and how the native path signals frame-packed 3D in the served HLS. |
 | `HDR10PlusDetectionProbe.swift` | `probe(url:detecting:)`: the opt-in HDR10+ / HDR Vivid pre-playback scan, its bounds and `ProbeDetail`. |
 | `HDR10PlusMetadataScan.swift` | Decoder-free HDR10+ confirmation from T.35 SEI / OBU or Matroska side data, for playback and the probe. |
+| `HDR10PassThroughProbe.swift` | AE#957: with `AETHER_HDR10_PROBE`, runs software-path frames through the frame chain and/or sets HDR10 metadata of its own, to check on a television whether that metadata arrives (`Probes/HDR10PassThrough`). |
 | `HDRVividMetadataScan.swift` | Decoder-free HDR Vivid (CUVA) confirmation for the detail probe (#699). |
 | `DolbyVisionRecordAudit.swift` | AE#532: what a DV source's own RPU says about the profile its container record claims. |
 | `DoviRpuGuard.swift` | CRC-checks every RPU before libdovi (built panic=abort) parses it. |
@@ -577,6 +582,7 @@ Notes:
 | `IFrameJPEGBuilder.swift` | AE#682: one keyframe as a Motion JPEG fragment, for sources whose own keyframes AVKit will not show. |
 | `IFramePayloadCache.swift` | AE#682: byte-capped on-disk cache of keyframe payloads read for the rendition. |
 | `FrameUpscaler.swift` | The per-frame upscale stage (#846): optional VT super resolution, then MetalFX, with overrun fallback. |
+| `FrameChainOutput.swift` | AE#957: `FrameChainColorVolume`, the colour volume a frame chain stage declares for its output, and the attachments a chain's output buffer carries (the source's, minus its geometry, with the declared HDR10 metadata). |
 | `UpscaleRouteDecision.swift` | Whether and how a load upscales: source geometry, the plan, and process-wide failure and cost memory. |
 
 ### `Video/FelCurves/`
@@ -597,7 +603,7 @@ The `Dovi*` files build only with the `DualLayerDolbyVision` trait.
 
 | File | What it does |
 | --- | --- |
-| `FrameChain.swift` | The GPU frame chain (AE#957, AE#1039): a decoded 8 or 10-bit 4:2:0 frame to half-float RGB, through a list of `FrameChainStage`s, and back to the input's format at the target size, in one command buffer. `PassThroughStage` and `LineArtStage` are its stages; `FrameUpscaler` runs it for the `.lineArt` plan. |
+| `FrameChain.swift` | The GPU frame chain (AE#957, AE#1039): a decoded 8 or 10-bit 4:2:0 frame to half-float RGB, through a list of `FrameChainStage`s, and back to the input's format at the target size, in one command buffer. `PassThroughStage` and `LineArtStage` are its stages; `FrameUpscaler` runs it for the `.lineArt` plan. A chain of identity stages at its own size runs as one kernel without the RGB texture (four luma samples per access where the width allows). Each stage declares its output's colour volume, and `attach` writes the frames' HDR10 metadata from it. |
 | `LineArtShaderSource.swift` | Generated (`Scripts/generate-line-art-shader.py`) from Anime4K's Upscale CNN x2 (S), MIT: four half-precision convolution kernels and the depth-to-space kernel, compiled at runtime. |
 | `UpscaleShaderSource.swift` | NV12 / RGBA kernels around MetalFX for the automatic upscale stage, and the Y'CbCr matrix from a buffer's tag. |
 | `DoviFelChromaFormat.swift` | Chroma sampling of the composed frame: 4:2:0 (the composition), 4:2:2 and 4:4:4 (experimental, `AETHER_FEL_CHROMA`), and each format's CoreVideo layout. |
@@ -652,6 +658,7 @@ Every subcommand is listed with its flags in [docs/cli.md](cli.md#subcommands-at
 | `PlaybackCmd.swift` | `play`, including host-call drills, telemetry and verdicts. |
 | `PictureProbe.swift` | `play --picture-probe` (AE#418): which source frame AVPlayer presents at an item time. |
 | `SWDecode.swift` | `swdecode`. |
+| `BenchCmd.swift` | `bench`: prints a benchmark report, saves it, compares two. |
 | `SeekTest.swift` | `seektest`. |
 | `Extract.swift` | `extract`. |
 | `ScrubPreviewCmd.swift` | `scrubpreview`. |

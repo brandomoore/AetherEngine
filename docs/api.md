@@ -1083,7 +1083,7 @@ A rebuild consumes no new stream. Anything a host sets up at the moment it hands
 | `volume` | Pass 0.0 to 1.0 (not clamped). A write before a session exists is remembered and applied at load. |
 | `selectTitle(id:)`, `selectChapter(id:)` | Disc titles and chapters. See the note below. |
 
-**Titles and chapters.** `selectTitle` is synchronous and returns before the switch. It rebuilds the session at the start of the new title, like a fresh load. It ignores an unknown id, the title already playing, and a forward-only custom source; a reload that fails is only logged. `selectChapter` looks only in `discChapters` and seeks with `exact: true`. It cannot reach container chapters (`mediaChapters`): pass their `startSeconds` to `seek(to:exact: true)`.
+**Titles and chapters.** `selectTitle` is synchronous and returns before the switch. It rebuilds the session at the start of the new title, like a fresh load. A pick made while a `load` is still running waits for that load to return, as an audio pick does. It ignores an unknown id, the title already playing, and a forward-only custom source; a reload that fails is only logged. `selectChapter` looks only in `discChapters` and seeks with `exact: true`. It cannot reach container chapters (`mediaChapters`): pass their `startSeconds` to `seek(to:exact: true)`.
 
 ### Seeking
 
@@ -1439,6 +1439,7 @@ The ids are synthetic (from 400000 up), because there is no stream index on that
 - **Native path.** The old item stays mounted while the source reopens. Its last picture is held until the new item's first frame, so the switch shows a still, not black. How and where it is held (still view, PiP, Dolby Vision, software path): [Held pictures across an audio switch](#held-pictures-across-an-audio-switch). Audio is not gapless, and a media-services reset still discards the item.
 - **Elsewhere** expect roughly 0.5 to 1 s of black.
 - **Rapid picks** are merged, so only one rebuild runs at a time. A pick back to the active track costs nothing, and `stop()` or a new `load` drops what is queued.
+- **A pick during a load** waits until that `load` returns, then rebuilds. `audioTracks` is published before the load's display handshake, and a rebuild that replaced the load there lost the HDR route (AE#1061). The host's `load()` now also returns normally instead of throwing `CancellationError`. To skip the extra rebuild, pass the track to `load` as `audioSourceStreamIndex`.
 - **Transport.** Like `reloadAtCurrentPosition()`, it comes back in the session's transport state: a paused session stays paused. A `play()` or `pause()` that arrives while the rebuild waits on I/O decides the final state.
 
 It does nothing in these cases. Every refusal is logged, so a picker that does nothing can be explained:
@@ -1517,7 +1518,7 @@ What each setting reads over HTTP, measured: [measurements.md › Subtitle offse
 
 | Symbol | Notes |
 | --- | --- |
-| `$nativeSubtitleTracks`, `setNativeSubtitleSelected(track:)` | The WebVTT renditions declared by `prepareNativeSubtitles`, for PiP / AirPlay / external display. nil deselects. |
+| `$nativeSubtitleTracks`, `setNativeSubtitleSelected(track:markerOnly:)` | The WebVTT renditions declared by `prepareNativeSubtitles`, for PiP / AirPlay / external display. nil deselects. `markerOnly: true` ticks the track in AVKit's menu but serves it empty, for a host that draws the track itself ([formats](formats.md#showing-the-hosts-pick-in-avkits-menu-markeronly)). |
 | `$nativeSubtitleDefaultOrdinal` | The rendition marked `DEFAULT=YES`, resolved from `nativeSubtitlePreferredLanguages`. A programmatic legible selection only renders if it is the default, so select **this** ordinal. |
 | `$nativeSubtitleRenditionAvailable` | At least one cue exists for the native track. Gate the AVMediaSelection picker on it. |
 | `$nativeSubtitleRenditionsServed` | Whether the served playlist is the master. Only a reload signal and a diagnostic: whether a legible rendition reaches a wired external display is up to AVKit and cannot be observed from here. |
@@ -2061,7 +2062,8 @@ Routes published through an `MPNowPlayingSession` take no part: the system arbit
 
 - Off by default, and independent of `ownsVideoNowPlayingSession`, so the native path is untouched. A secondary role never takes it.
 - Identity comes from `setExternalMetadata`, overlaid by `setNowPlayingInfo` (or `setVideoNowPlayingInfo`).
-- `softwareNowPlayingActive` is true while the engine is publishing for the software host.
+- `softwareNowPlayingActive` is true while the engine is publishing for the software host. It turns true once the engine's command targets are on `MPRemoteCommandCenter.shared()`, so a host may replace some of them from its observer. It is false while the engine waits behind another one for the shared surface, and turns false again when it loses the surface or stops.
+- To answer a command yourself, `nowPlayingCommandInterceptor` is the simpler route: it sees each command before the engine and never fights over targets.
 
 The centers are process-wide. The engine writes `MPNowPlayingInfoCenter.default()` and registers its own targets on `MPRemoteCommandCenter.shared()`, as it does on every shared route. At stop it:
 
@@ -2112,6 +2114,7 @@ Two families: cache-backed stills from the active session (no second connection)
 | `scrubPreviewDrawsInView`, `showScrubPreview(atSeconds:in:)`, `AetherScrubPreviewView`, `ScrubPreviewPlacement` | The scrub preview for Dolby Vision without a displayable base layer. See [Scrub previews for Dolby Vision Profile 5](#scrub-previews-for-dolby-vision-profile-5). |
 | `scrubPreviewSourceGeneration` | A fresh `UUID` on every teardown, distinct across engine instances, so a host can fence a preview that resolved after its source went away. |
 | `clearResidentPreviewFrames()` | Cancels in-flight resident previews and drops their cached approximations; playback media is untouched. |
+| `releaseScrubPreviewDecoders()` | Closes every still decoder and returns once they are closed. Call it when a scrub ends. Cached stills stay. See [Memory while scrubbing](#memory-while-scrubbing). |
 
 1. **`scrubThumbnail`** works on single-connection sources where a second demuxer is refused (debrid / torrent links, IPTV accounts capped at one request). A native session decodes from its segment cache; a software session from its packet cache (VOD, AE#605) or its DVR packet ring (live, #544). A VOD target outside what is retained returns nil, not the nearest retained frame.
 2. **The two variants** also serve software sessions. The live one reads the DVR packet ring (#544). The VOD one reads the packet cache its seeks land in (AE#605), from keyframe to target, on the same axis `seek(to:)` takes.
@@ -2131,6 +2134,15 @@ Two families: cache-backed stills from the active session (no second connection)
 - `refined: false` stops at the first decoded frame (cached per segment at the same width). `true` decodes toward the target. `refined` in the result means that decode reached the target, not that the two times are equal.
 - Missing, cancelled, replaced or stale work returns nil.
 - Decode is bounded at 750 ms and 900 packets per request.
+
+### Memory while scrubbing
+
+A still decoder costs memory in proportion to the video's size. On an Apple TV 4K one VideoToolbox decoder for 4K HEVC 10-bit holds 100 to 160 MB of reference frames, a 1080p one a quarter of that (AE#1059).
+
+- The engine keeps up to six recent segments ready for stills. Their open decoders share a budget of six 1080p pictures, so a 1080p title keeps all six open and a 4K title keeps one. The others close down to their cached still, and a repeat request at the same width is still answered from that cache.
+- Before a decoder opens, the older ones close, so the budget holds at the peak and not only after it.
+- A resident segment's decoder closes by itself after 3 s without a request.
+- Call `releaseScrubPreviewDecoders()` when the scrub ends to close the rest at once.
 
 **The keyframe still ladder.** On a native VOD session, a position no resident segment covers is answered from the keyframe still ladder instead of nil. The ladder is a sparse set of keyframe stills the engine collects in the background.
 
@@ -2466,6 +2478,10 @@ Both are per session, not a process-wide total. Two players with a 256 MiB cap c
 
 **Status fields.** `SessionCacheStatus` reports `hardLimitBytes`, `freeDiskReserveBytes`, `stagingBytes` and `rejectedDiskWrites`. `currentDiskBytes` is resident plus staging bytes, but staging is only counted while one of the two options is set, so with both off it equals the resident bytes. `diskAdmissionWaiting` is true while a writer waits for disk room. That is different from `producerParked`, which means the producer is waiting on the forward window.
 
+### Per-frame benchmark
+
+`AetherEngine.runPerFrameBenchmarks(iterations:width:height:)` times the software path's work around each decoded frame on the device it runs on, and returns a `PerFrameBenchmarkReport` (device, OS, picture size, one `PerFrameBenchmarkResult` per case with min, median, p95, p99 and max in microseconds). Both are `Codable`, so a report can be saved and compared with a later build: `report.regressions(against: baseline, tolerance: 0.2)` returns one `PerFrameBenchmarkRegression` (case `name`, `reason`) per case that got slower than the tolerance and `PerFrameBenchmarkReport.regressionFloorMicroseconds`, or that ran in the baseline and is skipped or missing now. It plays nothing and needs no session; call it on the main actor, away from playback, because it keeps the CPU and GPU busy for a few seconds. The cases and the regression rule are in [cli.md › bench](cli.md#bench).
+
 ## Optional components
 
 Five parts of the engine are compiled only with their package trait, all off by default ([Installation › Optional components](installation.md#optional-components)). The options that ask for them stay in the API and do nothing without the trait. So a host compiles the same either way, and asks at run time whether a setting would do anything:
@@ -2605,6 +2621,7 @@ Neither live startup option (`liveStartupGraceSeconds`, `liveStartupSingleSegmen
 | `audioOnly` | false | Lean audio pipeline, no video machinery. Also set automatically when the probe finds no video stream. |
 | `audioBridgeMode` | `.surroundCompat` | Bridge encoder for codecs that cannot be stream-copied into fMP4. `.surroundCompat` uses EAC3 for a source with more than two channels, and FLAC for two or fewer (no surround to carry). `.lossless` uses FLAC up to 7.1 throughout and needs a sink that accepts multichannel LPCM. |
 | `objectAudioRendering` | `.off` | TrueHD Atmos and DTS:X with heights (#731), in a build with the object-audio traits. See [`objectAudioRendering`](#objectaudiorendering). |
+| `rendersDTSXObjectAudio` | true | `false` keeps DTS:X on the channel bridge while `objectAudioRendering` still renders TrueHD Atmos (#1060). See [`objectAudioRendering`](#objectaudiorendering). |
 | `confirmAtmos` | false | Confirms JOC per track in the background, and republishes `audioTracks` as tracks are confirmed. Never on the start path; skipped for live and forward-only readers. |
 | `preferredAudioLanguages` | empty | Audio pick for the first frame, from the engine's single probe. Ordered BCP-47 / ISO 639 tags; region and script are normalized and rank within one preference (#590). An explicit `audioSourceStreamIndex` still wins. |
 | `audioShaping` | `AudioShaping()` | Start the session with audio shaping in force (AE#923). Same value `setAudioShaping(_:)` reads and writes. |
@@ -2795,7 +2812,7 @@ tvOS sends either form to an Atmos receiver as Dolby MAT, and iOS plays either a
 **Which sources.** At 48 kHz, on OS 26+, only these:
 
 - TrueHD that FFmpeg marks Atmos
-- DTS-HD Master Audio whose first frames decode as DTS:X in its standard presentation, whatever FFmpeg's label. DTS:X renders only into `.l714` or `.l916`.
+- DTS-HD Master Audio whose first frames decode as DTS:X, whatever FFmpeg's label. DTS:X renders into `.l714` or `.l916`, and a smaller layout gets `.l714` (the receiver maps it onto its speakers).
 
 Anything else, or any failure to start, keeps `audioBridgeMode` (on the software host, the PCM decode).
 
@@ -2808,6 +2825,13 @@ Anything else, or any failure to start, keeps `audioBridgeMode` (on the software
 
 - It never prefers across a language or dub, and never over an explicit `audioSourceStreamIndex`.
 - It only applies where the bed can be rendered: a VOD video session, on the loopback route or the software host, on OS 26 or later.
+
+**Keeping DTS:X on the bridge.** `rendersDTSXObjectAudio = false` keeps every DTS track of the load on `audioBridgeMode`, while TrueHD Atmos still renders into the asked layout (#1060).
+
+- Use it when TrueHD Atmos should go into a small bed (5.1.2, say) but DTS:X should stay on the 7.1 bridge instead of becoming 7.1.4.
+- It holds for the whole load, so a viewer switching between a TrueHD Atmos track and a DTS-HD MA track needs no reload, and the host does not have to know before the first frame whether a DTS-HD MA track carries X.
+- The automatic audio pick then does not prefer a DTS:X track.
+- The default, `true`, renders both codecs as before. A `reloadAtCurrentPosition(applying:)` can change it.
 
 See [formats.md](formats.md#truehd-atmos-with-heights) and [DTS:X](formats.md#dtsx-with-heights).
 

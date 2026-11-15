@@ -20,6 +20,9 @@ Media-selection getters use `NativeMediaSelectionReader` off the UI actor, with
 two process-wide reader slots and a 0.5-second waiter deadline. Timeout is not an
 empty selection and does not free a still-running reader. Consumers recheck item,
 cancellation and selection ownership after awaiting a snapshot.
+Subtitle menu markers use the same bounded reader and selection generation as
+ordinary picks and OCR prefill. Per-stream timestamp folding preserves active-picture
+generation boundaries at video seams, without flushing parked video early.
 
 Resume preroll below a VOD mount is not a native scrub: it keeps coalesced restart
 ownership without starting a backward-landing watch. Genuine scrubs after transport
