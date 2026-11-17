@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased: wider audio sync
+
+- **Audio sync accepts ten seconds in either direction.** On-demand direct rendering
+  reads farther ahead for advanced audio and reserves bounded compressed-video
+  headroom, without moving the video or subtitle clock.
+- Keep the existing bounded PCM replay window and advertise small live corrections
+  around the currently audible source time. Larger changes still refuse safely
+  when the necessary samples are absent, allowing the host to defer a seek/reload.
+- Retain delayed on-demand audio before a native restart's video seam, so applying
+  a large positive delay does not make AVPlayer skip ahead to find its first audio.
+
 ## Unreleased: live PCM audio sync
 
 - On-demand direct rendering can adjust buffered interleaved PCM without seeking

@@ -5408,9 +5408,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // Seek outside restartLock (network-bound). Concurrent stop() calls markClosed() so the
         // seek fails fast instead of racing teardown.
         let seekStart = DispatchTime.now()
+        let audioPrerollStart = max(0, AudioDelayPolicy.prerollStartPts(
+            targetStartPts, timeBase: videoTb, delaySeconds: isLiveSession ? 0 : audioDelaySeconds))
         // Disc plans use folded multi-clip timestamps that are not valid raw seek targets.
-        if activeDem.isDiscSource || !activeDem.seek(to: targetStartPts, streamIndex: videoStreamIndex) {
-            let absoluteTargetSeconds = Double(targetStartPts) * Double(videoTb.num) / Double(videoTb.den)
+        if activeDem.isDiscSource || !activeDem.seek(to: audioPrerollStart, streamIndex: videoStreamIndex) {
+            let absoluteTargetSeconds = Double(audioPrerollStart) * Double(videoTb.num) / Double(videoTb.den)
             activeDem.seek(to: absoluteTargetSeconds)
         }
         // AE#782: after the seek, so a container whose seek reads (a TS bisection) spends none of it.
@@ -5498,16 +5500,18 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
 extension HLSVideoEngine {
     /// Puts the demuxer where the first producer starts: no-op at segment 0. Seeks on the video
-    /// stream's exact plan timestamp and forbids an earlier landing. A global time seek can choose
+    /// stream's exact plan timestamp, with earlier audio preroll only for a positive delay. A global time seek can choose
     /// the previous sync point in a multi-stream MP4, leaving the producer to scan a whole GOP over
     /// the origin before writing anything (#191).
     func seekToInitialProducerStart(_ dem: Demuxer) {
         let plan = segmentPlan
         guard initialProducerBaseIndex > 0, initialProducerBaseIndex < plan.count else { return }
-        let targetPts = plan[initialProducerBaseIndex].startPts
+        let tb = savedVideoConfig?.timeBase ?? AVRational(num: 1, den: 1000)
+        let targetPts = max(0, AudioDelayPolicy.prerollStartPts(
+            plan[initialProducerBaseIndex].startPts, timeBase: tb,
+            delaySeconds: isLiveSession ? 0 : audioDelaySeconds))
         // Disc plans use folded multi-clip timestamps that are not valid raw seek targets.
         if dem.isDiscSource || !dem.seek(to: targetPts, streamIndex: videoStreamIndex) {
-            let tb = savedVideoConfig?.timeBase ?? AVRational(num: 1, den: 1000)
             dem.seek(to: Double(targetPts) * Double(tb.num) / Double(tb.den))
         }
     }

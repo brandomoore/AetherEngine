@@ -55,7 +55,7 @@ struct AudioDelayBuffer {
                              sampleRate: asbd.mSampleRate, bytesPerFrame: Int(asbd.mBytesPerFrame),
                              format: format))
         byteCount += bytes
-        let historyFloor = clock.isFinite ? clock - AudioDelayPolicy.maxAbsSeconds - 0.1 : -.infinity
+        let historyFloor = clock.isFinite ? clock - AudioDelayPolicy.liveAdjustmentRadiusSeconds - 0.1 : -.infinity
         let floor = max(historyFloor, end - Self.maximumDuration)
         var removed = 0
         while removed < entries.count,

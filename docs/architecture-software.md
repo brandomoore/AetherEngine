@@ -50,6 +50,12 @@ format changes and timestamp gaps start a new contiguous window. Encoded/object
 audio and live sessions keep their existing behavior. See [Audio delay](api.md#audio-delay)
 for availability, refusal and audible-transition limits.
 
+On-demand audio advances pace decoding against the source time needed at the
+speaker, while the video clock and packet timestamps remain on the original
+axis. The compressed video parking limit grows with the requested advance and
+source frame rate, subject to a hard packet cap. Zero/delayed audio and live
+sessions retain their ordinary pacing and parking limits.
+
 ```
 Source URL ──► Demuxer ──┬─► video decoder ──► [UpscalingFrameHandler] ──► SampleBufferRenderer
                           │   (SoftwareVideoDecoder,   (opt-in)                     │

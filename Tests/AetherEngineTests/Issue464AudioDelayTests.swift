@@ -15,8 +15,11 @@ struct Issue464AudioDelayPolicyTests {
     func clamping() {
         #expect(AudioDelayPolicy.clamp(0.15) == 0.15)
         #expect(AudioDelayPolicy.clamp(-0.15) == -0.15)
-        #expect(AudioDelayPolicy.clamp(9.0) == AudioDelayPolicy.maxAbsSeconds)
-        #expect(AudioDelayPolicy.clamp(-9.0) == -AudioDelayPolicy.maxAbsSeconds)
+        for value in [-10.0, -9, -2, 0, 2, 9, 10] {
+            #expect(AudioDelayPolicy.clamp(value) == value)
+        }
+        #expect(AudioDelayPolicy.clamp(11.0) == 10)
+        #expect(AudioDelayPolicy.clamp(-11.0) == -10)
         // An unset stepper reads back NaN often enough to be worth naming: it must not reach a
         // timestamp, where it would poison every packet the session writes rather than one value.
         #expect(AudioDelayPolicy.clamp(.nan) == 0)
@@ -31,12 +34,17 @@ struct Issue464AudioDelayPolicyTests {
         #expect(AudioDelayPolicy.isOutOfRange(.nan))
     }
 
-    @Test("the bound stays inside the muxer's interleave window, which a constant offset consumes")
-    func boundFitsTheInterleaveWindow() {
-        // A constant A/V offset costs the interleaver |delay| of buffering. The muxer's floor is 8 s
-        // (MP4SegmentMuxer construction in HLSSegmentProducer), so a bound at or above it would let a
-        // host trade lip-sync for a stalled interleaver.
-        #expect(AudioDelayPolicy.maxAbsSeconds < 8.0)
+    @Test("delayed audio preroll uses each stream's source timebase and does not move the video seam")
+    func delayedAudioSurvivesTheRestartGate() {
+        let videoTB = AVRational(num: 1, den: 1000)
+        let audioTB = AVRational(num: 1, den: 48000)
+        for delay in [0.0, 0.02, 10.0] {
+            let videoReadStart = AudioDelayPolicy.prerollStartPts(36000, timeBase: videoTB, delaySeconds: delay)
+            let audioGate = AudioDelayPolicy.prerollStartPts(36 * 48000, timeBase: audioTB, delaySeconds: delay)
+            #expect(abs(Double(videoReadStart) / 1000 + delay - 36) < 0.00001)
+            #expect(abs(Double(audioGate) / 48000 + delay - 36) < 0.00001)
+        }
+        #expect(AudioDelayPolicy.prerollStartPts(36000, timeBase: videoTB, delaySeconds: -10) == 36000)
     }
 
     @Test("every route says where its offset lands, and the two AVPlayer-owned ones say they cannot")
@@ -67,6 +75,8 @@ struct Issue464MuxerDelayTicksTests {
         let tb48k = AVRational(num: 1, den: 48000)
         #expect(MP4SegmentMuxer.audioDelayTicks(seconds: 0.100, audioTimeBase: tb48k) == 4800)
         #expect(MP4SegmentMuxer.audioDelayTicks(seconds: -0.250, audioTimeBase: tb48k) == -12000)
+        #expect(MP4SegmentMuxer.audioDelayTicks(seconds: 10, audioTimeBase: tb48k) == 480000)
+        #expect(MP4SegmentMuxer.audioDelayTicks(seconds: -10, audioTimeBase: tb48k) == -480000)
         #expect(MP4SegmentMuxer.audioDelayTicks(seconds: 0, audioTimeBase: tb48k) == 0)
     }
 
@@ -171,24 +181,25 @@ struct Issue464SampleRetimingTests {
         return out
     }
 
-    @Test("a positive offset moves the delivered stamp later, and the payload is untouched")
-    func shiftsLater() throws {
+    @Test("a positive offset moves the delivered stamp later, and the payload is untouched",
+          arguments: [0.2, 10.0])
+    func shiftsLater(offset: Double) throws {
         let source = CMTime(value: 48000, timescale: 48000)   // 1.000 s
         let buffer = try #require(makeBuffer(pts: source))
-        let shifted = AudioOutput.retimed(buffer, by: CMTime(seconds: 0.2, preferredTimescale: 90000))
+        let shifted = AudioOutput.retimed(buffer, by: CMTime(seconds: offset, preferredTimescale: 90000))
 
         let out = CMSampleBufferGetPresentationTimeStamp(shifted).seconds
-        #expect(abs(out - 1.2) < 0.0001, "delivered 200 ms later, got \(out)")
+        #expect(abs(out - (1 + offset)) < 0.0001)
         #expect(CMSampleBufferGetNumSamples(shifted) == CMSampleBufferGetNumSamples(buffer))
         #expect(abs(CMSampleBufferGetPresentationTimeStamp(buffer).seconds - 1.0) < 0.0001,
                 "the source buffer is not mutated: the audio tap is handed that one")
     }
 
-    @Test("a negative offset moves it earlier")
-    func shiftsEarlier() throws {
-        let buffer = try #require(makeBuffer(pts: CMTime(value: 48000, timescale: 48000)))
-        let shifted = AudioOutput.retimed(buffer, by: CMTime(seconds: -0.15, preferredTimescale: 90000))
-        #expect(abs(CMSampleBufferGetPresentationTimeStamp(shifted).seconds - 0.85) < 0.0001)
+    @Test("a negative offset moves it earlier", arguments: [-0.15, -10.0])
+    func shiftsEarlier(offset: Double) throws {
+        let buffer = try #require(makeBuffer(pts: CMTime(seconds: 20, preferredTimescale: 48000)))
+        let shifted = AudioOutput.retimed(buffer, by: CMTime(seconds: offset, preferredTimescale: 90000))
+        #expect(abs(CMSampleBufferGetPresentationTimeStamp(shifted).seconds - (20 + offset)) < 0.0001)
     }
 
     @Test("a zero offset hands back the very same buffer, so the common case costs no copy")

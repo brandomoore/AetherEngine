@@ -11,6 +11,24 @@ struct SWDemuxReadGateTests {
 
     private let cap = 256
 
+    @Test("advanced audio has bounded compressed video headroom beyond the ordinary read-ahead")
+    func largeAudioAdvanceCanReachItsSamples() {
+        for fps in [24.0, 60, 120] {
+            let limit = AudioDelayPolicy.parkedVideoLimit(audioAdvance: 10, frameRate: fps)
+            let packetsBeforeAudibleAudio = Int(ceil(10 * fps))
+            #expect(!SoftwarePlaybackHost.shouldHoldDemuxRead(
+                parkedCount: packetsBeforeAudibleAudio, parkedCap: limit, clockArmed: true,
+                lastAudioPts: 110, clockSeconds: 110))
+            #expect(SoftwarePlaybackHost.shouldHoldDemuxRead(
+                parkedCount: limit, parkedCap: limit, clockArmed: true,
+                lastAudioPts: 110, clockSeconds: 110))
+            #expect(AudioDelayPolicy.parkedVideoLimit(audioAdvance: 0, frameRate: fps) == cap)
+        }
+        #expect(AudioDelayPolicy.parkedVideoLimit(audioAdvance: 10, frameRate: .greatestFiniteMagnitude) <= 4096)
+        #expect(AudioDelayPolicy.parkedVideoLimit(audioAdvance: 10, frameRate: .nan)
+                == AudioDelayPolicy.parkedVideoLimit(audioAdvance: 10, frameRate: nil))
+    }
+
     @Test("audio at its target lead holds the read")
     func holdsAtTargetLead() {
         let clock = 100.0

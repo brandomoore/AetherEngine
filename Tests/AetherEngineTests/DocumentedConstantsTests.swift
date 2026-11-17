@@ -18,6 +18,11 @@ import AetherLibavcodec
 /// Adding a number to the docs? Pin it here in the same commit.
 @MainActor
 final class DocumentedConstantsTests: XCTestCase {
+    func testAudioDelayRangeMatchesDocumentation() throws {
+        XCTAssertEqual(AudioDelayPolicy.maxAbsSeconds, 10)
+        assertDocumented("Clamped to +/-10 s.", try documentation())
+    }
+
     func testDemuxNSErrorCaseCodesMatchDocumentation() throws {
         XCTAssertEqual((DemuxerError.openFailed(code: -1) as NSError).code, 0)
         XCTAssertEqual((DemuxerError.streamInfoFailed(code: -1) as NSError).code, 1)

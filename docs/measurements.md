@@ -49,6 +49,27 @@ Measured: `play` reproduces the AE#464 audio-delay defects without hardware. Eac
 
 Current rule and the healthy readings: [cli.md › Audio delay](cli.md#audio-delay---audio-delay---switch-audio-delay).
 
+**Wider on-demand range (2026-11-16).** A synthetic 90-second, 60 fps H.264/AAC
+Matroska clip exercised -10 s, +10 s and reset through both playback routes.
+The direct-rendering run also applied three fine corrections without seeking;
+at -10 s it maintained roughly 14 s of source audio lead, rather than feeding
+only four seconds ahead and presenting that audio in the past.
+
+The first native experiment showed why timestamp clamping alone is insufficient:
+changing to +10 s at 39.4 s made AVPlayer advance to approximately 46.3 s, because
+the restart had discarded the older audio it needed. Reading the positive-delay
+preroll and retaining it through the audio restart gate kept the next run at
+36.6 s, then 36.8 s on its next telemetry sample. A separate paused change to
++10 s stayed paused at exactly 20.00 s.
+
+`serve` plus `ffprobe` matched each remuxed AAC packet's SHA-256 payload to the
+original source. All 187 packets at zero, 187 at -10 s and 656 at +10 s carried
+the requested timestamp difference (maximum floating-point error below 0.000001 s).
+The first video PTS stayed 20.0 s in all three cases. This uses the existing
+fragment flush interval unchanged; that interval is not the PCM replay capacity.
+These are local macOS synthetic-media results, not physical-device latency or
+audible-output measurements.
+
 **Round 2 (`--paused`, three presses in one turn).** `--switch-audio-delay` is repeatable and `--paused` mounts with `autoplay = false`; together they reproduce the round-2 pair of AE#464 without hardware.
 
 - `--paused --host-calls play` is a host that owns transport (mounts paused, plays next to its own load). The rebuild the engine raises for a nudge has no such caller. Before the fix, item #2 settled `timeControlStatus=paused reason=- t+0.00s`, never reached `playing`, and the producer parked on `#65 backpressure PARK (advance) ... (consumer paused)`, while the run still ended `VERDICT: OK`. After it: `#2 timeControlStatus=playing t+0.06s`.

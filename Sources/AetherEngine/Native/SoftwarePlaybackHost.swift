@@ -2945,6 +2945,7 @@ final class SoftwarePlaybackHost {
         guard let dem = demuxer else { return }
         let vDec = videoDecoder
         let vIdx = videoStreamIndex
+        let videoFrameRate = dem.stream(at: vIdx).flatMap { AetherEngine.detectFrameRate(stream: $0) }
         let aDec = audioDecoder
         let aOut = audioOutput
         let aIdx = audioStreamIndex
@@ -3210,6 +3211,7 @@ final class SoftwarePlaybackHost {
                 videoTimeBaseSeconds: vTbSec,
                 audioTimeBaseSeconds: aTbSec,
                 isLive: liveSession,
+                videoFrameRate: videoFrameRate,
                 foldTimeline: Self.shouldFoldTimeline(
                     isLive: liveSession, sourceSeekable: dem.isSourceSeekable),
                 noteEdge: noteEdge,
@@ -3927,6 +3929,7 @@ final class SoftwarePlaybackHost {
         videoTimeBaseSeconds: Double,
         audioTimeBaseSeconds: Double,
         isLive: Bool,
+        videoFrameRate: Double?,
         foldTimeline: Bool,
         noteEdge: @Sendable (Double) -> Void,
         isPlaying: @Sendable () -> Bool,
@@ -4026,7 +4029,15 @@ final class SoftwarePlaybackHost {
         // but never pauses its clock for rebuffering. Its forward-only producer keeps already
         // parked video runnable while source I/O waits; DVR retains its separate feeder.
         var parkedVideo: [UnsafeMutablePointer<AVPacket>] = []
-        let parkedVideoCap = 256
+        var parkedVideoCap: Int {
+            isLive ? 256 : AudioDelayPolicy.parkedVideoLimit(
+                audioAdvance: audioOutput?.audioSourceAdvanceSeconds ?? 0,
+                frameRate: videoFrameRate)
+        }
+        var audioLookaheadClock: Double {
+            guard let audioOutput else { return .nan }
+            return isLive ? audioOutput.currentTimeSeconds : audioOutput.audioLookaheadClockSeconds
+        }
         /// Compressed allocation cost; the Live limit includes side data and packet headers.
         var parkedVideoBytes = 0
         var terminalGeneration = SoftwareTerminalGeneration()
@@ -4159,7 +4170,7 @@ final class SoftwarePlaybackHost {
                     return Self.shouldHoldDemuxRead(
                         parkedCount: parkedVideo.count, parkedCap: parkedVideoCap,
                         clockArmed: clockArmed(), lastAudioPts: lastEnqueuedAudioPtsSec,
-                        clockSeconds: audioOutput?.currentTimeSeconds ?? .nan)
+                        clockSeconds: audioLookaheadClock)
                 case .packetCapacity(let bytes):
                     return directLiveSource.map {
                         Self.shouldWaitForLivePacketCapacity(
@@ -4195,7 +4206,7 @@ final class SoftwarePlaybackHost {
                     // changes, so those cut the wait short where the sleep used to ride them out.
                     let wait = Self.parkedRendererWaitSeconds(
                         clockArmed: clockArmed(), lastAudioPts: lastEnqueuedAudioPtsSec,
-                        clockSeconds: audioOutput?.currentTimeSeconds ?? .nan, rate: currentRate())
+                        clockSeconds: audioLookaheadClock, rate: currentRate())
                     condition.lock()
                     autoreleasepool {
                         _ = condition.wait(until: Date(timeIntervalSinceNow: wait))
@@ -4213,13 +4224,13 @@ final class SoftwarePlaybackHost {
         func applyAudioClockAction() {
             guard !isLive, decoupleAudio, clockArmed(), let aOut = audioOutput else { return }
             let lead = lastEnqueuedAudioPtsSec.isFinite
-                ? lastEnqueuedAudioPtsSec - aOut.currentTimeSeconds : 0
+                ? lastEnqueuedAudioPtsSec - audioLookaheadClock : 0
             pauseArmOpen = AudioLookaheadPolicy.pauseArmOpens(wasOpen: pauseArmOpen, lead: lead)
             guard pauseArmOpen, isPlaying() || rebuffering else { return }
             switch AudioLookaheadPolicy.clockAction(
                 rebuffering: rebuffering,
                 lastFedAudioPTS: lastEnqueuedAudioPtsSec,
-                clockSeconds: aOut.currentTimeSeconds,
+                clockSeconds: audioLookaheadClock,
                 atRingEnd: true,
                 // End of media releases the hold explicitly in the read path below; there is no
                 // ring here whose end this could be read from.
@@ -4326,7 +4337,7 @@ final class SoftwarePlaybackHost {
                         || Self.shouldHoldDemuxRead(
                         parkedCount: parkedVideo.count, parkedCap: parkedVideoCap,
                         clockArmed: clockArmed(), lastAudioPts: lastEnqueuedAudioPtsSec,
-                        clockSeconds: audioOutput?.currentTimeSeconds ?? .nan) {
+                        clockSeconds: audioLookaheadClock) {
                         waitForRenderer(.readGate)
                         return true
                     }

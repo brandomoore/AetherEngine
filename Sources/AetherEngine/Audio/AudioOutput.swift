@@ -333,10 +333,10 @@ final class AudioOutput: @unchecked Sendable {
     var canAdjustAudioDelayLive: Bool {
         lock.lock()
         defer { lock.unlock() }
-        let now = currentTime.seconds
+        let now = currentTime.seconds - presentationOffset.seconds
         return retainsAudioForLiveSync
-            && audioDelayBuffer.covers(sourceTime: now - AudioDelayPolicy.maxAbsSeconds)
-            && audioDelayBuffer.covers(sourceTime: now + AudioDelayPolicy.maxAbsSeconds)
+            && audioDelayBuffer.covers(sourceTime: now - AudioDelayPolicy.liveAdjustmentRadiusSeconds)
+            && audioDelayBuffer.covers(sourceTime: now + AudioDelayPolicy.liveAdjustmentRadiusSeconds)
     }
 
     /// Replace only queued PCM. The video renderer, demux cursor, feed epoch and master clock do not move.
@@ -386,7 +386,7 @@ final class AudioOutput: @unchecked Sendable {
             return false
         }
         if retainsAudioForLiveSync {
-            audioDelayBuffer.append(sampleBuffer, clock: currentTime.seconds)
+            audioDelayBuffer.append(sampleBuffer, clock: currentTime.seconds - presentationOffset.seconds)
         }
         let offset = presentationOffset
         // AE#395: the lip-sync offset and the move onto the renderer axis are one retime, not two copies.
@@ -529,6 +529,17 @@ final class AudioOutput: @unchecked Sendable {
     var currentTimeSeconds: Double {
         let t = CMTimeGetSeconds(currentTime)
         return t.isFinite ? t : 0
+    }
+
+    var audioSourceAdvanceSeconds: Double {
+        lock.lock()
+        defer { lock.unlock() }
+        return max(0, -presentationOffset.seconds)
+    }
+
+    /// Pacing stays on the video axis for delayed audio, but advanced audio needs future samples.
+    var audioLookaheadClockSeconds: Double {
+        currentTimeSeconds + audioSourceAdvanceSeconds
     }
 
     /// Whether the audio renderer can accept more samples. The combined demux loop normally paces on the

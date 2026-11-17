@@ -1,10 +1,10 @@
 import Foundation
+import AetherLibavutil
 
 /// AE#464: where a host's audio-delay nudge lands, per video route.
 ///
-/// Lip-sync error is a property of the viewer's chain (a soundbar or AVR adding video-processing
-/// latency, or the reverse), not of the file, so the correction is a per-setup nudge the host sets
-/// once and the engine honours for the life of the session. AVFoundation offers no audio-delay
+/// Audio/video timing errors can come from the file or the viewer's equipment. The engine honours
+/// the host's correction for the life of the session. AVFoundation offers no audio-delay
 /// control on either surface a host can reach (`AVPlayerItem` has none, and an HLS-streamed asset
 /// vends no `AVAssetTrack` to bind an `AVAudioMix` to), so the offset has to be applied where the
 /// engine still holds the timestamps. That is a different place on each route, and on both of them
@@ -25,13 +25,26 @@ import Foundation
 enum AudioDelayPolicy {
 
     /// Largest offset the engine carries, either direction, in seconds.
-    ///
-    /// The correction this exists for is tens to a couple hundred milliseconds; the bound is a
-    /// generous ceiling rather than a target. It is well inside the muxer's 8 s interleave window
-    /// (`MP4SegmentMuxer.maxBufferedFragmentSeconds`), which a constant A/V offset consumes at
-    /// `|delay|`, so an out-of-range value cannot turn into a stalled interleaver or a live session
-    /// that has spent its edge on a typo.
-    static let maxAbsSeconds: Double = 2.0
+    static let maxAbsSeconds: Double = 10.0
+
+    /// Coverage around the currently audible source time used to advertise live PCM adjustment.
+    /// Wider requested changes still have to pass the replay buffer's exact coverage check.
+    static let liveAdjustmentRadiusSeconds: Double = 2.0
+
+    /// Delayed audio must be retained from before the video seam, not discarded by its restart gate.
+    static func prerollStartPts(_ videoStart: Int64, timeBase: AVRational, delaySeconds: Double) -> Int64 {
+        let ticks = MP4SegmentMuxer.audioDelayTicks(
+            seconds: max(0, clamp(delaySeconds)), audioTimeBase: timeBase)
+        return SourceTimestampBounds.difference(videoStart, ticks)
+    }
+
+    /// Reserve compressed video headroom only when audio must be read ahead of video.
+    /// Keep the ordinary queue limit, with an absolute packet cap for malformed frame-rate metadata.
+    static func parkedVideoLimit(audioAdvance: Double, frameRate: Double?) -> Int {
+        let advance = max(0, clamp(audioAdvance))
+        let fps = frameRate.flatMap { $0.isFinite && $0 > 0 ? $0 : nil } ?? 60
+        return Int(min(4096, 256 + ceil(advance * max(60, fps))))
+    }
 
     /// Bring a host value into range. A non-finite value (NaN from an unset stepper, an infinity out
     /// of a division) becomes 0 rather than propagating into a timestamp.

@@ -4557,11 +4557,10 @@ final class HLSSegmentProducer: @unchecked Sendable {
                         if audioWaitForVideo, let audio = audioConfig {
                             // Rescale into SOURCE audio TB (not encoder TB): FLAC bridge exposes this mismatch;
                             // using inputTimeBase landed the target 48x too far for bridged DTS sources.
-                            restartTargetAudioDts = av_rescale_q(
-                                firstActualVideoDts,
-                                sourceVideoTimeBase,
-                                audio.sourceTimeBase
-                            )
+                            restartTargetAudioDts = AudioDelayPolicy.prerollStartPts(
+                                av_rescale_q(firstActualVideoDts, sourceVideoTimeBase, audio.sourceTimeBase),
+                                timeBase: audio.sourceTimeBase,
+                                delaySeconds: isLive ? 0 : audioDelaySeconds)
                             audioWaitForVideo = false
                         }
                         EngineLog.emit(

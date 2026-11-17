@@ -2,9 +2,8 @@ import Foundation
 
 /// AE#464: the audio presentation offset as a live setting.
 ///
-/// Lip-sync error belongs to the viewer's chain (a soundbar or AVR adding video-processing latency,
-/// or the reverse), not to the file, so it is a per-setup nudge people set once and expect a player
-/// to honour on every session. `AVPlayerItem` carries no audio-delay control. OS 27 streaming
+/// Timing errors can originate in the file or the viewer's equipment. `AVPlayerItem` carries no
+/// audio-delay control. OS 27 streaming
 /// audio-mix taps are a possible separate PCM implementation, not a delay property or a replacement
 /// for the current format-preserving native pipeline. Timestamp ownership stays inside the engine.
 extension AetherEngine {
@@ -13,7 +12,8 @@ extension AetherEngine {
     /// LATER relative to video. 0 (the default) means untouched.
     public var audioDelaySeconds: Double { loadedOptions.audioDelaySeconds }
 
-    /// Current on-demand PCM coverage can service the full delay range without seeking.
+    /// Current on-demand PCM covers small corrections around the audible source time.
+    /// A larger requested change may still be refused by `setAudioDelayLive`.
     /// This can become false during startup, seeks, track changes, starvation or at the end.
     public var canAdjustAudioDelayLive: Bool {
         !isLive && !isSeeking && videoRoute == .software && (state == .playing || state == .paused)

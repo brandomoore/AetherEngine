@@ -186,10 +186,56 @@ struct AudioOutputFlushEpochTests {
         let delivered = Delivered()
         output.didEnqueueSampleBufferForTesting = { delivered.append($0) }
         #expect(!output.setPresentationOffsetLive(seconds: 2))
+        #expect(!output.setPresentationOffsetLive(seconds: 10))
+        #expect(!output.setPresentationOffsetLive(seconds: -10))
         #expect(!output.setPresentationOffsetLive(seconds: .nan))
         #expect(delivered.take().isEmpty)
         output.enqueue(sampleBuffer: try #require(makeBuffer(pts: 105)))
         #expect(abs(try #require(delivered.take().first).start - 105.1) < 0.0001)
+    }
+
+    @Test("fine live corrections remain available around a ten-second audio advance")
+    func liveCorrectionAroundLargeAdvance() throws {
+        let output = AudioOutput(retainsAudioForLiveSync: true)
+        defer { output.stop() }
+        output.seekClock(to: CMTime(seconds: 104, preferredTimescale: 48000), rate: 0)
+        output.setPlaybackEnabled(false)
+        output.setPresentationOffset(seconds: -10)
+        for second in 110..<118 {
+            output.enqueue(sampleBuffer: try #require(makeBuffer(pts: Double(second), samples: 48000)))
+        }
+        #expect(output.canAdjustAudioDelayLive)
+        let epoch = output.epoch
+        let revision = output.clockCommandRevision
+        let delivered = Delivered()
+        output.didEnqueueSampleBufferForTesting = { delivered.append($0) }
+        for offset in [-9.99, -10.0] {
+            #expect(output.setPresentationOffsetLive(seconds: offset))
+            let first = try #require(delivered.take().first)
+            #expect(abs(first.start - 104) <= 1.0 / 48000 + 0.000001)
+            #expect(output.epoch == epoch)
+            #expect(output.clockCommandRevision == revision)
+            #expect(output.rate == 0)
+        }
+    }
+
+    @Test("audio pacing reads far enough ahead for advanced audio without moving the video clock")
+    func advanceChangesLookaheadNotVideoClock() {
+        let output = AudioOutput()
+        defer { output.stop() }
+        output.seekClock(to: CMTime(seconds: 100, preferredTimescale: 48000), rate: 0)
+        for (offset, expected) in [(0.0, 100.0), (-2, 102), (-10, 110), (10, 100), (0, 100)] {
+            output.setPresentationOffset(seconds: offset)
+            #expect(output.audioLookaheadClockSeconds == expected)
+            #expect(output.currentTimeSeconds == 100)
+            let atTarget = expected + AudioLookaheadPolicy.targetLeadSeconds
+            #expect(!SoftwarePlaybackHost.shouldHoldDemuxRead(
+                parkedCount: 0, parkedCap: 256, clockArmed: true,
+                lastAudioPts: atTarget - 0.01, clockSeconds: output.audioLookaheadClockSeconds))
+            #expect(SoftwarePlaybackHost.shouldHoldDemuxRead(
+                parkedCount: 0, parkedCap: 256, clockArmed: true,
+                lastAudioPts: atTarget, clockSeconds: output.audioLookaheadClockSeconds))
+        }
     }
 
     @Test("seek and stop discard the replay history and stale feed cannot repopulate it")
