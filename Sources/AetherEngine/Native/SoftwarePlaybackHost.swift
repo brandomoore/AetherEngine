@@ -1595,7 +1595,7 @@ final class SoftwarePlaybackHost {
         self.splitDisplaySetSubtitleStreamIndices = dem.splitDisplaySetSubtitleStreamIndices()
 
         // AudioOutput owns the AVSampleBufferRenderSynchronizer (master clock). Created unconditionally: video-only previously got no clock (frozen frame, currentTime=0). Layer attached in play() after the engine hangs it in the view hierarchy (attaching free-floating fails FigVideoQueueRemote -12080 on tvOS 26+).
-        let audioOutput = AudioOutput()
+        let audioOutput = AudioOutput(retainsAudioForLiveSync: !isLive)
         self.audioOutput = audioOutput
         renderer.setTimeline(audioOutput.timeline)   // AE#395
         self.audioOutput?.volume = volume
@@ -2405,10 +2405,18 @@ final class SoftwarePlaybackHost {
     /// Only the stamp changes; nothing is flushed here. The samples already decoded (up to
     /// `AudioLookaheadPolicy.targetLeadSeconds` of them on the decoupled VOD arm) still carry the
     /// previous offset, so a caller that wants the change to be audible now re-anchors at the
-    /// playhead afterwards. `AetherEngine.setAudioDelay` does exactly that.
+    /// playhead afterwards. Buffered PCM can instead use `setAudioDelayLive`.
     func setAudioDelay(_ seconds: Double) {
         audioDelaySeconds = seconds
         audioOutput?.setPresentationOffset(seconds: seconds)
+    }
+
+    var canAdjustAudioDelayLive: Bool { audioOutput?.canAdjustAudioDelayLive == true }
+
+    func setAudioDelayLive(_ seconds: Double) -> Bool {
+        guard audioOutput?.setPresentationOffsetLive(seconds: seconds) == true else { return false }
+        audioDelaySeconds = seconds
+        return true
     }
 
     func setResumeRate(_ rate: Float) {

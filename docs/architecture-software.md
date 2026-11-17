@@ -40,6 +40,16 @@ The software path decodes in the engine and renders through sample-buffer layers
 - **Audio:** an audio producer (`SoftwareAudioProducing`, the component that turns the audio track into `CMSampleBuffer`s). It does one of three things: libavcodec PCM decode, pass E-AC-3 JOC through compressed, or render an APAC / PCM object-audio bed for TrueHD Atmos and DTS:X (`SoftwareAtmosRoute`).
 - **Rendering:** `AVSampleBufferDisplayLayer` + `AVSampleBufferAudioRenderer`, with `AVSampleBufferRenderSynchronizer` as the master clock.
 
+On-demand interleaved PCM retains a bounded source-timed replay window in
+`AudioOutput` for live lip-sync correction: at most 16 MiB, eight seconds and
+4096 buffers. A correction prepares trimmed/retimed buffer references before
+flushing audio, then replaces only that queue under the enqueue lock. It does not
+retire the source feed epoch, alter source-axis lead bookkeeping, move the shared
+clock or flush video. Seek, stop and automatic renderer flush discard the window;
+format changes and timestamp gaps start a new contiguous window. Encoded/object
+audio and live sessions keep their existing behavior. See [Audio delay](api.md#audio-delay)
+for availability, refusal and audible-transition limits.
+
 ```
 Source URL ──► Demuxer ──┬─► video decoder ──► [UpscalingFrameHandler] ──► SampleBufferRenderer
                           │   (SoftwareVideoDecoder,   (opt-in)                     │

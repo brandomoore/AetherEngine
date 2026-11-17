@@ -97,6 +97,7 @@ Notes:
 | `AudioClockAnchor.swift` | Software path: sample-count PTS anchor so consecutive buffers line up exactly; re-anchors on >100 ms drift (AVSampleBufferAudioRenderer crackle, #89). |
 | `AudioDecoder.swift` | Software path: libavcodec → PCM → `CMSampleBuffer`, with channel-layout tagging that names the resampler's own order (#401). |
 | `AudioOutput.swift` | Software path: `AVSampleBufferAudioRenderer` + synchronizer (master clock). |
+| `AudioDelayBuffer.swift` | Bounded source-timed PCM history and sample-boundary cropping for audio-only sync correction. |
 | `AudioPlaybackHost.swift` | Audio-only path: FFmpeg demux and decode into `AVSampleBufferAudioRenderer` for codecs off the whitelist. |
 | `AudioTailPadding.swift` | Native path: writes silence in the delivered codec from where a title's audio ends to where its video ends, into the final segment at end of file, because AVPlayer ends an item when its audio runs out (AE#847). |
 | `SoftwareAtmosRoute.swift` | Software path: the pure choice of how a track's audio reaches the renderer (PCM decode, compressed E-AC-3 JOC, or TrueHD Atmos / DTS:X rendered into a bed as APAC or PCM), from codec, stream shape, live and `objectAudioRendering`. |

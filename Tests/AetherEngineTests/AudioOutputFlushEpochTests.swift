@@ -38,6 +38,8 @@ struct AudioOutputFlushEpochTests {
                                                  flags: kCMBlockBufferAssureMemoryNowFlag,
                                                  blockBufferOut: &block) == noErr,
               let block else { return nil }
+        guard CMBlockBufferFillDataBytes(with: 0, blockBuffer: block,
+                                         offsetIntoDestination: 0, dataLength: samples * 4) == noErr else { return nil }
         var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: sampleRate),
                                         presentationTimeStamp: CMTime(seconds: pts, preferredTimescale: sampleRate),
                                         decodeTimeStamp: .invalid)
@@ -126,5 +128,127 @@ struct AudioOutputFlushEpochTests {
         output.flush()
         let buffer = try #require(makeBuffer(pts: 1))
         #expect(output.enqueue(sampleBuffer: buffer))
+    }
+
+    private final class Delivered: @unchecked Sendable {
+        private let lock = NSLock()
+        private var values: [(start: Double, end: Double)] = []
+        func append(_ buffer: CMSampleBuffer) {
+            let start = CMSampleBufferGetPresentationTimeStamp(buffer).seconds
+            let end = start + CMSampleBufferGetDuration(buffer).seconds
+            lock.withLock { values.append((start, end)) }
+        }
+        func take() -> [(start: Double, end: Double)] {
+            lock.withLock {
+                defer { values.removeAll() }
+                return values
+            }
+        }
+    }
+
+    @Test("repeated signed PCM corrections replace queued audio without moving the paused clock or feed epoch")
+    func liveCorrectionLeavesVideoClockAndEpochAlone() throws {
+        let output = AudioOutput(retainsAudioForLiveSync: true)
+        defer { output.stop() }
+        output.seekClock(to: CMTime(seconds: 104, preferredTimescale: 48000), rate: 0)
+        output.setPlaybackEnabled(false)
+        for second in 100..<108 {
+            output.enqueue(sampleBuffer: try #require(makeBuffer(pts: Double(second), samples: 48000)))
+        }
+        #expect(output.canAdjustAudioDelayLive)
+        let epoch = output.epoch
+        let revision = output.clockCommandRevision
+        let delivered = Delivered()
+        output.didEnqueueSampleBufferForTesting = { delivered.append($0) }
+        for offset in [0.01, 0.02, -0.01, -0.02, 2, -2, 0] {
+            #expect(output.setPresentationOffsetLive(seconds: offset))
+            let replay = delivered.take()
+            let first = try #require(replay.first)
+            let last = try #require(replay.last)
+            #expect(abs(first.start - 104) <= 1.0 / 48000 + 0.000001)
+            #expect(abs(last.end - (108 + offset)) < 0.0001)
+            #expect(output.epoch == epoch)
+            #expect(output.clockCommandRevision == revision)
+            #expect(output.rate == 0)
+            #expect(abs(output.currentTime.seconds - 104) < 0.0001)
+        }
+        #expect(output.enqueue(sampleBuffer: try #require(makeBuffer(pts: 108)), ifEpoch: epoch))
+    }
+
+    @Test("a failed correction keeps queued audio and the existing delay intact")
+    func unavailableHistoryDoesNotFlushOrChangeOffset() throws {
+        let output = AudioOutput(retainsAudioForLiveSync: true)
+        defer { output.stop() }
+        output.seekClock(to: CMTime(seconds: 104, preferredTimescale: 48000), rate: 0)
+        output.setPresentationOffset(seconds: 0.1)
+        output.enqueue(sampleBuffer: try #require(makeBuffer(pts: 104, samples: 48000)))
+        #expect(!output.canAdjustAudioDelayLive)
+        let delivered = Delivered()
+        output.didEnqueueSampleBufferForTesting = { delivered.append($0) }
+        #expect(!output.setPresentationOffsetLive(seconds: 2))
+        #expect(!output.setPresentationOffsetLive(seconds: .nan))
+        #expect(delivered.take().isEmpty)
+        output.enqueue(sampleBuffer: try #require(makeBuffer(pts: 105)))
+        #expect(abs(try #require(delivered.take().first).start - 105.1) < 0.0001)
+    }
+
+    @Test("seek and stop discard the replay history and stale feed cannot repopulate it")
+    func flushInvalidatesLiveCorrectionHistory() throws {
+        let output = AudioOutput(retainsAudioForLiveSync: true)
+        defer { output.stop() }
+        output.seekClock(to: CMTime(seconds: 104, preferredTimescale: 48000), rate: 0)
+        for second in 100..<108 {
+            output.enqueue(sampleBuffer: try #require(makeBuffer(pts: Double(second), samples: 48000)))
+        }
+        let epoch = output.epoch
+        output.flush()
+        #expect(!output.canAdjustAudioDelayLive)
+        #expect(!output.setPresentationOffsetLive(seconds: 0.01))
+        #expect(!output.enqueue(sampleBuffer: try #require(makeBuffer(pts: 104)), ifEpoch: epoch))
+        output.enqueue(sampleBuffer: try #require(makeBuffer(pts: 104, samples: 48000)))
+        output.stop()
+        #expect(!output.setPresentationOffsetLive(seconds: -0.01))
+    }
+
+    @Test("PCM history remains bounded and discontinuities cannot replay old audio")
+    func replayWindowIsBoundedAndContiguous() throws {
+        var history = AudioDelayBuffer()
+        for second in 0..<24 {
+            history.append(try #require(makeBuffer(pts: Double(second), samples: 48000)), clock: 0)
+        }
+        #expect(!history.covers(sourceTime: 2))
+        #expect(history.covers(sourceTime: 22))
+        #expect(history.byteCount <= AudioDelayBuffer.maximumBytes)
+        #expect(history.entries.count <= 9)
+        history.append(try #require(makeBuffer(pts: 40)), clock: 40)
+        #expect(!history.covers(sourceTime: 22))
+        #expect(history.covers(sourceTime: 40))
+    }
+
+    @Test("large PCM buffers respect the byte ceiling even inside the retained time window")
+    func replayWindowHonorsByteLimit() throws {
+        var history = AudioDelayBuffer()
+        for part in 0..<20 {
+            history.append(try #require(makeBuffer(pts: Double(part) / 4, samples: 250_000,
+                                                  sampleRate: 1_000_000)), clock: 0)
+        }
+        #expect(history.byteCount <= AudioDelayBuffer.maximumBytes)
+        #expect(history.entries.count == 16)
+        #expect(!history.covers(sourceTime: 0))
+        #expect(history.covers(sourceTime: 4.5))
+    }
+
+    @Test("sub-buffer corrections crop PCM samples without mutating retained source timestamps")
+    func replayCropsPCMAtTheRequestedSourceSample() throws {
+        var history = AudioDelayBuffer()
+        let source = try #require(makeBuffer(pts: 100, samples: 48000))
+        history.append(source, clock: 100)
+        let replay = try #require(history.replay(
+            sourceTime: 100.01, shift: CMTime(seconds: -0.01, preferredTimescale: 48000)))
+        let first = try #require(replay.first)
+        #expect(abs(CMSampleBufferGetPresentationTimeStamp(first).seconds - 100) < 0.00003)
+        #expect(abs(CMSampleBufferGetNumSamples(first) - 47520) <= 1)
+        #expect(CMSampleBufferGetNumSamples(source) == 48000)
+        #expect(CMSampleBufferGetPresentationTimeStamp(source).seconds == 100)
     }
 }

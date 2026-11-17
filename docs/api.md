@@ -1117,12 +1117,17 @@ Where a seek lands:
 - **Where it applies.** Only where the engine still holds the timestamps: the stamped sample PTS on `.software`, and the audio track of the fMP4 segments on `.loopback`.
   - AVFoundation exposes no equivalent a host can reach. So on `.remoteBypass` and on audio-only sessions the value is only kept for the session's own rebuilds, and the log says it had no effect.
   - A new `load()` starts from `LoadOptions.audioDelaySeconds`. A host that keeps the viewer's setting passes it there on every load.
-- **A change re-anchors at the playhead.** Unlike `setRate`, it has a cost: audio already decoded or fetched carries the previous value and cannot be re-timed in place.
-  - On `.software` the re-anchor is a seek to the current position.
+- **Buffered on-demand PCM changes audio only.** On `.software`, interleaved PCM with sufficient retained history is flushed and re-enqueued at the new offset without seeking, moving the shared clock, or changing the video queue.
+  - `canAdjustAudioDelayLive` reports current coverage of the full +/-2 s range. Startup, seek, track change, starvation, end-of-media or memory limits can make it false.
+  - `setAudioDelayLive(_:) -> Bool` attempts only audio-queue replacement. A false result leaves playback and the offset unchanged; it never falls back to a seek/reload. Use it during held/repeated adjustments, then optionally commit once with `setAudioDelay(_:)`.
+  - Retention is bounded by 16 MiB, eight seconds and 4096 buffers. Encoded audio, non-interleaved PCM and live sessions are excluded. This does not change format or output routing.
+  - Correction changes which samples play now: skips/repeats and a brief audio discontinuity remain possible. Output-device latency still applies. Continuous video is not a promise of gapless or instant speaker output.
+- **Other changes re-anchor at the playhead.** Audio already decoded or fetched carries the previous value.
+  - On `.software`, unsupported formats or insufficient history retain the seek to the current position.
   - On `.loopback` it is the session-preserving reload, so like any reload it ends an installed audio tap and an active recording. A seek would not do: seeking to the position AVPlayer already holds hits its buffer and plays out the old-offset segments anyway.
   - Measured on a 30 fps H.264 fixture: about 0.3 s of held picture on the loopback route, position kept.
 - A live session without a DVR window has no position to return to. It takes the new value at the next seam it makes on its own.
-- **Rapid presses.** Presses that arrive while a re-anchor runs are folded into it, instead of stacking one re-anchor per press (AE#464 round 3). A press after the running re-anchor read the value gets exactly one catch-up pass. The call does not carry the value with it, so the rebuild in flight delivers the newest one. Presses at a human pace arrive after a re-anchor has finished, and each gets its own.
+- **Rapid presses requiring a re-anchor.** Presses that arrive while a re-anchor runs are folded into it, instead of stacking one re-anchor per press (AE#464 round 3). A press after the running re-anchor read the value gets exactly one catch-up pass. The call does not carry the value with it, so the rebuild in flight delivers the newest one. Presses at a human pace arrive after a re-anchor has finished, and each gets its own.
 - A re-anchor or a `reloadAtCurrentPosition(applying:)` raised right as a previous rebuild returned, before the new host has published a position, rebuilds at the position that rebuild was mounted at, not at the start (round 5).
 - A call that arrives while the session is being rebuilt is neither applied nor refused. It is kept in the options the load in flight reads, and the log says so.
 

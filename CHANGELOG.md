@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased: live PCM audio sync
+
+- On-demand direct rendering can adjust buffered interleaved PCM without seeking
+  or replacing the video session. Retain at most 16 MiB, eight seconds and 4096
+  source-timed buffers; crop at PCM sample boundaries and replace only audio.
+- Expose `canAdjustAudioDelayLive` and a refusal-reporting `setAudioDelayLive(_:)`
+  for repeated controls that must never trigger a reload. Preserve the existing
+  seek/reload fallback for unsupported formats, routes or insufficient history.
+- Do not change codec selection, spatial-audio output, live playback or the
+  shared video clock. Audio transitions may skip/repeat samples or produce a
+  brief audible discontinuity; this is not a gapless-output guarantee.
+
 ## Plozz integration: 7.66.0
 
 - Preserve selective MEL handling, authored native intervals, bounded source

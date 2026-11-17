@@ -36,6 +36,8 @@ final class AudioOutput: @unchecked Sendable {
     /// renderer. Guarded because the host writes it from the main actor while the demux thread reads
     /// it in `enqueue`.
     private var presentationOffset: CMTime = .zero
+    private let retainsAudioForLiveSync: Bool
+    private var audioDelayBuffer = AudioDelayBuffer()
 
     /// One line per offset change, not per buffer. Reset by `setPresentationOffset`.
     private var loggedOffsetInEffect = false
@@ -50,8 +52,10 @@ final class AudioOutput: @unchecked Sendable {
         return _epoch
     }
 
-    init(outputLatency: @escaping @Sendable () -> Double = AudioOutput.sessionOutputLatency) {
+    init(outputLatency: @escaping @Sendable () -> Double = AudioOutput.sessionOutputLatency,
+         retainsAudioForLiveSync: Bool = false) {
         self.outputLatency = outputLatency
+        self.retainsAudioForLiveSync = retainsAudioForLiveSync
         renderer = AVSampleBufferAudioRenderer()
         synchronizer = AVSampleBufferRenderSynchronizer()
         synchronizer.addRenderer(renderer)
@@ -162,6 +166,7 @@ final class AudioOutput: @unchecked Sendable {
                 lock.lock()
                 _automaticFlushCount += 1
                 let count = _automaticFlushCount
+                audioDelayBuffer.removeAll()
                 renderer.flush()
                 lock.unlock()
                 EngineLog.emit(
@@ -325,6 +330,42 @@ final class AudioOutput: @unchecked Sendable {
         loggedOffsetInEffect = false
     }
 
+    var canAdjustAudioDelayLive: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        let now = currentTime.seconds
+        return retainsAudioForLiveSync
+            && audioDelayBuffer.covers(sourceTime: now - AudioDelayPolicy.maxAbsSeconds)
+            && audioDelayBuffer.covers(sourceTime: now + AudioDelayPolicy.maxAbsSeconds)
+    }
+
+    /// Replace only queued PCM. The video renderer, demux cursor, feed epoch and master clock do not move.
+    func setPresentationOffsetLive(seconds: Double) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard retainsAudioForLiveSync, seconds.isFinite,
+              abs(seconds) <= AudioDelayPolicy.maxAbsSeconds else { return false }
+        let now = currentTime.seconds
+        let offset = RendererTimeline.cmTime(seconds)
+        guard let origin = timeline.origin,
+              let replay = audioDelayBuffer.replay(
+                sourceTime: now - seconds,
+                shift: CMTimeSubtract(offset, RendererTimeline.cmTime(origin))
+              ) else { return false }
+        renderer.flush()
+        presentationOffset = offset
+        loggedOffsetInEffect = false
+        for buffer in replay {
+            renderer.enqueue(buffer)
+            #if DEBUG
+            didEnqueueSampleBufferForTesting?(buffer)
+            #endif
+        }
+        EngineLog.emit("[AudioOutput] audio delay applied without seeking: "
+                       + String(format: "%+.0f ms", seconds * 1000), category: .swPlayback)
+        return true
+    }
+
     /// Enqueue a decoded audio CMSampleBuffer. Always enqueues (renderer buffers internally); gating on
     /// isReadyForMoreMediaData dropped early samples before the synchronizer started, giving silence.
     ///
@@ -344,6 +385,9 @@ final class AudioOutput: @unchecked Sendable {
             lock.unlock()
             return false
         }
+        if retainsAudioForLiveSync {
+            audioDelayBuffer.append(sampleBuffer, clock: currentTime.seconds)
+        }
         let offset = presentationOffset
         // AE#395: the lip-sync offset and the move onto the renderer axis are one retime, not two copies.
         let shift = CMTimeSubtract(offset, timeline.offset(latchingFrom: sampleBuffer))
@@ -362,6 +406,7 @@ final class AudioOutput: @unchecked Sendable {
         renderer.enqueue(delivered)
         #if DEBUG
         afterRendererEnqueueForTesting?()
+        didEnqueueSampleBufferForTesting?(delivered)
         #endif
         lock.unlock()
         if let offsetLine { EngineLog.emit(offsetLine, category: .swPlayback) }
@@ -397,6 +442,7 @@ final class AudioOutput: @unchecked Sendable {
     /// Test-only: runs inside `enqueue`'s locked section, right after the renderer took the buffer, which
     /// is where a renderer that posts its notifications from inside `enqueue` would post them.
     var afterRendererEnqueueForTesting: (@Sendable () -> Void)?
+    var didEnqueueSampleBufferForTesting: (@Sendable (CMSampleBuffer) -> Void)?
 
     /// Holds a pending start without its timeout, so transport tests exercise cancellation
     /// independently of how long the main actor takes to run on a loaded test runner.
@@ -498,6 +544,7 @@ final class AudioOutput: @unchecked Sendable {
         defer { lock.unlock() }
         _clockCommandRevision &+= 1
         _epoch &+= 1
+        audioDelayBuffer.removeAll()
         renderer.flush()
     }
 
@@ -506,6 +553,7 @@ final class AudioOutput: @unchecked Sendable {
         defer { lock.unlock() }
         _clockCommandRevision &+= 1
         _epoch &+= 1
+        audioDelayBuffer.removeAll()
         playbackEnabled = false
         endPreroll()
         // Hosts discard the output after stop. An already-paused clock needs no time reset;

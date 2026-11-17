@@ -4,15 +4,42 @@ import Foundation
 ///
 /// Lip-sync error belongs to the viewer's chain (a soundbar or AVR adding video-processing latency,
 /// or the reverse), not to the file, so it is a per-setup nudge people set once and expect a player
-/// to honour on every session. AVFoundation offers a host nothing to set it with: `AVPlayerItem`
-/// carries no audio-delay control, and an HLS-streamed asset vends no `AVAssetTrack` for an
-/// `AVAudioMix` to bind to. Where the timestamps still exist is inside the engine, which is why this
-/// lives here rather than on top.
+/// to honour on every session. `AVPlayerItem` carries no audio-delay control. OS 27 streaming
+/// audio-mix taps are a possible separate PCM implementation, not a delay property or a replacement
+/// for the current format-preserving native pipeline. Timestamp ownership stays inside the engine.
 extension AetherEngine {
 
     /// The audio presentation offset in force for this session, in seconds. Positive presents audio
     /// LATER relative to video. 0 (the default) means untouched.
     public var audioDelaySeconds: Double { loadedOptions.audioDelaySeconds }
+
+    /// Current on-demand PCM coverage can service the full delay range without seeking.
+    /// This can become false during startup, seeks, track changes, starvation or at the end.
+    public var canAdjustAudioDelayLive: Bool {
+        !isLive && !isSeeking && videoRoute == .software && (state == .playing || state == .paused)
+            && softwareHost?.canAdjustAudioDelayLive == true
+    }
+
+    /// Try an audio-only correction. Refusal leaves the current offset and playback untouched.
+    /// Unlike `setAudioDelay`, this never falls back to a seek or reload.
+    @discardableResult
+    public func setAudioDelayLive(_ seconds: Double) -> Bool {
+        guard seconds.isFinite, !isLive, !isSeeking, videoRoute == .software,
+              state == .playing || state == .paused else {
+            EngineLog.emit("[AetherEngine] live audio delay unavailable for the current session",
+                           category: .engine)
+            return false
+        }
+        let clamped = AudioDelayPolicy.clamp(seconds)
+        if !AudioDelayPolicy.isChange(from: audioDelaySeconds, to: clamped) { return true }
+        guard softwareHost?.setAudioDelayLive(clamped) == true else {
+            EngineLog.emit("[AetherEngine] live audio delay refused: decoded PCM does not cover the requested time",
+                           category: .engine)
+            return false
+        }
+        setLoadedAudioDelay(clamped)
+        return true
+    }
 
     /// Change the audio presentation offset while playback runs.
     ///
@@ -30,8 +57,9 @@ extension AetherEngine {
     /// rule). So a change is brought to the playhead rather than left to arrive when that media
     /// drains, and what that costs differs:
     ///
-    /// - `.software`: a seek to the current position. Measured on a 30 fps H.264 fixture: set at
-    ///   t=4.90 s, landed at 4.90 s, the new offset delivered on the next buffer.
+    /// - `.software`: buffered on-demand interleaved PCM replaces only the audio queue, preserving
+    ///   the video clock and demux cursor. Unsupported formats or insufficient history still seek
+    ///   to the current position. Use `setAudioDelayLive` when a seek fallback is not acceptable.
     /// - `.loopback`: the session-preserving reload (#460). A seek is not enough and measuring it is
     ///   what settled this: seeking to the position AVPlayer already holds is a buffer hit, so it
     ///   plays its old-offset segments out regardless, and dropping those segments under it only
@@ -59,6 +87,7 @@ extension AetherEngine {
             )
         }
         guard AudioDelayPolicy.isChange(from: loadedOptions.audioDelaySeconds, to: clamped) else { return }
+        if canAdjustAudioDelayLive, setAudioDelayLive(clamped) { return }
         setLoadedAudioDelay(clamped)
 
         // Round 3: a session being rebuilt has no route to ask. `videoRoute` drops to `.none` at
