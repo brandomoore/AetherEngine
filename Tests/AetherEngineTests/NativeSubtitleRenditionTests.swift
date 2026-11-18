@@ -114,6 +114,33 @@ struct NativeSubtitleRenditionTests {
         #expect(infos[1].name == "\(infos[0].name) 2")
     }
 
+    @Test("generated suffixes cannot take an authored rendition name")
+    func authoredSuffixesStayUnique() {
+        for (titles, expected) in [
+            (["English", "English", "English 2"], ["English", "English 3", "English 2"]),
+            (["English 2", "English", "English"], ["English 2", "English", "English 3"]),
+            (["English", "English", "English 2", "English 3", "English", "English 2"],
+             ["English", "English 4", "English 2", "English 3", "English 5", "English 2 2"])
+        ] {
+            let infos = AetherEngine.nativeSubtitleRenditionInfos(for: titles.map { titled(nil, $0) })
+            #expect(infos.map(\.name) == expected)
+        }
+    }
+
+    @Test("fallback names are reserved and disposition order survives suffix collisions")
+    func fallbackSuffixesStayUnique() {
+        let entries = [
+            AetherEngine.NativeSubtitleTrackEntry(sourceStreamIndex: 1, language: nil, title: "Subtitle 3"),
+            AetherEngine.NativeSubtitleTrackEntry(sourceStreamIndex: 2, language: nil, isForced: true,
+                                                  title: "Subtitle 3"),
+            AetherEngine.NativeSubtitleTrackEntry(sourceStreamIndex: 3, language: nil, isHearingImpaired: true)
+        ]
+        let infos = AetherEngine.nativeSubtitleRenditionInfos(for: entries)
+        #expect(infos.map(\.name) == ["Subtitle 3", "Subtitle 3 2", "Subtitle 3 3"])
+        #expect(infos.map(\.isForced) == [false, true, false])
+        #expect(infos.map(\.isHearingImpaired) == [false, false, true])
+    }
+
     // MARK: - Phase D: bitmap OCR renditions
 
     @Test("bitmap tracks become needsOCR entries; text tracks and live sessions are excluded")

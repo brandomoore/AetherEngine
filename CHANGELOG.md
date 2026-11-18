@@ -5,6 +5,8 @@
 - **Preserve authored MP4 track names.** Track labels prefer nonempty stream `title`,
   then `name`, then a custom `handler_name`. Known muxer handler defaults keep the
   existing language/codec fallback. Selection IDs and dispositions are unchanged.
+- Native subtitle rendition suffixes reserve authored and fallback names, keeping
+  all tracks distinct when an original name already ends in a generated number.
 
 ## Unreleased: wider audio sync
 

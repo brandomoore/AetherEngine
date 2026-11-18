@@ -2810,16 +2810,26 @@ extension AetherEngine {
     nonisolated static func nativeSubtitleRenditionInfos(
         for entries: [NativeSubtitleTrackEntry]
     ) -> [NativeSubtitleRenditionInfo] {
-        var counts: [String: Int] = [:]
-        return entries.enumerated().map { i, entry in
-            let base = nativeSubtitleRenditionBaseName(language: entry.language, title: entry.title,
-                                                       isHearingImpaired: entry.isHearingImpaired)
+        let bases = entries.enumerated().map { i, entry in
+            nativeSubtitleRenditionBaseName(language: entry.language, title: entry.title,
+                                             isHearingImpaired: entry.isHearingImpaired)
                 ?? "Subtitle \(i + 1)"
-            let n = (counts[base] ?? 0) + 1
+        }
+        let reserved = Set(bases)
+        var counts: [String: Int] = [:]
+        var used: Set<String> = []
+        return zip(entries, bases).map { entry, base in
+            var n = (counts[base] ?? 0) + 1
+            var name = n == 1 ? base : "\(base) \(n)"
+            while used.contains(name) || (n > 1 && reserved.contains(name)) {
+                n += 1
+                name = "\(base) \(n)"
+            }
             counts[base] = n
+            used.insert(name)
             return NativeSubtitleRenditionInfo(
                 language: entry.language,
-                name: n == 1 ? base : "\(base) \(n)",
+                name: name,
                 isForced: entry.isForced,
                 isHearingImpaired: entry.isHearingImpaired
             )
