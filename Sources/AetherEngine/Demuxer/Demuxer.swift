@@ -2246,6 +2246,24 @@ public final class Demuxer: @unchecked Sendable {
         return nil
     }
 
+    static func resolvedTrackTitle(title: String?, name: String?, handlerName: String?) -> String? {
+        for value in [title, name] {
+            if let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty {
+                return value
+            }
+        }
+        // MP4 can put the authored label in its handler name; muxer defaults are not track titles.
+        guard let handler = handlerName?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !handler.isEmpty else { return nil }
+        let defaults: Set<String> = [
+            "soundhandler", "videohandler", "subtitlehandler", "texthandler",
+            "core media audio", "core media video", "core media subtitle", "core media text",
+            "gpac iso audio handler", "gpac iso video handler", "gpac iso subtitle handler",
+            "gpac iso text handler"
+        ]
+        return defaults.contains(handler.lowercased()) ? nil : handler
+    }
+
     private func trackInfo(from stream: UnsafeMutablePointer<AVStream>, index: Int) -> TrackInfo {
         let codecpar = stream.pointee.codecpar!
         let codecName: String
@@ -2264,7 +2282,11 @@ public final class Demuxer: @unchecked Sendable {
             streamID: stream.pointee.id,
             discLanguages: discStreamLanguages
         )
-        let title = metadataValue(stream.pointee.metadata, key: "title")
+        let title = Self.resolvedTrackTitle(
+            title: metadataValue(stream.pointee.metadata, key: "title"),
+            name: metadataValue(stream.pointee.metadata, key: "name"),
+            handlerName: metadataValue(stream.pointee.metadata, key: "handler_name")
+        )
         let name: String
         if let title = title, !title.isEmpty {
             name = title

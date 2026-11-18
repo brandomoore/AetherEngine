@@ -3134,6 +3134,10 @@ So correcting it through `reloadAtCurrentPosition(applying:)` does nothing. Call
 
 Fields: `id`, `name`, `codec`, `language`, `channels`, `bitrate`, `isDefault`, `isForced`, `isHearingImpaired`, `isCommentary`, `isVisualImpaired`, `isAtmos`, `isDTSX`, `trueHDAtmos`, `assHeader`, `isExternal`, `isNativelyRenderedSubtitle`; for audio also `sampleRate`, `bitsPerSample`, `sampleFormat`, `channelLayout`; and `profile` for every track (AE#658).
 
+- For demuxed tracks, `name` prefers a nonempty stream `title`, then `name`, then a
+  custom MP4 `handler_name`. Known muxer defaults such as `SoundHandler` and
+  `SubtitleHandler` are not authored names; those keep the language/codec or
+  numbered fallback. Names do not infer language, disposition or selection.
 - `isVisualImpaired` is audio description, from the container's `VISUAL_IMPAIRED` disposition (AE#919).
 - `bitsPerSample` is 0 where the codec has no fixed depth (AAC, AC-3, E-AC-3 and Opus decode to float).
 - `sampleFormat` is the probe decoder's output in libav's names ("fltp", "s32").

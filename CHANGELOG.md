@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+- **Preserve authored MP4 track names.** Track labels prefer nonempty stream `title`,
+  then `name`, then a custom `handler_name`. Known muxer handler defaults keep the
+  existing language/codec fallback. Selection IDs and dispositions are unchanged.
+
 ## Unreleased: wider audio sync
 
 - **Audio sync accepts ten seconds in either direction.** On-demand direct rendering
