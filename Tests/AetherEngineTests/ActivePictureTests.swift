@@ -4,6 +4,13 @@ import XCTest
 
 @testable import AetherEngine
 
+// Square-pixel fixtures without a player or renderer.
+private extension ActivePictureWorker {
+    static func sample(_ buffer: CVPixelBuffer) -> ActivePicturePixels {
+        sample(buffer, displaySize: CVImageBufferGetCleanRect(buffer).size)
+    }
+}
+
 final class ActivePictureLifetimeTests: XCTestCase {
     @MainActor
     func testSynchronousEngineAndAnalyzerReleaseWithoutTaskContext() throws {
@@ -417,7 +424,7 @@ struct ActivePictureTests {
         let display = CGSize(width: 1024, height: 576)
         let result = await ActivePictureWorker.shared.analyze(
             ActivePictureFrame(buffer: image, time: 0, generation: 0,
-                               displaySize: display, nativePixelFormat: format))
+                               source: .native(displaySize: display, pixelFormat: format)))
         #expect(result.failure == nil)
         let geometry = try #require(result.geometry)
         #expect(geometry.codedSize == CGSize(width: 320, height: 180))
@@ -561,7 +568,7 @@ struct ActivePictureTests {
             kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
             kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
         ])
-    func nv12(format: OSType) throws {
+    @MainActor func nv12(format: OSType) async throws {
         var buffer: CVPixelBuffer?
         try #require(
             CVPixelBufferCreate(kCFAllocatorDefault, 720, 576, format, nil, &buffer) == kCVReturnSuccess)
@@ -585,7 +592,15 @@ struct ActivePictureTests {
             }
         }
         CVPixelBufferUnlockBaseAddress(image, [])
-        let result = ActivePictureWorker.sample(image)
+        let renderer = SampleBufferRenderer()
+        renderer.enqueue(pixelBuffer: image, pts: .zero)
+        renderer.drainReorderBuffer()
+        let frame = try #require(renderer.activePictureFrame)
+        renderer.flush()
+        // The accepted sample's format description is anamorphic. Analysis must not
+        // rediscover the display canvas from a later read of image attachments.
+        CVBufferRemoveAttachment(image, kCVImageBufferPixelAspectRatioKey)
+        let result = await ActivePictureWorker.shared.analyze(frame)
         let geometry = try #require(result.geometry)
         let rect = try #require(result.bounds)
         #expect(abs(geometry.displaySize.width / geometry.displaySize.height - 16.0 / 9) < 0.001)

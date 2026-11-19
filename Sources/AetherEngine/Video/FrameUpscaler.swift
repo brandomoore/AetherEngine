@@ -751,14 +751,9 @@ private final class GPU {
 
     func dispatch(_ encoder: MTLComputeCommandEncoder, _ pipeline: MTLComputePipelineState,
                   textures: [MTLTexture], color: UpscaleColorParams, grid: (Int, Int)) {
-        encoder.setComputePipelineState(pipeline)
-        for (i, t) in textures.enumerated() { encoder.setTexture(t, index: i) }
         var params = color
         encoder.setBytes(&params, length: MemoryLayout<UpscaleColorParams>.size, index: 0)
-        let w = pipeline.threadExecutionWidth
-        let h = max(1, pipeline.maxTotalThreadsPerThreadgroup / w)
-        encoder.dispatchThreads(MTLSize(width: grid.0, height: grid.1, depth: 1),
-                                threadsPerThreadgroup: MTLSize(width: w, height: h, depth: 1))
+        FrameChain.dispatch(encoder, pipeline, textures: textures, grid: grid, maxGroupHeight: .max)
     }
 }
 

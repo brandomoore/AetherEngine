@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+- **Keep upscaling running on first-generation Apple TV 4K.** The line-art and
+  automatic scaler kernels no longer require nonuniform Metal threadgroups.
+- **Fix a crash sampling the active picture during software playback.** The
+  worker uses the renderer's presentation size instead of asking CoreVideo to
+  read display-dimension attachments again.
 - **Preserve authored MP4 track names.** Track labels prefer nonempty stream `title`,
   then `name`, then a custom `handler_name`. Known muxer handler defaults keep the
   existing language/codec fallback. Selection IDs and dispositions are unchanged.

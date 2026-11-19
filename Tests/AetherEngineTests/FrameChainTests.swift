@@ -38,8 +38,9 @@ struct FrameChainTests {
     @Test(arguments: [false, true])
     @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
     func passThroughRoundTripKeepsTheFrame(tenBit: Bool) throws {
-        let input = try ChainFrames.gradient(320, 180, tenBit: tenBit)
-        let (out, _) = try chain(320, 180, stages: [PassThroughStage()]).process(input, picture: whole(320, 180))
+        // Neither the luma nor chroma plane ends on a threadgroup boundary.
+        let input = try ChainFrames.gradient(322, 182, tenBit: tenBit)
+        let (out, _) = try chain(322, 182, stages: [PassThroughStage()]).process(input, picture: whole(322, 182))
         #expect(CVPixelBufferGetPixelFormatType(out) == CVPixelBufferGetPixelFormatType(input))
         let diff = ChainFrames.maxDifference(input, out)
         #expect(diff.y <= 1 && diff.c <= 1, "max difference Y \(diff.y), C \(diff.c) (tenBit \(tenBit))")

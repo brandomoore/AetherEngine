@@ -125,13 +125,15 @@ final class FrameChain {
     }
 
     static func dispatch(_ encoder: MTLComputeCommandEncoder, _ pipeline: MTLComputePipelineState,
-                         textures: [MTLTexture], grid: (Int, Int)) {
+                         textures: [MTLTexture], grid: (Int, Int), maxGroupHeight: Int = 16) {
         encoder.setComputePipelineState(pipeline)
         for (i, t) in textures.enumerated() { encoder.setTexture(t, index: i) }
         let w = pipeline.threadExecutionWidth
-        let h = max(1, min(16, pipeline.maxTotalThreadsPerThreadgroup / w))
-        encoder.dispatchThreads(MTLSize(width: grid.0, height: grid.1, depth: 1),
-                                threadsPerThreadgroup: MTLSize(width: w, height: h, depth: 1))
+        let h = max(1, min(maxGroupHeight, pipeline.maxTotalThreadsPerThreadgroup / w))
+        // A10X does not support nonuniform dispatch. Every upscale kernel bounds-checks
+        // its output coordinates, so the last group can safely extend beyond the plane.
+        encoder.dispatchThreadgroups(MTLSize(width: (grid.0 + w - 1) / w, height: (grid.1 + h - 1) / h, depth: 1),
+                                     threadsPerThreadgroup: MTLSize(width: w, height: h, depth: 1))
     }
 
     private func planeTexture(_ buffer: CVPixelBuffer, plane: Int, format: MTLPixelFormat) throws -> (MTLTexture, CVMetalTexture) {

@@ -1863,8 +1863,10 @@ detaches the native output and invalidates outstanding analysis when no consumer
 `ActivePictureState` is either `.unknown(UnknownReason)` or `.measured(ActivePictureObservation)`.
 An observation's `normalizedRect` describes the upright, clean-aperture/SAR-corrected
 display canvas before host zoom; its `displaySize` retains source presentation geometry
-even when native analysis buffers are downscaled. `Evidence.sampledPixels` is measured
-evidence, not permission to discard border content. Respect `presentationTime`,
+even when native analysis buffers are downscaled. On the software route the renderer
+hands off the accepted sample's format description, so analysis uses the same
+presentation size and pixel-aspect correction as playback. `Evidence.sampledPixels`
+is measured evidence, not permission to discard border content. Respect `presentationTime`,
 `validUntil` and `generation`; unavailable evidence is not confirmed full frame.
 
 Hosts already owning an AVPlayer can use `NativeActivePictureAnalyzer.sample(player:generation:videoFormat:)`

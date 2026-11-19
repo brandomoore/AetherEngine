@@ -335,7 +335,7 @@ final class ActivePictureAnalysis {
                     .applying((nativeTransform ?? .identity).inverted()).size
                 frame = ActivePictureFrame(
                     buffer: buffer, time: displayed.seconds, generation: frameGeneration,
-                    displaySize: displaySize, nativePixelFormat: source.nativePixelFormat)
+                    source: .native(displaySize: displaySize, pixelFormat: source.nativePixelFormat))
             } else {
                 frame = nil
             }

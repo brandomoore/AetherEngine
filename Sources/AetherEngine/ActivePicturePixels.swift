@@ -3,20 +3,15 @@ import VideoToolbox
 
 /// The buffer is borrowed read-only and released after one bounded worker call.
 struct ActivePictureFrame: @unchecked Sendable {
+    enum Source {
+        case software(CMVideoFormatDescription)
+        case native(displaySize: CGSize, pixelFormat: OSType)
+    }
+
     let buffer: CVPixelBuffer
     let time: Double
     let generation: UInt64
-    let displaySize: CGSize?
-    let nativePixelFormat: OSType?
-
-    init(buffer: CVPixelBuffer, time: Double, generation: UInt64, displaySize: CGSize? = nil,
-         nativePixelFormat: OSType? = nil) {
-        self.buffer = buffer
-        self.time = time
-        self.generation = generation
-        self.displaySize = displaySize
-        self.nativePixelFormat = nativePixelFormat
-    }
+    let source: Source
 }
 
 struct ActivePictureGeometry: Sendable, Equatable {
@@ -62,8 +57,13 @@ actor ActivePictureWorker {
         guard !Task.isCancelled else {
             return ActivePicturePixels(geometry: nil, bounds: nil, failure: .disabled)
         }
-        guard let format = frame.nativePixelFormat else {
-            return Self.sample(frame.buffer, displaySize: frame.displaySize)
+        let displaySize: CGSize, format: OSType
+        switch frame.source {
+        case .software(let description):
+            return Self.sample(frame.buffer, displaySize: SampleBufferRenderer.presentationSize(of: description))
+        case .native(let size, let pixelFormat):
+            displaySize = size
+            format = pixelFormat
         }
         var transfer: VTPixelTransferSession?
         let sessionStatus = VTPixelTransferSessionCreate(
@@ -90,10 +90,10 @@ actor ActivePictureWorker {
                            category: .engine)
             return ActivePicturePixels(geometry: nil, bounds: nil, failure: .unsupportedColor)
         }
-        return Self.sample(buffer, displaySize: frame.displaySize)
+        return Self.sample(buffer, displaySize: displaySize)
     }
 
-    nonisolated static func sample(_ buffer: CVPixelBuffer, displaySize: CGSize? = nil) -> ActivePicturePixels {
+    nonisolated static func sample(_ buffer: CVPixelBuffer, displaySize: CGSize) -> ActivePicturePixels {
         func failed(_ reason: ActivePictureState.UnknownReason) -> ActivePicturePixels {
             ActivePicturePixels(geometry: nil, bounds: nil, failure: reason)
         }
@@ -129,11 +129,10 @@ actor ActivePictureWorker {
         guard !linear || halfFloat else { return failed(.unsupportedColor) }
         let coded = CGSize(width: CVPixelBufferGetWidth(buffer), height: CVPixelBufferGetHeight(buffer))
         let clean = CVImageBufferGetCleanRect(buffer)
-        let display = displaySize ?? CVImageBufferGetDisplaySize(buffer)
         guard clean.minX.isFinite, clean.minY.isFinite, clean.width.isFinite, clean.height.isFinite,
             clean.width >= 8, clean.height >= 8,
             CGRect(origin: .zero, size: coded).contains(clean),
-            display.width.isFinite, display.height.isFinite, display.width > 0, display.height > 0
+            displaySize.width.isFinite, displaySize.height.isFinite, displaySize.width > 0, displaySize.height > 0
         else { return failed(.unsupportedGeometry) }
         guard CVPixelBufferLockBaseAddress(buffer, .readOnly) == kCVReturnSuccess else {
             return failed(.unavailable)
@@ -184,7 +183,7 @@ actor ActivePictureWorker {
         }
         return ActivePicturePixels(
             geometry: ActivePictureGeometry(
-                codedSize: coded, cleanRect: clean, displaySize: display,
+                codedSize: coded, cleanRect: clean, displaySize: displaySize,
                 format: format, transfer: transfer),
             // HDR near-black codes are not interchangeable with SDR. Keep
             // their threshold close to reference black, including raised bars.

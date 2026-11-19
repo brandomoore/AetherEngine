@@ -247,6 +247,7 @@ With `LoadOptions.upscalesLowResolutionVideo` (#846, AE#1039), `load()` asks `Up
 
 - `.automatic`: VideoToolbox low-latency super resolution on the Neural Engine where the device offers a scale factor, then MetalFX Spatial to the target size.
 - `.lineArt`: Anime4K's 2x upscale and restore networks as Metal compute kernels (`LineArtShaderSource`), then a bilinear resample.
+- Both scaler routes dispatch whole Metal threadgroups and bounds-check edge pixels, including on GPUs without nonuniform threadgroups.
 - The stage returns nil whenever the original frame should go out instead. Its VideoToolbox session is built off the decode thread (about 4 s cold on Apple TV), and frames pass through unchanged until it is ready.
 
 **Budget.** Over a 48-frame window the stage's mean time must stay under 90% of the frame interval.

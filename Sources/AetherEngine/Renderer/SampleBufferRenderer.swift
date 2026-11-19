@@ -1067,9 +1067,10 @@ final class SampleBufferRenderer: @unchecked Sendable {
         reorderLock.lock()
         _lastEnqueuedFrame = pixelBuffer
         if accepted, let analysisGeneration,
-           analysisGeneration == activePictureTimeline.generation(at: pts.seconds), pts.isNumeric {
+           analysisGeneration == activePictureTimeline.generation(at: pts.seconds), pts.isNumeric,
+           let description = CMSampleBufferGetFormatDescription(sampleBuffer) {
             _activePictureFrame = ActivePictureFrame(buffer: pixelBuffer, time: pts.seconds,
-                                                     generation: analysisGeneration)
+                                                     generation: analysisGeneration, source: .software(description))
         }
         if accepted {
             _acceptedFrameCount += 1
