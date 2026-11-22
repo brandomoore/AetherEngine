@@ -22,12 +22,14 @@ private enum ChainGate {
 struct FrameChainTests {
 
     @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
-    private func chain(_ w: Int, _ h: Int, target: (Int, Int)? = nil, stages: [any FrameChainStage]) throws -> FrameChain {
+    private func chain(_ w: Int, _ h: Int, target: (Int, Int)? = nil, stages: [any FrameChainStage],
+                       fusesRoundTrip: Bool = true, io: MetalFrameIO? = nil) throws -> FrameChain {
         let device = try #require(MTLCreateSystemDefaultDevice())
         let queue = try #require(device.makeCommandQueue())
         let t = target ?? (w, h)
         return try FrameChain(device: device, queue: queue, sourceWidth: w, sourceHeight: h,
-                              targetWidth: t.0, targetHeight: t.1, stages: stages)
+                              targetWidth: t.0, targetHeight: t.1, stages: stages, fusesRoundTrip: fusesRoundTrip,
+                              io: io)
     }
 
     @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
@@ -107,6 +109,160 @@ struct FrameChainTests {
         #expect(diff.y <= 1 && diff.c <= 1, "Y \(diff.y), C \(diff.c)")
     }
 
+    /// AE#957: a chain whose stages leave the picture alone, at its own size, runs as one kernel with no
+    /// RGB texture. It must give what the two passes give, to within rounding: 320 wide takes the wide
+    /// kernel (four luma samples per texel), 322 the narrow one.
+    @Test(arguments: [false, true], [320, 322])
+    @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
+    func issue957OneKernelRoundTripMatchesTheTwoPasses(tenBit: Bool, width: Int) throws {
+        let input = try ChainFrames.gradient(width, 180, tenBit: tenBit)
+        ChainFrames.paintLuma(input) { x, y in ((x / 7 + y / 5) % 9 == 0) ? 30 : 60 + x / 2 }
+        let fused = try chain(width, 180, stages: [PassThroughStage(), PassThroughStage()])
+        let twoPass = try chain(width, 180, stages: [PassThroughStage()], fusesRoundTrip: false)
+        let scaled = try chain(width, 180, target: (width * 2, 360), stages: [PassThroughStage()])
+        #expect(fused.isRoundTripOnly)
+        #expect(!twoPass.isRoundTripOnly)
+        #expect(!scaled.isRoundTripOnly)
+        let wide = FrameChain.roundTripIsWide(targetWidth: width, pictureX: 0)
+        #expect(wide == (width == 320))
+        let (a, _) = try fused.process(input, picture: whole(width, 180))
+        let (b, _) = try twoPass.process(input, picture: whole(width, 180))
+        let diff = ChainFrames.maxDifference(a, b)
+        #expect(diff.y <= 1 && diff.c <= 1, "Y \(diff.y), C \(diff.c) (tenBit \(tenBit), width \(width))")
+    }
+
+    /// A picture that starts inside the frame (a crop): both one-kernel versions read from its origin and give
+    /// what the two passes give. x 4 keeps the wide kernel, x 2 takes the narrow one.
+    @Test(arguments: [false, true], [4, 2])
+    @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
+    func issue957OneKernelRoundTripHonoursThePictureOrigin(tenBit: Bool, originX: Int) throws {
+        let input = try ChainFrames.gradient(336, 200, tenBit: tenBit)
+        ChainFrames.paintLuma(input) { x, y in ((x / 5 + y / 7) % 8 == 0) ? 40 : 50 + (x + y) / 3 }
+        let picture = FrameUpscaler.PictureRegion(x: originX, y: 8, width: 320, height: 180)
+        let fused = try chain(320, 180, stages: [PassThroughStage()])
+        let twoPass = try chain(320, 180, stages: [PassThroughStage()], fusesRoundTrip: false)
+        let wide = FrameChain.roundTripIsWide(targetWidth: 320, pictureX: originX)
+        #expect(wide == (originX == 4))
+        let (a, _) = try fused.process(input, picture: picture)
+        let (b, _) = try twoPass.process(input, picture: picture)
+        let diff = ChainFrames.maxDifference(a, b)
+        #expect(diff.y <= 1 && diff.c <= 1, "Y \(diff.y), C \(diff.c) (tenBit \(tenBit), origin x \(originX))")
+    }
+
+    /// The wide kernel reads luma four samples at a time: a picture origin off those texels takes the narrow one.
+    @Test
+    @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
+    func issue957TheWideRoundTripNeedsFourSampleAlignment() {
+        let aligned = FrameChain.roundTripIsWide(targetWidth: 3840, pictureX: 0)
+        let offset = FrameChain.roundTripIsWide(targetWidth: 1920, pictureX: 2)
+        let narrow = FrameChain.roundTripIsWide(targetWidth: 1918, pictureX: 0)
+        #expect(aligned)
+        #expect(!offset)
+        #expect(!narrow)
+    }
+
+    /// AE#957: a stage that declares its output's colour volume sets the frames' HDR10 metadata, and a
+    /// stage after it that declares nothing keeps it. The chain's attach step writes it over the source's.
+    @Test
+    @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
+    func issue957AStagesDeclaredColorVolumeReachesTheOutput() throws {
+        let fitted = HDR10StaticMetadata(maxCLL: 800, maxFALL: 300, masteringPeakNits: 800, masteringMinNits: 0.0005)
+        let input = try ChainFrames.gradient(320, 180, tenBit: true)
+        let source = HDR10StaticMetadata(maxCLL: 4000, maxFALL: 1000, masteringPeakNits: 4000, masteringMinNits: 0.005)
+        CVBufferSetAttachment(input, kCVImageBufferContentLightLevelInfoKey, source.contentLightLevel as CFData,
+                              .shouldPropagate)
+        let plain = try chain(320, 180, stages: [PassThroughStage()])
+        #expect(plain.outputColorVolume == .unchanged)
+        let fitting = try chain(320, 180, stages: [DeclaringStage(.hdr10(fitted)), PassThroughStage()])
+        #expect(fitting.outputColorVolume == .hdr10(fitted))
+        let (out, _) = try fitting.process(input, picture: whole(320, 180))
+        fitting.attach(from: input, to: out)
+        let lightLevel = CVBufferCopyAttachment(out, kCVImageBufferContentLightLevelInfoKey, nil) as? Data
+        let mastering = CVBufferCopyAttachment(out, kCVImageBufferMasteringDisplayColorVolumeKey, nil) as? Data
+        #expect(lightLevel == fitted.contentLightLevel)
+        #expect(mastering == fitted.masteringDisplayColorVolume)
+    }
+
+    /// AE#957: the tone map runs inside the one round-trip kernel and gives what its own pass between the two
+    /// passes gives, to within rounding. 320 wide takes the wide kernel, 322 the narrow one.
+    @Test(arguments: [320, 322])
+    @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
+    func issue957TheFusedToneMapMatchesItsOwnPass(width: Int) throws {
+        let curve = try #require(BT2390ToneCurve(sourcePeakNits: 1000, targetPeakNits: 600))
+        let master = HDR10StaticMetadata(maxCLL: 1000, maxFALL: 400, masteringPeakNits: 1000, masteringMinNits: 0.005)
+        let input = try ChainFrames.gradient(width, 180, tenBit: true)
+        // Luma 240...720 of 1023: from about 6 nit, below the 464 nit knee, to about 990 nit, above it.
+        let fused = try chain(width, 180, stages: [ToneMapStage(curve: curve, source: master), PassThroughStage()])
+        let twoPass = try chain(width, 180, stages: [ToneMapStage(curve: curve, source: master)], fusesRoundTrip: false)
+        let twoMaps = try chain(width, 180, stages: [ToneMapStage(curve: curve, source: master),
+                                                     ToneMapStage(curve: curve, source: master)])
+        #expect(fused.isRoundTripOnly)
+        #expect(!twoPass.isRoundTripOnly)
+        #expect(!twoMaps.isRoundTripOnly, "one fused stage per kernel")
+        let (a, _) = try fused.process(input, picture: whole(width, 180))
+        let (b, _) = try twoPass.process(input, picture: whole(width, 180))
+        let diff = ChainFrames.maxDifference(a, b)
+        #expect(diff.y <= 1 && diff.c <= 1, "Y \(diff.y), C \(diff.c) (width \(width))")
+        // The ramp's top is brighter than the target, so the map lowers it; the dark end is below the knee.
+        let plain = try chain(width, 180, stages: [PassThroughStage()]).process(input, picture: whole(width, 180)).0
+        #expect(ChainFrames.lumaRange(a).upperBound < ChainFrames.lumaRange(plain).upperBound)
+        #expect(ChainFrames.lumaRange(a).lowerBound == ChainFrames.lumaRange(plain).lowerBound)
+        #expect(fused.outputColorVolume == .hdr10(curve.outputMetadata(from: master)))
+    }
+
+    /// Audit GPU-204: an A10X (Apple TV 4K 1st gen) has no non-uniform threadgroups, so every kernel runs in
+    /// whole groups there and its bounds guard drops the threads past the edge. A width and height off the
+    /// threadgroup grid must give the picture the non-uniform dispatch gives, on each kind of chain.
+    @Test(arguments: ["round trip", "two passes", "line art"])
+    @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
+    func gpu204WholeThreadgroupsGiveTheSamePicture(kind: String) throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let uniform = try #require(MetalFrameIO(device: device, nonUniformThreadgroups: false))
+        let curve = try #require(BT2390ToneCurve(sourcePeakNits: 1000, targetPeakNits: 600))
+        let master = HDR10StaticMetadata(maxCLL: 1000, maxFALL: 400, masteringPeakNits: 1000, masteringMinNits: 0.005)
+        let (w, h) = (322, 182)
+        func build(_ io: MetalFrameIO?) throws -> FrameChain {
+            switch kind {
+            case "round trip":
+                return try chain(w, h, stages: [ToneMapStage(curve: curve, source: master)], io: io)
+            case "two passes":
+                return try chain(w, h, stages: [ToneMapStage(curve: curve, source: master)], fusesRoundTrip: false, io: io)
+            default:
+                return try chain(w, h, target: (w * 2, h * 2), stages: [LineArtStage()], io: io)
+            }
+        }
+        let input = try ChainFrames.gradient(w, h, tenBit: true)
+        let (expected, _) = try build(nil).process(input, picture: whole(w, h))
+        let (got, _) = try build(uniform).process(input, picture: whole(w, h))
+        let diff = ChainFrames.maxDifference(expected, got)
+        #expect(diff.y == 0 && diff.c == 0, "\(kind): Y \(diff.y), C \(diff.c)")
+    }
+
+    /// Audit GPU-201: the work of a frame holds the texture cache its textures came from. The tone mapper
+    /// drops or rebuilds its chain (and the chain's cache) with two frames on the GPU, and a CVMetalTexture
+    /// that finalizes after its cache calls into freed memory (the FEL composer crashed that way).
+    @Test
+    @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
+    func gpu201AFramesWorkHoldsItsTextureCache() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let made = try #require(MetalFrameIO(device: device))
+        let cache = made.textureCache
+        var io: MetalFrameIO? = made
+        var built: FrameChain? = try chain(320, 180, stages: [PassThroughStage()], io: io)
+        let input = try ChainFrames.gradient(320, 180, tenBit: false)
+        let encoded = try #require(try built?.encode(input, picture: whole(320, 180)))
+        let textures = try #require(encoded.work.textures)
+        #expect(textures.cache === cache)
+        #expect(textures.count == 4, "both planes of the input and of the output")
+        built = nil
+        io = nil
+        encoded.work.commandBuffer.commit()
+        encoded.work.commandBuffer.waitUntilCompleted()
+        _ = try encoded.work.finish()
+        let diff = ChainFrames.maxDifference(input, encoded.output)
+        #expect(diff.y <= 1 && diff.c <= 1)
+    }
+
     @Test
     @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
     func unsupportedFormatIsRefused() throws {
@@ -152,6 +308,27 @@ struct LineArtUpscalerTests {
         #expect(up.upscale(try ChainFrames.buffer(1280, 720, format: kCVPixelFormatType_32BGRA), pts: .invalid) == nil)
         #expect(!up.isDisabled)
         #expect(up.upscale(try ChainFrames.gradient(1280, 720, tenBit: false), pts: .invalid) != nil)
+    }
+
+    /// Audit GPU-203: the line-art chain's errors are `FrameChain.Failure`, which the upscaler's refusal check
+    /// did not look through, so iOS background refusals counted and switched the stage off after three.
+    @Test
+    @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
+    func gpu203BackgroundRefusalsNeverSwitchLineArtOff() throws {
+        let up = try #require(FrameUpscaler(plan: try plan(640, 360, display: CGSize(width: 1280, height: 720)),
+                                            frameInterval: 1.0 / 24))
+        let input = try ChainFrames.gradient(640, 360, tenBit: false)
+        up.forcedCommandBufferError = NSError(domain: MTLCommandBufferErrorDomain,
+                                              code: Int(MTLCommandBufferError.Code.notPermitted.rawValue))
+        for _ in 0..<6 { #expect(up.upscale(input, pts: .invalid) == nil) }
+        #expect(!up.isDisabled && up.stats.failures == 0)
+        up.forcedCommandBufferError = nil
+        #expect(up.upscale(input, pts: .invalid) != nil)
+
+        up.forcedCommandBufferError = NSError(domain: MTLCommandBufferErrorDomain,
+                                              code: Int(MTLCommandBufferError.Code.timeout.rawValue))
+        for _ in 0..<FrameUpscaler.maxConsecutiveFailures { _ = up.upscale(input, pts: .invalid) }
+        #expect(up.isDisabled)
     }
 
     /// The ladder at 1080p: an overrun first drops the restore pass, a second one switches the stage off
@@ -258,6 +435,197 @@ private final class LockedFlag: @unchecked Sendable {
     private var flag = false
     func set() { lock.lock(); flag = true; lock.unlock() }
     var value: Bool { lock.lock(); defer { lock.unlock() }; return flag }
+}
+
+/// Hands its input on unchanged but declares a colour volume, as a tone mapper would.
+@available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
+private final class DeclaringStage: FrameChainStage {
+    let outputColorVolume: FrameChainColorVolume
+    init(_ volume: FrameChainColorVolume) { outputColorVolume = volume }
+    func prepare(io: MetalFrameIO, kernels: FrameChainKernels, input: (Int, Int), finalTarget: (Int, Int)?) throws -> (Int, Int) {
+        input
+    }
+    func encode(_ encoder: MTLComputeCommandEncoder, input: MTLTexture) -> MTLTexture { input }
+}
+
+/// #957: the picture processing stage as the session runs it: a PQ frame is tone mapped and goes out with
+/// the target's metadata; what it does not apply to passes through; HDR10+ and an overrun switch it off.
+@Suite("Picture processing stage (#957)", .serialized, .offCooperativePoolOneLane, .timeLimit(.minutes(5)),
+       .enabled(if: ChainGate.gpuAvailable))
+struct FrameToneMapperTests {
+
+    private static let master = HDR10StaticMetadata(maxCLL: 1000, maxFALL: 400, masteringPeakNits: 1000,
+                                                    masteringMinNits: 0.005)
+
+    private func plan() throws -> VideoProcessingPlan {
+        try #require(VideoProcessingRouteDecision.decide(
+            options: VideoProcessingOptions(targetPeakNits: 600), osSupportsStage: true, isPQ: true,
+            isDolbyVision: false, carriesHDR10Plus: false, displayTakesHDR10: true, declared: Self.master,
+            width: 320, height: 180, isFourTwoZero: true, wirelessAirPlayRoute: false, demuxedAudioLive: false).plan)
+    }
+
+    /// A 10-bit ramp from about 6 to about 990 nit, tagged PQ, with `metadata` attached when given.
+    private func frame(pq: Bool = true, metadata: HDR10StaticMetadata? = master) throws -> CVPixelBuffer {
+        let pb = try ChainFrames.gradient(320, 180, tenBit: true)
+        CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey,
+                              pq ? kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ : kCVImageBufferTransferFunction_ITU_R_709_2,
+                              .shouldPropagate)
+        if let metadata {
+            CVBufferSetAttachment(pb, kCVImageBufferMasteringDisplayColorVolumeKey,
+                                  metadata.masteringDisplayColorVolume as CFData, .shouldPropagate)
+            CVBufferSetAttachment(pb, kCVImageBufferContentLightLevelInfoKey,
+                                  metadata.contentLightLevel as CFData, .shouldPropagate)
+        }
+        return pb
+    }
+
+    private static func metadata(of pb: CVPixelBuffer) -> HDR10StaticMetadata? {
+        HDR10StaticMetadata(
+            masteringDisplayColorVolume: CVBufferCopyAttachment(pb, kCVImageBufferMasteringDisplayColorVolumeKey, nil) as? Data,
+            contentLightLevel: CVBufferCopyAttachment(pb, kCVImageBufferContentLightLevelInfoKey, nil) as? Data)
+    }
+
+    @Test
+    @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
+    func issue957APQFrameIsMappedAndSaysTheTarget() throws {
+        let plan = try plan()
+        let stage = FrameToneMapper(plan: plan, frameInterval: 1.0 / 24)
+        let input = try frame()
+        let output = try #require(stage.process(input, pts: CMTime(value: 0, timescale: 24), carriesHDR10Plus: false))
+        #expect(ChainFrames.lumaRange(output).upperBound < ChainFrames.lumaRange(input).upperBound)
+        #expect(ChainFrames.lumaRange(output).lowerBound == ChainFrames.lumaRange(input).lowerBound)
+        #expect(Self.metadata(of: output) == plan.curve.outputMetadata(from: Self.master))
+        #expect(stage.delivered == VideoProcessingStatus(stages: [.toneMap], sourcePeakNits: 1000, sourcePeak: .mastering,
+                                                         targetPeakNits: 600))
+        #expect(stage.disabledReason == nil)
+    }
+
+    @Test
+    @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
+    func issue957AFrameWithoutMetadataUsesTheSourcesDeclaration() throws {
+        let plan = try plan()
+        let stage = FrameToneMapper(plan: plan, frameInterval: 1.0 / 24)
+        let output = try #require(stage.process(try frame(metadata: nil), pts: .zero, carriesHDR10Plus: false))
+        #expect(Self.metadata(of: output) == plan.curve.outputMetadata(from: Self.master))
+    }
+
+    /// A frame whose own metadata gives another peak rebuilds the curve, and the status follows it.
+    @Test
+    @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
+    func issue957AFrameWithItsOwnPeakRepublishesTheStatus() throws {
+        let stage = FrameToneMapper(plan: try plan(), frameInterval: 1.0 / 24)
+        let events = EventBox()
+        stage.onEvent = { events.append($0) }
+        #expect(stage.process(try frame(), pts: .zero, carriesHDR10Plus: false) != nil)
+        #expect(stage.process(try frame(), pts: .zero, carriesHDR10Plus: false) != nil)
+        let brighter = HDR10StaticMetadata(maxCLL: 1500, maxFALL: 400, masteringPeakNits: 4000, masteringMinNits: 0.005)
+        #expect(stage.process(try frame(metadata: brighter), pts: .zero, carriesHDR10Plus: false) != nil)
+        #expect(stage.delivered == VideoProcessingStatus(stages: [.toneMap], sourcePeakNits: 1500, sourcePeak: .maxCLL,
+                                                         targetPeakNits: 600))
+        #expect(events.count(where: { if case .processed = $0 { true } else { false } }) == 2,
+                "the first frame and the rebuild, not every frame")
+    }
+
+    @Test
+    @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
+    func issue957WhatTheStageDoesNotApplyToPassesThrough() throws {
+        let stage = FrameToneMapper(plan: try plan(), frameInterval: 1.0 / 24)
+        #expect(stage.process(try frame(pq: false), pts: .zero, carriesHDR10Plus: false) == nil)
+        let dim = HDR10StaticMetadata(maxCLL: 500, maxFALL: 200, masteringPeakNits: 500, masteringMinNits: 0.005)
+        #expect(stage.process(try frame(metadata: dim), pts: .zero, carriesHDR10Plus: false) == nil)
+        #expect(stage.disabledReason == nil, "passing a frame through is no failure")
+        #expect(stage.process(try frame(), pts: .zero, carriesHDR10Plus: false) != nil)
+    }
+
+    @Test
+    @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
+    func issue957HDR10PlusSwitchesItOffForGood() throws {
+        let stage = FrameToneMapper(plan: try plan(), frameInterval: 1.0 / 24)
+        #expect(stage.process(try frame(), pts: .zero, carriesHDR10Plus: true) == nil)
+        #expect(stage.disabled?.cause == .hdr10Plus)
+        #expect(stage.process(try frame(), pts: .zero, carriesHDR10Plus: false) == nil)
+    }
+
+    /// A frame interval no frame can meet: the 48-frame window fills, its mean is over 90% of it, and the
+    /// stage switches itself off once, with the reason.
+    @Test
+    @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
+    func issue957ASustainedOverrunSwitchesItOff() throws {
+        let stage = FrameToneMapper(plan: try plan(), frameInterval: 1e-6)
+        let events = EventBox()
+        stage.onEvent = { events.append($0) }
+        let input = try frame()
+        for _ in 0 ..< FrameToneMapper.budgetWindow - 1 {
+            #expect(stage.process(input, pts: .invalid, carriesHDR10Plus: false) != nil)
+        }
+        #expect(stage.disabledReason == nil)
+        _ = stage.process(input, pts: .invalid, carriesHDR10Plus: false)
+        #expect(stage.disabled?.cause == .overrun)
+        #expect(stage.disabledReason?.hasPrefix("over budget") == true)
+        #expect(stage.process(input, pts: .invalid, carriesHDR10Plus: false) == nil)
+        #expect(events.count(where: { if case .disabled = $0 { true } else { false } }) == 1)
+        #expect(events.count(where: { if case .processed = $0 { true } else { false } }) == 1)
+    }
+
+    /// Audit GPU-201: a frame with its own metadata rebuilds the chain while the two frames before it are
+    /// still on the GPU, which releases the old chain and its texture cache under them. Their work holds
+    /// that cache now, so they complete and deliver their picture.
+    @Test
+    @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
+    func gpu201ARebuildWithFramesInFlightDeliversThem() throws {
+        let stage = FrameToneMapper(plan: try plan(), frameInterval: 1.0 / 24)
+        var inFlight: [(EncodedGPUWork, @Sendable (Double) -> CVPixelBuffer?)] = []
+        for metadata in [Self.master, Self.master,
+                         HDR10StaticMetadata(maxCLL: 1500, maxFALL: 400, masteringPeakNits: 4000, masteringMinNits: 0.005)] {
+            guard case let .gpu(work, complete) = stage.begin(try frame(metadata: metadata), pts: .zero,
+                                                               carriesHDR10Plus: false) else {
+                Issue.record("a PQ frame above the target goes to the GPU")
+                return
+            }
+            inFlight.append((work, complete))
+        }
+        for (work, complete) in inFlight {
+            work.commandBuffer.commit()
+            work.commandBuffer.waitUntilCompleted()
+            #expect(complete(0) != nil)
+        }
+        inFlight.removeAll()
+        #expect(stage.disabled == nil && stage.stats.framesProcessed == 3)
+    }
+
+    /// Audit GPU-203: iOS refuses GPU work in the background with `notPermitted`. The chain wraps that in its
+    /// own error, which the check did not look through, so three refused frames switched the stage off and
+    /// the engine latched the title as failed for the process. Any other error still does after three.
+    @Test
+    @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
+    func gpu203BackgroundRefusalsNeverSwitchItOff() throws {
+        let stage = FrameToneMapper(plan: try plan(), frameInterval: 1.0 / 24)
+        let input = try frame()
+        stage.forcedCommandBufferError = NSError(domain: MTLCommandBufferErrorDomain,
+                                                 code: Int(MTLCommandBufferError.Code.notPermitted.rawValue))
+        for _ in 0..<6 { #expect(stage.process(input, pts: .invalid, carriesHDR10Plus: false) == nil) }
+        #expect(stage.disabled == nil && stage.stats.failures == 0)
+        stage.forcedCommandBufferError = nil
+        #expect(stage.process(input, pts: .invalid, carriesHDR10Plus: false) != nil)
+
+        stage.forcedCommandBufferError = NSError(domain: MTLCommandBufferErrorDomain,
+                                                 code: Int(MTLCommandBufferError.Code.timeout.rawValue))
+        for _ in 0..<FrameToneMapper.maxConsecutiveFailures {
+            #expect(stage.process(input, pts: .invalid, carriesHDR10Plus: false) == nil)
+        }
+        #expect(stage.disabled?.cause == .failures)
+    }
+
+    @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
+    private final class EventBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var events: [FrameToneMapper.Event] = []
+        func append(_ e: FrameToneMapper.Event) { lock.lock(); events.append(e); lock.unlock() }
+        func count(where match: (FrameToneMapper.Event) -> Bool) -> Int {
+            lock.lock(); defer { lock.unlock() }
+            return events.filter(match).count
+        }
+    }
 }
 
 /// 8-bit (420v) and 10-bit (x420) BT.709 video-range test frames. 10-bit samples sit in the high bits of 16.

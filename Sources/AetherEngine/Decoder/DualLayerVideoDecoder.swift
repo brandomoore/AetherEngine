@@ -520,6 +520,13 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// Frames dropped because an in-place composition failed after the GPU had started writing into the
     /// base-layer buffer. Guarded by `composeResultLock`.
     private var summaryInPlaceDropped: Int = 0
+    /// Set by the first in-place composition that failed after the GPU started writing. From then on
+    /// every frame takes the pool path, whose failure leaves the base layer intact and shows it. Without
+    /// this one GPU fault cost every later frame: tvOS stops running a process's GPU work after a couple
+    /// of faults, each later in-place command buffer failed too, and each frame was dropped while the
+    /// sound played on (AE#1055, an Apple TV 4K 2nd generation). Kept for the decoder's life, `flush()`
+    /// included: the GPU that faulted is the same one after a seek. Guarded by `composeResultLock`.
+    private var inPlaceOffAfterFault = false
     /// Frames sent out as the base layer, with its mapping-preserving RPU, because the compose queue was
     /// in stall mode (`acquireSlotOrStall`). Guarded by `composeResultLock`; reset by the 1 Hz summary.
     private var summaryBypassComposeStalled: Int = 0
@@ -696,9 +703,9 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// The time base the external base-layer route stamps its packets in; nil on the software host,
     /// where the base layer is decoded here. Guarded by `lock`.
     private var externalBaseLayerTimeBase: AVRational?
-    /// Whether the external-base-layer route composes into the buffers the host handed in. Off by default:
-    /// those buffers belong to the host's player, and no API contract says they may be written. Guarded by
-    /// `lock`.
+    /// Whether the external-base-layer route composes into the buffers the host handed in. Those buffers
+    /// belong to the host's player and no API contract says they may be written; the AVPlayer-output route
+    /// opens with it on all the same (see `openExternalBaseLayer`). Guarded by `lock`.
     private var externalBaseLayerComposesInPlace = false
 
     /// The software host always composes into its own decoder's buffers. The external-base-layer route does
@@ -719,8 +726,12 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// frames carry.
     ///
     /// `composeInPlace` writes the composition into the host's buffers instead of the output pool. It saves
-    /// the pool (129 to 195 MB measured for 4K) and is only safe when nothing else reads those buffers again, which
-    /// the host's player does not promise, so it is an opt-in for measurement and never the default.
+    /// the pool (129 to 195 MB measured for 4K) and is only safe when nothing else reads those buffers again,
+    /// which the host's player does not promise. The AVPlayer-output route turns it on by default since
+    /// `b34475dc`: on the Mac the video output vends x420 copies it converted from the decoder's own format,
+    /// and the in-place result is bit-identical to the pool's. Whether a tvOS or iOS player ever vends a
+    /// buffer it still reads is not measured (`docs/dolby-vision-fel.md` §5.2.4); `AETHER_FEL_OUTPUT_INPLACE=0`
+    /// turns it off for that comparison. The parameter itself defaults to off.
     func openExternalBaseLayer(
         codecpar: UnsafePointer<AVCodecParameters>, timeBase: AVRational, frameRate: Double?,
         composeInPlace: Bool = false,
@@ -1527,7 +1538,7 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         }
         // A measurement run (`AETHER_FEL_MEASURE`) composes the base layer a second and third time from
         // another queue, so the base buffer has to stay intact: those runs use the output pool.
-        let inPlace = FelResidualMeasure.stride == 0 && req.composesIntoBase
+        let inPlace = FelResidualMeasure.stride == 0 && req.composesIntoBase && !isInPlaceOffAfterFault()
             && composer.canComposeInPlace(baseBuffer: req.base, params: req.params)
         if !inPlace, !isInStallMode(), let concrete = composer as? DoviFelComposer {
             FelResidualMeasure.sampleIfDue(composer: concrete, base: req.base, enhancement: req.enhancement,
@@ -1577,7 +1588,8 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             // the GPU started writing drops the frame (the buffer holds half-composed pixels, so the
             // base-layer fallback below would show them). On the external-base-layer route the buffer is the
             // host player's, so this holds only as far as that player never hands it out again, which it
-            // does not promise; the route reaches this branch only when it was opened with `composeInPlace`.
+            // does not promise; the route reaches this branch when it was opened with `composeInPlace`, which
+            // the AVPlayer-output route does by default (see `openExternalBaseLayer`).
             composer.composeInPlaceAsyncWithAcquiredSlot(
                 baseBuffer: req.base,
                 enhancementBuffer: req.enhancement,
@@ -1596,6 +1608,7 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
                 case .baseCorrupted:
                     EngineLog.emit("[DualLayerVideoDecoder] compose failed after writing began (\(arrived)): pts=\(String(format: "%.3f", pts.seconds)); frame dropped", category: .swPlayback)
                     self?.recordInPlaceDrop()
+                    self?.turnInPlaceOffAfterFault()
                     delivery.skip(ticket: ticket, epoch: epoch)
                 }
                 self?.composeResultLock.lock(); self?.composeRequestsHandedOff += 1; self?.composeResultLock.unlock()
@@ -1622,6 +1635,21 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
     private func recordInPlaceDrop() {
         composeResultLock.lock(); summaryInPlaceDropped += 1; composeResultLock.unlock()
+    }
+
+    private func isInPlaceOffAfterFault() -> Bool {
+        composeResultLock.lock(); defer { composeResultLock.unlock() }
+        return inPlaceOffAfterFault
+    }
+
+    private func turnInPlaceOffAfterFault() {
+        composeResultLock.lock()
+        let first = !inPlaceOffAfterFault
+        inPlaceOffAfterFault = true
+        composeResultLock.unlock()
+        if first {
+            EngineLog.emit("[DualLayerVideoDecoder] in-place compose failed on the GPU; composing into the output pool from here on, so a failed frame shows its base layer instead of being dropped", category: .swPlayback)
+        }
     }
 
     private func recordComposeResult(success: Bool) {
@@ -2598,6 +2626,7 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     }
 
     var isComposeStalledForTesting: Bool { isInStallMode() }
+    var isInPlaceOffAfterFaultForTesting: Bool { isInPlaceOffAfterFault() }
 
     /// Compositions and bypasses handed to the compose queue and not yet handed to `orderedDelivery` (or
     /// dropped as retired): started minus handed off.

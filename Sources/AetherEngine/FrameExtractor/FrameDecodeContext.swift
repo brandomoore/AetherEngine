@@ -51,6 +51,12 @@ final class FrameDecodeContext: @unchecked Sendable {
     /// this the thumbnail draws square-pixel and looks stretched. Defaults 1:1.
     private var streamSAR = AVRational(num: 1, den: 1)
     private(set) var isOpen = false
+    /// Coded width times height of the open decoder, 0 while closed. A decoder's memory scales with
+    /// it: one VideoToolbox context on 4K HEVC 10-bit holds 100 to 160 MB of reference frames (AE#1059).
+    var openDecoderPixelArea: Int {
+        guard isOpen, let codecContext else { return 0 }
+        return max(0, Int(codecContext.pointee.width)) * max(0, Int(codecContext.pointee.height))
+    }
     /// AE#499: the container's colour declaration, captured at open. `isHDR` below is read off
     /// exactly this, so a frame whose VUI says nothing has to inherit it or the two disagree: the gate
     /// switches tone mapping on from the container while zscale reads the frame and finds no path to
@@ -73,7 +79,7 @@ final class FrameDecodeContext: @unchecked Sendable {
         ColorAttachments.isHDRTransfer(trc)
     }
 
-    /// True when the stream is Dolby Vision Profile 5 (HEVC) or Profile 10.0 (AV1) - the
+    /// True when the stream is Dolby Vision Profile 5 or 20 (HEVC) or Profile 10.0 (AV1), the
     /// no-base-layer profiles whose decoded planes are IPT-PQ-C2, not standard YCbCr. Read
     /// from the dvcC/dvvC configuration record (`AVDOVIDecoderConfigurationRecord`). Profiles
     /// 7 / 8.x carry HDR10/HLG base layers FFmpeg decodes correctly, so they are excluded.
@@ -86,7 +92,7 @@ final class FrameDecodeContext: @unchecked Sendable {
             let record = raw.withMemoryRebound(to: AVDOVIDecoderConfigurationRecord.self, capacity: 1) { $0.pointee }
             let profile = Int(record.dv_profile)
             let compat = Int(record.dv_bl_signal_compatibility_id)
-            if profile == 5 { return true }             // HEVC P5: IPT-PQ-c2, no base
+            if VideoRoutingPolicy.hevcDolbyVisionHasIPTBase(profile) { return true } // HEVC P5 / P20: IPT-PQ-c2
             if profile == 10 && compat == 0 { return true } // AV1 P10.0: no base
             return false
         }
@@ -326,56 +332,40 @@ final class FrameDecodeContext: @unchecked Sendable {
         codec: UnsafePointer<AVCodec>,
         useHardware: Bool
     ) throws -> UnsafeMutablePointer<AVCodecContext> {
-        guard let ctx = avcodec_alloc_context3(codec) else {
+        let hardwareDevice = useHardware ? hardwareDeviceContext : nil
+        do {
+            return try FFmpegDecoderContext.open(
+                codec: codec, codecpar: codecpar, maxPixels: FFmpegDecoderContext.maxVideoPixels,
+                // Belt-and-suspenders with the software get_format callback.
+                options: useHardware ? [:] : ["hwaccel": "none"]
+            ) { ctx in
+                if let hardwareDevice {
+                    ctx.pointee.hw_device_ctx = av_buffer_ref(hardwareDevice)
+                    ctx.pointee.get_format = { _, fmts in
+                        guard let fmts else { return AV_PIX_FMT_NONE }
+                        var fallback = AV_PIX_FMT_NONE
+                        var i = 0
+                        while fmts[i] != AV_PIX_FMT_NONE {
+                            if fmts[i] == AV_PIX_FMT_VIDEOTOOLBOX { return fmts[i] }
+                            if fallback == AV_PIX_FMT_NONE { fallback = fmts[i] }
+                            i += 1
+                        }
+                        return fallback
+                    }
+                } else {
+                    ctx.pointee.get_format = FFmpegDecoderContext.softwareOnlyGetFormat
+                }
+                ctx.pointee.thread_count = Int32(Self.stillExtractionThreadCount(
+                    activeProcessorCount: ProcessInfo.processInfo.activeProcessorCount))
+                ctx.pointee.thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE
+            }
+        } catch FFmpegDecoderContext.Failure.allocation {
             throw FrameDecodeError.allocationFailed
-        }
-        guard avcodec_parameters_to_context(ctx, codecpar) >= 0 else {
-            var doomed: UnsafeMutablePointer<AVCodecContext>? = ctx
-            avcodec_free_context(&doomed)
+        } catch FFmpegDecoderContext.Failure.parameters {
             throw FrameDecodeError.noCodecParameters
-        }
-
-        if useHardware, let hardwareDeviceContext {
-            ctx.pointee.hw_device_ctx = av_buffer_ref(hardwareDeviceContext)
-            ctx.pointee.get_format = { _, fmts in
-                guard let fmts else { return AV_PIX_FMT_NONE }
-                var fallback = AV_PIX_FMT_NONE
-                var i = 0
-                while fmts[i] != AV_PIX_FMT_NONE {
-                    if fmts[i] == AV_PIX_FMT_VIDEOTOOLBOX { return fmts[i] }
-                    if fallback == AV_PIX_FMT_NONE { fallback = fmts[i] }
-                    i += 1
-                }
-                return fallback
-            }
-        } else {
-            ctx.pointee.get_format = { _, fmts in
-                guard let fmts = fmts else { return AV_PIX_FMT_NONE }
-                var i = 0
-                while fmts[i] != AV_PIX_FMT_NONE {
-                    if fmts[i] != AV_PIX_FMT_VIDEOTOOLBOX { return fmts[i] }
-                    i += 1
-                }
-                return AV_PIX_FMT_YUV420P
-            }
-        }
-        ctx.pointee.thread_count = Int32(Self.stillExtractionThreadCount(
-            activeProcessorCount: ProcessInfo.processInfo.activeProcessorCount))
-        ctx.pointee.thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE
-
-        var opts: OpaquePointer?
-        if !useHardware {
-            // Belt-and-suspenders with the software get_format callback above.
-            av_dict_set(&opts, "hwaccel", "none", 0)
-        }
-        let openResult = avcodec_open2(ctx, codec, &opts)
-        av_dict_free(&opts)
-        guard openResult >= 0 else {
-            var doomed: UnsafeMutablePointer<AVCodecContext>? = ctx
-            avcodec_free_context(&doomed)
+        } catch {
             throw FrameDecodeError.decoderOpenFailed
         }
-        return ctx
     }
 
     private func disableHardwareDecode(_ reason: String) {

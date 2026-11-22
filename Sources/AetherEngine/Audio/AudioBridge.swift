@@ -173,12 +173,9 @@ final class AudioBridge: @unchecked Sendable {
     /// frame the decoder actually produced. The init seed is only a guess - dca/mlp leave sample_fmt
     /// unresolved at open unless avformat_find_stream_info pre-decoded a probe frame, and a bailed probe
     /// (live MPEG-TS) leaves it AV_SAMPLE_FMT_NONE -> the FLTP fallback. Reconfiguring from the frame keeps
-    /// every codec/container correct (no S32P-XLL-misread-as-FLTP noise). swrInLayout is owned: uninit it
-    /// before overwrite and in cleanup.
-    private var swrInFmt: AVSampleFormat = AV_SAMPLE_FMT_NONE
-    private var swrInRate: Int32 = 0
+    /// every codec/container correct (no S32P-XLL-misread-as-FLTP noise). Owns a layout copy: released in cleanup.
+    private var swrInput = ResamplerInputParameters()
     private var swrReconfigureFailures = 0
-    private var swrInLayout = AVChannelLayout()
     /// FIFO buffering resampled PCM until >= encoderCtx.frame_size samples. FLAC's wrapper has
     /// AV_CODEC_CAP_SMALL_LAST_FRAME but not VARIABLE_FRAME_SIZE, so non-final frames must hit frame_size exactly
     /// (~4608 @48kHz); EAC3 decodes 1536 samples/packet, so without the FIFO we'd hit -22 EINVAL on the first send.
@@ -209,7 +206,7 @@ final class AudioBridge: @unchecked Sendable {
     /// `AudioShapingGraph`, which ends in the encoder's own format: a fold or a lift resampled
     /// straight into S16/S32 would be clipped inside libswresample before the limiter ever saw it.
     private let shaping: AudioShaping
-    private var shapingGraph: AudioShapingGraph?
+    private var shapingStage: AudioShapingStage?
     private var swrOutFmt: AVSampleFormat = AV_SAMPLE_FMT_FLTP
     private var pcmBytesPerSample: Int32 = 4
     private var pcmBitsPerRawSample: Int32 = 32
@@ -325,7 +322,7 @@ final class AudioBridge: @unchecked Sendable {
         // probe -> garbled audio. The full path is correct; the only genuine failures are XLL frames that
         // residual-code channels without a usable core ("Residual encoded channels are present without core",
         // EINVAL -22), which feed() skips per-packet instead of failing the whole feed (#64).
-        let openRet = avcodec_open2(dec, srcCodec, nil)
+        let openRet = AudioDecoderOptions.open(dec, srcCodec)
         guard openRet >= 0 else {
             cleanup()
             throw AudioBridgeError.decoderOpenFailed(code: openRet)
@@ -476,21 +473,18 @@ final class AudioBridge: @unchecked Sendable {
         defer { av_channel_layout_uninit(&inLayout) }
 
         // Remember the input config so resampleAndPushIntoFIFO knows when a decoded frame diverges from it.
-        swrInFmt = inFmt
-        swrInRate = inRate
-        av_channel_layout_copy(&swrInLayout, &inLayout)
+        swrInput.adopt(layout: &inLayout, format: inFmt, rate: inRate)
 
         if self.shaping.isActive {
-            shapingGraph = AudioShapingGraph(shaping: self.shaping, sampleRate: sampleRate,
-                                             layout: &enc.pointee.ch_layout,
-                                             sourceHasCentre: AudioShapingMatrix.hasCentre(&inLayout),
-                                             outputFormat: pcmSampleFmt)
-            if shapingGraph == nil {
+            let stage = AudioShapingStage(shaping: self.shaping, outputFormat: pcmSampleFmt)
+            shapingStage = stage
+            if !stage.configure(sampleRate: sampleRate, outputLayout: &enc.pointee.ch_layout,
+                                sourceLayout: &inLayout, emit: nil) {
                 EngineLog.emit("[AudioBridge] AE#923 filter graph unavailable; the remix applies, the dynamics do not",
                                category: .session)
             }
         }
-        swrOutFmt = shapingGraph != nil ? AV_SAMPLE_FMT_FLT : pcmSampleFmt
+        swrOutFmt = shapingStage?.hasGraph == true ? AV_SAMPLE_FMT_FLT : pcmSampleFmt
         let swrRet = swr_alloc_set_opts2(
             &swrCtx,
             &enc.pointee.ch_layout,
@@ -506,10 +500,7 @@ final class AudioBridge: @unchecked Sendable {
             cleanup()
             throw AudioBridgeError.resamplerAllocFailed(code: swrRet)
         }
-        if self.shaping.isActive {
-            AudioShapingMatrix.apply(to: swrAllocated, input: &inLayout, output: &enc.pointee.ch_layout,
-                                     dialogueGain: self.shaping.dialogueGain, lfeMixLevel: self.shaping.lfeMixLevel)
-        }
+        shapingStage?.applyMatrix(to: swrAllocated, input: &inLayout, output: &enc.pointee.ch_layout)
         let initRet = initializeResampler(swrCtx, outputRate: sampleRate)
         guard initRet >= 0 else {
             cleanup()
@@ -742,7 +733,7 @@ final class AudioBridge: @unchecked Sendable {
         if let swr = swrCtx {
             _ = swr_init(swr)
         }
-        shapingGraph?.reset()
+        shapingStage?.reset()
         rebaseFromNextSourcePTS = true
     }
 
@@ -781,7 +772,7 @@ final class AudioBridge: @unchecked Sendable {
             }
         }
         // AE#923: the shaping graph holds back its latency; drain it, sample-aligned, into the FIFO.
-        shapingGraph?.drain { planes, count, _ in writeShaped(planes, count: count, fifo: fifoPtr) }
+        shapingStage?.drain { planes, count, _ in writeShaped(planes, count: count, fifo: fifoPtr) }
 
         // 2. Encode the FIFO remainder, including the final partial
         //    frame (requireFull: false pads/short-frames it).
@@ -881,7 +872,7 @@ final class AudioBridge: @unchecked Sendable {
             swr_free(&swrCtx)
         }
         // Releases the channel map allocated by av_channel_layout_copy; idempotent when already empty.
-        av_channel_layout_uninit(&swrInLayout)
+        swrInput.release()
         if encoderCodecpar != nil {
             avcodec_parameters_free(&encoderCodecpar)
         }
@@ -1080,10 +1071,7 @@ final class AudioBridge: @unchecked Sendable {
         let frameFmtRaw = sf.pointee.format
         let frameRate = sf.pointee.sample_rate
         guard frameFmtRaw >= 0, frameRate > 0, sf.pointee.ch_layout.nb_channels > 0 else { return true }
-        let matchesCurrent = frameFmtRaw == swrInFmt.rawValue
-            && frameRate == swrInRate
-            && av_channel_layout_compare(&swrInLayout, &sf.pointee.ch_layout) == 0
-        guard !matchesCurrent else { return true }
+        guard swrInput.differ(from: sf) else { return true }
 
         let frameFmt = AVSampleFormat(rawValue: frameFmtRaw)
         var scratch: OpaquePointer?
@@ -1098,9 +1086,8 @@ final class AudioBridge: @unchecked Sendable {
             0,
             nil
         )
-        if setRet >= 0, let scratchCtx = scratch, shaping.isActive {
-            AudioShapingMatrix.apply(to: scratchCtx, input: &sf.pointee.ch_layout, output: &enc.pointee.ch_layout,
-                                     dialogueGain: shaping.dialogueGain, lfeMixLevel: shaping.lfeMixLevel)
+        if setRet >= 0, let scratchCtx = scratch {
+            shapingStage?.applyMatrix(to: scratchCtx, input: &sf.pointee.ch_layout, output: &enc.pointee.ch_layout)
         }
         let initRet = setRet >= 0 && scratch != nil
             ? initializeResampler(scratch, outputRate: enc.pointee.sample_rate) : setRet
@@ -1120,10 +1107,16 @@ final class AudioBridge: @unchecked Sendable {
         swr_free(&swrCtx)
         swrCtx = scratch
 
-        av_channel_layout_uninit(&swrInLayout)
-        av_channel_layout_copy(&swrInLayout, &sf.pointee.ch_layout)
-        swrInFmt = frameFmt
-        swrInRate = frameRate
+        // AUD-203: the matrix above lifts a source's front centre and the graph lifts a stereo source
+        // without one, so the graph follows the layout the matrix now follows. Its tail goes into
+        // the FIFO first.
+        if let stage = shapingStage, stage.hasGraph, let fifoPtr = fifo {
+            stage.configure(sampleRate: enc.pointee.sample_rate, outputLayout: &enc.pointee.ch_layout,
+                            sourceLayout: &sf.pointee.ch_layout) { planes, count, _ in
+                self.writeShaped(planes, count: count, fifo: fifoPtr)
+            }
+        }
+        swrInput.adopt(layout: &sf.pointee.ch_layout, format: frameFmt, rate: frameRate)
 
         // .lossless pins the encoder + swr OUTPUT to the codecpar rate/layout at init (the muxer header is
         // already written from it, so it cannot change now). If the decoded frame differs, swr must resample
@@ -1178,11 +1171,11 @@ final class AudioBridge: @unchecked Sendable {
                 throw AudioBridgeError.resamplerDrainFailed(reason: "conversion returned \(produced)")
             }
             if produced == 0 { break }
-            if let shapingGraph {
+            if let shapingStage, shapingStage.hasGraph {
                 guard let data = frame.pointee.extended_data.pointee else {
                     throw AudioBridgeError.resamplerDrainFailed(reason: "missing shaping samples")
                 }
-                shapingGraph.process(
+                shapingStage.process(
                     UnsafeRawPointer(data).assumingMemoryBound(to: Float.self),
                     frames: Int(produced), pts: nil
                 ) { planes, count, _ in
@@ -1214,9 +1207,7 @@ final class AudioBridge: @unchecked Sendable {
         // Corrupt source audio (glitchy live MPEG-TS, mp2 with missing frame headers) can decode to a frame with
         // nb_samples > 0 but a NULL channel pointer in extended_data; swr_convert then derefs NULL and crashes
         // EXC_BAD_ACCESS at 0x0. Skip such frames (the video path tolerates the same corruption).
-        guard sf.pointee.nb_samples > 0,
-              let ext = sf.pointee.extended_data,
-              ext.pointee != nil else {
+        guard sf.pointee.nb_samples > 0, sf.pointee.extended_data != nil else {
             stats.framesDroppedBeforeFIFO += 1
             return
         }
@@ -1228,10 +1219,15 @@ final class AudioBridge: @unchecked Sendable {
             stats.framesDroppedBeforeFIFO += 1
             return
         }
+        // Every plane swr will read, now that the input side matches this frame (AUD-R201).
+        guard swrInput.framePlanesArePresent(sf) else {
+            stats.framesDroppedBeforeFIFO += 1
+            return
+        }
 
         if correctSourceTimeline, sf.pointee.pts != Self.avNoPTS {
             let ticks = av_rescale_q(sf.pointee.pts, srcTimeBase, encoderTimeBase)
-            let (timestamp, overflow) = ticks.multipliedReportingOverflow(by: Int64(swrInRate))
+            let (timestamp, overflow) = ticks.multipliedReportingOverflow(by: Int64(swrInput.rate))
             guard !overflow else { throw AudioBridgeError.resamplerTimestampOverflow }
             // swr_next_pts uses 1/(inputRate * outputRate), not the encoder's sample clock.
             _ = swr_next_pts(swr, timestamp)
@@ -1244,7 +1240,7 @@ final class AudioBridge: @unchecked Sendable {
         }
 
         let nChannels = enc.pointee.ch_layout.nb_channels
-        if shapingGraph != nil {
+        if shapingStage?.hasGraph == true {
             resampleShapedIntoFIFO(srcFrame: sf, swr: swr, outNbSamples: outNbSamples,
                                        channels: Int(nChannels), fifo: fifo)
             return
@@ -1321,7 +1317,7 @@ final class AudioBridge: @unchecked Sendable {
             return
         }
         // The bridge stamps from its own sample counter (`nextEncoderPTS`), so no pts rides along.
-        shapingGraph?.process(floats, frames: Int(produced), pts: nil) { planes, count, _ in
+        shapingStage?.process(floats, frames: Int(produced), pts: nil) { planes, count, _ in
             writeShaped(planes, count: count, fifo: fifo)
         }
     }

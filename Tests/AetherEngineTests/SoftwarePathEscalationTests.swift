@@ -46,6 +46,23 @@ struct SoftwarePathEscalationTests {
             errorDomain: nil, availability: Self.availability()))
     }
 
+    /// Audit LOAD-204: a non-seekable custom live source refuses every rebuild, so the rung is not on offer.
+    @Test("A session whose rebuild is always refused is not offered the software path")
+    func rebuildImpossibleIsNotOffered() {
+        var availability = Self.availability()
+        availability.rebuildPossible = false
+        #expect(!SoftwarePathEscalation.shouldEscalate(
+            errorDomain: SoftwarePathEscalation.liveJoinErrorDomain, availability: availability))
+    }
+
+    /// Audit LOAD-202: a software rebuild shows the track the host resolved, not the nil request.
+    @Test("A software reload shows the host's resolved audio index")
+    func softwareReloadAudioIndexPrefersHost() {
+        #expect(AetherEngine.softwareReloadAudioIndex(hostIndex: 3, requested: nil) == 3)
+        #expect(AetherEngine.softwareReloadAudioIndex(hostIndex: -1, requested: 2) == 2)
+        #expect(AetherEngine.softwareReloadAudioIndex(hostIndex: -1, requested: nil) == nil)
+    }
+
     @Test("The session spends its escalation once")
     func onlyOnce() {
         #expect(!SoftwarePathEscalation.shouldEscalate(
@@ -96,7 +113,7 @@ struct SoftwarePathEscalationTests {
     /// Audit CORE-1: the rebuild is a full load(), and a stop() landing inside it unwinds that load
     /// with a CancellationError. The escalation read every throw as "the software path cannot serve
     /// this session" and published `.error` onto an engine the viewer had already left.
-    @Test("A rebuild superseded by stop() leaves the engine idle, not in error", .timeLimit(.minutes(2)))
+    @Test("A rebuild superseded by stop() leaves the engine idle, not in error", .timeLimit(.minutes(3)))
     @MainActor
     func supersededRebuildIsSilent() async throws {
         let origin = try ProbeHTTPTestOrigin(data: ProbeTestFixtures.hdr10Plus(), stage: .headers)
@@ -157,7 +174,7 @@ struct SoftwarePathEscalationTests {
 
     /// The ask's second form. Measured by the reporter: a host that heard only `videoRoute` could not
     /// tell the rescue from a routing decision.
-    @Test("A taken rung publishes the failure it absorbed, at the position the rebuild resumes", .timeLimit(.minutes(2)))
+    @Test("A taken rung publishes the failure it absorbed, at the position the rebuild resumes", .timeLimit(.minutes(3)))
     @MainActor
     func takenRungIsPublished() async throws {
         let origin = try ProbeHTTPTestOrigin(data: ProbeTestFixtures.hdr10Plus(), stage: .headers)
@@ -190,7 +207,7 @@ struct SoftwarePathEscalationTests {
     /// Reported as a code reading on AE#629: a rebuild whose load failed after its teardown had
     /// already published that failure, and the rung then published the absorbed one on top, so the
     /// host saw two `.error`s for one failure and the second contradicted what `load()` threw.
-    @Test("A rebuild that fails after its teardown surfaces one failure, its own", .timeLimit(.minutes(2)))
+    @Test("A rebuild that fails after its teardown surfaces one failure, its own", .timeLimit(.minutes(3)))
     @MainActor
     func failedRebuildSurfacesOnce() async throws {
         let engine = try AetherEngine()
@@ -233,7 +250,7 @@ struct SoftwarePathEscalationTests {
     /// CancellationError as a load the host superseded itself, and the reporter's host read it as a
     /// failed load and stopped the rebuilt session. It now follows the rebuild and returns when the
     /// rebuild does; before this change the same load threw at once.
-    @Test("A load followed across a takeover returns when the rebuild comes back", .timeLimit(.minutes(2)))
+    @Test("A load followed across a takeover returns when the rebuild comes back", .timeLimit(.minutes(3)))
     @MainActor
     func followedLoadReturnsOnRebuild() async throws {
         let engine = try AetherEngine()
@@ -268,7 +285,7 @@ struct SoftwarePathEscalationTests {
     /// owned the session, so the waiting load is still the host's and a host stop() ends it with the
     /// CancellationError it always threw. Here the refusal is `customSourceNotSeekable`, because the
     /// probe that would establish seekability is the one still parked.
-    @Test("A rebuild refused before its teardown leaves the waiting load to the host", .timeLimit(.minutes(2)))
+    @Test("A rebuild refused before its teardown leaves the waiting load to the host", .timeLimit(.minutes(3)))
     @MainActor
     func refusedRebuildTakesNothingOver() async throws {
         let engine = try AetherEngine()

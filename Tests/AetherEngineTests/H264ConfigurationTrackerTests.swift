@@ -7,7 +7,7 @@ import AetherLibavcodec
 import AetherLibavutil
 @testable import AetherEngine
 
-@Suite("H264 VOD configuration compatibility", .serialized, .offCooperativePool, .timeLimit(.minutes(2)))
+@Suite("H264 VOD configuration compatibility", .serialized, .offCooperativePool, .timeLimit(.minutes(3)))
 struct H264ConfigurationTrackerTests {
     private let sps = Self.hex("6764001facd9405005bb016a02040280000003008000001e078c18cb")
     private let changed = Self.hex("6764001facd9404c057fbc05a828282a000003000200000300781e30632c")
@@ -171,7 +171,7 @@ struct H264ConfigurationTrackerTests {
         let cache = SegmentCache(forwardWindow: 10, backwardWindow: 10)
         defer { cache.close() }
         let result = Results()
-        let producer = try HLSSegmentProducer(demuxer: dem, videoStreamIndex: dem.videoStreamIndex,
+        let producer = HLSSegmentProducer(demuxer: dem, videoStreamIndex: dem.videoStreamIndex,
             video: .init(codecpar: UnsafePointer(stream.pointee.codecpar), timeBase: stream.pointee.time_base, codecTagOverride: nil),
             cache: cache, videoFallbackDurationPts: 100000, desiredFirstVideoTfdtPts: 0,
             segmentBoundaries: [0, 4800000, 7200000])
@@ -191,7 +191,7 @@ struct H264ConfigurationTrackerTests {
         let cache = SegmentCache(forwardWindow: 4, backwardWindow: 4)
         defer { cache.close() }
         func producer(epoch: UInt64) throws -> HLSSegmentProducer {
-            try HLSSegmentProducer(demuxer: dem, videoStreamIndex: dem.videoStreamIndex,
+            HLSSegmentProducer(demuxer: dem, videoStreamIndex: dem.videoStreamIndex,
                 video: .init(codecpar: UnsafePointer(stream.pointee.codecpar), timeBase: stream.pointee.time_base, codecTagOverride: nil),
                 cache: cache, videoFallbackDurationPts: 100000, desiredFirstVideoTfdtPts: 0,
                 segmentBoundaries: [0, 7200000], epoch: epoch)

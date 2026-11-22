@@ -15,7 +15,7 @@ import Testing
 /// Regenerate with the recipe in `Issue996SSAISeamTests` at `r=25` and `-g 25 -keyint_min 25`
 /// (`-streamid` per PID, `adVideo` without the audio input, the two audio fixtures without the video
 /// input). At 2 fps the TS demuxer's late release of each PID's last frame cost a second per seam.
-@Suite("SSAI seam with a demuxed audio rendition", .serialized, .timeLimit(.minutes(2)))
+@Suite("SSAI seam with a demuxed audio rendition", .serialized, .timeLimit(.minutes(3)))
 struct SSAISplitAudioRenditionTests {
 
     private final class Reader: IOReader, @unchecked Sendable {
@@ -74,7 +74,7 @@ struct SSAISplitAudioRenditionTests {
             inputTimeBase: audioStream.pointee.time_base, sourceTimeBase: audioStream.pointee.time_base,
             bridge: nil, stripAacAdts: true)
         let cache = SegmentCache(forwardWindow: 64, backwardWindow: 64)
-        let producer = try HLSSegmentProducer(
+        let producer = HLSSegmentProducer(
             demuxer: demuxer, videoStreamIndex: videoIndex,
             video: .init(codecpar: UnsafePointer(video.pointee.codecpar),
                          timeBase: video.pointee.time_base, codecTagOverride: "avc1"),

@@ -348,8 +348,9 @@ public struct DisplayCapabilities: Sendable, Equatable {
 /// interlaced H.264, which routes software because AVPlayer does not deinterlace, #107 /
 /// `VideoRoutingPolicy`).
 public enum DeinterlaceMode: String, Sendable, Equatable {
-    /// yadif_videotoolbox (Metal compute over VideoToolbox frames) when the linked FFmpeg build
-    /// ships it AND a Metal device exists at runtime; otherwise falls back to software bwdif.
+    /// A Metal deinterlacer over VideoToolbox frames when the linked FFmpeg build ships one AND a
+    /// Metal device exists at runtime: bwdif_videotoolbox, the software path's algorithm on the
+    /// GPU (AE#1102), else yadif_videotoolbox. Otherwise falls back to software bwdif.
     /// The hardware path also skips the sws_scale copy: the filter sink emits IOSurface-backed
     /// CVPixelBuffers that go straight to the renderer.
     case auto
@@ -368,6 +369,25 @@ public enum DeinterlaceFieldRate: String, Sendable, Equatable {
     case frame
 }
 
+/// Inverse telecine on the software-decode path (#853): film that was put on NTSC video with 3:2
+/// pulldown baked into the pictures (hard telecine, the usual NTSC DVD of a film-shot series) has
+/// its fields matched back into the original film frames, the repeated frame of each five dropped,
+/// and the display asked for 23.976 Hz, instead of being deinterlaced. Residual combed frames
+/// (titles and credits made at video rate) still go through the deinterlacer `DeinterlaceMode`
+/// picks.
+public enum InverseTelecineMode: String, Sendable, Equatable {
+    /// A load-time sample decides (VOD, SD NTSC-rate interlaced MPEG-2 only). A sample that is not
+    /// clearly film keeps the deinterlacer, so true interlaced video plays as before.
+    case auto
+    /// Never: interlaced sources are deinterlaced, as before #853.
+    case off
+    /// Always, without the sample, on any interlaced NTSC-rate (29.97 / 30 fps) source of a codec
+    /// that has no native route (MPEG-2, VC-1, MPEG-4 Part 2, not H.264 / HEVC / AV1), so the
+    /// display rate it asks for always meets the graph. On true interlaced video it drops one frame
+    /// in five.
+    case force
+}
+
 /// Live-join latency profile for loopback live sessions (`LoadOptions.liveJoinProfile`, AetherEngine#195).
 public enum LiveJoinProfile: Sendable, Equatable {
     /// The pre-default behavior: ~4s segment cut target, served TARGETDURATION >= 6, live-edge holdback
@@ -375,11 +395,10 @@ public enum LiveJoinProfile: Sendable, Equatable {
     /// waits for the full advertised holdback.
     case standard
     /// The default. Channel-zapping profile: cut live segments at every keyframe past 0.5s, so TARGETDURATION and
-    /// holdback collapse to the source keyframe cadence. The first playlist prefers the full holdback,
-    /// but after two finalized segments a strict-realtime source gets one observed-segment grace,
-    /// clamped to 0.5...2.0s, before a shallow first window is served. The grace ends early once the
-    /// source reads at 1x and the open segment cannot reach its keyframe within it (AE#936). That
-    /// bounded start can produce one early -16832 warning or a short rebuffer.
+    /// holdback collapse to the source keyframe cadence. The first playlist is served as soon as the
+    /// window holds the full holdback or two finalized segments, whichever comes first
+    /// (`LoadOptions.liveStartupGraceSeconds` can add a wait). That bounded start can produce one early
+    /// -16832 warning or a short rebuffer.
     case fastZap
 }
 
@@ -446,6 +465,16 @@ public enum DolbyVisionHandling: String, Sendable, Equatable, CaseIterable {
     case baseLayerOnly
 }
 
+/// What an untagged video stream is shown as. See `LoadOptions.untaggedVideoColor` (AE#1103).
+public enum UntaggedVideoColor: Sendable, Equatable {
+    /// The engine's own reading. An untagged stream is SDR and is presented as BT.709 (AE#654).
+    case standard
+    /// HDR10, which is BT.2020 primaries, PQ transfer (SMPTE ST 2084) and the BT.2020 non-constant-luminance matrix.
+    case hdr10
+    /// HLG, which is BT.2020 primaries, HLG transfer (ARIB STD-B67) and the BT.2020 non-constant-luminance matrix.
+    case hlg
+}
+
 public struct LoadOptions: Sendable, Equatable {
     /// Diagnostic identity only; retained with the source across internal reloads.
     public var sourceDiagnosticsContext: SourceNetworkDiagnostics.Context? = nil
@@ -497,6 +526,28 @@ public struct LoadOptions: Sendable, Equatable {
     /// which is served as the Profile 8.1 it is converted to. Reported by DrHurt against a Samsung HDR10 panel.
     public var forceDolbyVisionOnNonDVDisplay: Bool
 
+    /// Sodalite#245, default OFF. Lets a source's own HDR10+ (ST 2094-40) outrank the
+    /// `forceDolbyVisionOnNonDVDisplay` route.
+    ///
+    /// The forced route packages the Dolby Vision as Profile 5, so AVPlayer composes the RPU and the panel
+    /// receives HDR10 with the dynamic mapping already in the pixels. A Profile 8.1 remux very often carries
+    /// HDR10+ in its HDR10 base layer as well, and an HDR10+ panel would rather have that: on the native
+    /// Profile 8.1 route the base layer reaches the panel with its HDR10+ metadata intact. With this on, a
+    /// load that would take the forced route reads the head of the video stream first (the packets
+    /// `avformat_find_stream_info` already queued, plus a few more within a small budget), and a source
+    /// that carries HDR10+ keeps the native route. A source without it still takes the forced route.
+    ///
+    /// Whether the panel takes HDR10+ is not observable on tvOS (`AVPlayer.HDRMode` has no HDR10+ value), so
+    /// the claim is the host's, the same way `panelPresentsDolbyVision` is. On a panel that only takes
+    /// static HDR10 this costs the RPU composition for exactly the sources that carry HDR10+.
+    ///
+    /// Read only where `forceDolbyVisionOnNonDVDisplay` would apply: a display without Dolby Vision, HEVC
+    /// Profile 8.1 or Profile 7, `dolbyVisionHandling == .automatic`, on the native route. The head scan runs
+    /// on a seekable VOD source only; a live load keeps the forced route. A rebuild of the running session
+    /// also counts HDR10+ the segment producer has seen since, so turning this on mid-session through
+    /// `reloadAtCurrentPosition(applying:)` takes effect.
+    public var preferHDR10PlusOverForcedDolbyVision: Bool
+
     /// A `DolbyVisionHandling`. Default `.automatic`. `.baseLayerOnly` presents the HDR10 / HLG base layer
     /// of a Dolby Vision source and leaves the Dolby Vision out of the container, on every display: the
     /// route a host offers as "Dolby Vision: off (HDR10)".
@@ -516,6 +567,25 @@ public struct LoadOptions: Sendable, Equatable {
     /// layer alone in any case, so there it only lifts the Profile 5 refusal (#176) for a record the VUI
     /// contradicts.
     public var dolbyVisionHandling: DolbyVisionHandling
+
+    /// What to show a video stream as when it carries no colour description at all (AE#1103). Some
+    /// IPTV and re-encoded files are HDR10 with every tag stripped (no VUI colour, no HDR SEI, no
+    /// container colour). The engine cannot tell such a stream from SDR and plays it as BT.709 (AE#654),
+    /// so the picture looks pale. A host that knows better (its own frame check, a per-title switch)
+    /// sets `.hdr10` or `.hlg` here.
+    ///
+    /// It applies only when the stream is at least 10 bit, declares none of primaries, transfer and
+    /// matrix (neither in the bitstream nor in the container) and is not Dolby Vision. A stream that
+    /// declares anything keeps what it declares, so the option is safe to set for a whole library.
+    /// The range stays as declared and is limited where the stream says nothing. When it applies, the
+    /// whole session follows, which means the route, the display criteria, the `colr` box of the
+    /// native stream, the software path's frame tags and `probe(url:options:)`. The log says when it
+    /// was used.
+    ///
+    /// A tuning field, correctable on the playing session through `reloadAtCurrentPosition(applying:)`
+    /// on a URL source. A custom `IOReader` source refuses the change with
+    /// `SessionReloadRefusal.untaggedVideoColorNeedsFreshLoad`. Default `.standard`.
+    public var untaggedVideoColor: UntaggedVideoColor = .standard
 
     /// Opt in to full dual-layer Dolby Vision decoding of Profile 7 FEL streams, composed on the GPU, instead of
     /// the native route (the single-layer Profile 8.1 conversion, or the HDR10 base layer). When true, `dolbyVisionHandling` is `.automatic`, the stream's
@@ -605,6 +675,34 @@ public struct LoadOptions: Sendable, Equatable {
     /// Ignored while `upscalesLowResolutionVideo` is off. A tuning field like it.
     public var upscaleScaler: UpscaleScaler = .automatic
 
+    /// Opt in to picture processing for HDR10 titles brighter than the display (#957). nil (the default)
+    /// is off.
+    ///
+    /// What it costs: a processed title plays on `SoftwarePlaybackHost`, not AVPlayer. There it has no
+    /// AVPlayer Picture in Picture (the host presents `softwarePiPSource` instead), less over AirPlay (the
+    /// sound goes to the receiver, the picture stays on this device), and an E-AC-3 Atmos (JOC) track
+    /// plays as its channel bed, without the objects, because on tvOS only AVPlayer emits them.
+    ///
+    /// What it does: every decoded frame runs a BT.2390 tone map in the PQ domain, from the source peak
+    /// (MaxCLL when it is below the mastering peak, else the mastering peak) to
+    /// `VideoProcessingOptions.targetPeakNits`, and the frame goes out with HDR10 metadata that says the
+    /// target, so the display does not tone map it again. Needs tvOS / iOS / macOS 26. These keep their
+    /// usual route: Dolby Vision, a source that is not HDR10 (SDR, HLG), a display that does not take
+    /// HDR10, a source whose container declares no mastering display and no MaxCLL, a source peak at or
+    /// below the target, a wireless AirPlay route and a demuxed-audio live stream. The load logs one
+    /// `[VideoProcessing]` line saying which.
+    ///
+    /// The processing never stops playback: a frame it cannot process is delivered as decoded, and
+    /// repeated failures, a sustained overrun of the frame budget or HDR10+ metadata in the stream switch
+    /// it off for the session (`AetherEngine.activeVideoProcessing`). A session it alone moved to the
+    /// software path then reloads on the native path (URL sources, not live).
+    ///
+    /// A tuning field: `reloadAtCurrentPosition(applying:)` carries a change on a URL source, which
+    /// re-runs `load()` and re-decides the route. On a custom `IOReader` source turning it off is honoured
+    /// in place, and turning it on or changing the target is refused with
+    /// `SessionReloadRefusal.videoProcessingRouteNeedsFreshLoad`.
+    public var videoProcessing: VideoProcessingOptions? = nil
+
     /// Mirror of `AVDisplayManager.isDisplayCriteriaMatchingEnabled`. Default `true`. When `false`, engine routes HDR sources through the media playlist (auto-tonemap path) because AVKit cannot switch the panel.
     public var matchContentEnabled: Bool
 
@@ -688,6 +786,13 @@ public struct LoadOptions: Sendable, Equatable {
     /// (`AetherEngine.OptionalComponent`).
     public var objectAudioRendering: ObjectAudioRendering
 
+    /// Whether `objectAudioRendering` applies to DTS:X. `true` (default) renders TrueHD Atmos and DTS:X
+    /// alike. `false` keeps every DTS track of this load on `audioBridgeMode`'s 7.1 channel decode while
+    /// TrueHD Atmos still renders into the asked layout, so one load covers a file that carries both, and
+    /// a switch between them needs no reload (AE#1060). Also stops the initial track pick from preferring
+    /// a DTS:X track for its heights.
+    public var rendersDTSXObjectAudio: Bool = true
+
     /// How a 3D source is presented where the system shows stereo (visionOS; elsewhere every source plays
     /// 2D as before). `.automatic` (default) keeps an MV-HEVC stream's second view and presents the frame
     /// packing a container declares; `.sideBySide` / `.overUnder` say what the file's name alone says (a
@@ -731,10 +836,9 @@ public struct LoadOptions: Sendable, Equatable {
     /// cadence, TARGETDURATION follows the real GOP length with 1.5x headroom over the longest GOP seen
     /// before the seal (a broadcast's GOPs are irregular and each segment is one whole GOP, AE#670), and
     /// the holdback shrinks with it: 1 s GOPs serve TARGETDURATION 2, a 6 s holdback. The first serve
-    /// still prefers the full holdback, but after two finalized segments a strict-realtime source gets
-    /// one observed-segment grace clamped to 0.5...2.0s, then may serve a shallow first window, and the
-    /// grace ends early when the next keyframe cannot arrive inside it (AE#936). This bounds black-screen
-    /// startup but may produce one early `-16832` or a short rebuffer. A smaller TARGETDURATION also
+    /// goes out once the window holds that holdback or two finalized segments, whichever comes first,
+    /// so a shallow first window is normal. This bounds black-screen startup but may produce one early
+    /// `-16832` or a short rebuffer. A smaller TARGETDURATION also
     /// tightens AVPlayer's unchanged-playlist patience and live-edge buffer, so an origin that stalls or
     /// bursts mid-stream is likelier to rebuffer. `.standard` cuts ~4s segments, so the served
     /// TARGETDURATION lands at >= 6 and the first manifest waits for the full `3 x TARGETDURATION`
@@ -747,10 +851,12 @@ public struct LoadOptions: Sendable, Equatable {
     /// live, sequential-only sources and disposable frame probes retain their own policies.
     public var sourceOpenPolicy: SourceOpenPolicy = .init()
 
-    /// Extra wait after an eligible finalized window for `.fastZap` loopback live joins.
-    /// Nil uses the observed segment duration clamped to 0.5...2 seconds. Zero serves immediately
-    /// once the minimum media exists. Invalid or negative values use the automatic policy.
-    /// A shorter grace can increase early rebuffering on irregular sources. This does not change
+    /// Extra wait after an eligible finalized window for `.fastZap` loopback live joins, in the hope of
+    /// a deeper first window. Nil (default), zero, invalid or negative values serve as soon as the
+    /// minimum media exists. A positive value waits up to that long and ends early once the next
+    /// keyframe cannot arrive inside it (AE#936). Before 7.71 nil meant one observed segment duration
+    /// clamped to 0.5...2 s; measured, that cost every raw MPEG-TS start 1 to 2 s and prevented no
+    /// rebuffer, only a harmless `-16832` warning on a strict-realtime origin. This does not change
     /// TARGETDURATION, HOLD-BACK, or `.standard` joins. The minimum is two segments unless
     /// `liveStartupSingleSegmentMinimumSeconds` explicitly permits a sufficiently long first one.
     public var liveStartupGraceSeconds: Double? = nil
@@ -788,7 +894,7 @@ public struct LoadOptions: Sendable, Equatable {
     public var liveEdgeCushionSeconds: Double? = nil
 
     /// Cut AVPlayer's stall-avoidance wait short at the live join, once it is holding on media it has
-    /// already buffered. Live sessions on the AVPlayer-backed paths only. Default `false` (AE#440).
+    /// already buffered. Live sessions on the AVPlayer-backed paths only. Default `true` (AE#440).
     ///
     /// A live join can present its first frame and then hold it still. AVPlayer decides for itself how
     /// much cushion it wants before letting the rate roll (`AVPlayerWaitingToMinimizeStallsReason`), and
@@ -819,6 +925,26 @@ public struct LoadOptions: Sendable, Equatable {
     /// arms, the guards keeping the lever out of the starved case as designed. Set `false` to keep
     /// AVPlayer's own policy for the join.
     public var liveJoinStartsImmediately: Bool = true
+
+    /// Join a live HLS ingest at the oldest segment its playlist lists instead of near the live edge.
+    /// Default `false` (AE#1090).
+    ///
+    /// For "start from the beginning" on a recording that is still running: a DVR's playlist for an
+    /// in-progress recording (Plex's `offset=0`, for one) lists every segment since the recording
+    /// began and keeps growing. The session then plays as if it had been tuned in when the recording
+    /// started: the first serve waits for the same few seconds an edge join does, the rest of the
+    /// backlog is fetched at 1x as it is needed, and the rewind window grows from the start of the
+    /// recording. It stays that far behind live for the whole session, since nothing past the playhead
+    /// plus the join's few seconds has been fetched yet. A host that offers "jump to live" reloads
+    /// without the flag.
+    ///
+    /// Applies to the live ingest path only: an `HLSLiveIngestReader` loaded as `.custom`, or a live
+    /// HLS URL the engine routes onto its own ingest. `nativeRemoteHLS` keeps AVPlayer's edge join. An
+    /// in-engine reopen after an ingest failure resumes at the first segment not yet delivered rather
+    /// than at the edge. On a playlist that slides, the session runs about one window behind live, and
+    /// should the window slide past what it still needs, it rejoins at the live edge with a
+    /// discontinuity. Ignored for VOD.
+    public var liveJoinsAtPlaylistStart: Bool = false
 
     /// Whether `play()` may move a behind-live playhead by itself. Default `true`, which is the historical
     /// behaviour (AE#444).
@@ -1071,6 +1197,32 @@ public struct LoadOptions: Sendable, Equatable {
     /// Compressed-packet storage for seekable software VOD; automatic retains platform defaults.
     public var softwarePacketCacheStorage: SoftwarePacketCacheStorage = .automatic
 
+    /// Keep this session's segment cache after `stop()` and reuse it when the same source loads again
+    /// (AE#1095). Built for the viewer who leaves to a detail page and presses Resume: the reopen
+    /// serves what the last session already fetched from disk and fetches only what is missing.
+    ///
+    /// One stopped session is kept per process, as long as the process lives, in the same disk budget
+    /// it had while playing. It is reused only when the next `load()` names the exact same URL with
+    /// options that are equal apart from `sourceDiagnosticsContext`, the engine derives the same
+    /// output (display, audio stream, Dolby Vision handling) and the source yields the same segment
+    /// plan. Any other load deletes it, so does the end of the process, and so does a crash or kill
+    /// after the next session's stale sweep (one hour). `AetherEngine.discardRetainedSessionCache()`
+    /// deletes it on demand.
+    ///
+    /// Only the host's own `stop()` keeps a session: an internal reload, a reroute, an audio switch,
+    /// a failed session and the next `load()` while playing all delete the cache as before. Native
+    /// loopback VOD over a URL only; ignored for live, custom IO, `sequentialOrigin`,
+    /// `nativeRemoteHLS` and the software path. Default false, which changes nothing.
+    public var retainsSessionCacheAfterStop: Bool = false
+
+    /// The options a parked session is matched on: everything but the diagnostics label, which every
+    /// load carries a fresh one of.
+    var normalizedForSessionParking: LoadOptions {
+        var copy = self
+        copy.sourceDiagnosticsContext = nil
+        return copy
+    }
+
     /// Serve each VOD loopback segment while it is being written instead of after its cut. The
     /// muxer flushes a fragment about every half second and the loopback server sends each one as
     /// it lands, so AVPlayer can show and start on the first fragments of a segment rather than
@@ -1115,6 +1267,15 @@ public struct LoadOptions: Sendable, Equatable {
     /// it is carried. Change it mid-session with `AetherEngine.setAudioShaping(_:)`.
     public var audioShaping: AudioShaping = AudioShaping()
 
+    /// Sodalite#242: a loudness correction for an `audioOnly` session, in dB (clamped to
+    /// `NormalizationGainReport.gainRange`); nil (default) is none. Meant for a track's ReplayGain or
+    /// a server's measured normalization gain. Unlike `volume` it can lift: the engine applies it
+    /// with a -1 dBFS limiter behind it, inside the AVPlayer item through an audio tap on the native
+    /// audio host and in the decoder on the FFmpeg one, so the track stays on its host.
+    /// `AetherEngine.normalizationGainReport` says what was applied. Video sessions ignore it.
+    /// Change it mid-track with `AetherEngine.setNormalizationGain(_:)`.
+    public var normalizationGainDB: Double? = nil
+
     /// Teletext caption page for `dvb_teletext` subtitle decode. nil (default) = libzvbi auto-detect
     /// (`txt_page=subtitle`); an explicit page (e.g. 801 for AU) targets channels whose caption page
     /// libzvbi does not flag as a subtitle page. Only affects teletext streams (#107).
@@ -1129,6 +1290,12 @@ public struct LoadOptions: Sendable, Equatable {
     /// (50/60 fps), `.frame` keeps frame rate. Ignored by the software fallback (always frame
     /// rate). See `DeinterlaceFieldRate`.
     public var deinterlaceFieldRate: DeinterlaceFieldRate = .field
+
+    /// Inverse telecine for hard-telecined film on the software path (#853): `.auto` (default)
+    /// decides from a load-time sample, `.off` always deinterlaces, `.force` always matches fields.
+    /// While it runs the output is 23.976 fps whatever `deinterlaceFieldRate` says. See
+    /// `InverseTelecineMode`.
+    public var inverseTelecine: InverseTelecineMode = .auto
 
     /// AE#461: which decode path this session runs on when the host needs to overrule the engine's
     /// own routing. `.automatic` (default) leaves the routing alone. `.software` serves the source
@@ -1193,6 +1360,12 @@ public struct LoadOptions: Sendable, Equatable {
     /// so every rebuild of a rerouted session keeps the declaration.
     var hlsPlaylistProvenByBody: Bool = false
 
+    /// ENGINE-INTERNAL: the inverse telecine decision (#853) of the session a session-preserving reload
+    /// (`reloadAtCurrentPosition`) rebuilds. Not settable from the public initializer. When present the
+    /// load takes it instead of sampling again, so a rebuild never pays the sample twice and never moves
+    /// the display rate the first load chose. Consumed by the load; never persisted.
+    var inverseTelecineCarryover: Bool? = nil
+
     public init(
         omitCriteriaColorExtensions: Bool = false,
         suppressDisplayCriteria: Bool = false,
@@ -1200,18 +1373,22 @@ public struct LoadOptions: Sendable, Equatable {
         httpHeaders: [String: String] = [:],
         keepDvh1TagWithoutDV: Bool = false,
         forceDolbyVisionOnNonDVDisplay: Bool = false,
+        preferHDR10PlusOverForcedDolbyVision: Bool = false,
         dolbyVisionHandling: DolbyVisionHandling = .automatic,
+        untaggedVideoColor: UntaggedVideoColor = .standard,
         preferDualLayerDolbyVision: Bool = false,
         dualLayerRoute: DualLayerRoute = .softwareHost,
         foldsDolbyVisionFEL: Bool = true,
         upscalesLowResolutionVideo: Bool = false,
         upscaleScaler: UpscaleScaler = .automatic,
+        videoProcessing: VideoProcessingOptions? = nil,
         matchContentEnabled: Bool = true,
         panelIsInHDRMode: Bool = false,
         attemptsHDRMasterOnUnprovenPanel: Bool = true,
         panelPresentsDolbyVision: Bool = false,
         audioBridgeMode: AudioBridgeMode = .surroundCompat,
         objectAudioRendering: ObjectAudioRendering = .off,
+        rendersDTSXObjectAudio: Bool = true,
         stereoPresentation: StereoPresentation = .automatic,
         isLive: Bool = false,
         audioOnly: Bool = false,
@@ -1223,6 +1400,7 @@ public struct LoadOptions: Sendable, Equatable {
         liveStartupSingleSegmentMinimumSeconds: Double? = nil,
         liveEdgeCushionSeconds: Double? = nil,
         liveJoinStartsImmediately: Bool = true,
+        liveJoinsAtPlaylistStart: Bool = false,
         clampsLiveResumeToWindow: Bool = true,
         nativeRemoteHLS: Bool = false,
         nativeRemoteHLSIngestFallback: Bool = true,
@@ -1250,13 +1428,16 @@ public struct LoadOptions: Sendable, Equatable {
         sessionCacheHardLimitBytes: Int? = nil,
         sessionCacheFreeReserveBytes: Int = 0,
         softwarePacketCacheStorage: SoftwarePacketCacheStorage = .automatic,
+        retainsSessionCacheAfterStop: Bool = false,
         progressiveSegmentDelivery: Bool = false,
         autoplay: Bool = true,
         teletextPage: Int? = nil,
         audioDelaySeconds: Double = 0,
         audioShaping: AudioShaping = AudioShaping(),
+        normalizationGainDB: Double? = nil,
         deinterlaceMode: DeinterlaceMode = .auto,
         deinterlaceFieldRate: DeinterlaceFieldRate = .field,
+        inverseTelecine: InverseTelecineMode = .auto,
         preferredDecodePath: DecodePath = .automatic,
         escalatesToSoftwarePath: Bool = true,
         sharedOutputRole: SharedOutputRole = .primary,
@@ -1270,18 +1451,22 @@ public struct LoadOptions: Sendable, Equatable {
         self.httpHeaders = httpHeaders
         self.keepDvh1TagWithoutDV = keepDvh1TagWithoutDV
         self.forceDolbyVisionOnNonDVDisplay = forceDolbyVisionOnNonDVDisplay
+        self.preferHDR10PlusOverForcedDolbyVision = preferHDR10PlusOverForcedDolbyVision
         self.dolbyVisionHandling = dolbyVisionHandling
+        self.untaggedVideoColor = untaggedVideoColor
         self.preferDualLayerDolbyVision = preferDualLayerDolbyVision
         self.dualLayerRoute = dualLayerRoute
         self.foldsDolbyVisionFEL = foldsDolbyVisionFEL
         self.upscalesLowResolutionVideo = upscalesLowResolutionVideo
         self.upscaleScaler = upscaleScaler
+        self.videoProcessing = videoProcessing
         self.matchContentEnabled = matchContentEnabled
         self.panelIsInHDRMode = panelIsInHDRMode
         self.attemptsHDRMasterOnUnprovenPanel = attemptsHDRMasterOnUnprovenPanel
         self.panelPresentsDolbyVision = panelPresentsDolbyVision
         self.audioBridgeMode = audioBridgeMode
         self.objectAudioRendering = objectAudioRendering
+        self.rendersDTSXObjectAudio = rendersDTSXObjectAudio
         self.stereoPresentation = stereoPresentation
         self.isLive = isLive
         self.audioOnly = audioOnly
@@ -1293,6 +1478,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.liveStartupSingleSegmentMinimumSeconds = liveStartupSingleSegmentMinimumSeconds
         self.liveEdgeCushionSeconds = liveEdgeCushionSeconds
         self.liveJoinStartsImmediately = liveJoinStartsImmediately
+        self.liveJoinsAtPlaylistStart = liveJoinsAtPlaylistStart
         self.clampsLiveResumeToWindow = clampsLiveResumeToWindow
         self.nativeRemoteHLS = nativeRemoteHLS
         self.nativeRemoteHLSIngestFallback = nativeRemoteHLSIngestFallback
@@ -1320,13 +1506,17 @@ public struct LoadOptions: Sendable, Equatable {
         self.sessionCacheHardLimitBytes = sessionCacheHardLimitBytes
         self.sessionCacheFreeReserveBytes = max(0, sessionCacheFreeReserveBytes)
         self.softwarePacketCacheStorage = softwarePacketCacheStorage
+        self.retainsSessionCacheAfterStop = retainsSessionCacheAfterStop
         self.progressiveSegmentDelivery = progressiveSegmentDelivery
         self.autoplay = autoplay
         self.teletextPage = teletextPage
         self.audioDelaySeconds = audioDelaySeconds
         self.audioShaping = audioShaping.clamped
+        self.normalizationGainDB = normalizationGainDB.flatMap {
+            $0.isFinite ? NormalizationGainProcessor.clampedGainDB($0) : nil }
         self.deinterlaceMode = deinterlaceMode
         self.deinterlaceFieldRate = deinterlaceFieldRate
+        self.inverseTelecine = inverseTelecine
         self.preferredDecodePath = preferredDecodePath
         self.escalatesToSoftwarePath = escalatesToSoftwarePath
         self.sharedOutputRole = sharedOutputRole
@@ -1974,8 +2164,9 @@ public struct UpscaleStatus: Sendable, Equatable {
     /// Set when the stage switched itself off mid-session (repeated failures or a sustained overrun of
     /// the frame budget); frames are then delivered as decoded.
     public let disabledReason: String?
-    /// True once a sustained overrun made the stage drop MetalFX and deliver the VideoToolbox output at
-    /// its own size (`targetSize`, carrying the source's pixel aspect). Kept when it later disables.
+    /// True once the stage dropped a step: MetalFX after a sustained overrun (the VideoToolbox output then
+    /// goes out at its own size, `targetSize`, with the source's pixel aspect), the VideoToolbox pass after
+    /// it kept failing (MetalFX alone, `mlScale` nil), or a line-art rung. Kept when it later disables.
     public let degraded: Bool
     /// The scaler the stage runs (`LoadOptions.upscaleScaler`).
     public let scaler: UpscaleScaler
@@ -2014,5 +2205,71 @@ public struct UpscaleStatus: Sendable, Equatable {
         self.targetSize = targetSize
         self.degraded = degraded
         self.disabledReason = disabledReason
+    }
+}
+
+/// Picture processing for an HDR10 title on a display that cannot show all of it (#957), set as
+/// `LoadOptions.videoProcessing`. nil (the default) is off.
+public struct VideoProcessingOptions: Sendable, Equatable {
+    /// The display's peak luminance in nit: highlights above it are rolled off (BT.2390) before the
+    /// display gets the picture, and the HDR10 metadata sent with it says this peak, so the display does
+    /// not tone map a second time. A title whose source peak is at or below it is not processed.
+    public var targetPeakNits: Double
+
+    public init(targetPeakNits: Double) {
+        self.targetPeakNits = targetPeakNits
+    }
+}
+
+/// One stage of the picture processing (`VideoProcessingStatus.stages`).
+public enum VideoProcessingStage: String, Sendable, Equatable {
+    /// BT.2390 tone map in the PQ domain, from the source peak to `VideoProcessingOptions.targetPeakNits`.
+    case toneMap
+}
+
+/// What the picture processing is doing for the current session (#957), published as
+/// `AetherEngine.activeVideoProcessing` once the first processed frame is delivered, nil otherwise.
+public struct VideoProcessingStatus: Sendable, Equatable {
+    /// The stages that run on every frame, in order.
+    public let stages: [VideoProcessingStage]
+    /// The source peak the tone map starts from, in nit.
+    public let sourcePeakNits: Double
+    /// Which value set `sourcePeakNits`: the mastering display's peak, or MaxCLL when it is lower.
+    public let sourcePeak: ToneMapSourcePeak
+    /// The peak the picture is mapped to (`VideoProcessingOptions.targetPeakNits`).
+    public let targetPeakNits: Double
+    /// Set when the processing switched itself off mid-session (repeated failures, a sustained overrun
+    /// of the frame budget, or HDR10+ metadata in the stream); frames are then delivered as decoded.
+    public let disabledReason: String?
+
+    init(stages: [VideoProcessingStage], sourcePeakNits: Double, sourcePeak: ToneMapSourcePeak,
+         targetPeakNits: Double, disabledReason: String? = nil) {
+        self.stages = stages
+        self.sourcePeakNits = sourcePeakNits
+        self.sourcePeak = sourcePeak
+        self.targetPeakNits = targetPeakNits
+        self.disabledReason = disabledReason
+    }
+
+    /// The status of a plan before or without a processed frame.
+    init(plan: VideoProcessingPlan, disabledReason: String? = nil) {
+        self.init(stages: [.toneMap], sourcePeakNits: plan.curve.sourcePeakNits, sourcePeak: plan.sourcePeak,
+                  targetPeakNits: plan.curve.targetPeakNits, disabledReason: disabledReason)
+    }
+
+    /// A processed frame publishes what ran (the first one, and one that rebuilt the curve), unless a
+    /// disable was already published.
+    static func afterProcessedFrame(_ delivered: VideoProcessingStatus, current: VideoProcessingStatus?) -> VideoProcessingStatus {
+        if let current, current.disabledReason != nil { return current }
+        return delivered
+    }
+
+    /// A disable keeps what was published and adds the reason; `plan` stands in when nothing was.
+    static func afterDisable(reason: String, current: VideoProcessingStatus?, plan: VideoProcessingPlan)
+        -> VideoProcessingStatus {
+        let base = current ?? VideoProcessingStatus(plan: plan)
+        return VideoProcessingStatus(stages: base.stages, sourcePeakNits: base.sourcePeakNits,
+                                     sourcePeak: base.sourcePeak, targetPeakNits: base.targetPeakNits,
+                                     disabledReason: reason)
     }
 }

@@ -10,9 +10,11 @@ import AetherLibavutil
 /// and the device once per load; the published status follows the stage's own events.
 extension AetherEngine {
 
+    /// `outputFrameRate` overrides the stream's rate where the frames come out at another one: under
+    /// inverse telecine (#853) they arrive at 4/5 of it, and that is the per-frame budget the stage has.
     func upscaleRouteDecision(
         options: LoadOptions, videoStream: UnsafeMutablePointer<AVStream>?, dvProfile: Int?,
-        wirelessAirPlayRoute: Bool, demuxedAudioLive: Bool
+        wirelessAirPlayRoute: Bool, demuxedAudioLive: Bool, outputFrameRate: Double? = nil
     ) -> UpscaleRouteDecision {
         // Spares the off case the Metal device and the display read below.
         guard options.upscalesLowResolutionVideo else { return .notTaken(.preferenceOff) }
@@ -28,7 +30,7 @@ extension AetherEngine {
                 width: cp.pointee.width, height: cp.pointee.height)
             source = SourceGeometry(width: Int(cp.pointee.width), height: Int(cp.pointee.height),
                                     sarNum: Int(sar?.num ?? 0), sarDen: Int(sar?.den ?? 0))
-            frameRate = Self.detectFrameRate(stream: stream)
+            frameRate = outputFrameRate ?? Self.detectFrameRate(stream: stream)
             isSDR = UpscaleRouteDecision.isSDR(colorTransfer: cp.pointee.color_trc)
             isEightBit420 = UpscaleRouteDecision.isEightBit420(
                 pixelFormat: cp.pointee.format, bitsPerRawSample: cp.pointee.bits_per_raw_sample)
@@ -120,6 +122,7 @@ extension AetherEngine {
         else { return }
         guard upscaleNativeReturnOwed != loadGeneration else { return }
         upscaleNativeReturnOwed = loadGeneration
+        nativeReturnOwedBy = "[Upscale] stage"
         settleOwedUpscaleNativeReturn()
     }
 
@@ -140,14 +143,15 @@ extension AetherEngine {
         guard owed == loadGeneration else { upscaleNativeReturnOwed = nil; return }
         guard !loadInFlight, state == .playing || state == .paused else { return }
         upscaleNativeReturnOwed = nil
-        EngineLog.emit("[Upscale] stage disabled on a session it alone put on the software path: "
+        let by = nativeReturnOwedBy
+        EngineLog.emit("\(by) disabled on a session it alone put on the software path: "
                        + "reloading at the current position on the native path", category: .engine)
         Task { @MainActor [weak self] in
             guard let self, self.loadGeneration == owed else { return }
             do {
                 try await self.reloadAtCurrentPosition()
             } catch {
-                EngineLog.emit("[Upscale] native return failed: \(error)", category: .engine)
+                EngineLog.emit("\(by) native return failed: \(error)", category: .engine)
             }
         }
     }

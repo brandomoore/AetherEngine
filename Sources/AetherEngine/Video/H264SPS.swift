@@ -3,6 +3,8 @@ import Foundation
 /// Minimal H.264 SPS reader for SSAI direct play: ad creatives arrive mid-stream on a new PID with unparsed codecpar (width/height==0); calling avformat_find_stream_info would block the live pump. Field order per ITU-T H.264 §7.3.2.1.1.
 enum H264SPS {
 
+    static let maxDimension = 16384
+
     /// Parse cropped dimensions from a raw SPS NAL (with 1-byte NAL header, e.g. 0x67). Returns nil on malformed input.
     static func dimensions(fromNAL nal: [UInt8]) -> (width: Int, height: Int)? {
         parse(fromNAL: nal).map { ($0.width, $0.height) }
@@ -22,6 +24,17 @@ enum H264SPS {
         parse(fromNAL: nal)?.signature
     }
 
+    /// What a slice header parser needs from the SPS to reach `field_pic_flag` (AE#1070).
+    struct SliceContext: Equatable, Sendable {
+        let separateColourPlane: Bool
+        let log2MaxFrameNum: Int
+        let frameMbsOnly: Bool
+    }
+
+    static func sliceContext(fromNAL nal: [UInt8]) -> SliceContext? {
+        parse(fromNAL: nal)?.slice
+    }
+
     /// First SPS NAL (incl. 1-byte header) from codecpar extradata, accepting both layouts: Annex-B
     /// (MPEG-TS, start-code delimited) and avcC (MP4/MKV, configurationVersion byte 0x01 then
     /// length-prefixed parameter sets). Returns nil when neither layout yields an SPS.
@@ -39,7 +52,7 @@ enum H264SPS {
         return extradata.withUnsafeBufferPointer { extractSPSandPPS(fromAnnexB: $0)?.sps }
     }
 
-    private static func parse(fromNAL nal: [UInt8]) -> (width: Int, height: Int, frameMbsOnly: Bool, signature: [UInt8])? {
+    private static func parse(fromNAL nal: [UInt8]) -> (width: Int, height: Int, frameMbsOnly: Bool, signature: [UInt8], slice: SliceContext)? {
         guard nal.count > 1, (nal[0] & 0x1f) == 7 else { return nil }
         let rbsp = unescape(Array(nal[1...]))  // strip NAL header + emulation-prevention (00 00 03 -> 00 00)
         var r = BitReader(rbsp)
@@ -51,11 +64,12 @@ enum H264SPS {
         let coreStart = r.position
 
         var chromaFormatIdc = 1
+        var separateColourPlane = false
         let highProfiles: Set<Int> = [100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135]
         if highProfiles.contains(profileIdc) {
             guard let cf = r.ue() else { return nil }
             chromaFormatIdc = cf
-            if cf == 3 { _ = r.flag() }            // separate_colour_plane_flag
+            if cf == 3 { separateColourPlane = r.flag() == true }
             guard r.ue() != nil, r.ue() != nil else { return nil } // bit_depth_luma/chroma -8
             _ = r.flag()                            // qpprime_y_zero_transform_bypass
             if r.flag() == true {                   // seq_scaling_matrix_present
@@ -68,7 +82,7 @@ enum H264SPS {
             }
         }
 
-        guard r.ue() != nil else { return nil }     // log2_max_frame_num_minus4
+        guard let log2MaxFrameNumMinus4 = r.ue() else { return nil }
         guard let pocType = r.ue() else { return nil }
         if pocType == 0 {
             guard r.ue() != nil else { return nil }  // log2_max_pic_order_cnt_lsb_minus4
@@ -85,6 +99,8 @@ enum H264SPS {
               let heightMapUnitsMinus1 = r.ue() else { return nil }
         guard let frameMbsOnly = r.flag() else { return nil }
 
+        // 16384 matches H264ConfigurationTracker; level 6.2 tops out at 8192x4320 (audit BIT-201).
+        guard widthMbsMinus1 < Self.maxDimension / 16, heightMapUnitsMinus1 < Self.maxDimension / 16 else { return nil }
         let mbWidth = widthMbsMinus1 + 1
         let mbHeight = (heightMapUnitsMinus1 + 1) * (frameMbsOnly ? 1 : 2)
         var width = mbWidth * 16
@@ -110,7 +126,7 @@ enum H264SPS {
             height -= (ct + cb) * stepY
         }
 
-        guard width > 0, height > 0 else { return nil }
+        guard width > 0, height > 0, width <= Self.maxDimension, height <= Self.maxDimension else { return nil }
         var core = BitReader(rbsp), signature = [UInt8(profileIdc)], packed = 0, count = 0
         _ = core.u(coreStart)
         for _ in coreStart..<r.position {
@@ -119,32 +135,24 @@ enum H264SPS {
             if count == 8 { signature.append(UInt8(packed)); packed = 0; count = 0 }
         }
         if count > 0 { signature.append(UInt8(packed << (8 - count))) }
-        return (width, height, frameMbsOnly, signature)
+        let slice = SliceContext(separateColourPlane: separateColourPlane,
+                                 log2MaxFrameNum: log2MaxFrameNumMinus4 + 4, frameMbsOnly: frameMbsOnly)
+        return (width, height, frameMbsOnly, signature, slice)
+    }
+
+    private static func nalRanges(_ data: UnsafeBufferPointer<UInt8>) -> [Range<Int>] {
+        AnnexB.nalRanges(UnsafeRawBufferPointer(data))
     }
 
     /// Scan Annex-B for the first SPS (NAL type 7) and PPS (NAL type 8), returned with their 1-byte NAL header.
     static func extractSPSandPPS(fromAnnexB data: UnsafeBufferPointer<UInt8>) -> (sps: [UInt8], pps: [UInt8])? {
         var sps: [UInt8]?
         var pps: [UInt8]?
-        var i = 0
-        let n = data.count
-        func startCode(at p: Int) -> Int {
-            if p + 3 < n, data[p] == 0, data[p+1] == 0, data[p+2] == 0, data[p+3] == 1 { return 4 }
-            if p + 2 < n, data[p] == 0, data[p+1] == 0, data[p+2] == 1 { return 3 }
-            return 0
-        }
-        while i < n {
-            let sc = startCode(at: i)
-            if sc == 0 { i += 1; continue }
-            let start = i + sc
-            guard start < n else { break }
-            var j = start
-            while j < n, startCode(at: j) == 0 { j += 1 }
-            let type = data[start] & 0x1f
-            if type == 7, sps == nil { sps = Array(data[start..<j]) }
-            else if type == 8, pps == nil { pps = Array(data[start..<j]) }
+        for range in nalRanges(data) {
+            let type = data[range.lowerBound] & 0x1f
+            if type == 7, sps == nil { sps = Array(data[range]) }
+            else if type == 8, pps == nil { pps = Array(data[range]) }
             if sps != nil, pps != nil { break }
-            i = j
         }
         if let sps, let pps { return (sps, pps) }
         return nil
@@ -160,20 +168,8 @@ enum H264SPS {
         var recoversHere = false
         var sawSlice = false
         var allIntra = true
-        var i = 0
-        let n = data.count
-        func startCode(at p: Int) -> Int {
-            if p + 3 < n, data[p] == 0, data[p+1] == 0, data[p+2] == 0, data[p+3] == 1 { return 4 }
-            if p + 2 < n, data[p] == 0, data[p+1] == 0, data[p+2] == 1 { return 3 }
-            return 0
-        }
-        while i < n {
-            let sc = startCode(at: i)
-            if sc == 0 { i += 1; continue }
-            let start = i + sc
-            guard start < n else { break }
-            var j = start
-            while j < n, startCode(at: j) == 0 { j += 1 }
+        for range in nalRanges(data) {
+            let start = range.lowerBound, j = range.upperBound
             switch data[start] & 0x1f {
             case 5:
                 return true
@@ -191,7 +187,6 @@ enum H264SPS {
             default:
                 break
             }
-            i = j
         }
         return recoversHere && sawSlice && allIntra
     }
@@ -223,21 +218,8 @@ enum H264SPS {
         return sc + sps + sc + pps
     }
 
-    static func unescape(_ b: [UInt8]) -> [UInt8] {  // remove emulation-prevention bytes (00 00 03 -> 00 00)
-        var out = [UInt8](); out.reserveCapacity(b.count)
-        var zeros = 0
-        var i = 0
-        while i < b.count {
-            let v = b[i]
-            if zeros >= 2 && v == 0x03 && i + 1 < b.count && b[i + 1] <= 0x03 {
-                zeros = 0; i += 1; continue // drop the 0x03
-            }
-            out.append(v)
-            zeros = (v == 0) ? zeros + 1 : 0
-            i += 1
-        }
-        return out
-    }
+    /// Remove emulation-prevention bytes (00 00 03 -> 00 00), by the one rule every parser here shares.
+    static func unescape(_ b: [UInt8]) -> [UInt8] { A53SEIParser.unescapeRBSP(b) }
 
     private static func skipScalingList(_ r: inout BitReader, size: Int) {
         var lastScale = 8, nextScale = 8
@@ -269,6 +251,19 @@ enum H264SPS {
         }
 
         mutating func flag() -> Bool? { u(1).map { $0 == 1 } }
+
+        /// Skips `n` bits; false when that runs past the end.
+        mutating func skip(_ n: Int) -> Bool {
+            guard bit + n <= bytes.count * 8 else { return false }
+            bit += n
+            return true
+        }
+
+        /// The RBSP stop bit: the last bit set in the payload.
+        var lastSetBit: Int? {
+            guard let index = bytes.lastIndex(where: { $0 != 0 }) else { return nil }
+            return index * 8 + 7 - bytes[index].trailingZeroBitCount
+        }
 
         mutating func ue() -> Int? {
             var zeros = 0

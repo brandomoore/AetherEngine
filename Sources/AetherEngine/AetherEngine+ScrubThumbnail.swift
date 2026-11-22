@@ -8,10 +8,70 @@ extension AetherEngine {
     /// warm; each extractor maps its segment file (audit SEG-2), so the entries hold clean
     /// file-backed pages rather than heap copies, and the bound remains fixed.
     nonisolated static let scrubThumbnailExtractorLimit = 6
+
+    /// How much decoded picture the open still decoders may cover between them, in coded pixels.
+    /// Six 1920x1088 decoders fit, so a 1080p source keeps its whole LRU warm. A 4K decoder holds
+    /// 100 to 160 MB of reference frames, and AE#1059 measured six of them at 750 MB on an Apple TV
+    /// 4K, so a 4K source keeps one open and the others close down to their cached stills.
+    nonisolated static let scrubDecoderPixelBudget = 6 * 1920 * 1088
+
     public func clearResidentPreviewFrames() {
         for entry in scrubThumbnailExtractors {
             Task { await entry.extractor.clearResidentPreviewCache() }
         }
+    }
+
+    /// Closes every scrub-still decoder now and returns once they are closed. Call it when the
+    /// scrub ends. The extractors and their cached stills stay, so the next request answers from
+    /// the cache or reopens its decoder. Playback is untouched (AE#1059).
+    public func releaseScrubPreviewDecoders() async {
+        let extractors = scrubThumbnailExtractors.map(\.extractor)
+        await withTaskGroup(of: Void.self) { group in
+            for extractor in extractors {
+                group.addTask { await extractor.releaseDecoder() }
+            }
+        }
+    }
+
+    /// Keeps the open decoders inside `scrubDecoderPixelBudget` before `incoming` decodes. The
+    /// newest entries keep theirs; `incoming` counts at the size it last decoded at, or at the
+    /// largest size any entry knows when it never opened, so the budget holds before the open
+    /// rather than after it. Closing waits for the decode queue of each released extractor.
+    func enforceScrubDecoderBudget(before incoming: FrameExtractor) async {
+        let entries = scrubThumbnailExtractors.map(\.extractor)
+        var largest = 0
+        var states: [(extractor: FrameExtractor, open: Int)] = []
+        for extractor in entries {
+            largest = max(largest, await extractor.knownDecoderPixelArea)
+            // A first open still in flight knows no area yet; count it at the largest one known.
+            let budgeted = await extractor.budgetedDecoderPixelArea
+            let mayBeOpen = await extractor.decoderMayBeOpen
+            let open = budgeted == 0 && mayBeOpen ? -1 : budgeted
+            states.append((extractor, open))
+        }
+        let incomingKnown = await incoming.knownDecoderPixelArea
+        let released = Self.scrubDecodersToRelease(
+            newestLast: states.map { $0.extractor === incoming ? 0 : ($0.open < 0 ? max(largest, 1) : $0.open) },
+            incomingArea: incomingKnown > 0 ? incomingKnown : largest)
+        guard !released.isEmpty else { return }
+        await withTaskGroup(of: Void.self) { group in
+            for index in released {
+                let extractor = states[index].extractor
+                group.addTask { await extractor.releaseDecoder() }
+            }
+        }
+    }
+
+    /// Indices into `newestLast` (open decoder areas, oldest first, 0 for a closed one) whose
+    /// decoders close so they fit the budget next to `incomingArea`. Newest first wins.
+    nonisolated static func scrubDecodersToRelease(newestLast areas: [Int], incomingArea: Int,
+                                                   budget: Int = scrubDecoderPixelBudget) -> [Int] {
+        var used = incomingArea
+        var released: [Int] = []
+        for index in areas.indices.reversed() where areas[index] > 0 {
+            if used + areas[index] > budget { released.append(index) } else { used += areas[index] }
+        }
+        return released
     }
 
     /// Timestamped production preview. All reads come from existing resident
@@ -43,7 +103,9 @@ extension AetherEngine {
         let output = live ? seconds - liveShift
             : sourceTarget - session.firstKeyframeSeconds
         let planOrigin = session.firstKeyframeSeconds - origin
-        let source = await BlockingWork.detached(priority: .utility) { [session] in
+        // A finger on the scrubber waits for these three, so they run at `.userInitiated`. A BlockingWork job
+        // keeps the priority it was enqueued with; at `.utility` a busy CPU left the still behind everything else.
+        let source = await BlockingWork.detached(priority: .userInitiated) { [session] in
             session.scrubThumbnailSource(atSeconds: output)
         }.value
         guard gen == loadGeneration, !Task.isCancelled, !isCancelled() else { return nil }
@@ -53,27 +115,18 @@ extension AetherEngine {
                                             maxWidth: maxWidth, generation: gen, isCancelled: isCancelled)
         }
         guard let carried = source.carriedOffset else { return nil }
-        let extractor: FrameExtractor
-        if let index = scrubThumbnailExtractors.firstIndex(where: { $0.segmentIndex == source.segmentIndex }) {
-            let hit = scrubThumbnailExtractors.remove(at: index)
-            if hit.extractor.residentIdentity == source.identity {
-                scrubThumbnailExtractors.append(hit); extractor = hit.extractor
-            } else {
-                Task { await hit.extractor.shutdown() }
-                guard let reader = source.makeReader() else { return nil }
-                extractor = FrameExtractor(residentReader: reader, formatHint: "mp4", identity: source.identity)
-                scrubThumbnailExtractors.append((source.segmentIndex, extractor))
+        guard let extractor = scrubExtractor(key: source.segmentIndex, identity: source.identity, make: {
+            source.makeReader().map {
+                FrameExtractor(residentReader: $0, formatHint: "mp4", identity: source.identity)
             }
-        } else {
-            guard let reader = source.makeReader() else { return nil }
-            extractor = FrameExtractor(residentReader: reader, formatHint: "mp4", identity: source.identity)
-            scrubThumbnailExtractors.append((source.segmentIndex, extractor))
-            trimScrubThumbnailExtractors()
-        }
-        guard let frame = await extractor.residentPreview(rawTarget: live ? output : sourceTarget - carried,
-                    refined: refined, maxWidth: maxWidth, isCancelled: isCancelled),
-              gen == loadGeneration, !Task.isCancelled, !isCancelled() else { return nil }
-        let stillOwned = await BlockingWork.detached(priority: .utility) { [session] in
+        }) else { return nil }
+        let rawTarget = live ? output : sourceTarget - carried
+        guard let frame = await decodeScrubStill(
+            on: extractor, generation: gen, stillWanted: { !Task.isCancelled && !isCancelled() }, {
+                await extractor.residentPreview(rawTarget: rawTarget, refined: refined, maxWidth: maxWidth,
+                                                isCancelled: isCancelled)
+            }) else { return nil }
+        let stillOwned = await BlockingWork.detached(priority: .userInitiated) { [session] in
             guard let current = session.scrubThumbnailSource(atSeconds: output) else { return false }
             return current.identity == source.identity && current.carriedOffset == source.carriedOffset
         }.value
@@ -92,25 +145,19 @@ extension AetherEngine {
     private func ladderPreviewFrame(session: HLSVideoEngine, outputSeconds: Double, planOrigin: Double,
                                     maxWidth: Int, generation gen: UInt64,
                                     isCancelled: @escaping @Sendable () -> Bool) async -> ScrubFrame? {
-        let rung = await BlockingWork.detached(priority: .utility) { [session] in
+        let rung = await BlockingWork.detached(priority: .userInitiated) { [session] in
             session.stillLadderFrame(atSeconds: outputSeconds)
         }.value
         guard let rung, gen == loadGeneration, !Task.isCancelled, !isCancelled() else { return nil }
-        let key = Self.ladderStillKey(segmentIndex: rung.segmentIndex)
-        let extractor: FrameExtractor
-        if let index = scrubThumbnailExtractors.firstIndex(where: { $0.segmentIndex == key }) {
-            let hit = scrubThumbnailExtractors.remove(at: index)
-            scrubThumbnailExtractors.append(hit)
-            extractor = hit.extractor
-        } else {
-            extractor = FrameExtractor(residentReader: rung.makeReader(), formatHint: "mp4",
-                                       identity: "ladder:\(rung.segmentIndex)")
-            scrubThumbnailExtractors.append((key, extractor))
-            trimScrubThumbnailExtractors()
-        }
-        guard let frame = await extractor.residentPreview(rawTarget: 0, refined: false, maxWidth: maxWidth,
-                                                          isCancelled: isCancelled),
-              gen == loadGeneration, !Task.isCancelled, !isCancelled() else { return nil }
+        guard let extractor = scrubExtractor(key: Self.ladderStillKey(segmentIndex: rung.segmentIndex), make: {
+            FrameExtractor(residentReader: rung.makeReader(), formatHint: "mp4",
+                           identity: "ladder:\(rung.segmentIndex)")
+        }) else { return nil }
+        guard let frame = await decodeScrubStill(
+            on: extractor, generation: gen, stillWanted: { !Task.isCancelled && !isCancelled() }, {
+                await extractor.residentPreview(rawTarget: 0, refined: false, maxWidth: maxWidth,
+                                                isCancelled: isCancelled)
+            }) else { return nil }
         let start = rung.startSeconds + planOrigin
         return ScrubFrame(image: frame.image, actualSeconds: start, refined: false,
                           validRange: start..<(start + rung.durationSeconds))
@@ -180,18 +227,48 @@ extension AetherEngine {
         // Guard against zap/stop clearing the LRU: a stale extractor's segment indices
         // collide with the next source's.
         guard let source, loadGeneration == gen else { return nil }
-        let extractor: FrameExtractor
-        if let idx = scrubThumbnailExtractors.firstIndex(where: { $0.segmentIndex == source.segmentIndex }) {
-            let hit = scrubThumbnailExtractors.remove(at: idx)
-            scrubThumbnailExtractors.append(hit)
-            extractor = hit.extractor
-        } else {
-            guard let reader = source.makeReader() else { return nil }
-            extractor = FrameExtractor(reader: reader, formatHint: "mp4")
-            scrubThumbnailExtractors.append((source.segmentIndex, extractor))
-            trimScrubThumbnailExtractors()
+        guard let extractor = scrubExtractor(key: source.segmentIndex, make: {
+            source.makeReader().map { FrameExtractor(reader: $0, formatHint: "mp4") }
+        }) else { return nil }
+        return await decodeScrubStill(on: extractor, generation: gen) {
+            await extractor.thumbnail(at: 0, maxWidth: maxWidth)
         }
-        return await extractor.thumbnail(at: 0, maxWidth: maxWidth)
+    }
+
+    /// The one lookup into the still LRU (audit LOAD-R201). A hit moves to the newest end. A hit whose
+    /// resident `identity` no longer matches the bytes behind its key is shut down and replaced; nil
+    /// `identity` takes any extractor under the key. A miss is made by `make` and the list trimmed.
+    func scrubExtractor(key: Int, identity: String? = nil,
+                        make: () -> FrameExtractor?) -> FrameExtractor? {
+        if let index = scrubThumbnailExtractors.firstIndex(where: { $0.segmentIndex == key }) {
+            let hit = scrubThumbnailExtractors.remove(at: index)
+            if identity == nil || hit.extractor.residentIdentity == identity {
+                scrubThumbnailExtractors.append(hit)
+                return hit.extractor
+            }
+            Task { await hit.extractor.shutdown() }
+        }
+        guard let made = make() else { return nil }
+        scrubThumbnailExtractors.append((key, made))
+        trimScrubThumbnailExtractors()
+        return made
+    }
+
+    /// One still decode inside the AE#1059 decoder budget, for the session `generation` names. nil
+    /// when that session ended before or during the decode, or `stillWanted` says the caller gave up:
+    /// a zap in between would hand the new item the old one's picture (audit LOAD-205).
+    func decodeScrubStill<Still>(on extractor: FrameExtractor, generation: UInt64,
+                                 stillWanted: () -> Bool = { true },
+                                 _ decode: () async -> Still?) async -> Still? {
+        await extractor.reserveDecode()
+        await enforceScrubDecoderBudget(before: extractor)
+        guard generation == loadGeneration, stillWanted() else {
+            await extractor.endDecodeReservation()
+            return nil
+        }
+        let still = await decode()
+        await extractor.endDecodeReservation()
+        return generation == loadGeneration && stillWanted() ? still : nil
     }
 
     /// Enforce the cache-backed still LRU after a miss. Kept internal so the exact six-entry
@@ -226,18 +303,15 @@ extension AetherEngine {
                             isCancelled: @escaping @Sendable () -> Bool) async -> ScrubFrame? {
         guard let host = softwareHost, softwareStillsFromLocalFile, seconds.isFinite, seconds >= 0 else { return nil }
         let gen = loadGeneration
-        let extractor: FrameExtractor
-        if let held = scrubThumbnailExtractors.first(where: { $0.segmentIndex == Self.localSoftwareStillKey }) {
-            extractor = held.extractor
-        } else {
-            guard let made = makeFrameExtractor() else { return nil }
-            scrubThumbnailExtractors.append((Self.localSoftwareStillKey, made))
-            extractor = made
+        guard let extractor = scrubExtractor(key: Self.localSoftwareStillKey, make: { makeFrameExtractor() }) else {
+            return nil
         }
         let source = host.sourceSeconds(forSession: seconds)
-        guard let still = await extractor.boundedLocalStill(at: source, refined: refined, maxWidth: maxWidth,
-                                                            isCancelled: isCancelled),
-              gen == loadGeneration, !Task.isCancelled, !isCancelled() else { return nil }
+        guard let still = await decodeScrubStill(
+            on: extractor, generation: gen, stillWanted: { !Task.isCancelled && !isCancelled() }, {
+                await extractor.boundedLocalStill(at: source, refined: refined, maxWidth: maxWidth,
+                                                  isCancelled: isCancelled)
+            }) else { return nil }
         // The time of the frame that was decoded, back on the session axis. A source that stamps no
         // frame time can only be labelled with the request.
         let zero = host.sourceSeconds(forSession: 0)

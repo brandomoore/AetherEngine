@@ -115,16 +115,16 @@ The engine picks at load (`load(url:)` / `load(source:)`), in this order:
 1. **Audio-only**, when `LoadOptions.audioOnly` is set.
 2. Otherwise **by the video codec** (`VideoRoutingPolicy`).
    - The native side is an allowlist of what AVPlayer's HLS-fMP4 pipeline reliably accepts: HEVC, progressive H.264 and, on devices with a hardware AV1 decoder, AV1.
-   - Everything else goes to the software host: AV1 without hardware decode, VP9, VP8, MPEG-4 Part 2, MPEG-2, VC-1, interlaced H.264 (for deinterlacing), profiles VideoToolbox cannot decode, and every other codec.
+   - Everything else goes to the software host: AV1 without hardware decode, VP9, VP8, MPEG-4 Part 2, MPEG-2, VC-1, interlaced H.264 (for deinterlacing, except while an AirPlay receiver that shows video holds the route, AE#1070), profiles VideoToolbox cannot decode, and every other codec.
    - The full per-codec table, with the reason for each row, is in [formats.md, Software decode](formats.md#software-decode) and [Hardware decode](formats.md#hardware-decode).
 3. **How the source reaches AVPlayer.** Remote HLS can go to AVPlayer directly. HLS the engine reads itself feeds the loopback. MPEG-DASH becomes a virtual MP4 file. See [Native route variants](architecture-native.md#native-route-variants).
-4. **Optional stages**, all opt-in: low-resolution upscaling and Dolby Vision FEL composition (both can move a session onto the software path), the FEL curve fold, rendered object audio, the I-frame rendition and live recording. See [Optional video stages](architecture-software.md#optional-video-stages), [Audio routes and object audio](architecture-native.md#audio-routes-and-object-audio), [Trick play and scrub stills](architecture-native.md#trick-play-and-scrub-stills) and [Live recording](architecture-native.md#live-recording).
+4. **Optional stages**, all opt-in: low-resolution upscaling, picture processing (the HDR10 tone map) and Dolby Vision FEL composition (all three can move a session onto the software path), the FEL curve fold, rendered object audio, the I-frame rendition and live recording. See [Optional video stages](architecture-software.md#optional-video-stages), [Audio routes and object audio](architecture-native.md#audio-routes-and-object-audio), [Trick play and scrub stills](architecture-native.md#trick-play-and-scrub-stills) and [Live recording](architecture-native.md#live-recording).
 
 A few recoveries move a running session to another pipeline:
 
 - **Software escalation** (`SoftwarePathEscalation`): CoreMedia refuses the media mid-session, so the engine rebuilds the session on the software host.
 - **Remote HLS carriage fallback** (`RemoteHLSIngestFallback`): AVPlayer cannot play a remote HLS stream directly, so the engine reads it itself and serves it through the loopback.
-- **Return from the upscale route**: the upscaler gives up and the session goes back to native.
+- **Return from the upscale or picture processing route**: the stage gives up and the session goes back to native.
 
 `videoRoute` always reports the route actually running. The transitions are listed under [Effective video route](#effective-video-route-videoroute).
 
@@ -140,6 +140,7 @@ These cases take the libavcodec route even when the codec is on the whitelist:
 | Case | Reason |
 | --- | --- |
 | A custom `IOReader` | AVPlayer needs a URL. |
+| A container AVFoundation does not open (Matroska, Ogg, MPEG-TS, ASF, ...) | AVPlayer answers "Cannot Open" and the clock stays at 0. Only QuickTime/MP4/M4A, raw MP3/MP2, ADTS AAC, raw AC-3 / E-AC-3, raw FLAC, WAV, AIFF and CAF go to AVPlayer (`avPlayerReadsAudioContainer`). |
 | A FLAC whose blocks are under CoreMedia's floor | AE#764. |
 | An AAC whose layout sits in a PCE (`channelConfiguration` 0) | AVPlayer opens it and ends at 0 s with no duration (AE#1047). |
 | A FLAC whose first frame is smaller than its `STREAMINFO` `max_blocksize` | AVPlayer times each frame by the declared size and runs its clock past the end. Read from a peeked first packet (AE#946). |
@@ -150,7 +151,7 @@ These cases take the libavcodec route even when the codec is on the whitelist:
 
 ```
 audioOnly == true
-   ├─ whitelisted codec, URL source, not .software ──► AVPlayer (AudioAVPlayerHost) ──► AVR / speakers
+   ├─ whitelisted codec and container, URL source, not .software ──► AVPlayer (AudioAVPlayerHost) ──► AVR / speakers
    └─ otherwise ──► Demuxer ──► AudioDecoder ──► AVSampleBufferAudioRenderer ──► AVR / speakers
 ```
 
@@ -275,6 +276,7 @@ What stays the same: per-origin caps, FIFO ordering, pacing, cancellation drains
 
 - The task prefers `BlockingExecutor`, which runs its jobs on GCD's global queues. GCD adds a thread when one blocks.
 - Otherwise the task behaves like any detached task: it awaits, hops to the main actor, and can be cancelled.
+- **Its priority is fixed when it is enqueued.** The job lands on the global queue of that QoS, and a caller that awaits it later does not raise it, unlike a plain `Task.detached`. So work a caller waits for gets the caller's priority. The software host's load waited 11.7 s on a `.utility` packet cache setup in a busy test run, and 4.4 s at `.userInitiated`.
 - `BlockingWorkTests` pins both halves, and a test fails the build if a `Task.detached` comes back into `Sources/AetherEngine`.
 
 **Testing it.** `LIBDISPATCH_COOPERATIVE_POOL_STRICT=1` narrows the pool to one thread and reproduces pool exhaustion on any Mac. The full suite has to pass under it. How CI found the problem: [measurements.md, Cooperative pool exhaustion on CI](measurements.md#cooperative-pool-exhaustion-on-ci).
@@ -293,7 +295,7 @@ Bitmap subtitles (subtitles stored as images) are turned into text by OCR. Each 
 
 | Package | License | Purpose |
 | --- | --- | --- |
-| [FFmpegBuild](https://github.com/superuser404notfound/FFmpegBuild) | LGPL-2.1-or-later | Slim FFmpeg 8.1 (avcodec / avformat / avutil / swresample / swscale / avfilter + zimg) for demux, HLS-fMP4 mux, AudioBridge E-AC-3 / FLAC encode, software-path dav1d decode, and sws_scale YUV → NV12 / P010. avfilter ships a trimmed filter set: zscale + tonemap + colorspace (HDR → SDR still extraction), bwdif + yadif + yadif_videotoolbox + hwupload (software and GPU deinterlacing), and the audio shaping graph (abuffer, abuffersink, aformat, aresample, pan, dialoguenhance, acompressor, alimiter; #923). The dca decoder's `x_heights` option decodes DTS:X height channels (#798). Bundles libzvbi for the DVB teletext decoder (#107). Shipped as dynamically linked frameworks, no GPL components. |
+| [FFmpegBuild](https://github.com/superuser404notfound/FFmpegBuild) | LGPL-2.1-or-later | Slim FFmpeg 8.1 (avcodec / avformat / avutil / swresample / swscale / avfilter + zimg) for demux, HLS-fMP4 mux, AudioBridge E-AC-3 / FLAC encode, software-path dav1d decode, and sws_scale YUV → NV12 / P010. avfilter ships a trimmed filter set: zscale + tonemap + colorspace (HDR → SDR still extraction), bwdif + yadif + bwdif_videotoolbox + yadif_videotoolbox + hwupload (software and GPU deinterlacing), and the audio shaping graph (abuffer, abuffersink, aformat, aresample, pan, dialoguenhance, acompressor, alimiter; #923). The dca decoder's `x_heights` option decodes DTS:X height channels (#798). Bundles libzvbi for the DVB teletext decoder (#107). Shipped as dynamically linked frameworks, no GPL components. |
 | [LibDovi](https://github.com/superuser404notfound/LibDovi) | MIT / Apache-2.0 | libdovi (the `dolby_vision` crate's C API) for live Dolby Vision Profile 7 to single-layer 8.1 RPU conversion (`dovi_convert_rpu_with_mode`, mode 2), so the Apple TV engages real DV on dual-layer UHD-BD remuxes instead of plain HDR10. The software FEL path uses the same library to read the reshaping and NLQ parameters for the Metal composer and to produce the per-frame 8.1 RPU it attaches as display metadata. The native FEL curve fold writes its polynomial mapping back with `dovi_rpu_set_polynomial_mapping`. Prebuilt xcframework, no Rust at the consumer's build time. |
 | [SMBClient](https://github.com/kishikawakatsumi/SMBClient) | MIT | Pure-Swift SMB2 client over `NWConnection`, used only by the opt-in `AetherEngineSMB` product (never linked by the core engine). NTLMv2 / guest, SMB 2.0.2 / 2.1. Replaced AMSMB2/libsmb2, which `EPERM`s on tvOS / iOS. |
 | [dav1d](https://code.videolan.org/videolan/dav1d) film grain synthesis, ported | BSD-2-Clause | `AV1FilmGrain.swift` (`AV1FilmGrainTables`) and `AV1FilmGrainShaderSource.swift` port dav1d's grain synthesis (`filmgrain_tmpl.c`, `fg_apply_tmpl.c`) to the CPU tables and the Metal pass of `GPUFrameConverter`, so the GPU route's picture matches dav1d's sample for sample. dav1d's notice is kept in both files. |

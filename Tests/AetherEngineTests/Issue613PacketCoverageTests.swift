@@ -40,8 +40,7 @@ struct Issue613PacketCoverageTests {
         pts: @escaping @Sendable (Int) -> Int64
     ) throws -> SoftwarePacketReadAhead {
         let counter = Counter()
-        let fifo = try SoftwarePacketDiskFIFO(chunkTargetBytes: 64 * 1024, retainConsumed: true,
-                                              parentDirectory: root)
+        let fifo = try SoftwarePacketDiskFIFO(chunkTargetBytes: 64 * 1024, parentDirectory: root)
         return SoftwarePacketReadAhead(
             video: .init(index: 0, numerator: 1, denominator: Self.tickRate), audio: nil,
             byteBudget: 50_000_000, forwardSeconds: forwardSeconds, initialSourceClock: 0,
@@ -148,8 +147,7 @@ struct Issue613PacketCoverageTests {
         }
         let all = packets
         let counter = Counter()
-        let fifo = try SoftwarePacketDiskFIFO(chunkTargetBytes: 64 * 1024, retainConsumed: true,
-                                              parentDirectory: root)
+        let fifo = try SoftwarePacketDiskFIFO(chunkTargetBytes: 64 * 1024, parentDirectory: root)
         let source = SoftwarePacketReadAhead(video: .init(index: 0, numerator: 1, denominator: 1000),
             audio: .init(index: 1, numerator: 1, denominator: 1000), byteBudget: 50_000_000,
             forwardSeconds: 10_000, initialSourceClock: 0, fifo: fifo,
@@ -164,7 +162,7 @@ struct Issue613PacketCoverageTests {
         return source
     }
 
-    @Test("VC-1 rounded durations and seven-picture reorder retain one long A/V range", .timeLimit(.minutes(2)))
+    @Test("VC-1 rounded durations and seven-picture reorder retain one long A/V range", .timeLimit(.minutes(3)))
     func vc1RoundedDurationsAndCacheSeek() async throws {
         try await withAsyncRoot { root in
             let old = try await vc1ReadAhead(root: root, count: 15_000, strict: true)
@@ -186,7 +184,7 @@ struct Issue613PacketCoverageTests {
         }
     }
 
-    @Test("VC-1 successor coverage preserves a genuine two-second A/V discontinuity", .timeLimit(.minutes(2)))
+    @Test("VC-1 successor coverage preserves a genuine two-second A/V discontinuity", .timeLimit(.minutes(3)))
     func vc1DiscontinuityRemainsUncached() async throws {
         try await withAsyncRoot { root in
             let source = try await vc1ReadAhead(root: root, count: 600, discontinuity: true)

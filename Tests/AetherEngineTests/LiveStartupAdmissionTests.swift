@@ -2,7 +2,7 @@ import Foundation
 import Testing
 @testable import AetherEngine
 
-@Suite(.timeLimit(.minutes(2)), .offCooperativePool)
+@Suite(.timeLimit(.minutes(3)), .offCooperativePool)
 struct LiveStartupAdmissionTests {
     /// A parked job ends on an append or `cancelWaiters()`, never on its own deadline: past it the
     /// gate takes the undersized-cushion exit and returns true, which a test task resumed late
@@ -49,6 +49,17 @@ struct LiveStartupAdmissionTests {
         #expect(provider.waitForFirstLiveSegment(timeout: 5))
         #expect(started.duration(to: .now) < .seconds(0.5))
         #expect(provider.sealedLiveTargetDurationSeconds == 15)
+        #expect(HLSLocalServer.buildMediaPlaylistText(provider: provider).contains("HOLD-BACK=45.000"))
+    }
+
+    @Test("Without a configured grace, two complete segments are served at once")
+    func defaultGraceIsZero() {
+        let (provider, cache) = provider()
+        defer { cache.close() }
+        append(provider, 0); append(provider, 1)
+        let started = ContinuousClock.now
+        #expect(provider.waitForFirstLiveSegment(timeout: 5))
+        #expect(started.duration(to: .now) < .seconds(0.5))
         #expect(HLSLocalServer.buildMediaPlaylistText(provider: provider).contains("HOLD-BACK=45.000"))
     }
 

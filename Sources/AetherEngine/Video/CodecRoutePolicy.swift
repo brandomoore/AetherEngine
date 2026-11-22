@@ -11,6 +11,7 @@ extension HLSVideoEngine {
     enum DVVariant {
         case none              // not DV
         case profile5          // HEVC P5  (IPT-PQ-c2, no base)     → dvh1 + PQ
+        case profile20         // HEVC P20 (MV-HEVC 3D, P5 base)    → dvh1.20 in 3D, served as P5 in 2D
         case profile81         // HEVC P8.1 with HDR10-compat base  → dvh1 + PQ  (on DV display)
         case profile84         // HEVC P8.4 with HLG-compat base    → hvc1 + HLG + SUPPLEMENTAL dvh1/db4h
         case profile7          // HEVC P7 dual-layer (BL = HDR10)   → RPU converted to 8.1, EL dropped, routed as P8.1
@@ -56,6 +57,7 @@ extension HLSVideoEngine {
         // (AVPlayer accepts AVC but not AVC+DV per DrHurt's matrix).
         if codecID == AV_CODEC_ID_HEVC {
             if profile == 5 { return .profile5 }
+            if profile == 20 { return .profile20 }
             if profile == 7 { return .profile7 }
             if profile == 8 {
                 switch compat {
@@ -282,8 +284,19 @@ extension HLSVideoEngine {
         return "hvc1.2.4.L\(hevcLevel)"
     }
 
+    private func logForcedRouteYieldsToHDR10Plus(profile: String) {
+        EngineLog.emit(
+            "[HLSVideoEngine] Sodalite#245: HEVC DV Profile \(profile) carries HDR10+ and the host prefers it; "
+            + "keeping the native route instead of the AE#455 Profile 5 packaging",
+            category: .session
+        )
+    }
+
+    /// `stereoMultiview` is whether the session presents an MV-HEVC source's second view
+    /// (`StereoVideoSignal.multiview`). Only Dolby Vision Profile 20 routes differently on it.
     func resolveCodecRoute(
-        codecpar: UnsafePointer<AVCodecParameters>
+        codecpar: UnsafePointer<AVCodecParameters>,
+        stereoMultiview: Bool = false
     ) throws -> CodecRoute {
         let codecID = codecpar.pointee.codec_id
 
@@ -439,7 +452,7 @@ extension HLSVideoEngine {
             // HEVC DV variants can't reach this switch (classifyDVVariant
             // is called with AV_CODEC_ID_AV1) but Swift's exhaustivity
             // check needs explicit handling.
-            case .profile5, .profile81, .profile84, .profile7, .profile82:
+            case .profile5, .profile20, .profile81, .profile84, .profile7, .profile82:
                 throw HLSVideoEngineError.unsupportedDVProfile(profile: -1, compatID: -1)
             }
         }
@@ -560,6 +573,39 @@ extension HLSVideoEngine {
                 convertP7ToProfile81: false,
                 dvVariant: dvVariant
             )
+        case .profile20:
+            if stereoMultiview {
+                // 3D: the source as it is. The record stays Profile 20, the samples keep both views, and
+                // the muxer writes lhvC beside hvcC (`StereoVideoSignal.multiview`).
+                return CodecRoute(
+                    codecTagOverride: "dvh1",
+                    videoRange: .pq,
+                    primaryCodecs: "dvh1.20.\(dvLevelStr)",
+                    supplementalCodecs: nil,
+                    doviConfig: .keep,
+                    convertP7ToProfile81: false,
+                    dvVariant: dvVariant
+                )
+            }
+            // 2D: served as Profile 5. The base view is a Profile 5 base view and its RPU a Profile 5 RPU;
+            // the second view's NAL units stay in the samples and the decoder skips them, since without
+            // lhvC nothing declares their layer. The record rewrite also moves the version from 3.0 to
+            // 1.0: VideoToolbox refuses a Profile 5 record that says 3.0 (-12910, measured on macOS 27
+            // against a real Profile 20 sample, every other box and the samples ruled out one by one).
+            EngineLog.emit(
+                "[HLSVideoEngine] DV Profile 20 (MV-HEVC) in 2D: serving the base view as Profile 5 "
+                + "(dvh1, dvcC profile=5 version=1.0, CODECS=dvh1.05.\(dvLevelStr)), second view skipped",
+                category: .session
+            )
+            return CodecRoute(
+                codecTagOverride: "dvh1",
+                videoRange: .pq,
+                primaryCodecs: "dvh1.05.\(dvLevelStr)",
+                supplementalCodecs: nil,
+                doviConfig: .rewriteToProfile5,
+                convertP7ToProfile81: false,
+                dvVariant: dvVariant
+            )
         case .profile81:
             // P8.1 (HDR10-compat base).
             // DV panel: hvc1 + dvvC (muxer writes dvvC automatically) + SUPPLEMENTAL dvh1.08.XX/db1p.
@@ -582,7 +628,13 @@ extension HLSVideoEngine {
             //
             // P8.1 only. P8.4's base layer is HLG, and a profile-5 dvcC on an HLG `colr` is a container
             // that contradicts itself; nobody has measured that and it is not what was reported.
-            if !effectiveDvMode && forceDolbyVisionOnNonDVDisplay {
+            //
+            // Sodalite#245: a source that also carries HDR10+ keeps the route below when the host prefers
+            // it, so the panel receives the base layer with its HDR10+ instead of the composed HDR10.
+            if !effectiveDvMode && forceDolbyVisionOnNonDVDisplay && forcedDolbyVisionYieldsToHDR10Plus {
+                logForcedRouteYieldsToHDR10Plus(profile: "8.1")
+            }
+            if !effectiveDvMode && forceDolbyVisionOnNonDVDisplay && !forcedDolbyVisionYieldsToHDR10Plus {
                 EngineLog.emit(
                     "[HLSVideoEngine] AE#455: serving HEVC DV Profile 8.1 as Profile 5 "
                     + "(dvh1 sample entry, dvcC profile=5 compat=0, CODECS=dvh1.05.\(dvLevelStr)) "
@@ -669,7 +721,11 @@ extension HLSVideoEngine {
             // every Mac (no per-mode table, so `effectiveDvMode` is false unless the host asserts DV),
             // and shipped the EL NAL units (up to a FEL's bitrate) into segments that nothing decodes.
             // AE#455 applies to the converted stream the way it applies to a native P8.1.
-            if !effectiveDvMode && forceDolbyVisionOnNonDVDisplay {
+            // Sodalite#245 applies here too, for the same reason as on the P8.1 branch.
+            if !effectiveDvMode && forceDolbyVisionOnNonDVDisplay && forcedDolbyVisionYieldsToHDR10Plus {
+                logForcedRouteYieldsToHDR10Plus(profile: "7 (converted to 8.1)")
+            }
+            if !effectiveDvMode && forceDolbyVisionOnNonDVDisplay && !forcedDolbyVisionYieldsToHDR10Plus {
                 EngineLog.emit(
                     "[HLSVideoEngine] AE#455: serving HEVC DV Profile 7 (converted to 8.1) as Profile 5 "
                     + "(dvh1 sample entry, dvcC profile=5 compat=0, CODECS=dvh1.05.\(dvLevelStr)) "

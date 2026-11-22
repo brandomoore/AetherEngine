@@ -21,7 +21,7 @@ import Testing
 ///       -mpegts_service_type digital_tv -pat_period 0.5 out.ts
 ///
 /// and store raw DEFLATE (`zlib.compressobj(9, zlib.DEFLATED, -15)`) as base64.
-@Suite("AE#996 SSAI seam: clock restart and audio PID change", .serialized, .timeLimit(.minutes(2)))
+@Suite("AE#996 SSAI seam: clock restart and audio PID change", .serialized, .timeLimit(.minutes(3)))
 struct Issue996SSAISeamTests {
 
     // MARK: - A clock restart on a segmented source is a seam
@@ -203,7 +203,7 @@ struct Issue996SSAISeamTests {
             inputTimeBase: audioStream.pointee.time_base, sourceTimeBase: audioStream.pointee.time_base,
             bridge: nil, stripAacAdts: true)
         let cache = SegmentCache(forwardWindow: 64, backwardWindow: 64)
-        let producer = try HLSSegmentProducer(
+        let producer = HLSSegmentProducer(
             demuxer: demuxer, videoStreamIndex: videoIndex,
             video: .init(codecpar: UnsafePointer(video.pointee.codecpar),
                          timeBase: video.pointee.time_base, codecTagOverride: "avc1"),

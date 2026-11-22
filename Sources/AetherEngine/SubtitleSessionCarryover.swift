@@ -27,15 +27,20 @@ struct SubtitleSessionCarryover: Sendable, Equatable {
     var activeSubtitleTrackIndex: Int?
     /// One-shot `selectSidecarSubtitle` source (active with no track id); restored by URL.
     var primarySidecarURL: URL?
+    /// The explicit headers it was selected with. Credentials: never logged (audit SUB-204).
+    var primarySidecarHeaders: [String: String]?
     /// Secondary channel: external synthetic id or embedded stream index, whichever was active.
     var secondaryTrackIndex: Int?
     var secondarySidecarURL: URL?
+    var secondarySidecarHeaders: [String: String]?
     var nativeReapplyOrdinal: Int?
     /// True when the ordinal equals the mapping of the active track through the pre-reload
     /// rendition table (a `setNativeSubtitleRendering` pick). Such ordinals are recomputed
     /// against the reloaded table, which the seeded externals can grow or reorder; a diverging
     /// host-positional ordinal replays positionally like the #65 recovery.
     var reapplyOrdinalMatchesActiveTrack = false
+    /// AE#1052: the host's menu marker, restored before the replay so a marker comes back as one.
+    var nativeMarkerOrdinal: Int?
 }
 
 /// What the post-reload session must do to return to the pre-reload subtitle selection.

@@ -31,21 +31,12 @@ extension AetherEngine {
         guard let source else { return nil }
         // Guard against zap/stop clearing the LRU: a stale extractor's segment indices collide with the next channel's.
         guard loadGeneration == gen else { return nil }
-        let extractor: FrameExtractor
-        if let idx = scrubThumbnailExtractors.firstIndex(where: { $0.segmentIndex == source.segmentIndex }) {
-            let hit = scrubThumbnailExtractors.remove(at: idx)
-            scrubThumbnailExtractors.append(hit)
-            extractor = hit.extractor
-        } else {
-            guard let reader = source.makeReader() else { return nil }
-            extractor = FrameExtractor(reader: reader, formatHint: "mp4")
-            scrubThumbnailExtractors.append((source.segmentIndex, extractor))
-            while scrubThumbnailExtractors.count > 2 {
-                let evicted = scrubThumbnailExtractors.removeFirst()
-                Task { await evicted.extractor.shutdown() }
-            }
+        guard let extractor = scrubExtractor(key: source.segmentIndex, make: {
+            source.makeReader().map { FrameExtractor(reader: $0, formatHint: "mp4") }
+        }) else { return nil }
+        return await decodeScrubStill(on: extractor, generation: gen) {
+            await extractor.thumbnail(at: outputSeconds, maxWidth: maxWidth)
         }
-        return await extractor.thumbnail(at: outputSeconds, maxWidth: maxWidth)
     }
 
     /// 1 Hz timer to update live surfaces while paused (the `$currentTime` sink already covers the playing case).
@@ -718,6 +709,21 @@ extension AetherEngine {
         /// The engine coming back to a position it decided itself (the AE#446 outage swap, AE#442's
         /// in-place recovery reload). Not a scrub, and not bound by the scrubber's contract.
         case liveRejoin
+        /// A system remote command the engine answered itself (AE#1088). Bound by the host's contract.
+        case remoteCommand
+        /// A skip button in the software route's PiP window (AE#1088). Bound by the host's contract.
+        case pictureInPicture
+
+        /// Everything except the engine's own rejoin is held to what `seekableLiveRange` advertises.
+        var followsHostContract: Bool { self != .liveRejoin }
+
+        var eventOrigin: SeekEvent.Origin {
+            switch self {
+            case .host, .liveRejoin: return .programmatic
+            case .remoteCommand: return .remoteCommand
+            case .pictureInPicture: return .pictureInPicture
+            }
+        }
     }
 
     /// AE#446 round 4: whether a live seek is refused for having no DVR window to land in.
@@ -727,7 +733,7 @@ extension AetherEngine {
     /// play from. It says nothing about the engine's own rejoin, which picked its position out of
     /// content the session itself served.
     nonisolated static func liveSeekRefusedWithoutDVR(origin: SeekOrigin, windowSeconds: Double?) -> Bool {
-        guard origin == .host else { return false }
+        guard origin.followsHostContract else { return false }
         return windowSeconds == nil
     }
 
@@ -795,7 +801,7 @@ extension AetherEngine {
         // Floating-point axis inversion can put an edge seek a few picoseconds beyond the
         // item's measured end. Keep host seeks within that end; stale-edge recovery and live
         // rejoin deliberately use their resident bounds instead.
-        let clockTarget = origin == .host && itemEnd > 0 && playedResidentEdge == nil
+        let clockTarget = origin.followsHostContract && itemEnd > 0 && playedResidentEdge == nil
             ? Swift.min(mappedClockTarget, itemEnd) : mappedClockTarget
         return (sessionTarget, clockTarget)
     }

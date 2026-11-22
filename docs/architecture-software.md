@@ -72,7 +72,7 @@ Source URL ──► Demuxer ──┬─► video decoder ──► [UpscalingF
 
 **At load.** `VideoRoutingPolicy` sends a source here when AVPlayer's HLS-fMP4 pipeline cannot take its video. The per-codec list, with the reason for each row, is in [formats.md, Software decode](formats.md#software-decode).
 
-- Two opt-in stages also move a session here: [upscaling](#low-resolution-upscaling) and [Dolby Vision FEL composition](#dolby-vision-profile-7-fel).
+- Three opt-in stages also move a session here: [upscaling](#low-resolution-upscaling), [picture processing](#picture-processing) and [Dolby Vision FEL composition](#dolby-vision-profile-7-fel).
 - A host app can ask for this host directly with `LoadOptions.preferredDecodePath = .software`.
 
 **Mid-session (escalation).** A running native session can also move here. Escalation means `SoftwarePathEscalation` rebuilds the session on this host after CoreMedia refuses the media.
@@ -81,6 +81,8 @@ Source URL ──► Demuxer ──┬─► video decoder ──► [UpscalingF
 - The rebuild starts from the pending user seek or the actual playhead.
 - One trigger is described in [AVC configuration changes](architecture-native.md#avc-configuration-changes).
 - `videoRoute` reports the move ([Effective video route](architecture.md#effective-video-route-videoroute)).
+
+**Inverse telecine on VOD.** Hard-telecined NTSC MPEG-2 film is sampled before the display criteria are written (`TelecineCadenceProbe`, #853). On film the deinterlace graph becomes `fieldmatch`, the deinterlacer for frames left combed, then `decimate` (on the GPU engine `decimate` runs before the upload, since it takes CPU frames only), and the session runs at 23.976 fps. See [formats › Inverse telecine](formats.md#inverse-telecine).
 
 **Interlace check on VOD.** Interlaced H.264 comes here to be deinterlaced. On seekable VOD (#232) the declared field order is first checked against decoded frames (`InterlaceProbe`). The deinterlace filter engages on `AV_FRAME_FLAG_INTERLACED` alone. So if that flag never appears in a sample, the detour would do nothing, and the stream goes back to the native path.
 
@@ -114,6 +116,37 @@ A VideoToolbox decode callback can keep its output image buffer as a reference p
 **Exception: the dual-layer base-layer decoder** (`allowsInPlaceOutputMetadata`). The composer writes the composed pixels into that decoded buffer anyway, so an owned copy would only cost a second pool.
 
 The risk this accepts: later frames could decode from composed pixels, which would show as drift until the next IDR (the next full keyframe). It is verified on the Mac only. A long-GOP picture comparison on the Apple TV decoder is still open ([measurements.md](measurements.md#dual-layer-in-place-output-metadata)).
+
+**HDR10 static metadata (AE#957).** VideoToolbox attaches no mastering display colour volume or content light level to the frames it decodes, though the stream carries both. The hardware decoder finds the stream's values at `open()` and the normalizer adds them with the colour attachments, under the same policy. `HDR10StaticMetadataSEI` reads them for a PQ stream:
+
+- from the container first (`mdcv` / `clli` boxes, Matroska colour metadata, both arrive as `codecpar` side data);
+- then from the SEI in the `hvcC` (x265 writes it there), or the metadata OBUs in the `av1C`;
+- then from the first 3 key frames: the SEI for HEVC, the metadata OBUs (`HDR_MDCV`, `HDR_CLL`) for hardware AV1. This decoder opens no H.264, and VP9 has no in-band HDR10 metadata. Frames before the values are found go out without them.
+
+AV1's content light level has Core Video's layout. Its mastering display does not (red first, 0.16 fixed point chromaticity, 24.8 and 18.14 fixed point luminance), so it is converted.
+
+A key the frame already carries stays as it is. Only a missing key is filled, so a decoder that does attach its own values wins, and anything downstream of the decoder (a frame handler) can still set its own. The decoder clears its values at `close()`, and `open(parameterSets:)` (no stream to read them from) adds none.
+
+The SEI payloads are byte for byte what Core Video's attachments hold, so they are copied as they are. The television does read these attachments, see [measurements.md](measurements.md#hdr10-metadata-on-the-software-path-reaches-the-television-ae957).
+
+**The libavcodec decoder attaches the same keys (AE#957).** `SoftwareVideoDecoder` (dav1d AV1 without hardware decode, VP9 where VideoToolbox has none, H.264 High 10 / 4:2:2 / 4:4:4, interlaced H.264, HEVC Rext) builds its own buffers. On a PQ frame it attaches:
+
+- the values the latest decoded frame carried as side data (libavcodec exports them from the SEI, libdav1d from the metadata OBUs). They stay until a frame brings new ones, since HEVC carries them only on some frames;
+- otherwise the container's.
+
+Frames that are not PQ, or have no values, get both keys removed, because a pool buffer keeps what its last use left on it.
+
+**The decoder's format description carries the same values (AE#957).** The owned copy costs about 7 ms per 4K frame on an A12 Apple TV, so the normalizer should only ever need it as a fallback. For HEVC, AV1 and VP9 the description VideoToolbox decodes with names the stream's colour, and the HDR10 values known at `open()`. VideoToolbox then attaches both itself and the frames match as decoded. Without the colour keys it tagged a PQ BT.2020 HEVC clip as BT.709, and every frame was copied.
+
+Values found later, in a key frame, go into a new description and session at that key frame, before it decodes, the way a VP9 size change does. Many AV1 HDR10 encodes carry them in-band only.
+
+- Usually that is the stream's first key frame, with nothing decoded before it, so nothing is lost.
+- On a later key frame (the values were only in its SEI), its leading pictures can be lost once, as after a seek.
+- If VideoToolbox refuses the new session, the old one stays and those frames go on by copy.
+
+At `close()` the decoder logs how each frame went: `output metadata over N frames: A as decoded, B in place, C copied, D copy failed`. Copies on every frame mean the description and the normalizer disagree. Numbers: [measurements.md](measurements.md#per-frame-cost-of-the-software-path-ae957); to time it on a device, [`aetherctl bench`](cli.md#bench).
+
+**The renderer's format description follows the HDR10 values.** `SampleBufferRenderer` reuses one format description while the frames look the same. Its cache key includes the frame's mastering display and content light level bytes, so a change of those values at the same size and colour gets a new description (`FormatDescriptionFollowsHDR10MetadataTests`).
 
 **AV1 Dolby Vision RPU path.** (The RPU is the per-frame Dolby Vision metadata.) This path reuses that owned output, or makes its own copy, before changing buffer and IOSurface metadata. If copying fails, it delivers the original without setting or clearing RPU keys, including when RPU attachment is disabled.
 
@@ -159,6 +192,8 @@ A seek closes the arm again. Why both conditions:
 - The second catches a source slower than real time from the first byte. Such a source never builds that lead. Without this rule the clock would run on over a starved read-ahead with the phase at `.playing`.
 
 **Parked video keeps flowing.** Parked video is decoded video that waits until the renderer has room. While video is parked, the loop's read waits at most `parkedVideoReadWaitSeconds` (20 ms) for the source, then hands parked video to the renderer again. The loop is the only thread that does that, so an unbounded wait on a slow source would let the renderer run dry ([measured](measurements.md#parked-video-read-wait)).
+
+**The read gate follows the source's interleave.** The gate assumes a source that interleaves audio and video tightly, within the 4 s lead and the 256-packet cap. A source that interleaves in larger pieces gets a gate sized from that geometry (`SoftwareReadGateBudget`, AE#1079). Otherwise the next piece of the other track sits behind a held read. Then the picture freezes while the sound plays on, or the clock stalls on a full queue. Only DASH reports its interleave today (the subsegment durations from its `sidx`, see [MPEG-DASH](formats.md#mpeg-dash-on-demand)). Every other source keeps 4 s and 256 packets.
 
 **The resume.** After such a pause the clock restarts through the video preroll, and a full layer counts as ready there (`SampleBufferRenderer.prerollSatisfied`).
 
@@ -250,13 +285,71 @@ With `LoadOptions.upscalesLowResolutionVideo` (#846, AE#1039), `load()` asks `Up
 - Both scaler routes dispatch whole Metal threadgroups and bounds-check edge pixels, including on GPUs without nonuniform threadgroups.
 - The stage returns nil whenever the original frame should go out instead. Its VideoToolbox session is built off the decode thread (about 4 s cold on Apple TV), and frames pass through unchanged until it is ready.
 
-**Budget.** Over a 48-frame window the stage's mean time must stay under 90% of the frame interval.
+**Budget.** Over a 48-frame window the stage's mean time must stay under 90% of the frame interval. The time counted is how long each frame holds the decoder's thread ([two frames in flight](#two-frames-in-flight-on-the-gpu)).
 
 - An overrun first drops one rung: MetalFX after an ML pass, or the line-art restore pass and then line art itself for the automatic scaler.
-- A further overrun, or three failures in a row, disables the stage for the session.
+- Three ML failures in a row drop the VideoToolbox pass: MetalFX alone to the same target (AE#957). If the pass never delivered a frame, `MLRefusalMemory` stops offering ML factors for the process. An A12 Apple TV on tvOS 27.2 reports VT super resolution and fails every pass ([measurements](measurements.md#upscale-stage-on-the-a12-ae957)).
+- A further overrun, or three failures in a row of anything else, disables the stage for the session.
 - If only the stage had put a URL VOD session on the software path, the session is then rebuilt on the native path (`upscaleDisableReturnsToNative`).
 
-`$activeUpscale` publishes what runs. See [api.md, `upscalesLowResolutionVideo`](api.md#upscaleslowresolutionvideo).
+`$activeUpscale` publishes what runs. See [api.md, `upscalesLowResolutionVideo`](api.md#upscaleslowresolutionvideo). To time each plan on a device, [`aetherctl bench`](cli.md#bench) runs the real stage (`UpscaleBenchmarkStage`) for 480p and 720p automatic, 720p MetalFX only, and both line-art rungs at 1080p.
+
+**The frame chain** (`FrameChain`, AE#957) is what the line-art scaler runs on. It turns the 4:2:0 frame into a half-float RGB texture, runs its stages, and turns the result back into the input's format at the target size, all in one command buffer.
+
+- A chain whose stages all leave the picture alone (`FrameChainStage.isIdentity`, today `PassThroughStage`) at its own size runs as one kernel with no RGB texture. One per-pixel stage may join them (`FrameChainStage.fusedToneMap`, today [`ToneMapStage`](#hdr10-tone-map)): the kernel then runs that stage's arithmetic on each sample, rounded to half as the two passes store it. On an A12 Apple TV the RGB texture cost most of the 10 ms the two passes took per 4K frame. Line art changes the picture and the size, so it keeps the two passes. The one kernel is the fast path for chains that only convert or tone map, and the benchmark times both.
+- That kernel is `frameChainRoundTripWide` when the width and the picture's x origin are multiples of 4: it reads and writes four luma samples per texel and folds the colour arithmetic, 2.7 ms per 4K frame on the A12. Otherwise `frameChainRoundTrip`, one sample per access, 4.0 ms.
+- Every other chain keeps the two passes: a stage reads its neighbours from that texture.
+- Both paths give the same picture: luma unchanged, chroma within one code value.
+
+**Colour volume.** Each stage declares the colour volume of its output (`FrameChainStage.outputColorVolume`), and the chain writes the frames' HDR10 metadata from it. Without that, a stage that tone maps to the display's peak would still go out with the source's metadata, and the display would tone map a second time.
+
+| A stage declares | The output frame carries |
+|---|---|
+| `.unchanged` (the default) | the source's own mastering display and content light level, or none when the source has none |
+| `.hdr10(values)` | those values in both keys, over the source's |
+
+- The last stage that declares a volume sets the chain's. A dither or LUT stage after a tone mapper declares nothing and keeps the tone mapper's volume.
+- `FrameChain.attach(from:to:)` gives every output buffer its attachments: the source's, minus the geometry keys (the output is the picture region alone, so a clean aperture would crop it again), then the declared HDR10 metadata. The HDR10 probe calls it. `FrameUpscaler` runs the same step on every rung, with `.unchanged` when it built no chain.
+- `PassThroughStage` and `LineArtStage` declare nothing. `ToneMapStage` declares the mapped metadata ([HDR10 tone map](#hdr10-tone-map)).
+
+### HDR10 tone map
+
+`ToneMapStage` and `BT2390ToneCurve` (AE#957) are a [frame chain](#low-resolution-upscaling) stage: the BT.2390 EETF (ITU-R BT.2390, section 5.4.1) from the source's peak to a lower target peak, on the PQ-coded RGB of an HDR10 frame. The [picture processing](#picture-processing) runs it in playback; the HDR10 probe's `chain+tonemap` mode and the benchmark build it too.
+
+- Below the knee the picture is unchanged to the code value. From the knee, a Hermite spline rolls the rest of the source range off into the target's top. Values above the source peak land on the target peak.
+- The knee is at 1.5 times the target minus 0.5 on the curve's scale (PQ of the target over PQ of the source peak). A 1000 nit source to a 600 nit target starts rolling off at 464 nit.
+- No curve is built for a target below a third of the source peak on that scale (about 5 nit for a 1000 nit source): the knee would fall below 0 and the spline would turn back down.
+- It maps each R'G'B' component, as BT.2390 does: highlights above the target move toward white instead of clipping one channel.
+- Black is not mapped (source and target black are 0, as on an OLED).
+- The source peak is MaxCLL when it is known and below the mastering peak, else the mastering peak (`ToneMapSourcePeak`). No curve is built when the target is at or above it.
+- The stage declares the mapped metadata: the target as the mastering peak, the source's mastering black, and MaxCLL and MaxFALL through the same curve.
+- The shader computes both sides of the knee and picks one, so its cost does not depend on the picture. The spline is one cubic per component, its coefficients worked out once on the CPU (`FrameChainToneMapParams`). On a GPU it matches the CPU curve to within a quarter of a 10-bit code, and the one kernel matches the two passes to within one code.
+- On the A12 Apple TV at 4K the one-kernel tone map takes 5.3 ms per frame (GPU 4.0 ms), and 4K60 played with no dropped frame. As its own pass between the two passes it takes 16.9 ms, more than a 60 fps frame. Numbers: [measurements.md › Tone map at 4K60 on the A12](measurements.md#tone-map-at-4k60-on-the-a12-ae957).
+
+### Picture processing
+
+With `LoadOptions.videoProcessing` (#957), `load()` asks `VideoProcessingRouteDecision` once, from the probe and the display (`AetherEngine+VideoProcessing.swift`). The decision is a pure function and logs one `[VideoProcessing]` line. Its one stage today is the [HDR10 tone map](#hdr10-tone-map) above.
+
+**When the route is taken.** All of these must hold:
+
+- HDR10: PQ, not Dolby Vision, no HDR10+ known at load, 8 or 10-bit 4:2:0,
+- the stream declares a mastering display or MaxCLL before its first packet (container, `hvcC` or `av1C`, read by `HDR10StaticMetadataSEI.declared(by:)`, the same values the decoder starts from),
+- a curve exists: the source peak is above the target, and the target is not below a third of it on the PQ scale,
+- the display takes HDR10, and the panel routes as HDR once the load has settled it. A load with the option on and an HDR10 format waits for the panel switch before it decides, so it gives up AE#348's overlap of the switch with the first segments. An unsettled panel never counts as HDR,
+- OS 26 or later, not a wireless AirPlay route, and not a live session with demuxed audio.
+
+A title whose processing gave up earlier in this process (`VideoProcessingFailureMemory`) is not taken again: at that frame rate or a faster one after an overrun or failures, at any rate after HDR10+.
+
+**Where it runs.** A taken route moves the session to the software host, also when it would otherwise have played natively (`sourceSoftwareOnlyForVideoProcessing`). The host wraps its decoder's frame handler, and `FrameToneMapper` runs on every decoded frame:
+
+- It builds a `FrameChain` with one `ToneMapStage`, which the chain fuses into its one kernel, and `FrameChain.attach(from:to:)` writes the mapped metadata on every output frame.
+- The curve starts from the frame's own HDR10 metadata, and from the stream's declaration for a frame without any. Other values rebuild the chain.
+- A frame it does not apply to (not PQ, not 4:2:0, a peak at or below the target) goes out as decoded.
+- Upscaling and processing never both take a source: one wants SDR, the other HDR10.
+
+**Budget.** The upscaler's: over a 48-frame window the mean time a frame holds the decoder's thread must stay under 90% of the frame interval. There is no lighter rung, so an overrun, three failures in a row, or a frame carrying HDR10+ disables it for the session. A display applies HDR10+ to the picture it receives, so a mapped picture would be mapped twice.
+
+- If only the processing had put a URL VOD session on the software path, the session is then rebuilt on the native path, by the upscaler's rule (`upscaleDisableReturnsToNative`).
 
 ### Dolby Vision Profile 7 FEL
 
@@ -284,6 +377,76 @@ See [dolby-vision-fel.md, section 7](dolby-vision-fel.md#7-curve-fold-on-the-nat
 
 See [dolby-vision-fel.md, 5.2 Routing](dolby-vision-fel.md#52-routing) and [5.2.4 The AVPlayer-output route](dolby-vision-fel.md#524-the-avplayer-output-route).
 
+### Two frames in flight on the GPU
+
+`PipelinedFrameStage` (AE#957) runs the per-frame GPU stages: the upscaler and the picture processing. It keeps up to two frames on the GPU at once, so the GPU does not sit idle between one frame and the next.
+
+- The decoder's frame handler encodes the frame's GPU work, commits it and returns. The frame goes to the renderer when its work has completed.
+- Frames leave in the order they were decoded. A frame that needs no GPU waits for the frames ahead of it. With nothing ahead, it goes out on the decoder's thread, as before.
+- The handler waits while two frames are undelivered. That is the back-pressure: the decoder never runs more than two frames ahead of the renderer.
+- After every decoder flush or drain (seek, error recovery, end of stream, a live seam) and in `stop()`, the host calls `settle()`. The frames still on the GPU reach the renderer before it flushes. `settle()` gives up after 0.5 s and logs `[FramePipeline] settle: ...`, because seek and stop call it on the main actor.
+- Each frame carries the generation its packet was read under, taken when the decoder hands it over, and goes out only while that generation is live (the AE#491 check). At delivery the demux loop may already read packets of the new position, so a check made only then would let a frame from before the seek through. A frame stale at hand-over never reaches the GPU.
+- A frame whose GPU work failed goes out as decoded.
+- A stage can answer `.drop` (from `begin` or a `.later` step's `resume`) when it has no picture for the frame: the frame frees its slot and nothing is delivered for it.
+- A command buffer iOS refuses because the app is in the background (`notPermitted`) also delivers the frame as decoded, and neither stage counts it as a failure. Before, three refused frames switched the stage off for the title.
+- A frame's work holds its plane textures and the texture cache they came from (`MetalTextureLease`). A `CVMetalTexture` calls back into its cache when it is freed and does not retain it, so a stage can now drop or rebuild its chain while frames are still on the GPU.
+- The budget counts the time a frame holds the decoder's thread: waiting for a free slot, then encoding. In steady state that is the stage's cost per frame.
+- A frame that was in flight when its stage was rebuilt (an overrun rung, the ML fallback) is still delivered, but does not count against the new stage.
+- A completion only queues the frame's times, and the frame goes out at once. The stage counts them at its next frame, on the decoder's thread, so a completion never waits for the stage's lock.
+- The VideoToolbox super resolution pass runs off the decoder's thread too. The decoder's thread starts the pass and moves on. When VT answers, MetalFX is encoded and committed from VT's callback, so the next frame's ML pass (on the Neural Engine) overlaps this frame's MetalFX work (on the GPU).
+  - One ML pass at a time. The low-latency scaler numbers its frames, and the next frame's MetalFX work must be committed after this one's. So the decoder's thread waits for the pass before, and that wait counts in the budget: with ML slower than MetalFX, the budget measures the ML pass.
+  - The ML timeout (three frame intervals, at least 50 ms) is a timer. A pass that answers late keeps its buffers out of the pools until it does, as before.
+  - A stage replaced while its pass ran (the MetalFX-only fallback, a rebuild) delivers that frame as decoded.
+- `FrameChain.encode` and the upscaler's `encode` return the work uncommitted, because Metal takes a completion handler only before the commit. The synchronous `process` and `upscale` (tests, the probe) commit and wait; `upscale` also waits for an off-thread ML pass. The benchmark still runs the ML pass in line, so its wall time is one frame start to finish.
+
+**Shared Metal plumbing.** The frame chain, the upscaler's MetalFX path, the FEL composer and `GPUFrameConverter` make their plane textures, dispatch their kernels and hold their textures through one helper, `MetalFrameIO`. Their pipelines are compiled once per device and process (`MetalPipelineCache`).
+
+A failed build of the frame chain or upscaler kernels is kept for 60 s, so it is not compiled again for every stage, and is then retried (review R-P4-1). Metal reports a compiler-service interruption under memory pressure with the same error a broken shader gets, and a failure kept for good left tone mapping and upscaling off until the app relaunched. The FEL composer keeps its failure for the process, because it asks for its pipelines on every frame and a retry would put a compile on the decode thread.
+
+A GPU without non-uniform threadgroups (the A10X in the first Apple TV 4K) cannot run `dispatchThreads`. There every kernel is dispatched in whole threadgroups, and each kernel's bounds guard drops the threads past the picture's edge.
+
+On the A12, 720p to 2160p through MetalFX holds the decoder's thread about 9.5 ms per frame instead of 29.5 ms. Numbers: [measurements.md › Two frames in flight on the A12](measurements.md#two-frames-in-flight-on-the-a12-ae957).
+
+#### 10-bit AV1 conversion
+
+The P010 conversion and film grain of 10-bit AV1 (`GPUFrameConverter`, [formats › AV1](formats.md#av1)) run in a pipeline of the same kind, inside `SoftwareVideoDecoder`. While one frame converts, dav1d decodes the next.
+
+- **Who.** Only the playback host, which sets `overlapsGPUConversion` before it opens the decoder. The probe, the still extractor and the tests read a frame as soon as `decode` returns, so they keep the conversion that waits for each frame.
+- **Order.** Every frame of that decoder goes through the pipeline, one converted on the CPU included, so frames leave in decode order. The frame handler then runs on the pipeline's delivery queue.
+- **Buffers.** The converter has one set of per-frame buffers (uniforms, grain templates, scaling, offsets, staging) for each frame that can be on the GPU. A frame's work is encoded in the pipeline's `begin`, after the wait for a free slot, so the set it writes belongs to a frame already delivered.
+- **The picture.** The GPU reads dav1d's picture in place. The frame's work holds a reference to it until the work completes, because the decoder reuses its frame as soon as `submit` returns.
+- **Seeks.** Each frame carries the feed epoch it was emitted under (AE#492) and goes out only while that epoch is live. `flush()` moves the epoch on, so the frames still on the GPU are retired with the undecoded packets, and it waits for them before it returns. `drainForEndOfStream()` waits for the last frames, and `close()` for any left, so the host's own flush and drain order is unchanged.
+- **Failure.** A frame whose GPU work fails is converted with `sws_scale` when the work completes, without its grain, as when the waiting conversion fails. A frame that never reaches the GPU is converted on the decoder's thread. A frame neither converts is dropped, as the waiting conversion drops it, because its pixel buffer was never written. So the decoder commits the work in a `.later` step, whose `resume` can answer `.drop` once the work completed.
+- **Grain tables.** The frame's film grain tables (`AV1FilmGrainTables`) are built on the decoder's thread when its work is encoded. Their loops run with `while` over raw pointers, so a host's Debug build, which compiles the package unoptimised, keeps up too: written with `Array` and `for ... in` they took the whole frame interval there.
+- **Log.** Every 240 frames the converter logs `[GPUFrameConverter] last 240 frames: encode ... ms, GPU ... ms, decoder thread held ... ms per frame`, ending in `(overlapped)` on this route and `(waited for each)` on the other.
+
+Waiting for each frame held a 1080p 10-bit episode below its 24 frames a second on an Apple TV 4K (A15) in a host's Debug build, so the clock paused to rebuffer every few seconds; most of each frame's time there was the grain tables. Numbers: [measurements.md › 10-bit AV1 conversion on the A15](measurements.md#10-bit-av1-conversion-on-the-a15).
+
+### HDR10 pass-through probe
+
+A measurement switch for AE#957, not a feature. It checks whether HDR10 metadata the engine attaches to a frame of its own reaches the television. tvOS has no `CAEDRMetadata`, so the attachments on the buffer given to `AVSampleBufferDisplayLayer` are the only lever. Tone mapping to a panel's peak depends on the answer.
+
+It is off unless `AETHER_HDR10_PROBE` is set (`HDR10PassThroughProbe.swift`). The variable is read at every software-path load, so a test host can switch it between loads. It never runs with an upscale plan or on the dual-layer decoder.
+
+| `AETHER_HDR10_PROBE` | each decoded frame |
+|---|---|
+| `log` | unchanged; the first frame's colour tags and HDR10 metadata are logged |
+| `meta` | the decoder's buffer gets the probe's mastering display and content light level values |
+| `chain` | goes through the frame chain (`PassThroughStage`) into a buffer of the engine's own, attachments copied |
+| `chain+meta` | both: the engine's own buffer, with the probe's values |
+| `pulse` | as `meta`, but every 72 frames the values switch to a 4000 nit set (MaxCLL 4000, MaxFALL 1000) and back |
+| `chain+pulse` | as `chain+meta`, switching the same way |
+| `chain+tonemap` | through the frame chain with the tone-map stage, from the frame's own HDR10 peak to `AETHER_HDR10_PROBE_TARGET` nit (600 by default), with the metadata the stage declares |
+
+- `AETHER_HDR10_PROBE_META` sets the values, as `maxcll=345,maxfall=123,peak=777,min=0.005` (the default). They share no number with a real master, so an analyser shows whose metadata a television got, and a MaxCLL of 345 changes the television's tone mapping visibly (`Probes/HDR10PassThrough`). A value out of range turns the probe off with one `[HDR10Probe] ignored:` line.
+- `meta` changes the attachments of VideoToolbox's buffer in place. Attachments are not pixels, so reference frames decode the same, but it is a probe, not the output-metadata policy above.
+- The chain runs on OS 26 and later on a device. Elsewhere, and on a frame the chain cannot take, the chain modes deliver the frame unchanged, without the probe's values.
+- `chain+tonemap` is for timing the real tone-map kernel in playback (the 59.94 fps pacing number). A frame that is not PQ, carries no HDR10 metadata, or whose peak is not above the target passes through unchanged. When `AETHER_HDR10_PROBE_META` is set, a frame with no metadata of its own is mapped as if it carried those values, so a test clip without any still times the kernel (its cost does not depend on the values). The chain's log line names the curve: source peak and where it came from, target, knee, the output metadata, and whether it runs as one kernel.
+- The pulse modes need no instrument. The pixels stay the same and only the metadata changes, so a television that reads it tone-maps the bright parts brighter and dimmer every 3 s at 23.976 fps. The first four switches are logged. The renderer makes a new format description for each switch ([VideoToolbox output metadata](#videotoolbox-output-metadata)).
+- The log lines start with `[HDR10Probe]`: the first frame before and after, the format description built from the output, and the GPU time over each 48-frame window (the first ten). Three chain failures in a row turn the probe off for the session.
+
+The device harness that plays every mode on an Apple TV is [`Probes/HDR10PassThrough`](../Probes/HDR10PassThrough/README.md).
+
 The 2:3 pulldown retimer is not an optional stage. It is part of the native route's frame grid, see [2:3 pulldown timing on 24p film](architecture-native.md#23-pulldown-timing-on-24p-film).
 
 ## Audio on the software host
@@ -291,6 +454,12 @@ The 2:3 pulldown retimer is not an optional stage. It is part of the native rout
 One table, kept with the native side, shows how each audio route sits on this host next to the native one: stream copy of E-AC-3 JOC, PCM decode, the object-audio render through `SoftwareAPACProducer`, and how `SoftwareAtmosRoute` picks per track. See [architecture-native.md, Audio routes and object audio](architecture-native.md#audio-routes-and-object-audio).
 
 The channel layout and timestamp rules of the PCM decode are under [Audio channel layout and timestamps](#audio-channel-layout-and-timestamps).
+
+**AC-3 and E-AC-3 play with their full dynamics.** FFmpeg's Dolby decoders apply the stream's dynamic range compression unless told otherwise. Apple's decoder on the native path does not (unless the viewer turns on Reduce Loud Sounds). So every FFmpeg decoder whose output is heard opens through `AudioDecoderOptions` with `drc_scale` 0. That covers `AudioDecoder` (this host, the audio-only host and the lazy tap use it), the `AudioBridge` decode and `AudioTapDecoder`. Apple's decoder ignores dialnorm just like FFmpeg's, measured on AC-3 encoded at dialnorm -31 and -20. Both decoders put out the same level for both.
+
+- Before, a session that moved here (for example for upscaling) played quieter than the same title on the native path. On an E-AC-3 5.1 film it was -18.6 LUFS against Apple's -16.8, with peaks 1.5 dB lower, and -16.6 LUFS once the compression was off.
+- A host that wants a compressed sound sets it with `AudioShaping`, the same on both paths.
+- E-AC-3 JOC on this host goes through Apple's converter (`SoftwareEAC3AtmosDecoder`) or stays compressed, so it was never affected.
 
 ## Audio tap
 
@@ -363,6 +532,18 @@ Each path's tap reader belongs to that path (native, remote HLS, software). The 
 ## Live sources on the software host
 
 The native stream-copy path's live recovery (reconnect overlap, the replay boundary, playlist renewal) is in [architecture-native.md, Live sources](architecture-native.md#live-sources). The software host reuses the same replay guard and adds the rules below.
+
+### Timestamp jumps (the discontinuity fold)
+
+Live sources, and VOD sources that cannot seek, jump their timestamps at programme boundaries, ad breaks and recording chunks. The software host folds each jump away, so decoders, renderers, the DVR ring and the live edge all see one continuous timeline. Both the DVR reader and the combined demux loop do this through `LiveTimelineFold`.
+
+- A jump is a step of 10 s or more between two packets of the same stream. The stream's offset moves by the jump, minus one packet's spacing.
+- **Video and audio each find their own jumps** (AE#1053). An MPEG-TS splice does not move both streams at the same byte, so a fold keyed on video alone put the audio packets read between the two seams a whole jump off the clock. On a +347 s spike that left AC-3 queued 347 s ahead of the clock and the session silent until a retune.
+- When the second stream reaches a jump the first one already crossed, it takes over that stream's offset exactly, so a splice keeps the two in sync to the tick. The test is closeness: its own estimate within 1 s of the other stream's offset.
+- Each jump logs one `[SWHost] PTS discontinuity #n (reader|demux, video|audio)` line, capped at 40 per session. `(adopted from the other stream)` marks the second stream of a splice.
+- The live read-ahead measures its reservoir on raw timestamps, upstream of the fold. A distance past any fill it could have built (forward window + 10 s) counts as a jump, not as a full reservoir, so a spike no longer parks the producer. The VOD cache keeps the old reading, because a cached seek back legitimately leaves more stored than the window.
+
+**Where the video decoder is flushed.** A video jump needs the decoder drained and flushed, after the pre-jump packets and before the first post-jump one. On the combined loop's parked route that first packet carries a mark, and the flush runs when it reaches the head of the parked queue. The loop keeps reading audio meanwhile. It used to wait on the spot for the whole parked queue (~3.5 s of video), read no audio, and lose most of a 4 s audio lead at every jump (down to 0.33 s, measured). With the mark, a spike and a +5000 s splice both keep the lead at its no-jump level (3.30 s and 3.09 s minimum against 3.37 s). The audio decoder is still flushed when the video jump is read.
 
 ### Software live replay admission and recovery
 
@@ -462,6 +643,10 @@ The cache frontier is how far ahead of the playhead the cache provably holds pla
 
 - A cached seek restores a retained keyframe cursor, including an earlier keyframe for available preroll, and keeps the producer at its existing source frontier.
 - AV1 through dav1d restores to the last keyframe at or before the target instead (`anchorsOnLastKeyframe`). An AV1 keyframe opens on its own, and the earlier one only cost dav1d a whole GOP of decode before the picture came back.
+- A cached seek also needs audio for the target, and a keyframe's record does not always lead to it. With audio muxed in long blocks (DASH `SegmentBase` with 10 s audio fragments against 5 s video ones), the audio for a keyframe is stored before that keyframe, and a restore at the keyframe played up to a whole block silent (AE#1093).
+- So the read-ahead keeps audio restart points as well: one key-flagged audio packet every 0.25 s, pruned with the history. A hit picks the latest point at least 0.2 s before the target (decoder warm-up) and no more than 5 s before it.
+- When that point comes before the video keyframe in the spool, the restore starts there and the consumer drops the video records in between, so the decoder does not run a GOP it would throw away. Otherwise the restore is the keyframe's, as before.
+- No usable audio point means a cache miss and a source seek, never a silent hit. libavformat flags every packet of an intra-only audio codec as a key packet, TrueHD only on a major sync, so this only turns away audio that really cannot restart there.
 - A cache miss clears coverage and repositions the demuxer. Discarding the spool is the worker's job, not the seek's: removing every retained chunk costs more the longer the session has kept them, and no seek waits on it.
 - Consumer generations and source epochs are separate counters. A cached seek must not discard a producer packet in flight, and a superseded consumer must not steal the first packet of a new source epoch.
 - Admission applies equally to packet, EOF, error and delayed end-of-media callbacks.

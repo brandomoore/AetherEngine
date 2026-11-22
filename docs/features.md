@@ -39,10 +39,14 @@ The engine sends a format to hardware when the platform can decode it, and to it
 
 - Software is the default route. Only HEVC, H.264 and hardware-decodable AV1 go native.
 - H.264 High 4:2:2 / 4:4:4 / 10 and HEVC Rext go to software where VideoToolbox has no hardware decoder for them (Intel Macs, older chips).
-- **Interlaced H.264** goes to software, because AVPlayer does not deinterlace. On VOD (on-demand files, not live) the engine checks the declared field order against decoded frames. Progressive video that is only packed as interlaced therefore keeps hardware decode.
-- **Deinterlacing** runs on the GPU (yadif_videotoolbox, Metal, field rate by default), with a CPU bwdif fallback.
+- **Interlaced H.264** goes to software, because AVPlayer does not deinterlace. On VOD (on-demand files, not live) the engine checks the declared field order against decoded frames. Progressive video that is only packed as interlaced therefore keeps hardware decode. While the host reports an AirPlay receiver that shows video, it plays natively instead, so the TV gets the picture (AE#1070).
+- **Deinterlacing** runs on the GPU (bwdif_videotoolbox, Metal, field rate by default; yadif_videotoolbox on older FFmpegBuilds), with a CPU bwdif fallback that runs the same algorithm.
+- **Inverse telecine** for hard-telecined NTSC film (the usual DVD of a film-shot series): a load-time sample finds the 3:2 pulldown, the fields are matched back into 23.976 fps film frames and the display is asked for 23.976 Hz, instead of deinterlacing (#853). See [formats › Inverse telecine](formats.md#inverse-telecine).
 - **Upscaling (opt-in):** `LoadOptions.upscalesLowResolutionVideo` scales SDR video below 1080p up to the display. It uses VideoToolbox super resolution, then MetalFX, and needs OS 26. HDR, Dolby Vision and AirPlay keep their usual route, and the upscaling stage never stops playback. For animation, `upscaleScaler = .lineArt` runs a line-art network instead, which also takes 1080p. See [api.md › upscalesLowResolutionVideo](api.md#upscaleslowresolutionvideo).
+- **Tone mapping (opt-in):** `LoadOptions.videoProcessing` maps an HDR10 title whose declared peak is above `targetPeakNits` down to that peak (BT.2390), and the frame tells the display the target, so it does not map a second time. It plays the title on the software path and needs OS 26. Dolby Vision, HDR10+, HLG and SDR keep their usual route. See [api.md › videoProcessing](api.md#videoprocessing).
 - **3D on visionOS:** an MV-HEVC second view and side-by-side or over-under frame packing (HEVC) play in stereo (`LoadOptions.stereoPresentation`). Other platforms play 2D. See [api.md › stereoPresentation](api.md#stereopresentation).
+- **Dolby Vision Profile 20** (Dolby Vision on MV-HEVC, Apple's 3D format) is offered in stereo on visionOS, which is not yet confirmed on a Vision Pro. Every other system plays its base view in 2D as Profile 5, with correct colour.
+- **A 3D session the system refuses** at startup falls back to 2D at the same position instead of failing. See [api.md › stereoPresentation](api.md#stereopresentation).
 
 ## HDR and Dolby Vision
 
@@ -52,7 +56,7 @@ The engine sends a format to hardware when the platform can decode it, and to it
 | HDR10+ | Yes, per-frame ST 2094-40 |
 | HLG | Yes, declared or named by an alternative transfer SEI (as broadcast HLG is) |
 | HDR Vivid | Played on its HLG / PQ base; CUVA metadata reported by `probe` |
-| Dolby Vision | P5, P7, P8.1, P8.4, AV1 P10.x |
+| Dolby Vision | P5, P7, P8.1, P8.4, P20 (MV-HEVC 3D), AV1 P10.x |
 
 **Dolby Vision Profile 7** is the Blu-ray format: an HDR10 base layer plus an enhancement layer. With a FEL (full enhancement layer) the second layer carries real picture detail. Profile 7 plays in one of three ways:
 
@@ -76,6 +80,7 @@ Stream-copied audio is passed on untouched. Bridged audio is decoded and re-enco
 - **Surround:** 5.1 and 7.1 with the correct `AudioChannelLayout`.
 - **Audio-only:** `LoadOptions.audioOnly` runs a lean pipeline with no video machinery.
 - **Audio shaping (opt-in):** `LoadOptions.audioShaping` / `setAudioShaping(_:)` add a channel cap, a dialogue lift, a night mode (compressor plus limiter), a loudness target that lifts quiet sources (-36 to -12 LUFS) and an LFE level for stereo downmixes on 2.1 systems. See [formats.md › Audio shaping](formats.md#audio-shaping).
+- **Track loudness on audio-only sessions (opt-in):** `LoadOptions.normalizationGainDB` / `setNormalizationGain(_:)` apply a track's ReplayGain or server normalization gain, lifts included, behind a -1 dBFS limiter, on both the AVPlayer and the FFmpeg audio host. See [api.md › Track loudness on audio-only sessions](api.md#track-loudness-on-audio-only-sessions).
 - **Audio delay:** `setAudioDelay(_:)` corrects lip sync while playing, up to 10 s either way. See [api.md › Audio delay](api.md#audio-delay).
 - **Audio description:** `TrackInfo.isVisualImpaired` marks audio-description tracks.
 - **AVKit's audio menu (opt-in):** `LoadOptions.nativeAudioTrackMenu` lists every audio track there, and a pick switches the track. See [formats.md › Every audio track in AVKit's audio menu](formats.md#every-audio-track-in-avkits-audio-menu).
@@ -98,7 +103,7 @@ Setting `LoadOptions.objectAudioRendering` keeps the objects on that route: comp
 TrueHD Atmos and DTS:X can keep their height channels. This is opt-in through `LoadOptions.objectAudioRendering`, in a build with the `TrueHDObjectAudio` or `DTSXObjectAudio` trait ([Optional components](installation.md#optional-components)).
 
 - The engine builds a speaker bed (a fixed set of speaker channels, heights included) from the stream's own lossless 7.1, steered by its objects (TrueHD) or heights (DTS:X).
-- Layouts: TrueHD from 5.1.2 up to 9.1.6; DTS:X 7.1.4 and 9.1.6 (its four heights unfolded from the compatible 7.1).
+- Layouts: TrueHD from 5.1.2 up to 9.1.6; DTS:X 7.1.4 and 9.1.6 (its four heights unfolded from the compatible 7.1); a smaller layout renders DTS:X as 7.1.4.
 - Output: the bed as lossless 24-bit linear PCM. tvOS wraps it in Dolby MAT for an Atmos receiver, and iOS spatialises it on AirPods.
 - Over AirPlay it goes as Apple Positional Audio (APAC, a lossy encode). That holds on the loopback route (the engine's local server feeding AVPlayer) and on the software host alike. Needs OS 26.
 
@@ -150,6 +155,7 @@ How to use all of this: [guide.md › Live TV and DVR](guide.md#live-tv-and-dvr)
 **Streaming.**
 
 - One long-lived forward-streaming connection, reconnected when it drops. It rides out CDN stutter.
+- A reconnect that brings back only a few bytes is not counted as progress. A live source that answers every request with a short notice ("Channel starting.") gets five requests over about 15 s, then the open fails, instead of being asked again hundreds of times a second.
 - Optional open-time probe budget (`LoadOptions.probesize` / `maxAnalyzeDuration`): how much the engine reads to analyse a file before playing. A smaller budget cuts first-frame latency on sparse remote remuxes.
 - Configurable forward buffer (`LoadOptions.forwardBufferSegments`): from the 40 s default up to an opt-in whole-source pre-buffer. That pre-buffer is bounded in bytes by the session's disk budget, not in segments.
 
@@ -158,6 +164,8 @@ How to use all of this: [guide.md › Live TV and DVR](guide.md#live-tv-and-dvr)
 - The next `load()` of that URL reads its parse bytes from RAM, gets the size with the bytes instead of probing for it, and opens its data connection where the warm bytes end instead of at byte zero. Nothing waits on a first byte.
 - Static and off the main actor: no engine instance, no audio session, no layer.
 - It never queues for the origin. The bytes live only in memory until they are adopted and are dropped under memory pressure. The HTTP headers are part of the cache key.
+
+**Resume after a stop.** With `LoadOptions.retainsSessionCacheAfterStop` a stopped session's segments stay on disk, and the next load of the same source plays them from there instead of fetching them again. One kept session per process, deleted by any other load. See [api.md › Keeping the segment cache across a stop](api.md#keeping-the-segment-cache-across-a-stop).
 
 ## Picture in Picture
 
@@ -172,6 +180,7 @@ How to wire it: [guide.md › Picture in Picture](guide.md#picture-in-picture). 
 ## Background audio
 
 - **iOS:** audio keeps playing when the app goes to the background. The native AVPlayer stays alive; the software path drops video and keeps decoding audio (`backgroundPlaybackEnabled` / `pictureInPictureActive`).
+- **What the app has to provide:** the `audio` entry in `UIBackgroundModes` and a playback audio session. The engine only asks AVFoundation to keep going (the native player's `audiovisualBackgroundPlaybackPolicy` is `.continuesIfPossible` while `backgroundPlaybackEnabled` is on, `.automatic` when it is off). Without the background mode, iOS still suspends the app and the audio stops.
 - A paused session survives quick app switches for a grace window (`backgroundTeardownGraceSeconds`, default 15 s) before the wedge-safe teardown runs.
 - **tvOS:** tears down immediately (wedge-safe), unless a PiP window is active. PiP keeps the pipeline and the loopback server alive, and on the software path it keeps decoding video too, because the window needs frames.
 - A host waits for the published `isSessionReady` before any corrective action.
@@ -195,5 +204,5 @@ These are deliberate:
 - **No analytics or session reporting.** A 1 Hz `engine.diagnostics.liveTelemetry` surface exists for host UIs that show runtime stats locally. Nothing leaves the device.
 - **No playlist or queue.** Call `load(url:)` for the next item.
 - **No subtitle overlay.** The engine emits `SubtitleCue` (text or `CGImage`); your UI draws it.
-- **No custom renderer.** The picture goes through Apple's display stack (AVPlayerLayer or AVSampleBufferDisplayLayer). Metal runs only in opt-in stages (upscaling, the FEL composer) and in GPU deinterlacing.
+- **No custom renderer.** The picture goes through Apple's display stack (AVPlayerLayer or AVSampleBufferDisplayLayer). Metal runs only in opt-in stages (upscaling, tone mapping, the FEL composer) and in GPU deinterlacing.
 - **No third-party networking.** `URLSession` moves the bytes, so TLS, HTTP/3, proxies and MDM rules work for free.

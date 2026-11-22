@@ -30,10 +30,28 @@ final class DocumentedConstantsTests: XCTestCase {
         assertDocumented("0 (open), 1 (stream information), and 2 (read)", try documentation())
     }
 
+    func testFragmentHeaderFetchBoundsMatchDocumentation() throws {
+        let docs = try documentation()
+        XCTAssertEqual(AVIOReader.fragmentHeaderConnections, 8)
+        XCTAssertEqual(FragmentHeaderShare.retentionSeconds, 60)
+        assertDocumented("side by side, up to eight at a time within the origin's request budget", docs)
+        assertDocumented("to the other readers of the same source for 60 s", docs)
+    }
+
+    func testLazyFragmentProbeCheckMatchesDocumentation() throws {
+        XCTAssertEqual(FragmentedMP4RandomAccess.checkedEntries, 4)
+        assertDocumented("the probe reads up to four of the `moof`s the entries name", try documentation())
+    }
+
     func testLiveReplayQuarantineBoundsMatchDocumentation() throws {
         XCTAssertEqual(LivePacketReplayGuard.maximumPendingBytes, 96 * 1_024 * 1_024)
         XCTAssertEqual(LivePacketReplayGuard.maximumPendingPackets, 10_000)
         assertDocumented("Quarantine is bounded to 96 MiB and 10,000 packets", try documentation())
+    }
+
+    func testEndedSwitchFlagGraceMatchesDocumentation() throws {
+        XCTAssertEqual(DisplayCriteriaController.endedSwitchFlagGraceMs, 1000)
+        assertDocumented("until one second after the recorded end", try documentation())
     }
 
     func testSoftwarePositioningBudgetMatchesDocumentation() throws {
@@ -217,6 +235,32 @@ final class DocumentedConstantsTests: XCTestCase {
         assertDocumented("stops holding the other back after 10 s of its media", docs)
     }
 
+    /// docs/architecture-software.md quotes how many key frames the HDR10 static metadata scan reads (AE#957).
+    func testHDR10KeyFrameScanMatchesDocumentation() throws {
+        XCTAssertEqual(HDR10StaticMetadataSEI.keyFramesToScan, 3)
+        assertDocumented("then from the first 3 key frames", try documentation())
+    }
+
+    /// docs/cli.md quotes the bench gate's floor (AE#957).
+    func testBenchRegressionFloorMatchesDocumentation() throws {
+        XCTAssertEqual(PerFrameBenchmarkReport.regressionFloorMicroseconds, 50)
+        assertDocumented("by more than the tolerance and by more than 50 us", try documentation())
+    }
+
+    /// docs/architecture-software.md and docs/cli.md quote the tone curve's knee, the probe's default target
+    /// and the bench's curve (AE#957).
+    func testToneMapNumbersMatchDocumentation() throws {
+        let docs = try documentation()
+        let curve = try XCTUnwrap(BT2390ToneCurve(sourcePeakNits: 1000, targetPeakNits: 600))
+        let knee = BT2390ToneCurve.nits(pq: curve.kneeStart * curve.sourcePeakPQ)
+        XCTAssertEqual(knee.rounded(), 464)
+        assertDocumented("A 1000 nit source to a 600 nit target starts rolling off at 464 nit", docs)
+        XCTAssertEqual(HDR10ProbeSettings.defaultTargetPeakNits, 600)
+        assertDocumented("`AETHER_HDR10_PROBE_TARGET` nit (600 by default)", docs)
+        XCTAssertEqual(PerFrameBenchmark.toneMapCurve, curve)
+        assertDocumented("a 1000 nit master to a 600 nit target", docs)
+    }
+
     // MARK: - Documentation corpus
 
     private static var repoRoot: URL {
@@ -224,6 +268,36 @@ final class DocumentedConstantsTests: XCTestCase {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
+    }
+
+    // MARK: - Inverse telecine (#853)
+
+    /// docs/formats.md states the film decision, the block the repeat is judged on, the sample's budgets
+    /// and the SD bound.
+    func testInverseTelecineSampleMatchesDocumentation() throws {
+        let docs = try documentation()
+        XCTAssertEqual(TelecineCadenceAnalyzer.decidedWindow, 60)
+        XCTAssertEqual(TelecineCadenceAnalyzer.filmProgressiveShare, 0.90)
+        assertDocumented("over the last 60 decided frames, at least 90% read progressive after matching", docs)
+        XCTAssertEqual(TelecineCadenceAnalyzer.filmCadenceShare, 0.15)
+        XCTAssertEqual(TelecineCadenceAnalyzer.minimumCadenceHits, 4)
+        assertDocumented("keeps one phase in at least 15% of the cycle pairs (four at least)", docs)
+        XCTAssertEqual(TelecineCadenceAnalyzer.videoMovingCycles, 20)
+        XCTAssertEqual(TelecineCadenceAnalyzer.videoCadenceHits, 1)
+        assertDocumented("decides video early after 20 cycles in which every frame moved, with at most one such repeat", docs)
+        XCTAssertEqual(TelecineCadenceSampler.blockSide, 16)
+        assertDocumented("judged by the worst 16x16 block", docs)
+        XCTAssertEqual(TelecineCadenceProbe.startFrameCeiling, 300)
+        XCTAssertEqual(TelecineCadenceProbe.packetBudget, 3000)
+        XCTAssertEqual(TelecineCadenceProbe.wallClockBudget, 2.0)
+        assertDocumented("The sample stops at 300 frames, 3000 packets or 2 s", docs)
+        func gate(height: Int32) -> TelecineCadenceProbe.Gate {
+            TelecineCadenceProbe.gate(mode: .auto, isLive: false, isSeekable: true, codecID: AV_CODEC_ID_MPEG2VIDEO,
+                                      fieldOrder: AV_FIELD_TT, frameRate: 30000.0 / 1001.0, codedHeight: height)
+        }
+        XCTAssertEqual(gate(height: 576), .sample)
+        XCTAssertNotEqual(gate(height: 577), .sample)
+        assertDocumented("of 576 lines or fewer", docs)
     }
 
     private func documentation() throws -> String {
@@ -594,6 +668,27 @@ final class DocumentedConstantsTests: XCTestCase {
     #endif
 
     // MARK: - Split-layer join repair (docs/dolby-vision-fel.md)
+
+    func testFramePipelineDepthAndSettleMatchDocumentation() throws {
+        XCTAssertEqual(PipelinedFrameStage.defaultDepth, 2)
+        XCTAssertEqual(PipelinedFrameStage.settleTimeout, 0.5)
+        let docs = try documentation()
+        assertDocumented("It keeps up to two frames on the GPU at once", docs)
+        assertDocumented("`settle()` gives up after 0.5 s", docs)
+    }
+
+    func testAV1ConversionSlotsAndTimingLineMatchDocumentation() throws {
+        XCTAssertEqual(GPUFrameConverter.slotCount, PipelinedFrameStage.defaultDepth)
+        XCTAssertEqual(GPUFrameConverter.statsInterval, 240)
+        let docs = try documentation()
+        assertDocumented("up to two frames convert while dav1d decodes the next", docs)
+        assertDocumented("Every 240 frames the converter logs `[GPUFrameConverter] last 240 frames", docs)
+    }
+
+    func testHeldPictureFrameWaitMatchesDocumentation() throws {
+        XCTAssertEqual(AetherEngine.defaultHeldPictureFrameWaitSeconds, 0.5)
+        assertDocumented("waits up to 0.5 s for that frame", try documentation())
+    }
 
     func testLayerJoinRepairRunMatchesDocumentation() throws {
         XCTAssertEqual(DolbyVisionLayerJoin<Int>.agreeingRunForRepair, 16)

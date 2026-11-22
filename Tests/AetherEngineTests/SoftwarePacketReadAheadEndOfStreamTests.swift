@@ -23,8 +23,7 @@ struct SoftwarePacketReadAheadEndOfStreamTests {
     private static func readAhead(_ root: URL,
                                   source: @escaping @Sendable (@Sendable () -> Bool) throws -> SoftwareStoredPacket?
     ) throws -> SoftwarePacketReadAhead {
-        let fifo = try SoftwarePacketDiskFIFO(chunkTargetBytes: 64 * 1024, retainConsumed: true,
-                                              parentDirectory: root)
+        let fifo = try SoftwarePacketDiskFIFO(chunkTargetBytes: 64 * 1024, parentDirectory: root)
         return SoftwarePacketReadAhead(
             video: .init(index: 0, numerator: 1, denominator: 1000), audio: nil,
             byteBudget: 1 << 20, forwardSeconds: 10, initialSourceClock: 0, fifo: fifo,
@@ -145,7 +144,7 @@ struct SoftwarePacketReadAheadEndOfStreamTests {
         }
         try await waitFor { sourceIO.entered && enteredRead.value }
         switch stop {
-        case .seek: source.beginSeek()
+        case .seek: _ = source.beginSeek(to: 0)
         case .close: source.close()
         }
         let outcome = try await read.outcome()

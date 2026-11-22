@@ -15,6 +15,9 @@ struct BackgroundTeardownSelection: Sendable, Equatable {
     var discTitleID: Int?
     /// nil means no loaded-session evidence; false is a verified decision worth retaining too.
     var requiresDeinterlaceWarmup: Bool?
+    /// #853: the session's inverse telecine decision, which also chose the display rate. nil means no
+    /// loaded session to take it from (the reload then decides afresh).
+    var inverseTelecine: Bool?
 }
 
 extension AetherEngine {
@@ -44,7 +47,8 @@ extension AetherEngine {
             audioTrackIndex: activeAudioTrackIndex ?? parked?.audioTrackIndex,
             discTitleID: activeDiscTitleID ?? parked?.discTitleID,
             requiresDeinterlaceWarmup: playbackBackend != .none
-                ? lastRequiresDeinterlaceWarmup : parked?.requiresDeinterlaceWarmup
+                ? lastRequiresDeinterlaceWarmup : parked?.requiresDeinterlaceWarmup,
+            inverseTelecine: playbackBackend != .none ? lastInverseTelecine : parked?.inverseTelecine
         )
     }
 
@@ -65,6 +69,7 @@ extension AetherEngine {
         if live.activeSubtitleTrackIndex == nil, live.primarySidecarURL == nil {
             merged.activeSubtitleTrackIndex = snapshot.activeSubtitleTrackIndex
             merged.primarySidecarURL = snapshot.primarySidecarURL
+            merged.primarySidecarHeaders = snapshot.primarySidecarHeaders
             // The ordinal is the active pick's mapping through the rendition table, so it travels
             // with the pick rather than on its own.
             merged.nativeReapplyOrdinal = snapshot.nativeReapplyOrdinal
@@ -73,6 +78,7 @@ extension AetherEngine {
         if live.secondaryTrackIndex == nil, live.secondarySidecarURL == nil {
             merged.secondaryTrackIndex = snapshot.secondaryTrackIndex
             merged.secondarySidecarURL = snapshot.secondarySidecarURL
+            merged.secondarySidecarHeaders = snapshot.secondarySidecarHeaders
         }
         return merged
     }

@@ -16,12 +16,27 @@ enum KeyframeStillLadder {
     /// Disk budget for the rungs. A 30 s ladder over a two-hour 1080p title is about 240 keyframes.
     static let payloadByteLimit = 160 * 1024 * 1024
 
-    /// The plan index of the next rung to read: the unread rung nearest the playhead on the coarsest
-    /// stride that still has one. Rungs inside the resident window are skipped, the segment cache
-    /// already answers there. nil when the ladder is complete.
+    /// Segments on each side of the playhead's own that a served I-frame rendition reads one by one
+    /// before any coarse rung. AVKit asks for exactly these keyframes when a scrub starts, and each one
+    /// it has to wait for shows as a grey placeholder. 30 four-second segments is two minutes either way.
+    static let iFrameWindowSegments = 30
+
+    /// The plan index of the next rung to read. With `fineWindowSegments` above zero, every unread
+    /// segment that close to the playhead's comes first, nearest first. Then the unread rung nearest
+    /// the playhead on the coarsest stride that still has one. Rungs inside the resident window are
+    /// skipped, the segment cache already answers there. nil when the ladder is complete.
     static func nextRung(segmentStarts: [Double], totalSeconds: Double, playheadSeconds: Double,
+                         fineWindowSegments: Int = 0,
                          isCached: (Int) -> Bool, isResident: (Int) -> Bool) -> Int? {
         guard !segmentStarts.isEmpty, totalSeconds.isFinite, totalSeconds > 0 else { return nil }
+        if fineWindowSegments > 0, let center = planIndex(atOrBefore: playheadSeconds, in: segmentStarts) {
+            for distance in 0...fineWindowSegments {
+                for index in distance == 0 ? [center] : [center + distance, center - distance]
+                where segmentStarts.indices.contains(index) && !isCached(index) && !isResident(index) {
+                    return index
+                }
+            }
+        }
         for stride in strideSeconds {
             var seen = Set<Int>()
             var rungs: [(index: Int, distance: Double)] = []
@@ -69,6 +84,9 @@ enum KeyframeStillLadder {
         var secondsSinceOriginRefusal: Double?
         var secondsSinceSessionStart: Double
         var secondsSinceLastRung: Double?
+        /// The gap this rung keeps to the last one. `fineWindowSpacingSeconds` for a served
+        /// rendition's window, `rungSpacingSeconds` for everything else.
+        var minimumSpacingSeconds: Double = KeyframeStillLadder.rungSpacingSeconds
     }
 
     /// Below this the pump may need the link any moment, and a rung read could be the request it waits on.
@@ -79,6 +97,10 @@ enum KeyframeStillLadder {
     static let refusalQuietSeconds: Double = 120
     /// At most one rung read per this many seconds, however idle the link looks.
     static let rungSpacingSeconds: Double = 2
+    /// The window of a served I-frame rendition reads back to back while the link stays idle. At one
+    /// read per 2 s the 61 segments took two minutes, so a scrub soon after a pause found them cold
+    /// (Harsh, 7.69.1: the box stayed empty for about 8 s). Every read still checks the link first.
+    static let fineWindowSpacingSeconds: Double = 0
 
     /// True when one rung read may go out now. It requires the origin to have NOTHING in flight and
     /// nobody queued, not merely a free slot, so on an origin whose limit nobody has learned yet the
@@ -92,7 +114,7 @@ enum KeyframeStillLadder {
         guard s.secondsSinceSessionStart >= startupGraceSeconds else { return false }
         guard s.originInflight == 0, s.originWaiting == 0, !s.originPaced else { return false }
         if let refusal = s.secondsSinceOriginRefusal, refusal < refusalQuietSeconds { return false }
-        if let last = s.secondsSinceLastRung, last < rungSpacingSeconds { return false }
+        if let last = s.secondsSinceLastRung, last < s.minimumSpacingSeconds { return false }
         return true
     }
 

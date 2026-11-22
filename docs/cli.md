@@ -14,6 +14,7 @@
 - Custom byte sources: [customio](#customio), [smbtest](#smbtest)
 - Live: [live](#live), [dvr](#dvr), [hlsfixture](#hlsfixture), [hlslive](#hlslive)
 - Dolby Vision: [dovitest](#dovitest), [feltest](#feltest), [dvsurvey](#dvsurvey), [eltype](#eltype), [elsurvey](#elsurvey), [elframe](#elframe), [felcurves](#felcurves), [dmpass](#dmpass)
+- Performance: [bench](#bench)
 - [Fixtures](#fixtures)
 
 ## Building with optional components
@@ -55,11 +56,12 @@ Most subcommands take a media source URL (`file://` or `http(s)://`). `live`, `d
 | Test the software decoder alone | [`swdecode`](#swdecode) | Decoder open, frame count and first-frame format, no render layer. |
 | Inspect a disc image | [`disc-inspect`](#disc-inspect), then `probe` | Recognition stages, titles and chapters. |
 | Pull stills or scrub previews | [`extract`](#extract), [`scrubpreview`](#scrubpreview) | `FrameExtractor` stills, and compositor or keyframe scrub previews. |
+| Check a change did not make frames slower | [`bench`](#bench) | Per-frame time of the software path's frame work, and a verdict against a saved baseline. |
 | Dolby Vision Profile 7 / FEL | [`eltype`](#eltype), [`dvsurvey`](#dvsurvey), [`feltest`](#feltest), [`dmpass`](#dmpass), [`play --fel`](#dolby-vision---fel---assert-dv) | FEL or MEL, metadata survey, the composer audit, metadata pass-through, and the live route. |
 
 ## Subcommands at a glance
 
-Twenty-nine subcommands plus the bare-URL `serve` alias.
+Thirty subcommands plus the bare-URL `serve` alias.
 
 | Subcommand | Purpose |
 |---|---|
@@ -92,6 +94,7 @@ Twenty-nine subcommands plus the bare-URL `serve` alias.
 | [`elframe <url>`](#elframe) | Write one FEL keyframe composed with and without its residual. |
 | [`felcurves <url> <out.rpu>`](#felcurves) | Fold a FEL source into per-scene Profile 8.1 curves. |
 | [`dmpass <url>`](#dmpass) | Check that the FEL route keeps the display-management metadata. |
+| [`bench`](#bench) | Time the software path's per-frame work and compare it with a baseline. |
 | `<url>` | Alias for `serve`. The alias takes no flags. |
 
 ```bash
@@ -114,6 +117,7 @@ These flags mean the same on every subcommand that takes them. The per-command t
 | `--no-dv` | `serve`, `validate`, `segverify` | Forces the SDR / HDR10 route, see [Dolby Vision routes](#dolby-vision-routes). | off |
 | `--force-dv` | `serve`, `validate`, `segverify` | `LoadOptions.forceDolbyVisionOnNonDVDisplay`: serves Profile 8.1 as Profile 5 (AE#455). Only with `--no-dv`. | off |
 | `--dv-base-layer` | `serve`, `validate`, `segverify`, `play` | `LoadOptions.dolbyVisionHandling = .baseLayerOnly`. | off |
+| `--untagged-color hdr10\|hlg` | `probe`, `serve` | `LoadOptions.untaggedVideoColor` (AE#1103): a 10-bit stream with no colour description is shown as HDR10 or HLG. A stream that declares anything keeps it. | off |
 | `--audio-index <n>` | `serve`, `customio` | Names the source audio stream at load. | engine choice |
 | `--standard-join` | `play`, `live` | `LoadOptions.liveJoinProfile = .standard`, see [Live join and cushion](#live-join-and-cushion). | `.fastZap` |
 | `--fast-zap` | `play`, `live` | Accepted and ignored, kept for older scripts. | |
@@ -164,12 +168,16 @@ The [Works on](#shared-flags) column lists where it is accepted.
 
 ### Object audio (`--atmos-bed`)
 
-`--atmos-bed <layout>` sets `LoadOptions.objectAudioRendering = .apac(layout)`. A TrueHD Atmos or DTS:X track is rendered into that bed and served as APAC. Layouts: `5.1.2`, `5.1.4`, `7.1.2`, `7.1.4` or `9.1.6` (#731, #744). It renders only in a build with the `TrueHDObjectAudio` / `DTSXObjectAudio` traits.
+`--atmos-bed <layout>` sets `LoadOptions.objectAudioRendering = .apac(layout)`. A TrueHD Atmos or DTS:X track is rendered into that bed and served as APAC. Layouts: `5.1.2`, `5.1.4`, `7.1.2`, `7.1.4` or `9.1.6` (#731, #744). DTS:X with a layout below 7.1.4 is rendered as 7.1.4. It renders only in a build with the `TrueHDObjectAudio` / `DTSXObjectAudio` traits.
+
+`play --no-dtsx-objects` sets `LoadOptions.rendersDTSXObjectAudio = false`: TrueHD Atmos still renders into the `--atmos-bed` layout, and DTS keeps the channel bridge (#1060). The log then says `DTS:X rendering is off for this load`.
 
 - The master reads `CODECS="…,apac.31.03"` (up to 12 channels) or `apac.31.04` (16).
 - The log carries `TrueHD Atmos: objects rendered into …` (or `DTS:X: bed and heights routed one to one into …`) and the `[SpatialAudioBridge] bed levels` lines.
 - A DTS-HD MA track whose frames do not decode as DTS:X logs `DTS-HD MA track is not DTS:X this engine renders (…); keeping the channel bridge` instead.
 - On `play` the 1 Hz line adds `obj=<active>/<declared> up=<overhead> bed=<layout>`, and `hch=<n>` for height channels.
+
+On an M1 a debug build plays the bed in real time too. Before AE#1106 the regression ran at about a fifth of real time there, and `play` ended in `VERDICT: clock did not advance`. Judge CPU from a release build (`swift build -c release`), because in a debug build the rest of the pipeline still costs more. A debug build on an Apple TV has not been measured since the change.
 
 With `--bed-format lpcm` it sets `.lpcm(layout)` instead, which serves the bed as 24-bit PCM (`CODECS="…,ipcm"`, log `delivered as ipcm (lossless 24-bit PCM)`). With `--bed-format auto` it sets `.render(layout)`, the form a host should use: PCM, or APAC when the route plays over AirPlay.
 
@@ -192,7 +200,11 @@ On a 30 fps H.264 + AAC fixture the source's own alignment is +21.8 ms. `--audio
 
 **`--standard-join`** loads with `LoadOptions.liveJoinProfile = .standard`. Without it the load takes the engine default, `.fastZap`. `--fast-zap` is still accepted (and does nothing) so older scripts keep running. To judge a join, read the first-serve line (AE#374), not a first-frame stopwatch.
 
-The default `.fastZap` first serve prefers the full holdback (how far behind the live edge the first manifest waits to start). It does not wait forever: it is bounded after two finalized segments plus a 0.5 to 2.0 s observed-segment grace. That grace ends early once the source reads at 1x and the open segment cannot reach its next keyframe inside it (AE#936).
+The default `.fastZap` first serve goes out once the window holds the full holdback (how far behind the live edge the first manifest starts) or two finalized segments, whichever comes first.
+
+**`--startup-grace SECONDS`** sets `LoadOptions.liveStartupGraceSeconds`, an extra wait for a deeper first window. It ends early once the source reads at 1x and the open segment cannot reach its next keyframe inside it (AE#936). **`--single-segment-min SECONDS`** sets `LoadOptions.liveStartupSingleSegmentMinimumSeconds`.
+
+**Reading a start.** `live` prints every startup checkpoint and every `playbackPhase` change to the millisecond from load start (`STARTUP +0.193s routed`, `PHASE +0.221s playing`). The 1 Hz `JOIN` line is quantized to a second; use these to compare against a stopwatch.
 
 To try fastZap against an origin of your own (the shape a downstream player ships), put [`hlsfixture`](#hlsfixture) in front. The served `#EXT-X-TARGETDURATION` is then floored by the upstream's observed arrival cadence (`LiveCadencePolicy`). `live`'s raw-TS fixture has no playlist, so it cannot show this. The numbers are in [Measurements › fastZap against an own origin](measurements.md#play-fastzap-against-an-own-origin-ae374).
 
@@ -236,13 +248,14 @@ Opens the demuxer, prints what it finds, then exits. No HLS server is started. I
 - the subtitle track list with language, `(default)` and title,
 - the parsed container metadata (`MediaMetadata`): title, artist, album, and the size of embedded cover art (`artwork: N bytes`).
 
-**Usage:** `aetherctl probe [--detect-hdr10plus] [--detect-hdr-vivid] [--detect-dv-el] [--detect-atmos] <url>`
+**Usage:** `aetherctl probe [--untagged-color hdr10|hlg] [--detect-hdr10plus] [--detect-hdr-vivid] [--detect-dv-el] [--detect-atmos] <url>`
 
 | Flag | Meaning | Default |
 |---|---|---|
 | `--detect-hdr10plus` | Adds the HDR10+ detail pass of `AetherEngine.probe(url:detecting:)`. | off |
 | `--detect-atmos` | Adds the Atmos detail pass: E-AC-3 JOC, and for TrueHD the major sync, printed as `truehd-atmos=atmos|noAtmos|unsettled` (#1035). | off |
 | `--detect-hdr-vivid` | Adds the HDR Vivid (CUVA) check to the same packet pass. Prints `HDR Vivid: CUVA metadata seen`. | off |
+| `--untagged-color hdr10\|hlg` | Probes with `LoadOptions.untaggedVideoColor` (AE#1103). The `colour:` line and `format:` then read what the session would play, and a `[Demuxer] AE#1103` line says whether it applied and why not. | off |
 | `--detect-dv-el` | Adds the Dolby Vision enhancement-layer check to the same packet pass (#1030). Prints `DV EL: FEL` or `DV EL: MEL`; `not Profile 7` when the container declares no Profile 7, `no RPU seen` when none turned up in the budget. | off |
 
 ```bash
@@ -403,6 +416,7 @@ The log line says which it was: `[HLSVideoEngine] i-frame rendition: served segm
 The log's `[HLSVideoEngine] stereo:` line names what was chosen and why.
 
 - A stereo master carries `REQ-VIDEO-LAYOUT="CH-STEREO"` at `EXT-X-VERSION:12`.
+- A Dolby Vision Profile 20 source is served as `CODECS="dvh1.20.LL"` under `auto` and as `dvh1.05.LL` under `mono`. A Mac's AVPlayer refuses the `dvh1.20` master (`-12927`), so only the `mono` form plays there. The `serve` harness has no 2D fallback, unlike a full session.
 - A packed HEVC init carries a `vexu` with `eyes` and `pack`.
 - H.264 stays 2D, because AVPlayer refuses it packed over HLS.
 
@@ -481,6 +495,7 @@ swift run aetherctl play --fel --fel-output <p7-file.mkv>      # compose it on A
 swift run aetherctl play --fel --surface --cycle-el 10 <p7-file.mkv>   # flip the residual off and on every 10 s over a visible window (--window is the same flag)
 swift run aetherctl play --fel --surface --dv-pin 'darkest:240,period:2' <url>   # DEBUG: pulse a pinned frame's DV metadata (from dvsurvey)
 swift run aetherctl play --upscale <sd-or-720p-url>           # opt in to upscaling sub-1080p SDR video to the display (LoadOptions.upscalesLowResolutionVideo, #846); logs one [Upscale] line and an UPSCALE line once the first frame is upscaled
+swift run aetherctl play --tone-map 600 <hdr10-url>           # opt in to tone mapping HDR10 brighter than 600 nit to 600 nit (LoadOptions.videoProcessing, #957); logs one [VideoProcessing] line and a PROCESSING line once the first frame is processed
 ```
 
 ### Telemetry
@@ -575,6 +590,7 @@ Other lines `play` prints:
 | `--native-hls` | `LoadOptions.nativeRemoteHLS`. | off |
 | `--standard-join`, `--fast-zap`, `--live-cushion SECONDS` | Live join profile and cushion. See [Shared flags](#shared-flags). | `.fastZap`, engine default |
 | `--live-start-immediately` / `--no-live-start-immediately` | `LoadOptions.liveJoinStartsImmediately` (AE#440). | on |
+| `--live-join-at-start` | `LoadOptions.liveJoinsAtPlaylistStart` (AE#1090): joins at the oldest listed segment. Pair with [`hlsfixture --recording-backlog`](#a-recording-in-progress---recording-backlog). | off |
 | `--header "Name: Value"` | `LoadOptions.httpHeaders`, repeatable. | none |
 | `--trust-any-certificate` | Answers `EngineTLS.serverTrustEvaluator` for every origin (AE#495). | off |
 | `--record <path>` | Records the live source to a file (AE#560). | off |
@@ -591,12 +607,14 @@ Other lines `play` prints:
 | `--subtitle-delay-reach SECONDS`, `--subtitle-advance-reach SECONDS` | Set `maximumSubtitleDelaySeconds` / `maximumSubtitleAdvanceSeconds` before the load (0 to 600), after `--subtitle-offset-reach` (AE#1031). | engine default |
 | `--preserve-ass-markup` | `LoadOptions.preserveASSMarkup`. | off |
 | `--skip-attachments` | `LoadOptions.skipsContainerAttachments` (AE#956). | off |
+| `--iframes` | `LoadOptions.serveIFramePlaylist` (AE#682) on a full session, where the still ladder prefetches into the rendition. | off |
 
 **Audio**
 
 | Flag | Meaning | Default |
 |---|---|---|
 | `--switch-audio <index>[@ms]` | Switches the audio stream just after playback starts (#337). | +20 ms |
+| `--live-reopen-param NAME` | Answers `liveReopenURL` by giving the query parameter `NAME` a new value on every reopen, the way a host mints a fresh HDHomeRun `SessionID` (AE#1100). Each answer prints a `LIVEREOPEN` line. | off |
 | `--audio-delay <ms>` | `LoadOptions.audioDelaySeconds` at load. See [Shared flags](#shared-flags). | 0 |
 | `--switch-audio-delay <ms>[@ms]` | Calls `setAudioDelay(_:)` mid-session. Repeatable. | +20 s |
 | `--audio-shaping <spec>` | `LoadOptions.audioShaping` at load. | off |
@@ -620,7 +638,9 @@ Other lines `play` prints:
 | `--dv-pin <spec>` | DEBUG: pulses a pinned frame's DV metadata. | off |
 | `--upscale` | `LoadOptions.upscalesLowResolutionVideo` (#846). | off |
 | `--line-art` | `LoadOptions.upscaleScaler = .lineArt` (AE#1039); implies `--upscale`. | off |
+| `--tone-map <nits>` | `LoadOptions.videoProcessing` with this `targetPeakNits` (#957). | off |
 | `--deinterlace-field-rate field\|frame` | `LoadOptions.deinterlaceFieldRate` (AE#492). | `field` |
+| `--inverse-telecine auto\|off\|force` | `LoadOptions.inverseTelecine` (#853). | `auto` |
 | `--native-video-frame-diagnostics` | `LoadOptions.nativeVideoFrameDiagnostics`. | off |
 | `--native-video-frame-recovery` | Bounded SDR native decoded-output repair. | off |
 
@@ -682,8 +702,18 @@ A misspelt call is not an error: it prints `HOSTCALL unknown '<call>'` and the r
 | `subsoff@N`, `subson@N` | The viewer turning subtitles off and back on while the picture is away. Defaults t=12 and t=18. `subson` re-picks the `--subs` track; `subson@N:<lang>` picks a different one (the track-switch case). |
 | `subsatload` | Picks the `--subs` track the moment `load` returns, before the first frame, like a host restoring a remembered track. The default pick at t=5 is a mid-session start, which the prefetch and the drain handle differently (#1021). `CUE` lines end in `at=<clock>`, so the lead a cue arrived with is readable. |
 | `lanreload@N` | Fires `reloadAtCurrentPosition()` (AE#955). Default t=10. |
+| `stopreopen@N`, `stopreopen@N:off` | Stop at t=N (default 20), then load the same URL at the stopped position, with `retainsSessionCacheAfterStop` on, or off for the control arm (AE#1095). See below. |
 
 **`pausestart`.** This is the shape of a host that holds a fresh load paused. On a software session the healthy reading is: the `[SWHost] #104` lines show the first frame presented at a stopped clock, and `startup 8/8 presenting` arrives while paused. The defect reading is eight ticks of `enq=+0 status=unknown r4d=n`: a black picture under a paused clock.
+
+**`stopreopen`.** The viewer who leaves to the detail page and presses Resume. The first session plays N seconds without telemetry, then `stop()`, two seconds of nothing, and a `load()` of the same URL at the stopped position. The telemetry after that describes the reopened session. Three lines carry the result: `stopped at <s>, retained <n> MiB`, `load returned after <ms>` and `clock moving after <ms>`, the last one being the wait a viewer feels. Run both arms against an origin with a delay and a rate limit, or loopback hides the difference:
+
+```bash
+aetherctl play --seconds 20 --host-calls stopreopen@25     http://127.0.0.1:8871/movie.mkv
+aetherctl play --seconds 20 --host-calls stopreopen@25:off http://127.0.0.1:8871/movie.mkv
+```
+
+Also run it on a source whose timestamps do not start at zero (`-output_ts_offset 600`): `cur=` has to continue from the stopped position there, not jump by the offset.
 
 **`reloadnext`.** The same URL is loaded again at t=4 on the still-playing engine, with no `stop()` in between, so the native host is reused. Every published `state` prints as `STATE <state> t=<s>`. The second load must go `loading`, `playing` with no `paused` between them. The defect behind this drill: the reused host still carried the outgoing item's `.playing` status, and every host raised its transport over the next episode.
 
@@ -732,7 +762,12 @@ aetherctl play --subs eng --seconds 30 \
   --host-calls nativesubs,lanreload@8,nativerender@14,subson@15 file://$PWD/pgs.mkv
 ```
 
-A healthy run arms `[SubtitleOCR] worker armed` once, logs `OCR pre-fill done ... exit=covered`, and reads `selected=English engineActive=4` after the on. The first Vision call in a process can take about a minute while the system compiles its model, so judge a slow pre-fill from a second run. The `VTT` readout fetches the first rendition when none is selected, so its empty segments before the select are the harness asking, not a receiver.
+A healthy run arms `[SubtitleOCR] worker armed` once, logs `OCR pre-fill done ... exit=covered`, and reads `selected=English engineActive=4` after the on. A `pre-fill done ... exit=superseded` right before it is expected: `subson` re-picks the track a tick after `nativerender` and replaces that select.
+
+Two things make this drill read empty without any engine defect:
+
+- **The PGS pictures need readable text.** A fixture with stripes or blank boxes gives OCR nothing, so the rendition stays empty and the engine correctly refuses to select it (`native subtitle select refused: rendition ordinal=0 is empty at the playhead`).
+- **Vision has to compile its model first.** The first text recognition after a fresh `aetherctl` build, or after macOS dropped the cached model, takes about a minute on a Mac (53 s measured, 0.05 s after). Every drill with `nativerender` therefore runs one recognition before the load and prints `OCR warm-up: Vision text recognition ready after N s`. Without it, the readouts at +2 and +4 ticks came long before the pre-fill could finish (AE#1052). The `VTT` readout fetches the first rendition when none is selected, so its empty segments before the select are the harness asking, not a receiver.
 
 ### Sidecar subtitles (`--sidecar`)
 
@@ -807,6 +842,17 @@ Serve an HLS master over https with a self-signed certificate, and the two arms 
 
 - Pick a stream whose first packet sits late in the mux. The defect reading (before the fix) is `state=playing cur=0.00` for the whole run with a first frame on screen. The end-of-run verdict names it.
 - `--audio-stats` with it re-installs the tap after the switch. The tap is bound to the software host the switch replaces, and would otherwise report silence for a session that is playing fine.
+- On a software live session with a ring the switch happens in place (AE#1100): no rebuild, and the log shows `AE#1100 live audio switched in place`. The tap re-install is then harmless.
+
+**A replaying live origin (AE#1100).** To see whether a live session opens its source twice, put an origin in front that behaves like an HDHomeRun tuner: a `SessionID` opened again replays from where that session began. Then read the origin's request log. Measured on a 720p MPEG-2 fixture with two AC-3 tracks (`-ac:a:0 2 -ac:a:1 6`):
+
+```bash
+aetherctl play --live --dvr-window 600 --switch-audio 2@25000 --seconds 45 "http://127.0.0.1:8912/auto/v4.1?ClientID=1&SessionID=101"
+aetherctl play --live --live-reopen-param SessionID --switch-audio 2@15000 --seconds 30 "<same URL>"
+```
+
+- With the ring, the switch opens nothing: one request in the origin log, `cur` runs on (23.42 to 24.36 s) and `range=` keeps its start.
+- Without a ring the switch reloads. Without the flag the reload replayed the session (the source PTS fell from 31.05 to 18.04 s); with `--live-reopen-param SessionID` it opened `SessionID=9r1` at live (31.29 to 32.96 s).
 
 Build a fixture with a late track by offsetting one input:
 
@@ -895,6 +941,7 @@ The mid-session switch is the harder case. At load the offset is just a number h
 | `preferred-audio` | comma list of languages | preferred audio languages |
 | `decode-path` | a `DecodePath` raw value, for example `software` | `preferredDecodePath` |
 | `dolby-vision` | a `DolbyVisionHandling` raw value, for example `baseLayerOnly` | `dolbyVisionHandling` |
+| `untagged-color` | `standard\|hdr10\|hlg` | `untaggedVideoColor` (AE#1103), the per-title "Force HDR" switch a host offers |
 | `prefer-dual-layer-dv` (alias `fel-mode`) | `true\|false` | `LoadOptions.preferDualLayerDolbyVision`, so a running session can move on or off the Profile 7 FEL route |
 | `is-live` | `true\|false` | Drives the refusal: a field that names the session must be observably refused, not observably ignored. |
 | `autoplay` | `true\|false` | Drives the third answer: a field the session owns, neither refused nor applied. |
@@ -957,6 +1004,10 @@ See [dolby-vision-fel.md](dolby-vision-fel.md).
 
 `--line-art` runs the line-art scaler instead (`LoadOptions.upscaleScaler = .lineArt`, AE#1039) and implies `--upscale`. It also takes 1080p and 10-bit SDR. The `UPSCALE` line then ends in `scaler=lineArt`, and the `[Upscale] timing` lines show the chain's GPU time under `metal`.
 
+### Tone map (`--tone-map`)
+
+`--tone-map <nits>` opts in to the picture processing with that target peak (`LoadOptions.videoProcessing`, #957). It logs one `[VideoProcessing]` line, and a `PROCESSING toneMap <source> nit (<mastering|maxCLL>) -> <target> nit` line once the first frame is processed, again with `disabled: <reason>` if it switches itself off. The stage needs macOS 26; before that the line says `not taken (needs OS 26)`.
+
 ### Dropped audio (`--drop-audio`)
 
 `--drop-audio` forces every audio pipeline to fail, so the AE#462 video-only drop can be observed without a source this build has no decoder for. The loopback cascade skips both the stream-copy probe and the bridge, and `SoftwarePlaybackHost` refuses its decoder open.
@@ -970,6 +1021,18 @@ The run then prints `audio delivery=droppedNoPipeline pipeline=none`, the pair a
 Measured on a 480i fixture through the hardware chain, four runs per arm: 59.9 fps and 17.47 drops/s at `field`, against 30.0 fps and 7.49 at `frame`. That is 0.291 against 0.250 per frame delivered, with the progressive arm at 0.254.
 
 Nothing binds a render surface in a CLI run, so the absolute drop level belongs to the harness. Only the ratio between arms is a measurement.
+
+### Inverse telecine (#853)
+
+`--inverse-telecine auto|off|force` sets `LoadOptions.inverseTelecine`. On a hard-telecined NTSC MPEG-2 source the load logs its decision before the `[AetherEngine] load` line, and that line's `rate=` is the rate asked of the display:
+
+```
+[Deinterlace] inverse telecine on: film, progressive 100% of 60 decided frames, cadence 100%, 61 frames in 155 ms, 155 ms with the rewind (#853)
+[AetherEngine] load url=... rate=23.976
+[Deinterlace] engaged [hardware]: 720x480 pixFmt=0 (fieldmatch=order=auto:combmatch=full,decimate,format=nv12,hwupload,bwdif_videotoolbox=mode=send_frame:parity=auto:deint=interlaced) outTB=1001/48000 built in 3.3ms
+```
+
+With `--frame-times` the output reads `ft=24` a second and the `[SWDiag]` lines `dpts=41.7/41.7`; the deinterlacer alone reads `ft=60` at field rate. The sample's cost to the first frame over a throttled origin is in [measurements › Inverse telecine](measurements.md#inverse-telecine-853).
 
 ### Frame times (`--frame-times`, `--present-times`)
 
@@ -999,6 +1062,8 @@ Nothing binds a render surface in a CLI run, so the absolute drop level belongs 
 - The reader makes one long-lived unranged GET, no ranged probes and no tail read.
 - A seek lands only inside the resident span that reaches the producer's frontier; every other target is rejected (AE#958).
 - On VOD it needs `--declared-duration S`, which fills `LoadOptions.declaredDurationSeconds`. The duration estimate normally comes from the tail read, which this shape skips.
+
+**`--iframes`** sets `LoadOptions.serveIFramePlaylist` (AE#682). `serve --iframes` only lists the rendition; `play` also runs the 1 Hz still ladder that reads into it. The log says `[StillLadder] reading through the I-frame rendition`. To see the effect, add `--served-url`, wait about 25 s, and `curl` `iframe<N>.mp4` next to the printed URL. An index near the playhead is answered from the cache in about a millisecond, one far from it pays the read (and for HDR the tone map). The window reads back to back once the ladder starts at 15 s, so 30 segments either way take a few seconds, not two minutes.
 
 **`--skip-attachments`** sets `LoadOptions.skipsContainerAttachments` (AE#956). A Matroska source then opens without reading its attached files (the fonts of its ASS subtitles). The observable is the open itself. Against a throttled origin and an MKV that carries fonts, the time to the first `[AetherEngine]` load line drops by the fonts' transfer time, and the `[AVIOReader]` byte counts drop by their size.
 
@@ -1232,7 +1297,7 @@ Tests scrub previews. By default it covers Dolby Vision Profile 5 / 10.0 sources
 
 The default mode needs a build WITHOUT the `DolbyVisionStillReshaping` trait. With the trait such a source serves reshaped stills instead of drawing in a view, so the default mode fails with exit 1; use `--stills` there.
 
-**Usage:** `aetherctl scrubpreview [--warm S] [--at s1,s2,...] [--keep DIR] [--throttle-kbps N] [--stills [--max-concurrent-requests N] [--forward-buffer-segments N]] <url>`
+**Usage:** `aetherctl scrubpreview [--warm S] [--at s1,s2,...] [--keep DIR] [--throttle-kbps N] [--stills [--max-concurrent-requests N] [--forward-buffer-segments N] [--inverse-telecine auto|off|force]] <url>`
 
 | Flag | Meaning | Default |
 |---|---|---|
@@ -1243,6 +1308,7 @@ The default mode needs a build WITHOUT the `DolbyVisionStillReshaping` trait. Wi
 | `--stills` | Asks `scrubPreviewFrame` instead, for any source. | off |
 | `--max-concurrent-requests N` | Only with `--stills`. See [Shared flags](#shared-flags). | engine default |
 | `--forward-buffer-segments N` | Passes through to `LoadOptions`. Only with `--stills`. | engine default |
+| `--inverse-telecine auto\|off\|force` | `LoadOptions.inverseTelecine` for the playing session, only with `--stills`. The stills themselves always come off the plain deinterlacer (#853). | `auto` |
 
 **Default mode.** Loads the source on the native path, plays it for `--warm` seconds, then asks `showScrubPreview(atSeconds:in:)` for each position. For each it prints whether a picture came, how long it took, the span it stands for, and whether the position was resident.
 
@@ -1292,11 +1358,12 @@ Activates two subtitle tracks at once on one source (primary + secondary) and pr
 
 Plays a source through the audio-only pipeline (`LoadOptions.audioOnly`) and reports which host took it: bare AVPlayer, or the FFmpeg renderer path. It exercises the same dispatch a music host sees.
 
-**Usage:** `aetherctl audio [--seconds N] <url>`
+**Usage:** `aetherctl audio [--seconds N] [--gain DB] <url>`
 
 | Flag | Meaning | Default |
 |---|---|---|
 | `--seconds N` | Run length. See [Shared flags](#shared-flags). | 10 |
+| `--gain DB` | Sets `LoadOptions.normalizationGainDB` and prints `normalizationGainReport` before stopping, e.g. `requested=+8.0 applied=+8.0 host=AVPlayer stage=tap limiter=3.3 dB 97.2%`. | off |
 
 **Exit codes**
 
@@ -1753,6 +1820,7 @@ It prints the entry URL: `/media.m3u8`, `/master.m3u8` with `--master`, or `/ent
 | `--redirect-host H` | Host name for the redirect target. | `localhost` |
 | `--redirect-port N` | Port for the redirect target. | the fixture's bound port |
 | `--media-origin H:P` | Master's variants point at a second origin absolutely. | off |
+| `--recording-backlog N` | A recording in progress: the playlist lists every segment from 0 and grows, N segments deep at start. `--window` is ignored. See [below](#a-recording-in-progress---recording-backlog). | off |
 
 **Exit codes**
 
@@ -1771,6 +1839,18 @@ ffmpeg -i in.ts -c copy -f hls -hls_time 4 -hls_flags independent_segments -hls_
 Byte slicing is not keyframe-aligned, so segments start mid-GOP and the decoder logs parameter-set errors on the rerouted ingest. That is fine for routing and plumbing questions ("did it route"), but useless for "did it play": the run rebuffers forever because nothing decodes. Use the directory whenever the question is playthrough.
 
 **`--codecs` / `--resolution`.** Without them AVFoundation reports no `videoAttributes` for the variants. Everything that reads master evidence (the #168 watchdog, the #293 probe gate) then sees a master advertising no video at all, and the fixture quietly stops carrying the case under test.
+
+### A recording in progress (`--recording-backlog`)
+
+`--recording-backlog N` serves the shape a DVR gives for a recording that is still running: `#EXT-X-MEDIA-SEQUENCE:0`, every segment since the start, no `#EXT-X-ENDLIST`, and one more segment per `--segment-seconds`. It is the origin for `play --live-join-at-start` (AE#1090):
+
+```bash
+aetherctl hlsfixture --segments-dir ./segs --segment-seconds 2 --recording-backlog 150 --port 8091
+aetherctl play --live --live-ingest --live-join-at-start --dvr-window 3600 --seconds 50 \
+  --seek-every 30 --seek-count 1 --seek-pattern 1 http://127.0.0.1:8091/media.m3u8
+```
+
+What to read off the run: the `[HLSIngest] AE#1090: joined at the playlist start` line says how much was delivered at once, the fixture's `REQ /segN.ts` lines start at `seg0` and then come one per segment duration, and `src=` starts near 0. Measured on 2 s H.264 and MPEG-2 segments with a 5 minute backlog: first picture within a second on both routes, 27 segments fetched in 46 s, and a seek back to 1 s landing in 105 ms with the edge still moving at 1x.
 
 ### TARGETDURATION and window depth (`--target-duration`, `--window`)
 
@@ -2126,6 +2206,61 @@ swift run --traits DualLayerDolbyVision aetherctl dmpass --frames 120 --out /tmp
 | `AETHER_DM_PRINT=1` (or `hex`) | Echoes the per-frame `[dm-digest]` lines in `dmpass`. |
 | `AETHER_DM_DIGEST` = `1`, `log` or `hex` | Runs the same digest inside any host. `hex` adds both RPU byte strings to each line. |
 | `AETHER_DM_DIGEST_FILE` | Appends the JSON form to a file. |
+
+## bench
+
+Times the work the software path does around each decoded frame, and fails when a case got slower than a saved baseline. It calls `AetherEngine.runPerFrameBenchmarks`, which returns a `PerFrameBenchmarkReport` with one `PerFrameBenchmarkResult` per case. No source is needed: it builds its frames itself, a 4K P010 frame and 8-bit NV12 frames for the upscale sources.
+
+**Usage:** `aetherctl bench [--iterations N] [--json out.json] [--baseline base.json] [--tolerance PCT]`, or `aetherctl bench --compare <base.json> <new.json> [--tolerance PCT]`
+
+| Flag | Meaning | Default |
+|---|---|---|
+| `--iterations N` | Timed runs per case (10 to 100000), after 20 untimed ones. | 300 |
+| `--json PATH` | Writes the report as JSON, to keep as a baseline. | off |
+| `--baseline PATH` | Compares this run with a saved report. | off |
+| `--tolerance PCT` | How much slower a case's median may get before it counts as a regression. | 20 |
+| `--compare BASE NEW` | Compares two saved reports and runs nothing. This is how a report saved on an Apple TV is checked. | off |
+
+```bash
+swift run -c release aetherctl bench --json /tmp/base.json
+swift run -c release aetherctl bench --baseline /tmp/base.json
+```
+
+**Cases.** All times are microseconds of wall time per frame.
+
+| Case | What it times |
+|---|---|
+| `normalizer: frame already tagged` | The output metadata check on a frame that already carries everything. The usual case. |
+| `normalizer: tag in place` | Writing the attachments on a frame the decoder lets us change. |
+| `normalizer: owned copy` | Copying a frame the decoder still owns into a pool of our own, then tagging it. |
+| `renderer: sample buffer` | Wrapping a frame for the display layer, format description cache hit. |
+| `chain: pass-through, wall time` | The frame chain with one pass-through stage, which runs as one kernel. Its GPU time is in the note. Needs OS 26 and real hardware. |
+| `chain: two passes through RGB, wall time` | The same frame through the RGB texture, as every chain with a real stage runs. |
+| `chain: tone map, one kernel, wall time` | The frame chain with the BT.2390 tone-map stage, a 1000 nit master to a 600 nit target, run inside the one round-trip kernel. The real kernel, which costs the same on any picture. |
+| `chain: tone map, two passes, wall time` | The same tone map as its own pass between the two passes through RGB, as when it shares a chain with a stage that needs the texture. |
+| `sei: HDR10 scan of a 250 KB key frame` | The in-band scan for the HDR10 SEI. |
+| `upscale: 480p to 2160p, automatic, wall time` | The `upscalesLowResolutionVideo` stage on a 16:9 DVD frame (720x480) for a 3840x2160 display: VT super resolution at the largest factor the device offers, then MetalFX. |
+| `upscale: 720p to 2160p, automatic, wall time` | The same stage on a 1280x720 frame. |
+| `upscale: 720p to 2160p, MetalFX only, wall time` | MetalFX alone on the 720p frame, the rung the stage drops to without an ML pass. |
+| `upscale: 1080p to 2160p, line art, wall time` | `upscaleScaler = .lineArt` on a 1920x1080 frame, upscale network only (its lower rung). |
+| `upscale: 1080p to 2160p, line art with restore, wall time` | The same with the restore pass and the highlight clamp, the stage's top rung. |
+
+The upscale cases build the stage playback builds for that plan, with its VT session and MetalFX scaler, and wait for each frame's ML pass. Their note names the plan's steps (for example `1280x720 -> ML 2x 2560x1440 -> MetalFX 3840x2160`) and the median ML and GPU time. A case is skipped with the reason when the device cannot build it: MetalFX needs tvOS 27.1, and every upscale case needs OS 26 and real hardware. The display size is fixed, so `--iterations` is the only flag that changes them.
+
+**Verdict.** A case regresses when:
+
+- its median grows by more than the tolerance and by more than 50 us. Below that the same build moves between runs: in-place tagging measured 18 us, then 48 us, on the A12 Apple TV;
+- or it ran in the baseline and is skipped or missing now. A broken frame chain reports its cases as skipped, and that must not pass.
+
+Each regression is printed with its reason. Compare reports from the same device only; the tool prints a note when the device or picture size differ. The rule is `PerFrameBenchmarkReport.regressions(against:tolerance:)`.
+
+| Exit | Meaning |
+|---|---|
+| 0 | No regression, or no baseline given. |
+| 1 | At least one regression, or a report could not be read or written. |
+| 64 | Bad arguments. |
+
+On an Apple TV, a host calls `AetherEngine.runPerFrameBenchmarks` and saves the report as JSON (`PerFrameBenchmarkReport` is `Codable`), and `--compare` checks it on the Mac. Measured numbers are in [measurements.md](measurements.md#per-frame-cost-of-the-software-path-ae957).
 
 ## Fixtures
 

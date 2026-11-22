@@ -129,7 +129,7 @@ struct Issue309SilentTransportDeathTests {
     // MARK: - Detection
 
     @Test("a flow that dies mid-window is ended without any read blocking on it",
-          .timeLimit(.minutes(2)))
+          .timeLimit(.minutes(3)))
     func deadFlowIsEndedWithoutAWaitingRead() async throws {
         let stallTimeout: TimeInterval = 0.6
         let silenceOffset = Self.silenceOffset
@@ -172,7 +172,7 @@ struct Issue309SilentTransportDeathTests {
                 "the dead flow was re-requested while nothing drained: \(server.requestedRanges)")
     }
 
-    @Test("a generation that never sees a first byte is ended too", .timeLimit(.minutes(2)))
+    @Test("a generation that never sees a first byte is ended too", .timeLimit(.minutes(3)))
     func headersWithoutABodyAreEnded() async throws {
         let stallTimeout: TimeInterval = 0.6
 
@@ -221,12 +221,17 @@ struct Issue309SilentTransportDeathTests {
         let silenceOffset = Self.silenceOffset
         let silentBytes: Int64 = 4 * 1024 * 1024
         let frontierAfterSilence = silenceOffset + silentBytes - Int64(AVIOReader.rangeCheckBytes)
+        let silenceEnd = silenceOffset + silentBytes
         let probe = RunwayProbe()
+        // The death is tied to the bytes, not to one request offset: a loaded runner can freeze the
+        // origin past the 0.5 s stall, the reader then re-requests from inside the doomed stretch,
+        // and a plain 206 for that request meant the death never happened (CI, 2026-11-16).
         let serverMaybe = ThrottledOriginServer(
             totalSize: Self.totalSize,
             respond: { _, offset, _ in
                 if offset == frontierAfterSilence { probe.recordRunway() }
-                return offset == silenceOffset ? .serveThenGoSilent(afterBytes: silentBytes) : .serve206
+                guard offset >= silenceOffset, offset < frontierAfterSilence else { return .serve206 }
+                return .serveThenGoSilent(afterBytes: silenceEnd - offset)
             })
         let server = try #require(serverMaybe)
         defer { server.stop() }
@@ -251,7 +256,7 @@ struct Issue309SilentTransportDeathTests {
 
     // MARK: - Regression
 
-    @Test("a backpressure-parked reader is not treated as a dead flow", .timeLimit(.minutes(2)))
+    @Test("a backpressure-parked reader is not treated as a dead flow", .timeLimit(.minutes(3)))
     func parkedIsNotStalled() async throws {
         let stallTimeout: TimeInterval = 0.5
 

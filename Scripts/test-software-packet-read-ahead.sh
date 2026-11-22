@@ -14,8 +14,10 @@ xcrun swiftc \
   "$TASK_ROOT/Sources/AetherEngine/Native/SoftwareAudioPacketCoverage.swift" \
   "$TASK_ROOT/Sources/AetherEngine/Native/SoftwareVideoPacketCoverage.swift" \
   "$TASK_ROOT/Sources/AetherEngine/Native/SoftwarePacketDiskFIFO.swift" \
+  "$TASK_ROOT/Sources/AetherEngine/Video/SessionDirectoryLiveness.swift" \
   "$TASK_ROOT/Sources/AetherEngine/Native/SoftwarePacketStore.swift" \
   "$TASK_ROOT/Sources/AetherEngine/Native/SoftwarePacketReadAhead.swift" \
+  "$TASK_ROOT/Sources/AetherEngine/Native/LiveTimelineFold.swift" \
   "$TASK_ROOT/Sources/AetherEngine/Diagnostics/EngineLog.swift" \
   "$TASK_ROOT/Sources/AetherEngine/Diagnostics/LogRedaction.swift" \
   "$TASK_ROOT/Sources/AetherEngine/Diagnostics/QoSClassName.swift" \

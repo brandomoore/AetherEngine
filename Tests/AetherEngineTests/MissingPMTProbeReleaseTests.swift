@@ -325,17 +325,23 @@ private struct PacedOpen {
         let url = URL(string: "http://127.0.0.1:\(origin.port)/live.ts")!
         let demuxer = Demuxer()
         defer { demuxer.close() }
-        let containerOpened = InstantBox<ContinuousClock.Instant?>(nil)
-        demuxer.onOpenProgress = { stage in
-            if stage == .containerOpened { containerOpened.set(ContinuousClock.now) }
+        // The close is armed on a thread of its own from the open's progress callback, not polled from
+        // this task and not on a GCD global queue. In the nightly one-thread pool job the pool sat
+        // starved for two minutes and the poll ran after the pass had released at 3.5 s; on the CI
+        // runners a full run starved the global queue the same way, and the close came too late.
+        if let closeDelay {
+            let seconds = Double(closeDelay / .milliseconds(1)) / 1000
+            demuxer.onOpenProgress = { [weak demuxer] stage in
+                guard stage == .containerOpened else { return }
+                Thread.detachNewThread {
+                    Thread.sleep(forTimeInterval: seconds)
+                    demuxer?.markClosed()
+                }
+            }
         }
 
         let opening = Task { await openOffTheTestThread(demuxer, url: url,
                                                         profile: .playback.withReaderLabel(marker)) }
-        if let closeDelay {
-            try await waitFor { containerOpened.get().map { ContinuousClock.now >= $0 + closeDelay } ?? false }
-            demuxer.markClosed()
-        }
         _ = await opening.value
 
         let line = try #require(capture.matching("open timings (\(marker))").first,
@@ -370,14 +376,6 @@ private struct PacedOpen {
             demuxer.markClosed()
         }
     }
-}
-
-private final class InstantBox<Value: Sendable>: @unchecked Sendable {
-    private let lock = NSLock()
-    private var value: Value
-    init(_ value: Value) { self.value = value }
-    func get() -> Value { lock.withLock { value } }
-    func set(_ newValue: Value) { lock.withLock { value = newValue } }
 }
 
 /// Packet-level edits of an ffmpeg-muxed transport stream: PAT on PID 0, PMT on 0x1000, H.264 on

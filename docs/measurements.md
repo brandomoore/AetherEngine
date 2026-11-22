@@ -354,6 +354,56 @@ Current rule: [cli.md › audiotap](cli.md#audiotap).
 
 With no harness here, a force unwrap that trapped on the FIRST buffer of any multichannel track shipped in 6.1.3 and survived to main (#400). The silent-downmix defect under it only showed once the trap was gone.
 
+### Inverse telecine (#853)
+
+Measured on 2026-11-21 on a MacBook Pro (M1 Pro, macOS) with a release `aetherctl play`, FFmpegBuild 3.17.0. Film: the Friends S1 NTSC DVD remuxes (MPEG-2 720x480, 29.97i, top field first, every frame `interlaced_frame=1`, `repeat_pict=0`). True interlaced video: clips made from the same discs, either motion-interpolated from the film to 59.94 fields (`minterpolate`), or a camera pan, a zoom and a still shot with one moving box over a frame of it at a true 60 Hz, all interleaved to 29.97i (`tinterlace`) and coded as MPEG-2 again.
+
+Current rule: [formats.md › Inverse telecine](formats.md#inverse-telecine).
+
+**Detection, final thresholds.**
+
+Samples were taken at the start position and, for the comparison below, at the middle of the file.
+
+| Material | Sample | Runs | Verdict |
+|---|---|---|---|
+| Friends S1, 24 episodes from their first frame | start | 24 | film in 24 |
+| Same | middle | 24 | film in 24 |
+| Six episodes from 2, 5, 10, 15 and 20 min | start | 30 | film in 30 |
+| Season 2 trailer (film cut with titles made at video rate) | both | 3 | film in 3 |
+| Three Friends scenes motion-interpolated to 59.94 fields | both | 13 | video in 13 |
+| Pan, zoom and still shot with one moving box over a Friends frame | both | 12 | video in 12 |
+| Synthetic 59.94 fields (`testsrc2`) | both | 2 | video in 2 |
+| Synthetic PAL 25i | | 1 | not sampled (25 fps) |
+
+**Why two signals.** `idet` after `fieldmatch` alone does not separate them: an episode's first 120 frames read 67-71% progressive (one second of black, then a fade-in made at field rate), while true video reads anywhere from 18% to 100% progressive, because its still stretches match trivially. The repeated frame of each five, at a steady phase, does separate them, but only judged by the worst 16x16 block. Judged by the frame mean, the interpolated scenes kept a five-frame rhythm and read as film in 10 of 13 samples. By the worst block the cadence share is 27-100% per film window and 0% on every true video sample.
+
+**The early video exit.** A cycle in which even the lowest difference is motion (worst block 8 or more) is 0-22% of film cycles, where the repeat sits near still, and 66-95% of true video cycles. Twenty such cycles with at most one repeat end a sample as video. Counting every cycle with any motion instead stopped one quiet, grainy film stretch (S01E12 from 5:00) as video after 155 frames.
+
+**What a sample reads.** From an episode's first frame film decides after 60-206 frames (the opening black and fade come first), from inside an episode after about 60. True video stops after 60-230 frames. The window was 120 decided frames in the first rounds; 60 halved what a start inside an episode downloads and changed no verdict above.
+
+**What it costs to the first frame, and where to take the sample.** Over a network the sample costs the video it downloads before the first frame, not its decoding. S01E05 served by `Scripts/slowrange.py` (a delay on every response, one rate shared by every connection), `FIRSTFRAME` of `aetherctl play`, median of 3 runs, sample time with its rewind in brackets:
+
+| Link | Start | Inverse telecine off | Sample at the start position | One window at the middle |
+|---|---|---|---|---|
+| 80 Mbit/s, 10 ms | 0:00 | 0.39 s | 0.72 s (0.31 s, film) | 2.17 s (0.90 s, film) |
+| 80 Mbit/s, 10 ms | 10:00 | 1.02 s | 1.22 s (0.82 s, film) | 2.26 s (0.95 s, film) |
+| 20 Mbit/s, 40 ms | 0:00 | 0.54 s | 1.84 s (1.13 s, film) | 2.96 s (2.25 s, budget spent) |
+| 20 Mbit/s, 40 ms | 10:00 | 2.96 s | 3.04 s (2.24 s, budget spent) | 3.04 s (2.23 s, budget spent) |
+| 8 Mbit/s, 100 ms | 0:00 | 0.84 s | 3.67 s (2.43 s, budget spent) | 9.95 s (4.65 s, budget spent) |
+| 8 Mbit/s, 100 ms | 10:00 | 5.71 s | 5.50 s (4.61 s, budget spent) | 10.14 s (4.61 s, budget spent) |
+
+- The middle window is never cheaper. Its two seeks and the reader's 4 MB blocks around them cost about a second more on the fast link, and on the slow one its rewind runs into its own timeout.
+- From a resume point the start-position sample costs little: the playback seeks there and buffers the same bytes anyway.
+- At 20 Mbit/s from a resume point, and at 8 Mbit/s always, the sample spends its 2 s and keeps the deinterlacer. A local file decides in 0.12-0.5 s on the M1 Pro.
+- So the sample is taken at the start position, and the middle window was dropped after this comparison.
+
+**Playback, seeks and scrub stills.**
+
+- The output runs at 24 frames a second (`--frame-times` reads `ft=24`, the `[SWDiag]` lines `dpts=41.7/41.7`), with no frame lost in a CLI run.
+- CPU per SD frame on one M1 Pro core (FFmpeg CLI, decode included): 4.5 ms for `fieldmatch` with comb scores, `bwdif` on the flagged frames and `decimate`, against 0.46 ms for `bwdif` alone. `fieldmatch` with comb scores is 2.9 ms of it, `decimate` 1.15 ms. At 29.97 frames in, that is about 14% of one core.
+- Seek to first frame, eight seeks per run on S01E05, two runs each: the clock hold after a seek (`[AudioOutput] preroll ready after N ms`) took 69-77 ms median with inverse telecine and 43-45 ms without. The graph rebuilt in about 1 ms either way; `decimate` needs about five frames before its first picture.
+- Scrub stills (`scrubpreview --stills`, five positions): 2-10 ms each, the same with and without, because stills keep the plain deinterlacer.
+
 ## Engine architecture
 
 Measurements behind [architecture.md](architecture.md), [architecture-native.md](architecture-native.md) and [architecture-software.md](architecture-software.md).
@@ -391,6 +441,207 @@ Measured on the Mac only: writing output metadata in place changes no pixel, so 
 Current rule: [architecture-software.md › VideoToolbox output metadata](architecture-software.md#videotoolbox-output-metadata).
 
 The check: 240 frames of two real FEL clips were bit-identical with and without the copy. A long-GOP picture comparison on the Apple TV decoder is still open.
+
+### HDR10 metadata on the software path reaches the television (AE#957)
+
+Measured on an Apple TV 4K (A12, tvOS 27.2) into an LG OLED77G4 on 2026-11-13: mastering display and content light level attached to the buffers given to `AVSampleBufferDisplayLayer` reach the television, on VideoToolbox's buffers and on buffers the engine rendered itself.
+
+Current rule: [architecture-software.md › VideoToolbox output metadata](architecture-software.md#videotoolbox-output-metadata).
+
+The check: the metadata on an unchanged picture switched every 3 s between a 1000 and a 4000 nit set. Filmed with the exposure locked, the ratio of the 4000 to the 1500 nit patch followed each switch about 2 s later, as it does when AVPlayer switches between a 1000 and a 4000 nit clip. Numbers and method: [`Probes/HDR10PassThrough`](../Probes/HDR10PassThrough/README.md), with the probe described in [architecture-software.md › HDR10 pass-through probe](architecture-software.md#hdr10-pass-through-probe). Also found: VideoToolbox attaches no HDR10 metadata to the frames it decodes, so the software path sent none.
+
+### Per-frame cost of the software path (AE#957)
+
+Measured on an Apple TV 4K (A12, tvOS 27.2) on 2026-11-13 with `AetherEngine.runPerFrameBenchmarks`, 4K P010, 300 runs per case.
+
+Current rule: [architecture-software.md › VideoToolbox output metadata](architecture-software.md#videotoolbox-output-metadata).
+
+| Case | Median (us) | p99 (us) |
+|---|---|---|
+| Normalizer, frame already tagged | 30 | 32 |
+| Normalizer, tag in place | 18 | 30 |
+| Normalizer, owned copy | 7193 | 7778 |
+| Renderer, sample buffer | 25 | 41 |
+| Frame chain, one pass-through stage, two passes through RGB | 11647 (GPU 10087) | 11908 |
+| HDR10 SEI scan, 250 KB key frame | 12 | 13 |
+
+**The owned copy is the cost that matters.** A frame lasts 41708 us at 23.976 fps and 16683 us at 59.94. Before the fix below, an HDR10 HEVC clip on the software path took the copy on every frame (489 of 489).
+
+**Why it copied.** VideoToolbox tagged its output BT.709 (`ColorInfoGuessedBy`) for a PQ BT.2020 HEVC clip whose VUI said otherwise, and carried no HDR10 static metadata. Both mismatched what the normalizer attaches, and the output buffers are not modifiable.
+
+**The fix.** The format description VideoToolbox decodes with now carries the stream's colour (as AV1 and VP9 already did) and its HDR10 values when they are known at open. VideoToolbox then attaches both to its own output: 486 of 486 frames matched as decoded, none copied.
+
+**The frame chain's RGB texture.** The two passes write a 66 MB half-float RGB texture per 4K frame and read it back. A chain of pass-through stages now runs as one kernel without it. A separate run on the same device and day, so the two-pass row differs a little from the table above:
+
+| Chain, 4K P010 | Wall median (us) | GPU median (us) |
+|---|---|---|
+| Two passes through RGB | 11426 | 9871 |
+| One kernel | 5341 | 3987 |
+| One kernel, wide texels, folded arithmetic | 3973 | 2675 |
+
+Luma is identical between all three, and chroma is within one code value.
+
+**What set the one kernel's time on the A12.** Variants of it, same frame and day (GPU median, us):
+
+| Variant | GPU |
+|---|---|
+| Copy only, one sample per access | 3456 |
+| Copy only, four luma samples per access | 1936 |
+| Four per access, chroma sampler but no arithmetic | 1956 |
+| Four per access, full arithmetic | 3970 |
+| The same, coefficients folded per thread | 2583 |
+| The same, chroma read by hand (9 texels) instead of sampled | 4587 |
+
+So the sampler is free, wide accesses halve the memory cost, and the arithmetic set the rest. Half precision arithmetic took 2606 but moved luma by up to 2 codes, so it is not used.
+
+**The time outside the GPU** (about 1.3 ms) is mostly the CPU slowing down while it waits for the command buffer. Spinning on the status instead of `waitUntilCompleted` cut the wall time by 0.8 ms, but holds a core busy for the whole GPU time, so the chain still waits.
+
+### Tone map at 4K60 on the A12 (AE#957)
+
+Measured on an Apple TV 4K (A12, tvOS 27.2) on 2026-11-14. The answer first: **the BT.2390 tone map fits 4K at 60 fps on the A12, inside the one round-trip kernel.** No frame-rate gate is needed for a chain of the tone map alone. As its own pass between the two passes through RGB it does not fit.
+
+Current rule: [architecture-software.md › HDR10 tone map](architecture-software.md#hdr10-tone-map).
+
+**Benchmark.** `AetherEngine.runPerFrameBenchmarks`, 4K P010, 300 runs per case, a 1000 nit master to a 600 nit target:
+
+| Chain, 4K P010 | Wall median (us) | GPU median (us) |
+|---|---|---|
+| Pass-through, one kernel | 3950 | 2674 |
+| Tone map, one kernel | 5297 | 3976 |
+| Tone map, two passes | 16869 | 15209 |
+
+- A 60 fps frame lasts 16683 us, so the one-kernel tone map takes about a third of it.
+- The first version wrote the spline out term by term: 8531 wall, 7150 GPU. As one cubic per component (coefficients worked out once on the CPU) it is the 5297 / 3976 above, with the same output to within a quarter of a 10-bit code. The arithmetic sets the time on the A12, as for the round trip.
+- The two-pass tone map costs what the extra trip through the RGB texture costs, not the curve.
+
+**Playback.** The Jellyfin test clip "4K HEVC HDR10 40M" (3840x2160, HEVC Main 10, PQ BT.2020, 60 fps, 30 s), on the software path through the HDR10 probe. The clip carries no HDR10 metadata, so the probe's values stood in (`maxcll=1000,maxfall=400,peak=1000`), mapped to 600 nit. Each run played 28.9 s.
+
+| Run | Dropped frames | Chain GPU per frame, mean of 48-frame windows | Worst frame |
+|---|---|---|---|
+| Software path, no chain | 1 | - | - |
+| Chain, pass-through | 1 | 4.16 ms | 8.71 ms |
+| Tone map, six runs in a row (173 s) | 0 in every run | 4.95 to 5.04 ms | 13.68 ms |
+
+- The first ten windows of each run are logged (480 frames). The six tone-map runs show no drift, so the A12 did not slow down as it warmed.
+- The output frames and the format description carried the stage's metadata: mastering peak 600, MaxCLL / MaxFALL 600 / 400.
+- In playback the chain's GPU time is about 1.5 ms above the benchmark's, with the decoder and the display on the same GPU.
+
+### Upscale stage on the A12 (AE#957)
+
+Measured on an Apple TV 4K (A12, tvOS 27.2.1) on 2026-11-15 with `AetherEngine.runPerFrameBenchmarks`, 300 runs per case, each to a 3840x2160 display. The answer first: **on the A12 only MetalFX alone and the line-art upscale rung fit a 23.976 fps frame, and nothing fits 59.94.** VT super resolution does not run there at all.
+
+| Case | Plan | Wall median (us) | GPU median (us) |
+|---|---|---|---|
+| `upscale: 720p to 2160p, MetalFX only` | 1280x720 -> MetalFX 3840x2160 | 19593 | 17154 |
+| `upscale: 1080p to 2160p, line art` | 1920x1080 -> line art 3840x2160 | 18920 | 16697 |
+| `upscale: 1080p to 2160p, line art with restore` | the same, with restore and clamp | 25239 | 22799 |
+| `upscale: 480p` and `720p to 2160p, automatic` | ML first | skipped | skipped |
+
+- The stage's budget is 90% of the frame interval: 37.5 ms at 23.976, 15.0 ms at 59.94. All three cases that ran fit 23.976; none fits 59.94.
+- VT super resolution reports support on the A12 (it offers 1.5x and 2x at 720p), then fails every pass with `VCPFrameSuperResolutionProcessor failed`, also after 10 s of retries. GitHub's macOS runner VMs behave the same way (`FrameUpscalerTests` gates its ML tests on a real pass).
+- Before the fix, playback of a 720p SDR clip with `upscalesLowResolutionVideo` failed three frames, switched the stage off and reloaded on the native path: no upscaling at all. Now the stage drops the ML pass and carries on with MetalFX alone ([architecture-software.md › Low-resolution upscaling](architecture-software.md#low-resolution-upscaling)). The same 20 s clip at 23.976 fps then played upscaled to the end, 0 dropped frames, at 28.9 to 30.3 ms per frame (26.2 to 27.6 ms GPU) over 48-frame windows.
+- Playback costs half again what the bench measures (29.5 against 19.6 ms): the GPU lowers its clock under a regular load that leaves it idle part of each frame, as `FrameUpscaler.budgetFraction` describes.
+- The frame chain cases in the same run matched the earlier A12 numbers within 3%.
+
+### Two frames in flight on the A12 (AE#957)
+
+Measured on an Apple TV 4K (A12, tvOS 27.2.1) on 2026-11-15, in playback through the HDR10 probe host. The answer first: **with two frames in flight, the upscaler holds the decoder's thread a third as long, and the GPU time per frame does not change.**
+
+Current rule: [architecture-software.md › Two frames in flight on the GPU](architecture-software.md#two-frames-in-flight-on-the-gpu).
+
+**Why two.** An experiment on the same device timed MetalFX 720p to 2160p back to back: 17.7 ms per frame one at a time, 9.9 ms with two command buffers in flight. A third gave nothing more.
+
+**Playback.** The 20 s 720p SDR clip at 23.976 fps with `upscalesLowResolutionVideo`, MetalFX alone (the device refuses VT super resolution), means of 48-frame windows:
+
+| Build | Decoder's thread per frame | GPU per frame | Dropped frames |
+|---|---|---|---|
+| One frame at a time | 28.9 to 30.3 ms | 26.2 to 27.6 ms | 0 |
+| Two in flight | 9.0 to 10.8 ms | 23.8 to 28.1 ms | 0 |
+
+- Encoding takes about 1 ms. The rest of the 9 to 10 ms is waiting for a free slot, when the decoder runs ahead.
+- The GPU time is the same, so the frames do not get cheaper. The decoder's thread is free sooner, and the budget, which counts that time, is a quarter used instead of three quarters.
+- A seek to 3 s while playing and a seek to 12 s while paused both landed on their target, the paused one with its frame on screen. The clip played to the end with 0 dropped frames and no `settle` timeout.
+- The picture processing tone map (1000 to 600 nit) on the 4K 23.976 fps pattern held the decoder's thread 1.3 to 1.5 ms per frame, 0 dropped frames. 4K60 is not measured through the pipeline: the 4K60 test clip declares no HDR10 metadata, so the route is not taken.
+
+### 10-bit AV1 conversion on the A15
+
+Measured on an Apple TV 4K (A15, tvOS 27.2.1) on 2026-11-18, in playback in a host app's Debug build (the package compiled unoptimised, as in every run in this section): a 1080p 23.976 fps 10-bit AV1 episode with film grain, Opus stereo, MKV, 2.8 Mbit/s over the home network. The answer first: **waiting for the GPU on every frame held the decode below real time, and the clock paused to rebuffer every few seconds.**
+
+Current rule: [architecture-software.md › 10-bit AV1 conversion](architecture-software.md#10-bit-av1-conversion).
+
+| Route | Frames to the renderer per second | Audio lead | CPU (one core = 100%) |
+|---|---|---|---|
+| GPU conversion, waiting for each frame (7.54) | 22 to 23 | fell 1 s per second, clock paused every 4.5 s | dav1d 9%, other threads 63% |
+| GPU conversion, waiting for each frame (7.70) | 22 to 23 | same, clock paused every 8 s | dav1d 10%, other threads 62% |
+| CPU (`convertsAV1FramesOnGPU` off) | 23 to 26, mean 24 | steady at 4.0 s, no pause | dav1d 55%, other threads 11% |
+
+- Per-second counts from `[SWDiag]` (`enq=`), CPU from the 30 s `cpuprobe`. The network was not the cause: the reader stopped at its 16 MB window and every pause resumed within 0.3 s.
+- With the GPU route the dav1d workers were mostly idle. The decoder's thread was the limit: it encoded each frame, then waited for the GPU before it took the next.
+- The audio lead could only grow as far as the file was read, and the file was read only as fast as video was decoded, so the lead drained at the shortfall.
+
+**With the conversion overlapped** (two frames on the GPU), the same episode in the host's Debug build: the GPU took 1.7 ms per frame, but encoding a frame held the decoder's thread 40 to 44 ms, at 100% of a core. The clock paused about once a minute, then every few seconds once the encode crept past the 41.7 ms frame interval. The film grain tables were that cost, not the GPU.
+
+**The film grain tables**, timed on an M1 on 2026-11-19 (lag 3, 1080p):
+
+| Code | Unoptimised (debug build) | Optimised |
+|---|---|---|
+| Luma and both chroma templates, `Array` and `for ... in` | 37.9 ms per frame | 0.61 ms |
+| The same, `while` over raw pointers | 1.3 ms | 0.22 ms |
+| Whole table build, before | 40.8 ms | |
+| Whole table build, template loops written out | 3.05 ms | |
+| Whole table build, every loop written out | 1.45 ms | |
+
+- An unoptimised build makes every `Array` subscript and every `for ... in` step a call, which dav1d's C never pays, so the CPU route kept up in the same debug build.
+- On the A15 the whole encode (the tables, mapping the picture and encoding the passes) took 40 to 44 ms with the old loops, against 40.8 ms for the tables alone on the M1: the tables were nearly all of it.
+- The output is unchanged: `AV1FilmGrainTablesMatchTheReferenceArithmeticTests` holds the new loops to the plain version, and the GPU digest tests hold both to dav1d.
+
+**With both changes**, the same episode on the same Apple TV, in the host's Debug build (four minutes, then two after the last loop change):
+
+| Route | Frames to the renderer per second | Encode per frame | GPU per frame | Clock paused | CPU (one core = 100%) |
+|---|---|---|---|---|---|
+| GPU conversion, overlapped, template loops written out | 24 in 213 of 249 one-second samples, 22 to 26 in all but 3 (the first second, and two resumes from a pause, each only partly playing) | 8.4 to 11.7 ms | 1.7 ms | only for the first fill at the start | 50% to 78% in all |
+| GPU conversion, overlapped, every loop written out (2026-11-19, two minutes) | 24 in 75 of 112, 22 to 26 in all but the first second | 6.2 to 8.9 ms | 1.7 ms | only for the first fill at the start | 68% to 74% in all |
+
+- The encode is the decoder's thread per frame: the grain tables, mapping the picture for the GPU and encoding the two passes. It uses a quarter of the 41.7 ms frame interval or less.
+- Writing out the narrowing and scaling loops too (1.45 ms against 3.05 ms for the whole table build on the M1) took about 2 ms off the A15's encode per frame.
+- The audio lead stayed at 4.0 s throughout both runs, in the first through two pauses by the viewer.
+- Every session pauses once as it starts, while the audio lead fills for the first time (`audio lead exhausted (-2.48s)` 50 ms after the open). The earlier runs did too.
+
+### Upscale edge band in a Debug build (AE#1097)
+
+Measured on 2026-11-19. The answer first: **in a host's Debug build, the CPU step that rewrites the upscaled frame's outer band (`edge` in the timing line) cost 20 to 22 ms per 720p frame on an A15, and that alone put a 720p60 upscale over its 15 ms budget.** The same arithmetic in raw-pointer `while` loops costs about 5 ms there and writes the same bytes.
+
+The band is the outer 8 output samples on every side (4 in chroma), rewritten as a bilinear scale of the source since AE#846. It is about 72,000 samples per 1080p frame, which takes a fraction of a millisecond optimised. Unoptimised, every `Array` subscript, tuple copy and `for ... in` step is a call.
+
+| Build | Code | 720p to 1080p `edge` per frame |
+|---|---|---|
+| M1, `aetherctl bench`, debug | tuple arrays, range loops (7.70.0) | 21.5 ms |
+| M1, `aetherctl bench`, debug | raw pointers, `while` | 5.7 ms |
+| M1, `aetherctl bench`, release | raw pointers, `while` | 0.52 ms |
+| Apple TV 4K (A15, tvOS 27.2), host Debug build | tuple arrays, range loops (7.70.0, reporter's log) | 20.3 to 22.4 ms |
+| Apple TV 4K (A15, tvOS 27.2.1), Sodalite Debug build | raw pointers, `while` | 4.7 to 6.1 ms |
+
+- The reporter's stage (1280x720 59.94 fps MPEG-2) went over budget in the first 48-frame window, dropped MetalFX, and the VideoToolbox-only step then read 43 to 49 ms and switched off. That step's `total` is a frame's whole latency, and with a 20 ms `edge` at a 16.7 ms frame interval each frame waited behind the one before. The MetalFX step's `total` is the time the decoder's thread is held, so the two steps are not directly comparable.
+- On the A15 run (720p 25 fps, a Debug build with the fix), the full chain read 11.2 to 13.1 ms per window: `copy` 0.5 to 0.8, `ml` 6.2 to 7.2, `edge` 4.7 to 6.1, MetalFX 17 to 19 ms on the GPU. From these steps, the VideoToolbox-only step at 59.94 fps comes to about 13 ms against 15.01 ms, and MetalFX at 17 to 19 ms of GPU per frame still does not fit, as before.
+- The micro benchmark of the loop alone (M1, same sizes) read 18.8 ms unoptimised and 0.18 ms optimised before, 1.9 ms and 0.14 ms after, with identical output. `edgeBandIsABilinearScaleOfTheSource` holds the band to a plain bilinear reference in both planes.
+- Not measured: a 59.94 fps source on the device with the fix. The test server has no such title, and its "720p" NDR channel turned out to be 1080p.
+
+### Bed regression in a Debug build (AE#1106)
+
+Measured on an M1 on 2026-11-21. **With per-bin Swift loops the bed regression ran at 0.2x real time in an unoptimised build, so a host's Debug build stalled TrueHD Atmos on every segment. Through Accelerate it runs at 11x there, and twice as fast optimised.** An Apple TV has not been measured since the change.
+
+The benchmark feeds `BedRegression` a 7.1 bed and 16 placed elements (noise) into 9.1.6, in 40-frame blocks as TrueHD delivers them. CPU per second of audio:
+
+| Stage | Per-bin loops, debug | Per-bin loops, optimised | Accelerate, debug | Accelerate, optimised |
+|---|---|---|---|---|
+| Statistics (covariance, cross-spectra) | 1987 ms | 30 ms | 17 ms | 16 ms |
+| Solve (Cholesky, `W = R · A`, energy bound) | 2176 ms | 40 ms | 35 ms | 20 ms |
+| Apply (`W · bed` per bin) | 1623 ms | 38 ms | 11 ms | 9 ms |
+| Whole hop, FFTs included | 5816 ms | 112 ms | 91 ms | 53 ms |
+
+- The output is the same within float rounding: 118 dB signal to difference against the old code for 1, 12 and 16 elements, and 130 dB in the DTS:X fold mode.
+- End to end, `aetherctl play --atmos-bed 9.1.6` in a debug build played The Matrix (UHD remux, TrueHD Atmos with 11 objects) for 60 s from 10:00, switching to the Atmos track 2 s in. The clock reached 10:56.85, the buffer ran 60 s ahead, and the 30 s `cpuprobe` put the pump at 69% of a core. Before, a debug build rendered Unfold at about a fifth of real time and ended in `VERDICT: clock did not advance`.
+- The reporter's Time Profiler run on an Apple TV 4K (A15) put `BedRegression.processHop` at 74% of the segment pump's samples, with `applyWeights`, `accumulateStatistics` and `solveWeights` the three largest parts. Those are the three stages above.
 
 ### Software channel layout mismatch
 
@@ -580,6 +831,27 @@ Measured: a live resume whose position had slid out of the window moved silently
 Current rule: [api.md › Live: a resume that had to move](api.md#live-a-resume-that-had-to-move).
 
 On the harness, with a 30 s window and a 70 s pause, the playhead sat at 93881.2, the window slid to 93890.0...93920.0 underneath it, and the resume landed at 93895.0 without a word. A viewer who paused a match came back to it continuing somewhere else, with nothing on screen to say why.
+
+### Live join: the first-serve grace
+
+Measured: the automatic `.fastZap` grace (one observed segment, clamped to 0.5 to 2 s) delayed every raw MPEG-TS start by 1 to 2 s and prevented no rebuffer. Since 7.71 the default is no grace.
+
+Current rule: [api.md › Live](api.md) note 2 on `liveStartupGraceSeconds`.
+
+`aetherctl live --realtime --seconds 20`, release build, 1080p25 H.264 + AAC raw TS at 6 Mbit/s, three runs per cell, median time from load start to `playbackPhase == .playing`. `--preroll 0` is a strict-realtime origin, `--preroll 3` one that bursts 3 s on connect (with the fixture's 2 s lead, 5 s), which is the shape of most IPTV providers.
+
+| GOP | origin | old auto grace | grace 0 | grace 0 + one segment (`--single-segment-min 0.4`) |
+|---|---|---|---|---|
+| 0.48 s | strict | 1.27 s | 0.27 s | 0.22 s |
+| 0.48 s | burst | 1.15 s | 0.23 s | 0.22 s |
+| 1 s | strict | 1.40 s | 0.36 s | 0.25 s |
+| 1 s | burst | 1.26 s | 0.22 s | 0.22 s |
+| 2 s | strict | 4.39 s | 2.38 s | 0.37 s |
+| 2 s | burst | 1.39 s | 0.21 s | 0.22 s |
+
+- **Rebuffers:** none in the first two columns. The one-segment start rebuffered in 3 of 3 runs on the 2 s strict cell, so it stays opt-in. A host saw a 4.5 s stall from it on real channels.
+- **`-16832`:** grace 0 on a strict origin logs one or two `restarting ... from end of live playlist` warnings per start. On macOS they delay nothing (`playing` still comes at 0.27 to 0.37 s). On a bursting origin there were none, because the burst deepens the window before AVPlayer looks.
+- **Why the grace bought nothing:** on a burst origin the window stops just short of the holdback (5.76 of 6 s on the 0.48 s cell), and the grace waited a full segment for the next keyframe at 1x. The AE#936 early exit keeps 0.5 s of slack, so it rarely fires at these lengths.
 
 ### Live join: sealing over the upstream segment
 

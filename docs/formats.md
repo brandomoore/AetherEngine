@@ -131,6 +131,8 @@ A remote HLS playlist plays on AVPlayer straight from the origin by default (the
 
 **How the HEVC-in-MPEG-TS check runs** (#168). The engine reads the playlist and the head of one segment while AVPlayer starts, so the reroute does not wait for a grace window to run out. A media playlist URL with no master is covered too (#293). Only a codec that the HLS Authoring Spec allows in fMP4 alone triggers that read, so an H.264 channel spends no extra request on it.
 
+**Encrypted segments in that check** (AE#1089). An AES-128 clear-key segment hides its PMT, so the engine first fetches the 16-byte key, then decrypts only the head of the segment and reads the PMT from that. This costs one small extra request. A wrong key gives bytes without TS sync, and that never triggers a reroute. SAMPLE-AES segments and encrypted sub-range segments (`EXT-X-BYTERANGE`) are not read, so this check leaves them alone.
+
 **Refused by the origin** (#363). HTTP 401 and 403 reach the item as `NSURLError` -1013 / -1102. The engine then hands the session to the ingest instead of failing the load. The ingest fetches differently from AVPlayer:
 
 - it sends the configured headers on every request,
@@ -171,10 +173,28 @@ The only rewrite happens as the bytes are served: each moof gets the virtual fil
   - There is no adaptive switching: the session plays the representations it opened with.
   - Every carried audio track is fetched while it plays, selected or not. For the reporting asset that was three AAC tracks totalling about 310 kbit/s next to a 1 Mbit/s video.
   - Text and image (thumbnail) adaptation sets are not carried.
+- **Audio cap.** At most 16 audio tracks are carried, the first 16 in manifest order. Each track is its own file, reader, connection and block cache, and a hostile MPD can declare thousands of audio sets. The rest are logged and dropped.
 - **Languages.** An adaptation set's `lang` replaces a track's `und`, mapped to ISO 639-2/T (`en` becomes `eng`, `de-DE` becomes `deu`).
+- **Credentials and limits.** `LoadOptions.httpHeaders` that carry a credential (`Authorization`, `Cookie`, `X-Emby-Token` and the like) go only to the origin of the manifest URL, the same rule a redirect follows. A `BaseURL` that names another host, another port or plain http behind an https manifest gets the other headers and no credentials. The manifest is read through the bounded fetch: a body over 8 MB fails the open as too large, and so does a trickle that outlasts 120 s. A declared head (`Initialization` or `indexRange`) wider than 64 MB is refused. Numbers in the MPD or in the boxes that overflow end the open with an error instead of crashing.
 - **Network cost.** One request for the manifest and one per representation before the first media byte. During playback each representation file is read forward in requests that grow the way a single file's do. A small block cache per file (eight 1 MiB blocks) sits in front of them. It matters because libavformat reads an interleaved file in decode order, switching between a video fragment and the audio fragments beside it on every sample. Without the cache, each return to the video file would cost a fresh request: measured 1,042 requests for 45 s of one video file, against 65 with the cache. The origin byte total is the same as for the equivalent single MP4.
+- **No cue prewarm.** A seekable file normally gets a seek to its middle before the segment plan is built, which is how libavformat loads an MKV's Cues or an MP4's `stss` (see [Segment plan](architecture-native.md#segment-plan)). The virtual MP4 has neither: it is fragmented, and libavformat indexes it one fragment at a time, so the seek would add only the fragment at the middle. The native route skips it for a DASH source (AE#1075). Measured on a 10 minute presentation behind an origin with 80 ms latency and 4 MB/s, the seek cost about 5.7 MB and 2 s before `readyToPlay`, and the plan came out the same without it.
+- **Segment plan from the `sidx`.** The video representation's `sidx` says which subsegments start with a random-access point and when. The native route cuts its HLS segments on those points instead of on an even grid that ignores the GOPs (AE#1075, see [Declared boundaries](architecture-native.md#segment-plan)). Measured on a 5 minute presentation with keyframes 1.5 to 9 s apart: every segment decodes on its own (35 of 35, against 25 of 40 on the grid), and seeks to 15, 150 and 285 s land exactly, where the grid landed 1.8 and 3.3 s late.
+- **Software route read-ahead from the interleave.** The software path's read gate normally stops reading once decoded audio is 4 s ahead of the clock or 256 video packets are parked. Interleaved by subsegment, audio can sit a whole audio subsegment ahead of the next video in read order, and video a whole video subsegment ahead of the next audio. So for a DASH source the gate is sized from the `sidx`: the audio lead grows by the longest audio subsegment, and the packet cap covers the 4 s lead plus the longest video subsegment at the stream's frame rate (AE#1079, see `SoftwareReadGateBudget`). Both are clamped at 15 s. Measured at 60 fps: 10 s audio against 4 s video subsegments froze the picture for 3 to 5 s at every audio subsegment while the sound played on, and 10 s video against 2 s audio held the clock at 10 s. Both now play through with the picture on the clock.
 - **Refused, with the reason in the error:** live manifests (`type="dynamic"`), more than one Period, `SegmentTemplate` and `SegmentList` addressing, an initialization segment in a separate file, hierarchical `sidx` (`reference_type` 1), and encryption (`ContentProtection`, `pssh`, `encv` / `enca`). An unplayable audio adaptation set is skipped when the video plays. An unplayable video one fails the load.
 - **Seeking a fragmented MP4.** libavformat indexes such a file one fragment at a time. Without a guard, a forward seek whose next sync sample starts an unread fragment lands on whatever later fragment an earlier read indexed (a start at 150 s and a seek to 60 s rendered 122 s). So `Demuxer.seek(to:streamIndex:)` checks the samples between the target and the chosen sync sample for a hole in the index. If it finds one, it lands on the sync sample before the target instead. This applies to every fragmented MP4, not only to DASH.
+
+### Fragmented MP4 over HTTP
+
+A fragmented MP4 (a `moov` with an `mvex`, then `moof` + `mdat` pairs) without a complete `sidx` has no up-front index. libavformat builds one while it opens by reading every top-level `moof` to the end of the file, one seek per fragment. Over HTTP each of those seeks is a request, so the open costs one request per fragment before the first packet: a 4 minute file of 96 fragments needs about 95, a 2 hour file of 2.6 s fragments about 2,800.
+
+When the file ends in an `mfra`, the engine avoids that in one of two ways:
+
+- **Lazy index** (FFmpegBuild 3.16.0 or later, which has the `mov-lazy-frag-index` patch). Before the open, `FragmentedMP4RandomAccess` reads the head boxes, the `moov` and the `mfra` (both usually inside the bytes the open fetches anyway). When the `mfra` lists the video track's random-access points, the demuxer opens with movdec's `lazy_frag_index`: it reads the first fragment and the last one (for the durations) and finds the others as seeks need them. Only the first is in its index at that point. The keyframes the segment plan needs come from the `mfra`.
+
+  A `tfra` entry is meant to name a sync sample, but ffmpeg's mp4 muxer writes the first sample of every fragment, sync or not. A file cut at fixed durations (`-frag_duration` without `frag_keyframe`) would then give the plan a keyframe at every fragment start and seeks would land seconds off. So before the open the probe reads up to four of the `moof`s the entries name, spread over the file, and checks that each named sample is a sync sample. If one is not, the file is indexed in full, with the fragment header fetch below. A `tfra` time is the sync sample's presentation time, the index holds decode times, so the first indexed keyframe sets the shift between them, and every `tfra` entry of a fragment the demuxer has read must land on an indexed keyframe. When they agree, the plan is the keyframe-aligned plan a full index builds. When they do not, the `mfra` times are used as declared boundaries ([Segment plan](architecture-native.md#segment-plan)).
+- **Fragment header fetch** (any FFmpegBuild). The open walks every fragment as before, but `AVIOReader` fetches the ranges that hold the `moof` headers side by side, up to eight at a time within the origin's request budget, from the offsets the `mfra` lists, and answers the walk from them. Each `moof` it fetched is also offered to the other readers of the same source for 60 s, so the I-frame reader's walk as the session starts does not refetch them; a reader that opens later fetches its own. If the origin allows only one request at a time, the tail is not prefetched and the walk reads as before.
+
+The `mfra` decides where the plan may cut and which bytes are fetched early, never what a seek returns: the demuxer still reads and checks every `moof` it uses. A file without an `mfra`, or with one the engine cannot use (no video `tfra`, more than one video track, times that go backwards), is opened as before.
 
 ### Hardware decode
 
@@ -203,17 +223,18 @@ Native AVPlayer path, VideoToolbox:
 | H.264 with both MVC stereo views in one track | VideoToolbox is handed both views in one sample and renders nothing (#435) | libavcodec (base view) |
 | Dolby Vision Profile 7 FEL, opt-in | `preferDualLayerDolbyVision` with the `DualLayerDolbyVision` trait composes both layers here ([Profile 7](#profile-7)) | VideoToolbox, both layers, plus the Metal composer |
 | Upscaling, opt-in | With `upscalesLowResolutionVideo`, a source the route accepts moves here for the Metal scaler, and returns to native when the stage is dropped (#846, [Upscaling](#upscaling)) | The source's usual decoder |
+| HDR10 tone map, opt-in | With `videoProcessing`, an HDR10 source brighter than the target moves here for the tone map, and returns to native when the processing is dropped (#957, [Tone map to the display's peak](#tone-map-to-the-displays-peak)) | The source's usual decoder |
 | A native session AVPlayer refuses on its media | With `escalatesToSoftwarePath` (default), a CoreMedia refusal or a confirmed H.264 parameter-set change rebuilds the session here at its playhead ([Files with broken timestamps or bitstreams](#files-with-broken-timestamps-or-bitstreams)) | libavcodec, or VideoToolbox for HEVC |
 | Anything, by request | `preferredDecodePath = .software` ([api › Overriding the decode path](api.md#overriding-the-decode-path)) | As above |
 
-On the software host, VideoToolbox still decodes where it can: VP9 (see below), HEVC (which reaches the software host through, for example, escalation, the dual-layer route, upscaling or `preferredDecodePath = .software`), and AV1 Dolby Vision Profile 10.1 on devices with hardware AV1. Everything else there decodes in libavcodec.
+On the software host, VideoToolbox still decodes where it can: VP9 (see below), HEVC (which reaches the software host through, for example, escalation, the dual-layer route, upscaling, the tone map or `preferredDecodePath = .software`), and AV1 Dolby Vision Profile 10.1 on devices with hardware AV1. Everything else there decodes in libavcodec.
 
 
 #### AV1
 
 AV1 runs through libavcodec / dav1d on devices without hardware AV1.
 
-- **10-bit.** A 10-bit AV1 frame is converted to P010 (a 10-bit pixel format) on the GPU, and its film grain is applied there too (`GPUFrameConverter`). dav1d exports the grain parameters instead of applying them. One Metal pass then does both the grain and the planar-to-P010 conversion, in place of `sws_scale`, and matches dav1d's picture sample for sample. That takes two per-pixel passes off the CPU, which the decode already keeps busy. On a fanless Apple TV, CPU load means heat.
+- **10-bit.** A 10-bit AV1 frame is converted to P010 (a 10-bit pixel format) on the GPU, and its film grain is applied there too (`GPUFrameConverter`). dav1d exports the grain parameters instead of applying them. One Metal pass then does both the grain and the planar-to-P010 conversion, in place of `sws_scale`, and matches dav1d's picture sample for sample. That takes two per-pixel passes off the CPU, which the decode already keeps busy. On a fanless Apple TV, CPU load means heat. In playback, up to two frames convert while dav1d decodes the next ([architecture-software › 10-bit AV1 conversion](architecture-software.md#10-bit-av1-conversion)).
 - **8-bit.** Keeps dav1d's grain and `sws_scale`.
 - **Fallback.** A 10-bit frame the GPU pass refuses (no Metal device, a failed command buffer) falls back to `sws_scale` without its grain, since dav1d was told at open not to apply it.
 - **Seeking.** A seek lands on the keyframe nearest its target, not exactly on it (`SWKeyframeSnap`). An exact landing would make dav1d decode from the keyframe before the target up to the target. 4K AV1 encodes run long GOPs (long gaps between keyframes), and on an Apple TV 4K (A15) that took 2 to 5 s ([api › Transport](api.md#transport)).
@@ -231,13 +252,15 @@ VP9 and VP8 always use the software presentation route, because AVPlayer's HLS p
 
 MPEG-4 Part 2 (XVID / DIVX / SP / ASP), MPEG-2 video and VC-1: AVPlayer's HLS-fMP4 pipeline accepts none of them, and libavcodec ships native decoders for all three.
 
+VC-1 and WMV3 decode with frame threads since FFmpegBuild 3.18.0 (AE#1107). Before that, upstream declared no threading capability for either decoder, so the engine asked for frame threads and VC-1 got one thread. The gain shows mostly at a seek, which decodes forward from the last keyframe. On 6 cores a progressive 1080 Blu-ray title gets there about 4 times as fast, a title with field pictures about 2.3 times. A stream whose pictures have slices gains little, because a sliced reference picture lets the next one start only when it is done.
+
 #### Legacy Microsoft codecs (FFmpegBuild 2.4.3, 3.1.0)
 
 - **Video (FFmpegBuild 2.4.3):** MS-MPEG4 v1 / v2 / v3 (the DivX 3.x that pre-2005 AVI rips carry) and WMV1 / WMV2 / WMV3 (WMV9). These always routed to `SoftwareVideoDecoder`. Before that release they failed the load there with `unsupportedCodec`, because no decoder was compiled in.
 - **Native `.wmv` / `.asf` files (FFmpegBuild 3.1.0):** play whole. That release added the `asf` demuxer and the entire WMA decoder family (Standard, Pro, Lossless, Voice). The video in such a file is usually WMV3 or VC-1, both already supported in Matroska and MPEG-TS.
 - **All or nothing, on purpose.** The demuxer ships only together with the WMA decoders. Without a matching decoder the demuxer would open the file and then have nothing to decode its audio with: `AudioBridge` init fails, the cascade ends in `droppedNoPipeline`, and the session serves video only and plays the file silently. That is worse than an honest failure.
 - WMA is not fMP4-legal in any flavour, so it always takes the AudioBridge, like MP2 and Blu-ray LPCM.
-- None of the six video codecs supports frame threading, so they decode single-threaded. The content that carries them is SD.
+- Of the six video codecs only WMV3 decodes with frame threads (FFmpegBuild 3.18.0, see [VC-1](#mpeg-4-part-2-mpeg-2-vc-1)). The other five decode single-threaded, and the content that carries them is SD.
 - Reported by cmcpherson274 (FFmpegBuild#3), whose library carries WMV only inside Matroska and MPEG-TS. So native `.wmv` / `.asf` support waited for a second field report.
 
 #### Flash codecs (FFmpegBuild 3.2.0)
@@ -280,6 +303,10 @@ On a seekable VOD source the engine first checks the declared field order agains
 - A flagged frame ends the sample at once (~29 ms on 1080i, ~100 ms for a full sample).
 - Live sources are never probed.
 
+**On an AirPlay receiver that shows video it plays natively (AE#1070).** The software host draws into a layer that stays on the device, so an Apple TV picked from the AirPlay button got the sound alone. While the host reports a video receiver on the wireless route (`setAirPlayReceiverShowsVideo(true)`), interlaced H.264 takes the native route and the receiver gets the stream as it is, without the device's deinterlacer. The engine reloads at the playhead when that changes mid-session, in both directions. See [AirPlay and the software host](api.md#airplay-and-the-software-host).
+
+**On the native route, field pairs become one sample.** Broadcast 1080i often codes each field as a picture of its own (PAFF), so MPEG-TS delivers 50 packets a second for 25 frames. Muxed one field per sample, AVPlayer shows every field as a frame and the picture bounces up and down. `H264FieldPairJoiner` puts both fields of a frame into one sample, the way ISO/IEC 14496-15 wants it. It only runs when the SPS allows field pictures, and a frame picture or a field without its partner passes through unchanged. The receiver still gets the frame woven, so motion can show combing where the device's deinterlacer would have removed it.
+
 #### High profiles without a hardware decoder
 
 H.264 High 4:2:2 / 4:4:4 / High-10 and HEVC Rext (4:2:2 / 4:4:4 / 12-bit), on hardware whose VideoToolbox has no decoder for the profile (Intel Macs, older Apple TV chips).
@@ -302,9 +329,26 @@ This covers H.264 that carries both stereo views inside one track. That is how a
 
 ### Deinterlacing
 
-Interlaced sources (DVD-rip MPEG-2, SD / HD broadcast H.264) are deinterlaced through a persistent filter graph. By default it runs on the GPU (`yadif_videotoolbox`, a Metal kernel, at field rate), with CPU bwdif (yadif on older builds) as the fallback. It engages on the first interlaced frame and costs nothing on progressive content.
+Interlaced sources (DVD-rip MPEG-2, SD / HD broadcast H.264) are deinterlaced through a persistent filter graph. By default it runs on the GPU at field rate, with CPU bwdif (yadif on older builds) as the fallback. It engages on the first interlaced frame and costs nothing on progressive content.
+
+The GPU filter is `bwdif_videotoolbox`, a Metal port of bwdif from FFmpegBuild, so the GPU path and the CPU fallback deinterlace with the same algorithm (AE#1102). Given the same frames, the GPU filter's output equals CPU bwdif's sample for sample. The two paths still differ in cadence (the GPU runs at field rate by default, the CPU at frame rate) and the GPU path converts to 4:2:0 first.
+
+When the linked FFmpegBuild has no `bwdif_videotoolbox`, or its graph fails to build, the engine uses FFmpeg's `yadif_videotoolbox` instead. A GPU graph that errors while it runs falls back to the CPU. `$sourceVideoStreamFormat`'s `deinterlace.filter` names the one that runs.
 
 `AetherEngine.load` decides the route (`VideoRoutingPolicy`), per source, from `VTCapabilityProbe`, the codec id, the declared field order, and on VOD the decode sample that verifies it.
+
+#### Inverse telecine
+
+Film put on NTSC video with its 3:2 pulldown baked into the pictures (hard telecine, the usual NTSC DVD of a film-shot series) gets its film frames back instead of being deinterlaced (#853). `fieldmatch` pairs each frame's fields with their matching ones, `decimate` drops the repeated frame of each five, and the display is asked for 23.976 Hz. The deinterlacer still runs, but only on the frames `fieldmatch` could not match: titles and credits made at video rate.
+
+- **Which sources.** `LoadOptions.inverseTelecine = .auto`, the default, samples a VOD, seekable, 29.97 / 30 fps MPEG-2 source of 576 lines or fewer whose frames decode interlaced. Soft telecine (the decoder repeats fields) already decodes to film frames and is left alone. Live, HD, PAL (25 fps, 2:2 pulldown) and other codecs keep the deinterlacer.
+- **`.force` and `.off`.** `.force` matches fields without the sample on any NTSC-rate interlaced source of a codec that always decodes on the software path; on true interlaced video it loses one frame in five. `.off` never matches fields.
+- **The sample.** Before the display criteria are written, the load decodes from its start position through `fieldmatch` and `idet`. It decides film when, over the last 60 decided frames, at least 90% read progressive after matching and the repeated frame of each five keeps one phase in at least 15% of the cycle pairs (four at least). The repeat is judged by the worst 16x16 block, so video made from film by motion interpolation is not mistaken for it. It decides video early after 20 cycles in which every frame moved, with at most one such repeat. The sample stops at 300 frames, 3000 packets or 2 s, then rewinds. Anything short of film keeps the deinterlacer. Measurements: [measurements › Inverse telecine](measurements.md#inverse-telecine-853).
+- **The session keeps it.** Seeks, audio-track switches, `reloadAtCurrentPosition` and the return from background keep the first load's decision and display rate. A changed `inverseTelecine` takes effect at the next load.
+- **A disc title switch decides again.** Another title is another stream, so the new title is sampled like a fresh load, on a URL source and on a custom source (an ISO through a reader) alike. On a custom source the display keeps the rate the first title asked for, so a title that decides differently (a video-shot extra after a film episode) plays on that rate.
+- **Only when the graph can run.** The load decides film only when the linked FFmpeg has `fieldmatch` and `decimate` and the stream states its frame rate, because the decision also sets the display rate. An `audioOnly` load is never sampled.
+- **The output.** 23.976 fps on a 1001/24000 timeline that starts again at every seek or timestamp gap, at frame rate whatever `deinterlaceFieldRate` says. Scrub stills keep the plain deinterlacer.
+- `decodedVideoFormat?.deinterlace?.inverseTelecine` tells a host it runs ([api › Stream and decoded format](api.md#stream-and-decoded-format)).
 
 `$sourceVideoScan` tells a host whether the source is progressive or interlaced, from the same evidence (AE#983, [api › Scan type](api.md#scan-type)).
 
@@ -325,10 +369,38 @@ Some files carry timestamps or bitstreams that a player would show wrongly. The 
 | MP4 whose composition offsets are missing only in later regions (judder after a seek) | Streams the same slot repair per sequence | None | [architecture › MP4 with composition offsets missing only in later regions](architecture-native.md#mp4-with-composition-offsets-missing-only-in-later-regions), [regression and reproduction](notes/partial-composition-regression.md) |
 | H.264 VOD whose parameter sets change mid-file (audio, no picture) | Moves the session to the software path | Software decode | [Below](#h264-vod-with-changing-parameter-sets) |
 | A video sample whose NAL chain overruns it, or confirmed HEVC with an incomplete two-byte NAL header (AE#561, #960) | Cuts an overlong chain at its last complete NAL; removes incomplete HEVC headers while preserving valid NALs, dropping a sample with no complete header. A CoreMedia refusal that still happens rebuilds the session on the software path, once | None, or software decode | [architecture › A video sample whose NAL chain overruns it](architecture-native.md#a-video-sample-whose-nal-chain-overruns-it) |
+| HEVC coded 3840x2176 and cropped to 2160 by a conformance window, on tvOS. An Apple TV (AppleTV18,1, tvOS 27.2.1) restarts when its hardware decoder gets this SPS | On AppleTV18 and later, sets the window's offsets to zero in the init segment and in the in-band SPS of every sample, and crops the 16 padding lines with a `clap` box instead (`HEVCConformanceCrop`). Older models keep the window | None, hardware decode stays | [Below](#hevc-coded-3840x2176-and-cropped-to-2160) |
 | 24p film stamped with 2:3 pulldown times, 50 and 33 ms per frame (Sodalite#236) | Puts each frame on its 24p slot on the native route (`PulldownCadenceRetimer`) | None | [architecture › 2:3 pulldown timing on 24p film](architecture-native.md#23-pulldown-timing-on-24p-film) |
 | A declared frame rate that is not a standard rate (mkvmerge writes the first frame's duration, so such a file declares 20 fps) | Measures the rate on the head packets the probe already queued and uses that (23.976 here) for the display switch, the master's `FRAME-RATE` and the frame grid | None | |
 
 On the pulldown clip, 587 of 606 frame steps came out at exactly 41.7 ms, where every step had been 50 or 33. Content that is not film (true 30p or 60p, constant-rate stretches) is untouched.
+
+#### HEVC coded 3840x2176 and cropped to 2160
+
+**The problem.** Some encoders pad a 2160-line picture to 2176 lines and crop the 16 extra lines with the SPS conformance window. On an Apple TV (AppleTV18,1, tvOS 27.2.1) the hardware decoder takes such a stream and the device restarts within about 160 ms of the first frame. An iPhone plays the same segments. The software path plays them on the Apple TV.
+
+**What was measured.** One variable was changed at a time on the device. The same pictures play once the window's offsets are zero. An ordinary x265 encode restarts the device as soon as it carries this window. The level, the HRD parameters, the timing SEI, the access unit delimiters and the coding tools make no difference.
+
+**What happens.** On tvOS the muxer rewrites the SPS so the window's four offsets are zero. This covers the configuration record in the init segment (an `hvcC` record or Annex-B parameter sets) and the in-band SPS of every sample, Annex-B or length-prefixed (an `hev1` or Matroska source).
+
+Without the window the decoder hands out all 2176 lines. So the sample entry states the coded height, and a `clap` box (clean aperture, the container's own crop) of 3840x2160 hides the 16 padding lines. The device played this combination in the same test series.
+
+The `clap` carries a vertical offset of +8, not the -8 the spec asks for. tvOS applies that offset with the opposite sign to the spec and to macOS. Measured on an Apple TV (AppleTV14,1) with a test pattern, over HLS and from an MP4: -8 shows lines 16 to 2175, so 16 lines of picture go missing at the top and 16 padding lines show at the bottom. +8 shows exactly lines 0 to 2159. The same file would sit 16 lines low on macOS, which is another reason the repair stays on tvOS.
+
+**Only the restarting generation gets it.** The `clap` is not a full stand-in for the window. With PQ HDR, tvOS does not crop the picture at all. It squeezes all 2176 lines into the 2160-line aperture, so the padding shows at the bottom, whatever the sign of the offset. A model that plays the window correctly is better off keeping it.
+
+Measured on an Apple TV (AppleTV14,1, tvOS 27.2) over HLS fMP4, with marker rows at the top, at the bottom and in the 16 padding lines:
+
+| Stream | Conformance window | `clap` -8 | `clap` +8 | Neither |
+|---|---|---|---|---|
+| SDR | Lines 0 to 2159 | Lines 16 to 2175 | Lines 0 to 2159 | All 2176 lines, scaled, with thin side bars |
+| PQ HDR10 (with and without the HDR mode switch) | Lines 0 to 2159 | All 2176 lines squeezed | All 2176 lines squeezed | All 2176 lines, scaled, with thin side bars |
+
+A 10-bit SDR file with +8 shows lines 0 to 2159 as well, so the PQ transfer is what changes it, not the bit depth.
+
+So the muxer clears the window only on AppleTV18 and later (`HEVCConformanceCrop.modelNeedsCropFreeSPS`, read from `uname`). An AppleTV14,1 and older models keep the window, as before 7.69.0. A simulator keeps it too. PQ HDR of this geometry is untested on an AppleTV18,1. There it either restarts with the window or shows the padding with the `clap`, and the engine accepts the padding (AE#1094).
+
+The repair is fail-closed. Only a 4:2:0 base-layer SPS of exactly 3840x2176 with a bottom crop of 16 lines and no other crop is rewritten. Other platforms keep the window, since only the Apple TV failed on it.
 
 #### H.264 VOD with changing parameter sets
 
@@ -352,12 +424,25 @@ An explicit decode-path choice and disabled escalation are honored; the load the
 | HEVC Main10 (HLG) | BT.2020 / HLG |
 | HEVC / H.264 with a BT.2020 SDR VUI and an alternative-transfer SEI naming HLG | BT.2020 / HLG (AE#839) |
 | AV1 HDR | BT.2020 / PQ |
+| 10-bit stream with no colour description, `untaggedVideoColor = .hdr10` / `.hlg` | BT.2020 / PQ or BT.2020 / HLG (AE#1103). Without the option it is SDR, BT.709 |
 
 Broadcast HLG (BBC iPlayer, UK DVB-T2 UHD) names HLG only in the `alternative_transfer_characteristics` SEI. Its VUI keeps a backward-compatible transfer (BT.709, BT.2020 10 or 12 bit, or unspecified) over BT.2020 primaries, so an SDR set still shows a picture. The demuxer reads the first video packets (at most 8) for that SEI. When it names HLG, the stream is marked HLG for every later reader: format detection, display criteria, `VIDEO-RANGE`, the muxer's `colr` and `probe(url:)` (AE#839).
 
-AetherEngine does not tone-map (convert HDR to SDR) on the host. It tells the system "this is BT.2020 PQ" (or DV, or HLG) through the HLS-fMP4 sample description. AVPlayer and the system compositor then map HDR to SDR as the connected display needs. tvOS / iOS pick the right path.
+A stream with no colour description at all cannot be told from SDR, so it plays as BT.709 (AE#654). A host that knows such a stream is HDR sets `LoadOptions.untaggedVideoColor` (AE#1103). The demuxer then marks the stream the same way as the HLG case above, so every later reader agrees. It only touches a stream of at least 10 bit that declares none of primaries, transfer and matrix and is not Dolby Vision. Details: [api › `untaggedVideoColor`](api.md#untaggedvideocolor).
+
+By default AetherEngine does not tone-map (convert HDR to SDR, or to a dimmer display) on the host. It tells the system "this is BT.2020 PQ" (or DV, or HLG) through the HLS-fMP4 sample description. AVPlayer and the system compositor then map HDR to SDR as the connected display needs. tvOS / iOS pick the right path.
 
 **On the software host** there is no HLS sample description, so the same signal travels on each decoded frame. Both decoders (libavcodec and VideoToolbox) attach the colour primaries, transfer (PQ, HLG) and matrix to every pixel buffer. HDR10+ metadata goes out per frame as `kCMSampleAttachmentKey_HDR10PlusPerFrameData`. So an AV1 or VP9 HDR10 or HDR10+ source keeps its HDR and its dynamic metadata off the native route too. `videoFormat` moves to `.hdr10Plus` on the first frame that carries it.
+
+### Tone map to the display's peak
+
+`LoadOptions.videoProcessing` (#957, opt-in) maps an HDR10 title brighter than the display to the display's peak itself, with BT.2390, instead of leaving it to the television. The title then plays on the software host.
+
+- Taken only for HDR10 (PQ) with a declared mastering display or MaxCLL whose peak is above `targetPeakNits`, on a display that takes HDR10.
+- Dolby Vision, HDR10+, HLG and SDR keep their usual route.
+- Each frame goes out with HDR10 metadata that says the target, so the television does not tone map it a second time.
+
+Details and costs: [api › `videoProcessing`](api.md#videoprocessing).
 
 ### When an HDR master is served
 
@@ -470,6 +555,7 @@ With `LoadOptions.forceDolbyVisionOnNonDVDisplay` (experimental, default off, AE
 - **Why it works.** The bitstream never changes, only the container's claim about it. A Profile 8.1 RPU already carries the mapping out of its own HDR10 base layer, so the composer does not need the container to describe that layer.
 - **Why it is experimental.** This is not what the profile field means. A decoder that read the base layer's colorimetry from the profile rather than from the RPU would decode IPT out of YCbCr: the green / violet cast of #4 and #176.
 - **Scope.** Profile 8.1, and Profile 7 once converted to it. Profile 8.4's base layer is HLG, and a profile-5 `dvcC` over an HLG `colr` is a container that contradicts itself.
+- **HDR10+ in the same file.** The forced route gives up the HDR10+ a Profile 8.1 base layer may carry, because the panel then receives composed HDR10. With `LoadOptions.preferHDR10PlusOverForcedDolbyVision`, the load checks the head of the video stream first, and a source with HDR10+ keeps the default route, so an HDR10+ panel gets it (Sodalite#245).
 
 #### Base layer only: `dolbyVisionHandling = .baseLayerOnly`
 
@@ -699,6 +785,7 @@ AVPlayer ends a muxed HLS item the moment its audio runs out, however much video
 
 - **Padded:** AC-3, E-AC-3 and FLAC always; AAC-LC and ALAC since FFmpegBuild 3.10.0 (the encoders come from the FFmpeg build).
 - **Not padded:** HE-AAC, MP3, Opus and a stand-in sample entry (the APAC bed). These log `AE#847 audio tail not padded` with the reason.
+- **Cap.** The fill is at most 10 minutes (`AudioTailPadding.maxFillSeconds`), written packet by packet as the encoder produces it. A final segment is seconds long, so only a corrupt last timestamp ever reaches the cap, and the log says `capped`.
 - **Limit.** The fill exists only in the segment written at end of file. On a source that arrives barely faster than its bitrate, with a silent tail longer than the producer's lead, AVPlayer waits at the end of the audio until that segment exists, and then plays on.
 
 ### Audio shaping
@@ -730,6 +817,8 @@ AVPlayer ends a muxed HLS item the moment its audio runs out, however much video
 - **Why `dialoguenhance`.** It beat a mid/side lift, measured on a mix of centred speech and wide music: at +6 dB the mid/side lift gained 2.0 dB against the wide music, `dialoguenhance` 5.1 to 7.2 dB. Neither separates speech from music mixed to the centre itself (0 to 1.2 dB); no stereo method can.
 - A mono source is left alone.
 
+**The decoder does not compress.** AC-3 and E-AC-3 reach this graph with their full dynamics. The engine opens FFmpeg's Dolby decoders with `drc_scale` 0, as Apple's decoder plays them on the native path. Night mode below is the one place dynamics get compressed. See [architecture-software.md › Audio on the software host](architecture-software.md#audio-on-the-software-host).
+
 **Night mode (`compressor`).** libavfilter's `acompressor`, peak detection, one gain for all channels so the image does not move. The `night` preset compresses everything above -30 dBFS 4:1 and adds 10 dB. Measured on a steady 1 kHz tone: 0 dBFS in comes out at -12.2 dBFS, -20 at -17.2, -40 at -30.0.
 
 **Plain gain.** A compressor with `ratio: 1` compresses nothing, so `AudioShaping(compressor: .init(thresholdDB: 0, ratio: 1, makeupGainDB: g))` is a plain gain of `g` dB (up to 24) into the limiter. This is a supported use. Measured on a steady 997 Hz tone: -20 dBFS at +6 dB comes out at -14.0 dBFS, 0 dBFS at +12 dB stays at the -1 dBFS ceiling. A fixed gain is the same for every film; the loudness target below adapts it per film.
@@ -750,6 +839,8 @@ AVPlayer ends a muxed HLS item the moment its audio runs out, however much video
 - It is used instead of an instant-attack limiter because it measured far cleaner. On a steady overload its THD was -155 dB against -48.6. On two tones under limiting bass hits, its splatter above 3 kHz was -67 dB against -42 (relative to the tones), at the input's own floor.
 
 **Timing.** `dialoguenhance` delays its content by three quarters of its FFT window (1536 samples at 48 kHz, 3072 at 96 kHz) and stamps its output with its input's timestamps regardless. So the engine runs the graph on a sample counter of its own: it drops the delay's priming, pushes the same number of silent samples at the end of the stream, and carries the timestamps itself. Output sample k is then input sample k. Measured: an impulse at sample 60000 of a stereo source comes out of the bridge at sample 60000 with 96000 samples in and out, and the software decoder presents it at 1.25000 s, its source time.
+
+**A source that changes layout mid-stream.** A live programme can switch between stereo and 5.1. The remix matrix follows the new layout and lifts the front centre when there is one. The graph's `dialoguenhance` runs only when there is none, so the engine rebuilds the graph when that answer changes (`AudioShapingStage`). The loudness measurement and the graph's held tail carry over, so the gain does not restart at 0 dB and the last milliseconds before the change are not dropped. A mono source gets no matrix lift, only the graph's.
 
 **Requirements.** The graph (`AudioShapingGraph`) needs FFmpegBuild 3.11.0 or later, which adds `abuffer`, `abuffersink`, `aformat`, `aresample`, `pan`, `dialoguenhance`, `acompressor` and `alimiter`. The loudness target needs no filter of its own (it is Swift, `LoudnessNormalizer`). Where the graph cannot be built, the remix still applies and the log says the dynamics do not; the loudness target is then off as well, because without the limiter its gain could clip.
 
@@ -772,6 +863,8 @@ AC-4 (ATSC 3.0 / NextGen TV) and MPEG-H 3D Audio have no decoder in the bundled 
 **Such a track is expensive, not just silent.** `has_codec_parameters` fails an audio stream with no sample rate, and that value can only come from the container or from opening a decoder. So `find_stream_info` reads the full probe budget, then gives up and opens with the track missing anyway. On a live source that budget is spent at the wire rate. That is where Sodalite#100's minute-long tuning indicator came from.
 
 **What the engine does.** The demuxer hides such a stream from the probe (one whose codec has no decoder AND whose parameters the container left unset), and restores it right after. The open then costs what it would without the track, and the caller still sees the track in `audioTracks`. A host with its own metadata can do better still and refuse the channel with a real sentence (Jellyfin names a live channel's audio codec in PlaybackInfo without opening a tuner).
+
+An ATSC 3.0 channel often also carries an STPP caption track, which had a probe cost of its own. See [Raw live MPEG-TS and the live join](#raw-live-mpeg-ts-and-the-live-join) (AE#1087).
 
 ### Track language on the native path
 
@@ -900,6 +993,8 @@ The object presentation is decoded without matrix interpolation. LibTrueHD 3.2.0
 
 So each output takes from the bed exactly the part of it that belongs to the elements the layout places there. No element is reconstructed from the bed or mixed into an output.
 
+**Cost.** Each hop runs through Accelerate. Per band, the statistics are one matrix product of the spectra with the conjugated bed, and the weights are interpolated across the bins with `vDSP_vlint`. On an M1, 16 elements into 9.1.6 take about 53 ms of CPU per second of audio, and about 90 ms in a host's Debug build, which compiles the package without optimisation. With the earlier per-bin Swift loops a Debug build took 5.8 s per second of audio and stalled playback (AE#1106). Numbers: [measurements.md › Bed regression in a Debug build](measurements.md#bed-regression-in-a-debug-build-ae1106).
+
 **Energy bound.** Per band the output carries 0.9 to 1.6 times the bed's energy (a constant-power layout over Dolby's 7.1, whose objects measure 0.7 to 1.0 in power, lands inside). An element the decode got wrong can misplace energy but not add or remove it, and the output cannot click. The LFE is the bed's own.
 
 **Accuracy.** Compared against the exact decode and mix of earlier releases, on 30 windows of ten films plus Dolby's Unfold demo:
@@ -937,6 +1032,7 @@ tvOS sends APAC over HDMI as Dolby MAT, and some sinks show Dolby Atmos for it o
 
 - The stream is 2 s of digital silence written bit by bit from the E-AC-3 and object audio specifications (`Scripts/make-silent-atmos.swift`).
 - It plays only while the engine's player plays or waits to play a rendered item on a route whose every output is HDMI, and is released otherwise.
+- **Its player goes with the stream.** The second player is built when the stream starts and thrown away when it is released, at `stop()` too. Kept around paused and empty, it held an Apple TV 4K's HDMI route (tvOS 27.3) in its 32-channel layout, and on an engine reused across titles the next title's 5.1 PCM reached the receiver as Dolby Atmos (#1081).
 - **Pause grace.** A pause does not stop it at once. It keeps playing for 60 s and pauses only if the engine's player is still paused then, because stopping it let the output leave Atmos, and a Samsung HW-Q990H re-locked on every resume and scrub (#848). The grace is bounded so a long pause does not keep the receiver busy, and it ends before tvOS's shortest screen saver delay.
 - **DTS:X.** A rendered DTS:X programme runs it too. tvOS carries a bed with heights over HDMI only as Dolby MAT, so the receiver shows Dolby Atmos for an intact DTS:X bed either way. Without the stream, the Sonos above, with Continuous Audio off, kept a DTS:X bed rendered to PCM on stereo.
 - **AirPlay.** Not run. There is no sink indicator to light, and the second player restarting beside the programme on resume left a HomePod pair silent after a pause (#834).
@@ -972,6 +1068,7 @@ Decoding the object presentation and encoding APAC each take about one core (a P
 - The queue inherits the producer's QoS.
 - A pool of three chunk buffers holds the producer at most two chunks ahead of the encoder.
 - The producer waits for the queue (`settle()`) before a keyframe advances its segment cutter or a write cuts the open segment. So every packet is routed as the encode in series routed it, and every segment carries the same audio, byte for byte. Those waits cost about 0.1 s of the sample's overlap.
+- `APACEncodePipelineTests` checks that against a second encoder fed in series. It compares decoded audio (signal to error ratio above 60 dB), not bytes: two encoder instances do not always write the same packets for the same PCM. On an M6 under macOS 27.0.1 they never did, and on an M1 they always did (#1063).
 
 #### What the session log says
 
@@ -1006,7 +1103,11 @@ DTS:X's standard presentation is a 7.1 bed and four fixed heights (the top front
 
 **Latency.** The regression's 2048 frames, kept off the timeline.
 
-**Layouts.** Each of the twelve channels has its own speaker, so DTS:X is rendered into the two layouts that carry all twelve one to one, 7.1.4 and 9.1.6. Any other layout keeps the channel bridge.
+**Layouts.** Each of the twelve channels has its own speaker, so DTS:X is rendered into the two layouts that carry all twelve one to one, 7.1.4 and 9.1.6.
+
+A smaller layout (5.1.2, 5.1.4, 7.1.2) renders DTS:X as 7.1.4 instead. The host can set the layout to match the room, and the receiver maps the 7.1.4 bed onto its own speakers, the same as it does with tvOS's own Atmos. Nothing is panned, and a chain that cannot take twelve channels gets the 7.1 it would have had from the channel bridge, since tvOS folds the bed itself.
+
+A host that wants TrueHD Atmos in the small layout but DTS:X on the 7.1 channel bridge sets `LoadOptions.rendersDTSXObjectAudio = false` (#1060). That holds for every DTS track of the load, so a file with both tracks plays either one without a reload.
 
 #### The alternate presentations
 
@@ -1061,7 +1162,7 @@ Those runs predate the decoder in FFmpeg. The activator still runs for a rendere
   - `DTS:X in an alternate presentation without heights, which plays as its 7.1 bed` (a stream FFmpeg labels IMAX whose frames carry none)
   - `DTS:X in alternate presentation 0xd4, whose height fold is not known, which plays as its 7.1 bed`
 - A frame whose height channel set does not decode keeps the 7.1.4 layout with silent heights and the bed as coded, and libavcodec logs `DTS:X height channels not decoded, output silent heights`.
-- A layout other than 7.1.4 or 9.1.6 logs `DTS:X is rendered into 7.1.4 or 9.1.6 only`.
+- A layout other than 7.1.4 or 9.1.6 logs `DTS:X is rendered into 7.1.4 instead of 5.1.2, the smallest bed that carries its channels one to one`.
 - The `object configuration` and `bed levels` lines are the same as for TrueHD Atmos. So is the 1200-packet silence report: at 512 samples a DTS frame, that is 12.8 s of DTS, against a second of TrueHD.
 
 ## Subtitles
@@ -1137,6 +1238,7 @@ PGS / HDMV PGS / DVB / DVD produce `.image(SubtitleImage)`. The indexed pixel pl
 - **DVB (#971) and DVD on a rescaled encode (#993)** report the video frame instead of their 720x576 / 720x480 plane, since that display covers the whole picture with non-square pixels. A DVD on video wider than 16:9 reports the 16:9 frame at the video's width, as the picture was cropped out of it.
 - **Several objects (#146).** A display set carrying multiple composition objects (a forced sign plus dialogue is a common real-disc shape) fans into one cue per object, all sharing the set's start PTS, and every object is kept and rendered.
 - **Forced flag.** Each object's `AV_SUBTITLE_FLAG_FORCED` rides along as `SubtitleImage.isForced`, surfaced per cue via `SubtitleCue.isForced`. Track-level forcedness stays on `TrackInfo.isForced`.
+- **Size cap.** A bitmap canvas or object larger than 4096x4096 pixels is refused and produces no cue. A UHD Blu-ray canvas is 3840x2160. A hostile display set of about 100 KB could otherwise make the decoder allocate around 1 GB.
 
 #### External files
 
@@ -1154,6 +1256,11 @@ In-band CEA-608 (`eia_608` / QuickTime `c608`, a demuxable caption track) produc
 - Instead, a read-only tap on the segment producer's existing source connection reads the caption track's `cc_data`. Its packets are kept in the demuxer's keep-set, observed, then dropped. They are never muxed, so the loopback-HLS output stays byte-identical.
 - An in-house line-21 decoder (validated against FFmpeg's `ccaption_dec.c`) turns it into cues, and they publish on the same `subtitleCues` overlay path as every other codec.
 - First cut: field-1 / channel CC1 only. CEA-708 (DTVCC) and field 2 are follow-ons.
+- Only CC1 caption characters reach the screen. Field 1 also carries three other services, and the decoder keeps their characters out:
+  - CC2, the second caption channel. Its control codes start with 0x18-0x1F instead of CC1's 0x10-0x17.
+  - XDS (Extended Data Services), packets of programme data such as the network name. A packet starts with a byte from 0x01-0x0F.
+  - The text service T1, a scrolling text page that shares CC1's control codes. TR (Text Restart) and RTD (Resume Text Display) switch to it.
+- A character belongs to the service of the last control code before it. After TR or RTD, CC1 stays in the text service until a caption mode command comes back: RCL (pop-on), RU2-RU4 (roll-up with 2 to 4 rows) or RDC (paint-on).
 
 **Captions inside the video bitstream (#131).** Captions carried only inside the video (ATSC A/53 `cc_data`, the US broadcast/cable case) are extracted too:
 
@@ -1313,6 +1420,10 @@ Bitmap subtitles (PGS / DVB / DVD) join as OCR-fed renditions.
 
 **External `.sup` sidecars** fill their store from the packets the selection already read (no second fetch), decoded a batch at a time so each picture lives only as long as its recognition (#921).
 
+**A bitmap rendition nothing fills answers at once.** A text rendition's segment request waits up to 3 s for its reader to reach that window, because AVKit caches whatever it gets. A bitmap rendition has no reader: only the OCR worker or a sidecar fill puts text in. While neither runs on it, its segments are served empty right away, and the whole-program file skips its 30 s wait the same way. Before, every such request held the loopback connection AVPlayer also loads video on for the full 3 s, and on tvOS a seek after it never landed (AE#1052). This happens when the user picks a bitmap track in AVKit's menu before the host reacts, or when a select names a bitmap track that is not the overlay's, since the worker only runs for the track the overlay shows. The log says it once per rendition: `AE#1052 subtitle rendition ord=N is a bitmap track no OCR worker fills`.
+
+**Those empty answers are not the empty-segment warning.** `served an EMPTY subtitle .vtt` is kept for a rendition that should have had text and lost the race with its reader (Sodalite#156). A marker and a bitmap rendition nothing fills are empty on purpose, so they never print it. That AVKit keeps such a segment does no harm: a select that later gives the rendition text (PiP, AirPlay, `setNativeSubtitleRendering(true)`) waits for OCR coverage, then deselects and reselects, and AVKit fetches the segments under the playhead again.
+
 #### Wireless AirPlay (#86, #227)
 
 While an iOS session plays to a wireless AirPlay receiver, the engine reloads its loopback over the device's LAN IP: the receiver fetches the stream for itself and cannot reach `127.0.0.1`. It keeps the master there, so the `SUBTITLES` renditions travel and `setNativeSubtitleSelected(track:)` has a legible group to select against. The `EXT-X-MEDIA` URIs are relative, so they resolve against the LAN base with no further work.
@@ -1381,7 +1492,7 @@ engine.$nativeSubtitleTracks               // @Published var [NativeSubtitleTrac
 
 // select a rendition by ordinal (nil deselects); language-tag match, positional fallback.
 // Re-asserts automatically if AVFoundation drops the selection during a stall recovery.
-engine.setNativeSubtitleSelected(track ordinal: Int?)
+engine.setNativeSubtitleSelected(track ordinal: Int?, markerOnly: Bool = false)
 
 // convenience for the enter/leave pattern below: true resolves the rendition matching the
 // currently-active overlay track and selects it, false deselects
@@ -1407,6 +1518,19 @@ The recommended host pattern for PiP / AirPlay:
 3. On leaving: call `setNativeSubtitleRendering(false)` and re-enable the host overlay.
 
 This avoids double subtitles during inline playback (where the host overlay is already painting them), and makes sure the user sees subtitles the moment the stream is mirrored or sent to PiP.
+
+#### Showing the host's pick in AVKit's menu (`markerOnly`)
+
+A host that draws a bitmap track itself inside a stock `AVPlayerViewController` would normally see AVKit's subtitle menu say "Off", because the engine keeps the legible group deselected while the overlay paints. `setNativeSubtitleSelected(track: n, markerOnly: true)` selects rendition `n` in that menu without drawing anything (AE#1052). The user sees their track ticked and can pick Off or another track from the menu.
+
+- The marker rendition is served as empty WebVTT segments, so AVKit shows no text and no caption box over the host's overlay. The host's text style rules are left alone.
+- No OCR runs for a marker. Bitmap recognition starts only when the rendition has to carry text.
+- `setNativeSubtitleRendering(true)` (PiP, AirPlay, external display) turns the marker into a full rendition: OCR arms, and the engine deselects and reselects so AVKit refetches the segments under the playhead with text. Measured on an iPhone with iOS 27, the first OCR cue showed up right after the reselect.
+- `setNativeSubtitleRendering(false)` goes back to the marker instead of deselecting.
+- Any plain `setNativeSubtitleSelected(track:)` call, nil included, replaces the marker. The marker survives the engine's own reloads (audio switch, recovery, AirPlay).
+- `clearSubtitle()` leaves the renditions' stores in place, so a marker set after subtitles-off still lands on the rendition AVKit fetches.
+- When the marker moves to another track or to Off, its rendition stays empty until AVKit's select of the new choice has landed. AVKit keeps asking for the old rendition until then, and an empty answer costs nothing, while a rendition waiting for text that never comes holds each request for 3 s. Only a marker that becomes the display itself (`setNativeSubtitleRendering(true)`, or a plain select of the same track) gets its text at once.
+- Scope is the VOD loopback, the same as bitmap renditions in general.
 
 ### Live HLS subtitle renditions (host overlay)
 
@@ -1643,6 +1767,10 @@ With a fixed 4 s lead instead, the buffer runs dry before every 10 s segment and
 - `SourceProbe.isLive` flags no-duration network streams, so hosts can detect and reload.
 - **Mid-stream joins (#107).** Sources joined mid-stream deliver their first samples at arbitrary PTS hours past zero. They anchor the clock at the first decoded sample on every session shape (live, live+DVR, and a plain VOD open of the same URL or of a mid-broadcast capture file), publishing session-relative positions while `sourceTime` stays on the source axis for subtitles.
 
+**Reads on a live source return what has arrived (AE#1076).** FFmpeg reads a network source through a 256 KB buffer. On a live source the reader hands back whatever bytes are there instead of waiting until that buffer is full, the way a socket read does. Waiting for the full 256 KB cost 4 s per read on a 0.5 Mbit/s tuner sub-channel. That showed up as a 1.7 to 2.9 s `open_input` and as a live edge that moved in 3 s steps. A VOD read still fills its request.
+
+Measured with `aetherctl play --live` against an origin that sends MPEG-2 + AC-3 in real time, PAT and PMT in the first packets: `open_input` went from 3.07 s to 20 ms at 0.68 Mbit/s and from 0.44 s to 2 ms at 4.8 Mbit/s.
+
 **A PAT program that never sends its PMT.** The TS demuxer only knows its stream list is complete once every program its PAT lists has sent a PMT. Until then `avformat_find_stream_info` cannot take its "all info found" exit. Some IPTV panels and restreamers pass on a multiplex fragment whose PAT still lists a program they do not carry. Without a release, such a channel reads the whole playback budget (50 MiB / 60 s) after every stream it has is resolved.
 
 - The engine releases that wait once the stream analysis has received data for 2.5 s while one program still has no PMT and another has its PMT and an audio or video stream. 2.5 s is five missed repetitions of the 0.5 s PMT interval ETSI TR 101 290 expects.
@@ -1654,6 +1782,26 @@ With a fixed 4 s lead instead, the buffer runs dry before every 10 s segment and
 
 Measured through `aetherctl play --live` on a live-paced synthetic channel, median of 5: the stream analysis went from 58.7 s (32 MB, three requests, because the reader reconnects at the end of the 30 s fixture and the pass runs on to its 60 s cap) to 2.5 s (1.6 MB, one request), with both tracks. With audio that starts 5 s late it takes 4.9 s, and with a join 3 s into a 10 s GOP 7.6 s, the same as those channels without the silent program.
 
+**A data track the PMT does not name (AE#1087).** The engine keeps such a track out of the stream analysis, so it no longer holds the video back. ATSC 3.0 channels from an HDHomeRun carry their STPP captions this way, as a private stream (stream_type 0x06) with no descriptor.
+
+- The TS demuxer can only call such a track `bin_data`, and libavformat then tries to identify it from its content. Until that ends, every later packet of every stream waits in a queue behind the track's first packet, the video included.
+- The content check ends after 2500 packets of that track, or once the queue holds the probe size (50 MiB). A caption track sends a packet every few seconds, so it is always the 50 MiB, read at the wire rate on a live source. The reported channel spent 13 to 17 s there before the host's watchdog gave up.
+- Whether it happens depends on which comes first after the tune, a caption packet or the first picture. That is why the same channel sometimes opened at once.
+- The engine sets such a track to `AVDISCARD_ALL` for the analysis and restores it after, so its packets never enter the queue. Playback already discarded it.
+- What this gives up is the content check itself. An audio track in such a mux would stay `bin_data` instead of being recognised as DTS or AC-3. FFmpeg names every descriptor-carrying form (AC-3, E-AC-3, DTS, AC-4, Opus, teletext, DVB subtitles), so only a broken mux loses anything.
+
+Measured with `aetherctl play --live` on a synthetic channel shaped like the report (HEVC Main 10 720p59.94, two AC-4 tracks, one caption track whose first packet comes before the first picture), paced at 7.3 Mbit/s. Before, the analysis had not finished after 40 s and 36 MB. After, it took 366 ms and 329 KB, and the session played.
+
+### Live AC-3 that changes layout
+
+Some channels carry AC-3 2.0 during ads and 5.1 during the programme on the same PID. The fMP4 `dac3` / `dec3` box (the audio track's configuration) is written once per init segment, from one parsed frame.
+
+- On a live source the producer compares each stream-copied AC-3 / E-AC-3 frame with the layout of the current init: sample rate, bsid, `acmod`, LFE, and the E-AC-3 substreams.
+- A new layout counts only after three frames in a row, and a frame flagged corrupt is skipped, so one damaged packet does not cost a discontinuity.
+- On a change it cuts at the next keyframe, marks the segment with `#EXT-X-DISCONTINUITY` and gives it a versioned `#EXT-X-MAP` primed with a frame in the new layout, the same rotation as the SSAI program switch. The log line is `audio layout change`.
+- Until that keyframe, the frames in the new layout stay in the segment on the old init.
+- A bridged track is untouched: its encoder output keeps one layout.
+
 ## Known limitations
 
 Things that work today but have a documented edge case, or are deferred behind an upstream dependency.
@@ -1663,6 +1811,7 @@ Things that work today but have a documented edge case, or are deferred behind a
 - **Now Playing and the audio session.** On the HLS-loopback path of tvOS 26, manual `MPNowPlayingInfoCenter` writes race the player; a host with a custom transport lets the engine own the card instead (`ownsVideoNowPlayingSession`). The engine activates the audio session per playback, not at launch, so tvOS can negotiate the HDMI channel count (AetherEngine#24). Both are host contracts: [api › Now Playing and the audio session](api.md#now-playing-and-the-audio-session).
 - **AV1 on Apple TV is software-decoded.** No current Apple TV chip ships hardware AV1. The `SoftwarePlaybackHost` + dav1d path handles it, but CPU use is clearly higher than with hardware HEVC. For 10-bit AV1, film grain and the P010 conversion run on the GPU, so what stays on the CPU is dav1d's decode. A Profile 10.1 source keeps its Dolby Vision there ([Dolby Vision signaling](#dolby-vision-signaling)). Where the chip decodes AV1 (A17 Pro, M3 and later), Main profile AV1 takes the native route; High and Professional stay on software. Future Apple TV chips with hardware AV1 will be picked up automatically by `VTCapabilityProbe`.
 - **AV1 Dolby Vision Profile 10.0 does not play on the software path.** dav1d / libavcodec cannot decode the proprietary DV colour space, so a Profile 10.0 source (DV-only, no fallback base layer) would show a green / purple picture there. The load fails instead, with `AetherEngineError.dolbyVisionUnplayableOnSoftwarePath` and the error kind `.dolbyVisionRequiresHardware`. HEVC Profile 5 is refused the same way when it reaches the software path (#176). Profiles 10.1 and 10.4 are unaffected, because they carry an HDR10 / HLG base layer. Profile 10.0 only plays through the native AVPlayer path on hosts with hardware AV1 decode.
+- **Software decode stops at 8192x8192 pixels.** The software host and frame extraction refuse a picture larger than that, which still covers 8K UHD (7680x4320) and DCI 8K (8192x4320). The cap keeps a hostile stream from making the decoder allocate gigabytes.
 - **Dolby Vision Profile 5 / AV1 Profile 10.0 thumbnails need the `DolbyVisionStillReshaping` trait.** Without it such a source yields no still ([Frame extraction](#frame-extraction)). A frame that carries no DV metadata falls back to the standard path.
 
 ## Moved sections

@@ -137,6 +137,7 @@ How these kinds arrived in earlier releases is in [measurements.md › API histo
 - **A plain-URL live open** (`isLive`) that the origin answers with a status fails the same way (#796). A 500 or 502 is asked once more first. A 2xx answer with a short text notice instead of media fails the same way too: that is how an Xtream panel at its connection cap answers, and it publishes `.sourceRateLimited` with 509 (#925).
 - **A TLS trust refusal** on either publishes `.sourceCertificateRejected`.
 - **Only a live open that reaches nothing** publishes `.liveSourceUnavailable`. The reconnect ladder first tries to ride out a transport failure. When the start gives up, the last connection's URL error domain and code are in `underlyingDomain` / `underlyingCode`. A transport failure does not prove that the media format is unsupported.
+- **A live open that gets only a few bytes per request** publishes `.liveSourceUnavailable` too. Some panels answer a channel that is still starting with a short body labelled as TS, or with text and no length. A connection that ends with 64 KiB or less does not count as delivering, so the open retries on the never-productive ladder (five requests, about 15 s) and then fails. A low-bitrate stream that closes its connection every few hundred KB still reconnects at once.
 
 #### Origin refusals: `.sourceRefused` and `.sourceRateLimited`
 
@@ -145,7 +146,18 @@ Both kinds mean the origin answered the source request with an HTTP status inste
 - `.sourceRefused` is the origin's verdict on the resource or on itself: a 401/403 refusal (on a connection-capped IPTV panel this most often means "the slot is still held"), a 404, a 5xx.
 - `.sourceRateLimited` is the same answer in the rate-limit shapes (429/503/509). It is split off because the recovery differs: the source is being metered, not lost. The same request is expected to work later, and a handoff to a second player meets the same meter (AE#377).
 
+**The seekable TS ingest does not re-ask a refusing origin at once (AE#1084).** A 429/503/509 on one of its segments is booked on the playlist's origin, as the HTTP reader books it, and ends the ingest. The session then revives it on the same widening wait as a metered HTTP source (3, 8, 20, then 45 s) and publishes `.sourceRateLimited` once that budget is spent. A reset, a stall or another 5xx on a segment is still retried in place, up to three times, 0.5 and 1 s apart.
+
 Both differ from `.sourceOpenFailed`, which is what a corrupt or unreadable source produces.
+
+#### A source that keeps dropping: `.vodSourceFailed`
+
+A VOD source that drops the connection mid-session (a reset, a short read, a close without a status) is reopened by the engine at the playhead. Each reopen reads as `.stalled(reconnecting: true)` while it runs. Two limits decide when the engine stops and publishes `.vodSourceFailed` instead:
+
+- **Two drops in a row without new media.** Once the session stored a segment after a reopen, the next drop counts as a new outage, so a long film that heals every outage keeps playing.
+- **Five reopens in any ten minutes, progress or not (AE#1085).** A source that is cut every few seconds and delivers a little in between used to be reopened for the whole film. On a panel that allows one connection per account, that churn is what gets an address blocked. The sixth drop inside the window now ends the session, so the host's own reconnect policy decides whether and when to open the source again.
+
+Refusals (above) and refused credentials (see [Rotating a credential without a rebuild](#rotating-a-credential-without-a-rebuild)) have budgets of their own and do not count here.
 
 #### Certificate refusals: `.sourceCertificateRejected`
 
@@ -243,6 +255,30 @@ A URL with a rotated per-session token misses that memory, so every retune pays 
 - by handing `HLSLiveIngestReader` to `.custom(_:formatHint: "mpegts")` itself, which costs nothing at all
 
 Either way skips the native mount and up to 4 s of carriage-watchdog grace per retune, whatever the URL looks like this time.
+
+### Live: a one-shot live URL
+
+**What the host must do, if its origin replays:** set `liveReopenURL` before `load`, and return the URL with a fresh session id. Return nil to reopen the loaded URL.
+
+```swift
+player.liveReopenURL = { loaded in
+    var parts = URLComponents(url: loaded, resolvingAgainstBaseURL: false)
+    parts?.queryItems = parts?.queryItems?.map {
+        $0.name == "SessionID" ? URLQueryItem(name: "SessionID", value: UUID().uuidString) : $0
+    }
+    return parts?.url
+}
+```
+
+**Why.** Some origins treat a live URL as one session. An HDHomeRun tuner opened a second time with the same `ClientID` and `SessionID` replays that session from its start instead of joining at live (AE#1100: the second open delivered the first one's bytes again, 25 MB in 6 s). Every reopen of the loaded URL then puts the viewer minutes behind.
+
+**When the engine asks.** Before each time it opens a live URL source again inside the session:
+
+- an audio-track switch that reloads the session (not the in-place switch of the software live route)
+- `reloadAtCurrentPosition()`, which the return from the background also runs
+- each reconnect of a live connection that dropped, on both routes, and each attempt of the native route's own source reopen
+
+It is handed the URL the session loaded, every time, so the closure needs no state of its own. The reconnects run off the main actor, so keep it quick and never block in it. It is not asked for a custom source or for VOD. The native route reads the value the session loaded with, so set it before `load`.
 
 ### Live: exhausted verified replay
 
@@ -401,6 +437,12 @@ The result is `@discardableResult`, so a host that only needs the refusals can i
 - It costs no teardown and comes back as `sessionOwned` (round 4).
 - The one rebuild that DOES apply the flag is the resume after a background teardown (#357). It has no session transport left to keep, so there the field is named as applied.
 
+**`inverseTelecine` belongs to the load, not to the session** (#853). The load decided it together with the display rate it asked for, and every rebuild keeps both.
+
+- A correction of it comes back in `sessionOwned` and does not change the running session. The engine keeps it for the loads it makes itself later (a disc title switch), and a host's own `load()` takes what it passes.
+- With a session up, it costs no teardown (`rebuilt` false).
+- After a background teardown (#357) the call is the restore itself, so it still rebuilds (`rebuilt` true) and keeps the session's old decision.
+
 #### Refusals
 
 Both refusals are thrown BEFORE any teardown, so a refused correction leaves the session playing. Both are all-or-nothing: if one field is refused, none of the correction is installed.
@@ -409,16 +451,18 @@ Both refusals are thrown BEFORE any teardown, so a refused correction leaves the
 | --- | --- |
 | `AetherEngineError.loadIdentityNotCorrectable(fields:)` | the closure changed `isLive`, `audioOnly`, `nativeRemoteHLS`, `sequentialOrigin`, `heldSourceConnection`, `sharedOutputRole` or `sourceDiagnosticsContext`. Load the source again instead. See note 1. |
 | `AetherEngineError.sessionNotReloadable(_:)` | there is no session, or the source is a custom `IOReader` that reported itself non-seekable and cannot be reopened at the current position. Its `SessionReloadRefusal` says which (`.noActiveSession` / `.customSourceNotSeekable`); a correction can also throw the cases below. |
-| `AetherEngineError.sessionNotReloadable(.softwarePathCannotRepresentSource)` | the correction moves a native session onto the software path, and the source's only signal is IPT-PQ-c2 (Dolby Vision HEVC Profile 5, AV1 Profile 10.0). The software decoders pass that on as YCbCr, so the picture would render green/purple. |
+| `AetherEngineError.sessionNotReloadable(.softwarePathCannotRepresentSource)` | the correction moves a native session onto the software path, and the source's only signal is IPT-PQ-c2 (Dolby Vision HEVC Profile 5 or 20, AV1 Profile 10.0). The software decoders pass that on as YCbCr, so the picture would render green/purple. |
 | `AetherEngineError.sessionNotReloadable(.dualLayerRouteNeedsFreshLoad)` | the correction changes `preferDualLayerDolbyVision` (or `dolbyVisionHandling` or `dualLayerRoute` while the preference is on) on a custom `IOReader` Profile 7 session. The in-place rebuild keeps the route the session was loaded with; call `load()` again with the new option. |
 | `AetherEngineError.sessionNotReloadable(.upscaleRouteNeedsFreshLoad)` | the correction turns `upscalesLowResolutionVideo` on, or changes `upscaleScaler` while it is on (AE#1039), for a custom `IOReader` session. Call `load()` again with the new option. See note 2. |
+| `AetherEngineError.sessionNotReloadable(.videoProcessingRouteNeedsFreshLoad)` | the correction turns `videoProcessing` on, or changes its target while it is on, for a custom `IOReader` session (#957). Call `load()` again with the new option. See note 2. |
+| `AetherEngineError.sessionNotReloadable(.untaggedVideoColorNeedsFreshLoad)` | the correction changes `untaggedVideoColor` for a custom `IOReader` session (AE#1103). Call `load()` again with the new option. See note 2. |
 | `AetherEngineError.sessionNotReloadable(.demuxedAudioLiveIsNativeOnly)` | the correction moves a demuxed-audio live session onto the software path. The side-audio merge does not exist there, so it would play silent. |
 
 1. **Identity fields.** These name the session rather than tune it: each opens the source on a different pipeline or gives the session a different role. Changing one makes a different item, not a correction.
    - The engine writes `nativeRemoteHLS` and `sequentialOrigin` itself.
    - `heldSourceConnection` picks the transport when the source is opened, so a correction could not take effect (AE#377).
    - `sourceDiagnosticsContext` identifies the original load and its requests. Pass a different context to a fresh `load()`. A tuning correction that keeps the context is allowed.
-2. **Upscale route.** `load()` decides the route, and the in-place rebuild does not re-run it. Turning upscaling off is honoured in place: the rebuilt session stays on the software path, delivers frames as decoded and clears `$activeUpscale`. URL sources re-run `load()` and are not refused.
+2. **Upscale and picture processing routes.** `load()` decides the route, and the in-place rebuild does not re-run it. Turning upscaling off is honoured in place: the rebuilt session stays on the software path, delivers frames as decoded and clears `$activeUpscale`. Turning `videoProcessing` off works the same way and clears `$activeVideoProcessing`. URL sources re-run `load()` and are not refused.
 
 `SessionReloadRefusal` is a public enum that gains cases over time; switch over it with a `default:`.
 
@@ -536,7 +580,7 @@ A live H.264 / HEVC load never reaches that check. For those codecs it is VOD-on
 What to know:
 
 - **One-way.** `DecodePath` has `.automatic` and `.software`, and no `.native`. The engine only sends a route to software when the native path cannot serve it (AV1 without hardware decode, VP9, a forward-only source, MVC carriage). Forcing native there gives a black screen. A host's evidence can only ever be "this native session is not decoding".
-- **It does not override what the software path cannot represent.** A source whose only signal is IPT-PQ-c2 (Dolby Vision HEVC Profile 5, AV1 Profile 10.0) still fails the load with `dolbyVisionUnplayableOnSoftwarePath`, instead of decoding as YCbCr and rendering green/purple. A demuxed-audio live source still fails instead of playing silent. An override picks which host serves the session, not what that host can do.
+- **It does not override what the software path cannot represent.** A source whose only signal is IPT-PQ-c2 (Dolby Vision HEVC Profile 5 or 20, AV1 Profile 10.0) still fails the load with `dolbyVisionUnplayableOnSoftwarePath`, instead of decoding as YCbCr and rendering green/purple. A demuxed-audio live source still fails instead of playing silent. An override picks which host serves the session, not what that host can do.
 - **`nativeRemoteHLS` is a different route, with one exception.** There AVPlayer plays the remote playlist and the engine demuxes and decodes nothing, so usually there is no decode path to prefer. The engine logs that it ignored the preference, so it does not look applied. See the note on the exception below.
 - **An audio-only session honours it too.** With `audioOnly`, `.software` sends a codec AVPlayer could play (FLAC, ALAC, AAC, MP3, LPCM...) to the FFmpeg host (internal `AudioPlaybackHost`) instead of the AVPlayer audio host (internal `AudioAVPlayerHost`). The audio dispatch line in the log says the host asked for it. The cost is the system Now-Playing session: as for every audio-only source the FFmpeg host plays, `audioNowPlayingSession` is nil. A host that registers its transport commands on that session must drive Now Playing itself for such a session, through `MPNowPlayingInfoCenter.default()` and `MPRemoteCommandCenter.shared()`.
 - **A mid-play correction lands on both source shapes**, URL and custom `IOReader` alike. It moves the session at its own playhead, without a restart. On a source the software path cannot represent, the correction is refused before any teardown with `SessionReloadRefusal` `.softwarePathCannotRepresentSource` or `.demuxedAudioLiveIsNativeOnly`, so the session keeps playing.
@@ -703,6 +747,7 @@ A custom source (`IOReader`, the disc-folder readers) is described under [Custom
 - The kept transport includes a pause the viewer made in AVKit's own controls, which call the `AVPlayer` directly.
 - **Position.** A VOD session comes back at the playhead; a playhead at or below 1 s restarts from the beginning. A live session does not keep its position: it rejoins at the live edge, and the DVR window starts over.
 - **It ends an active recording** with `.ended(.sourceReset)`, because the reopened source can bring back different codecs (see [Recording a live stream](#recording-a-live-stream)).
+- **Cancelling the caller's Task.** A URL source reopens through `load()`, so a cancel ends it the way [Cancelling a load](#cancelling-a-load) describes. A custom source rebuilds in place and does not stop for a cancel: only a `stop()` or a newer `load()` supersedes it, and then it throws `CancellationError`. If that rebuild fails, it throws the failure and publishes `.error`, cancelled Task or not.
 
 To change options at the same time, use [`reloadAtCurrentPosition(applying:)`](#correcting-a-loadoption-without-restarting-the-item).
 
@@ -1083,7 +1128,7 @@ A rebuild consumes no new stream. Anything a host sets up at the moment it hands
 | `volume` | Pass 0.0 to 1.0 (not clamped). A write before a session exists is remembered and applied at load. |
 | `selectTitle(id:)`, `selectChapter(id:)` | Disc titles and chapters. See the note below. |
 
-**Titles and chapters.** `selectTitle` is synchronous and returns before the switch. It rebuilds the session at the start of the new title, like a fresh load. It ignores an unknown id, the title already playing, and a forward-only custom source; a reload that fails is only logged. `selectChapter` looks only in `discChapters` and seeks with `exact: true`. It cannot reach container chapters (`mediaChapters`): pass their `startSeconds` to `seek(to:exact: true)`.
+**Titles and chapters.** `selectTitle` is synchronous and returns before the switch. It rebuilds the session at the start of the new title, like a fresh load. A pick made while a `load` is still running waits for that load to return, as an audio pick does. When several picks wait like that, only the last one rebuilds. It ignores an unknown id, the title already playing, and a forward-only custom source; a reload that fails is only logged. `selectChapter` looks only in `discChapters` and seeks with `exact: true`. It cannot reach container chapters (`mediaChapters`): pass their `startSeconds` to `seek(to:exact: true)`.
 
 ### Seeking
 
@@ -1243,13 +1288,19 @@ Prefer `$playbackPhase` over stitching `state` + `isBuffering` + `isSeeking` tog
 
 `seekEvents` publishes `.began`, `.landed(renderedTime:)`, `.stalled`, `.superseded` and `.rejected(SeekEvent.Rejection)`. Each carries its `target`, an `id` that spans the seek, and a `SeekEvent.Origin`:
 
-- `.programmatic`
+- `.programmatic`: a `seek(to:)` from the host, or the engine's own live rejoin.
 - `.nativeScrub`
 - `.deferred`: a seek the session could not take yet. This is where the engine publishes an optimistic `currentTime` for a position nothing has reached.
+- `.remoteCommand`: a skip or a position change from the system (Control Center, the lock screen, the iPhone Remote, AirPods) that the engine carried out itself. That happens on a route where the engine owns Now Playing and `nowPlayingCommandInterceptor` did not take the command. A command the host handles, or one AVKit answers on a route the engine does not own, never shows up here.
+- `.pictureInPicture`: a skip button in the software route's PiP window (`softwarePiPSource`). On the native route AVKit seeks the player itself, and the engine sees no seek.
 
 Use it where the moment `$isSeeking` turns false matters. A plain Boolean cannot say whether a seek landed, gave up, or was superseded, and a `.stalled` seek can still land later under the same id.
 
-The value is a struct: `id`, `origin`, `target` and `outcome` (a `SeekEvent.Outcome`, the cases named above), plus `isTerminal`, true for every outcome except `.began`.
+The value is a struct: `id`, `origin`, `target`, `departure` and `outcome` (a `SeekEvent.Outcome`, the cases named above), plus `isTerminal`, true for every outcome except `.began`.
+
+`departure` is where the playhead stood when the seek was asked for, on the same axis as `target`. Every event of one seek carries the same value. A remote skip reports the position its target was computed from. A seek replayed from the load stash keeps the position from before the stash, not the target the stash published on the clock. It is nil for `.nativeScrub` and for the engine's own live rejoin.
+
+Telling a skip back from other seeks takes the `.began` alone: `target < departure`. A host that reacts to every skip back (subtitles for the line you missed, say) reads both fields there, whatever button sent it (AE#1088).
 
 - `id` rises per engine instance.
 - Every `.began` ends in exactly one `.landed`, `.stalled` or `.superseded` under its id.
@@ -1259,7 +1310,7 @@ The value is a struct: `id`, `origin`, `target` and `outcome` (a `SeekEvent.Outc
 - `.liveWithoutDVR`: a live source with no DVR window to land in.
 - `.sourceNotSeekable`: a forward-only source.
 
-Two seeks publish no rejection. A non-finite target (NaN, infinity) is dropped with a log line and no event. A seek during `.loading` is not rejected: the latest one is stashed and replayed when the session settles, with origin `.deferred` (#178).
+Two seeks publish no rejection. A non-finite target (NaN, infinity) is dropped with a log line and no event. A seek during `.loading` is not rejected: the latest one is stashed and replayed when the session settles, with origin `.deferred` (#178). The replay then carries the origin of the seek that was stashed, so a remote skip during a load reads `.deferred` first and `.remoteCommand` once it runs.
 
 #### Clock hold
 
@@ -1318,6 +1369,7 @@ It is per engine instance, so several engines at once can be told apart without 
 | `$audioDelivery` | `AudioDelivery`: how the audio reaches the renderer, one of `.none`, `.noAudioInSource`, `.streamCopy`, `.bridged`, `.decoded`, `.droppedNoPipeline`, `.playerManaged`. A fallback ladder demotes on `.droppedNoPipeline` (AE#641). See [Reading whether the audio was delivered](#reading-whether-the-audio-was-delivered). |
 | `$currentAVPlayer`, `$currentAVPlayerItem` | The live AVFoundation objects, re-emitted on every reload. Both nil on `.software`, which renders into its own layer. A host that only hands `currentAVPlayer` to an `AVPlayerViewController` gets audio over an empty video plane on that route (#298). |
 | `$airPlayPictureStaysLocal` | iOS: true while a wireless AirPlay receiver holds the audio route but the session runs on the software host. See [AirPlay and the software host](#airplay-and-the-software-host). |
+| `$airPlayPictureCanMoveToReceiver` | iOS: true while the picture stays local and `setAirPlayReceiverShowsVideo(true)` would move it to the receiver. |
 | `setScreenMirrored(_:)` | iOS: tell the engine whether the screen is being mirrored. |
 | `setAirPlayReceiverShowsVideo(_:)` | iOS: tell the engine whether the AirPlay receiver on the audio route shows video. |
 
@@ -1331,6 +1383,11 @@ It is per engine instance, so several engines at once can be told apart without 
 - False on the native paths, where the receiver gets the stream, and everywhere off iOS.
 - False too while the host reports the screen as mirrored (`setScreenMirrored(_:)`), because the mirror carries the layer.
 
+**`$airPlayPictureCanMoveToReceiver`** (iOS, AE#1070) is true while `airPlayPictureStaysLocal` is true and `setAirPlayReceiverShowsVideo(true)` would move the picture to the receiver. Show a "show it on the TV" action exactly while it is true, and call that setter when the viewer taps it. The engine reloads at the playhead onto the native route, and both flags drop.
+
+- Today that covers interlaced H.264 on a URL source that can reopen at its position (seekable VOD, or live).
+- VP9, AV1 without hardware decode, MPEG-2, VC-1 and a host's `preferredDecodePath = .software` have no native route for it, so it stays false there.
+
 **`setScreenMirrored(_:)`** (iOS). Pass `true` for a mirror only, derived from `UITraitCollection.sceneCaptureState`; a screen recording also reads as captured there. A mirror carries the software host's layer to the receiver, so `airPlayPictureStaysLocal` reads false while it is on. No effect off iOS.
 
 **`setAirPlayReceiverShowsVideo(_:)`** (iOS) tells the engine whether the AirPlay receiver on the audio route shows video (an Apple TV or a TV).
@@ -1338,8 +1395,9 @@ It is per engine instance, so several engines at once can be told apart without 
 - The audio session reports every AirPlay output as the same port type, so the engine cannot tell a TV from a HomePod on its own. The default is false (audio-only or unknown).
 - A host has the same limit, so pass what it knows itself: the viewer's own choice (for example a "playing to a TV" control), or a host-owned `AVPlayer`'s `isExternalPlaybackActive`.
 - While true and a wireless route is active, a Profile 7 FEL source loads on the native route (8.1 where the display takes Dolby Vision, no enhancement layer), so the receiver gets a picture. The dual-layer route would draw into a layer no receiver picks up.
+- Interlaced H.264 does the same (AE#1070): native while a video receiver holds the route, so the receiver gets the stream without this device's deinterlacer, and the software deinterlacer otherwise. For it the engine does not wait for the next load. A session the interlace rule routed reloads at its position by itself when this value or the wireless route changes (VOD on a seekable URL source, or live). A host can therefore offer "show it on the TV" when `airPlayPictureStaysLocal` turns true and only call this setter.
 - Opt-in: nothing changes for a host that never calls it.
-- Read at each load. On a URL source, `reloadAtCurrentPosition()` decides again; a custom source keeps its route until the next `load()`.
+- Read at each load. For a FEL source, `reloadAtCurrentPosition()` on a URL source decides again; a custom source keeps its route until the next `load()`.
 - No effect off iOS.
 
 ### Source and format
@@ -1407,7 +1465,7 @@ It is per engine instance, so several engines at once can be told apart without 
 
 - `frame` is a `VideoStreamFormat` for the decoded picture: libavcodec's output pixel format, or the libav name of the VideoToolbox buffer on the software host's hardware decoder.
 - `pixelBufferFormat` is the CoreVideo buffer it was displayed from (`420v`, `x420`); `pixelBufferLabel` reads "P010 (x420)".
-- `deinterlace` is a `VideoDeinterlace?` (AE#983) naming the deinterlace graph the frames pass through: `filter` (`yadif_videotoolbox`, `bwdif`, `yadif`), `isHardware`, `fieldRate`, and `outputFramesPerSourceFrame` (2 at field rate, so "deinterlaced to 50 fps" is `sourceVideoFrameRate * 2`). nil while frames go out as decoded. The graph starts on the first frame flagged interlaced and stays until a seek.
+- `deinterlace` is a `VideoDeinterlace?` (AE#983) naming the deinterlace graph the frames pass through: `filter` (`bwdif_videotoolbox`, `yadif_videotoolbox`, `bwdif`, `yadif`), `isHardware`, `fieldRate`, `inverseTelecine` (#853: `fieldmatch` and `decimate` run around `filter`, which then only touches frames left combed, and the output is film at 4/5 of the source rate), `outputFramesPerSourceFrame` (frames the deinterlacer emits per frame it takes in: 2 at field rate) and `outputFrameRateFactor` (multiply `sourceVideoFrameRate` by it for the output rate: 2 at field rate, 1 at frame rate, 0.8 under inverse telecine). nil while frames go out as decoded. The graph starts on the first frame flagged interlaced and stays until a seek. A filter error drops the graph and the next interlaced frame builds a new one (a hardware graph that failed is replaced by the software one; a GPU filter that fails to build is passed over for the next, `yadif_videotoolbox` after `bwdif_videotoolbox`). After three errors in a session the frames go out as decoded. At the end of a stream the graph is flushed first, so the last picture is not lost.
 - Republished when any of these changes mid-stream.
 - **nil on every native route.** AVPlayer decodes there, and its frames never pass through the engine. A panel shows `$sourceVideoStreamFormat` and names AVPlayer as the decoder, instead of inventing a pixel format nobody measured.
 
@@ -1427,8 +1485,9 @@ A settings screen reads `AetherEngine.displayCapabilities` instead of guessing f
 | --- | --- |
 | `$audioTracks` | `[TrackInfo]`. Republished when `LoadOptions.confirmAtmos` confirms a track, and when the DTS:X decoder confirms the playing track as DTS:X (`isDTSX`). On `.remoteBypass`, see below. |
 | `$activeAudioTrackIndex` | The selected track's id. On `.remoteBypass`, the enabled item track's. |
-| `selectAudioTrack(index:)` | Session-preserving reload. `index` is `TrackInfo.id`. See [Switching audio tracks](#switching-audio-tracks). |
+| `selectAudioTrack(index:)` | Session-preserving reload, or an in-place switch on a software live session with a ring. `index` is `TrackInfo.id`. See [Switching audio tracks](#switching-audio-tracks). |
 | `audioShaping`, `setAudioShaping(_:)`, `$audioShapingState` | Shape the session's audio before it reaches the output (AE#923). See [Audio shaping](#audio-shaping). |
+| `normalizationGainDB`, `setNormalizationGain(_:)`, `normalizationGainReport` | Per-track loudness gain on audio-only sessions, lift included. See [Track loudness on audio-only sessions](#track-loudness-on-audio-only-sessions). |
 | `installAudioTap(channels:)`, `removeAudioTap()`, `audioTapHasDeliverySource`, `AetherEngine.audioTapFormat` | Opt-in decoded PCM, mono Float32 48 kHz with source-PTS stamps, off the render path. `channels` is an `AudioTapChannels`: `.downmix` (default) or `.dialogue` (the centre channel alone). See [the audio tap contract](#the-audio-tap-ends-with-its-session). |
 
 **`$audioTracks` on `.remoteBypass`** lists the audio tracks AVPlayer built for the item, normally just the one playing. They are read from their format descriptions:
@@ -1441,17 +1500,31 @@ The ids are synthetic (from 400000 up), because there is no stream index on that
 
 ### Switching audio tracks
 
-`selectAudioTrack(index:)` is a session-preserving reload.
+`selectAudioTrack(index:)` is a session-preserving reload. The one exception is the software live route, which switches in place (next paragraph).
+
+**Software live with a ring: no reload (AE#1100).** A live session on the software path that has a packet ring (`dvrWindowSeconds`, or `liveEdgeCushionSeconds`) keeps every audio track of the source in that ring, not only the one playing. A pick opens a decoder for the new track and reseeds the feeder at the playhead, the way a DVR seek to the same spot would. So:
+
+- the source is not opened again, and an origin that replays a session opened twice (HDHomeRun) cannot put the viewer back at the tune-in
+- the position and the whole rewind window stay, and a rewind behind the switch plays the new track too
+- it also works on a forward-only custom source, which could not switch at all before
+- the picture holds through the reseed, like a DVR seek
+
+The extra tracks cost ring space: each one adds its own bitrate (an AC-3 track at 192 to 448 kbit/s next to 8 to 19 Mbit/s of broadcast MPEG-2, so a few percent). A session that cannot switch in place, for example one whose clock has not started yet, falls back to the reload and logs why. Every other live session reloads, which opens the source again; see [Live: a one-shot live URL](#live-a-one-shot-live-url).
+
+The rest of this section describes the reload.
 
 - **Native path.** The old item stays mounted while the source reopens. Its last picture is held until the new item's first frame, so the switch shows a still, not black. How and where it is held (still view, PiP, Dolby Vision, software path): [Held pictures across an audio switch](#held-pictures-across-an-audio-switch). Audio is not gapless, and a media-services reset still discards the item.
 - **Elsewhere** expect roughly 0.5 to 1 s of black.
 - **Rapid picks** are merged, so only one rebuild runs at a time. A pick back to the active track costs nothing, and `stop()` or a new `load` drops what is queued.
+- **A pick during a load** waits until that `load` returns, then rebuilds. `audioTracks` is published before the load's display handshake, and a rebuild that replaced the load there lost the HDR route (AE#1061). The host's `load()` now also returns normally instead of throwing `CancellationError`. To skip the extra rebuild, pass the track to `load` as `audioSourceStreamIndex`.
 - **Transport.** Like `reloadAtCurrentPosition()`, it comes back in the session's transport state: a paused session stays paused. A `play()` or `pause()` that arrives while the rebuild waits on I/O decides the final state.
+- **Seeking survives it.** `canSeek` keeps the source's answer on both paths, so a scrubber stays up after the switch.
+- **A live session stays live.** The rebuild keeps `$isLive` and the DVR window as `load` set them, so `startRecording(to:)` works after a switch. A recording running at the switch ends with `.ended(.sessionEnded)`, as at any session end.
 
 It does nothing in these cases. Every refusal is logged, so a picker that does nothing can be explained:
 
 - when out of range or already active
-- on a forward-only custom source (live ingest included), which cannot rebuild its pipeline. There a track change is a fresh `load` naming the stream.
+- on a forward-only custom source (live ingest included), which cannot rebuild its pipeline, unless the software live route switches it in place (above). Otherwise a track change there is a fresh `load` naming the stream.
 - on a sequential origin (`$isSequentialOrigin`): a track change there is a fresh `load`, see [`sequentialOrigin`](#sequentialorigin).
 - on `.remoteBypass`, where AVPlayer owns the audio selection and the track list is informational. A different language there is a different URL.
 
@@ -1473,12 +1546,24 @@ Values are clamped, and read back clamped. The default shapes nothing and leaves
 
 See [Audio shaping](formats.md#audio-shaping) for what each setting does to the signal.
 
+### Track loudness on audio-only sessions
+
+`LoadOptions.normalizationGainDB` applies a fixed gain in dB to an `audioOnly` session: the track's ReplayGain, or a server's measured normalization gain (Jellyfin's `NormalizationGain`). nil (the default) applies none. Video sessions ignore it.
+
+- **It can lift.** `volume` stops at 1.0, so a quiet track could only be turned down before. This gain runs inside the engine with a -1 dBFS lookahead limiter behind it (`NormalizationGainReport.ceilingDBFS`), so a lift cannot clip.
+- **The track stays on its host.** On the AVPlayer audio host the gain runs in an `MTAudioProcessingTap` on the item. On the FFmpeg audio host it runs in the decoder, ahead of `audioShaping`.
+- **Clamped** to `NormalizationGainReport.gainRange`, -30 to +18 dB.
+- **The limiter delays the audio by 5 ms.** A track starts 5 ms later than without the gain, and the FFmpeg host pushes the held tail out at the end.
+- **`setNormalizationGain(_:)`** changes it on the running track. The gain ramps to the new value over one audio buffer, no rebuild. nil turns it off; a tap already on the item stays at 0 dB until the track ends.
+- **`normalizationGainReport`** returns a `NormalizationGainReport`: the gain asked for and applied, the host, the stage (`.tap`, `.decoder`, `.volume`, `.none`), the limiter's largest reduction in dB (`limiterMaxReductionDB`) and the share of played audio it was reducing (`limitingShare`, 0 to 1). Between tracks it holds the last session's figures, captured at teardown, which also writes them to the log. Read it before loading the next track to log the finished one.
+- **Where less is applied.** If AVPlayer gives the tap no audio track to bind to, `volume` carries the cut part of the gain and a lift is dropped (`stage == .volume`, `appliedDB` below `requestedDB`, `note` says why).
+
 ## Subtitles
 
 | Symbol | Notes |
 | --- | --- |
 | `$subtitleTracks` | `[TrackInfo]`: embedded text, embedded bitmap, external files and a live channel's HLS renditions in one list. |
-| `selectSubtitleTrack(index:)`, `clearSubtitle()` | Drives the host-overlay path, or AVPlayer's media selection on `.remoteBypass`. `clearSubtitle()` keeps `nativeSubtitleTracks` listed; only `load` / `stop` reset that. |
+| `selectSubtitleTrack(index:)`, `clearSubtitle()` | Drives the host-overlay path, or AVPlayer's media selection on `.remoteBypass`. `clearSubtitle()` keeps `nativeSubtitleTracks` listed and the native renditions' cues stored; only `load` / `stop` reset them. |
 | `$subtitleCues` | `[SubtitleCue]`: `.text`, `.richText([SubtitleTextRun])`, or `.image(SubtitleImage)`, with an optional `SubtitleTextPlacement`. Cues carry raw source PTS. See [Cue retention](#cue-retention). |
 | `$isSubtitleActive`, `$isLoadingSubtitles` | State for a subtitle toggle: active is the selection, loading is a sidecar or side-demuxer pass in flight. |
 | `$activeSubtitleTrackIndex` | The selected id, including one resolved by `preferredSubtitleLanguages`. |
@@ -1524,7 +1609,7 @@ What each setting reads over HTTP, measured: [measurements.md › Subtitle offse
 
 | Symbol | Notes |
 | --- | --- |
-| `$nativeSubtitleTracks`, `setNativeSubtitleSelected(track:)` | The WebVTT renditions declared by `prepareNativeSubtitles`, for PiP / AirPlay / external display. nil deselects. |
+| `$nativeSubtitleTracks`, `setNativeSubtitleSelected(track:markerOnly:)` | The WebVTT renditions declared by `prepareNativeSubtitles`, for PiP / AirPlay / external display. nil deselects. `markerOnly: true` ticks the track in AVKit's menu but serves it empty, for a host that draws the track itself ([formats](formats.md#showing-the-hosts-pick-in-avkits-menu-markeronly)). |
 | `$nativeSubtitleDefaultOrdinal` | The rendition marked `DEFAULT=YES`, resolved from `nativeSubtitlePreferredLanguages`. A programmatic legible selection only renders if it is the default, so select **this** ordinal. |
 | `$nativeSubtitleRenditionAvailable` | At least one cue exists for the native track. Gate the AVMediaSelection picker on it. |
 | `$nativeSubtitleRenditionsServed` | Whether the served playlist is the master. Only a reload signal and a diagnostic: whether a legible rendition reaches a wired external display is up to AVKit and cannot be observed from here. |
@@ -1636,8 +1721,8 @@ Hosts can supply other positive limits. Ordinary subtitle selection behaves as b
 
 | Symbol | Notes |
 | --- | --- |
-| `$isLive` | Mirrors `LoadOptions.isLive` for the session. |
-| `$isSequentialOrigin` | True while a VOD session is served as a sequential origin, declared or found by the reader. Set during `load()`, cleared on stop. See [`sequentialOrigin`](#sequentialorigin). |
+| `$isLive` | Mirrors `LoadOptions.isLive` for the session, across its rebuilds too (an audio-track switch). |
+| `$isSequentialOrigin` | True while a VOD session is served as a sequential origin, declared or found by the reader. Set during `load()` and kept across its rebuilds (an audio-track switch), cleared on stop. See [`sequentialOrigin`](#sequentialorigin). |
 | `seekToLiveEdge(offsetSeconds:)` | `async`. Lands `offsetSeconds` behind the usable edge (default 0; negative or non-finite read as 0), clamped to retained media. The safety margin is the host's call. On a live-only session it moves the native item to its own seekable end minus the offset. |
 | `currentItemLiveEdgeTime` | The native item's usable live edge on the display axis. nil before the item has a range, and on the software route. See the note below. |
 | `liveTargetDurationSeconds` | The TARGETDURATION the engine's own live playlist is serving. nil on remote HLS live, on the software path and before the first playlist build. |
@@ -1645,6 +1730,7 @@ Hosts can supply other positive limits. Ordinary subtitle selection behaves as b
 | `nativeLiveDVRMandatoryBytes` | The finite pinned playback payload that may exceed that allowance. Excludes init and subtitle data, muxer staging, AVPlayer's buffers, filesystem overhead and recordings. |
 | `setSoftwareLiveDVRLimits(_:availableCapacityBytes:)`, `softwareLiveDVRBytes` | The same lease for the software live spool, which needs `LoadOptions.softwareDVRRetention`. `softwareLiveDVRBytes` is the retained packet payload. See [DVR limits](#dvr-limits). |
 | `liveSourceReset` | The [retune contract](#live-the-retune-request). |
+| `liveReopenURL` | `(@Sendable (URL) -> URL?)?`. The URL to open when the engine opens a live URL source again inside one session. See [Live: a one-shot live URL](#live-a-one-shot-live-url). |
 | `liveSourceReplayExhausted` | Verified replay exhausted one bounded recovery round. Cached DVR stays readable; retry via `retryLiveSourceRecovery()` under the host's backoff without losing packet history. See [exhausted verified replay](#live-exhausted-verified-replay). |
 | `liveResumeClamped`, `LiveResumeClamp` | A resume that found the playhead outside the window and moved it; see [a resume that had to move](#live-a-resume-that-had-to-move). |
 | `liveScrubThumbnail(atSessionSeconds:maxWidth:)` | Still on the live session axis, decoded from what the session already holds. A native session reads its DVR segment cache; a software session reads its DVR packet ring (#544). So a tuner channel the box decodes in software has a scrub preview too. |
@@ -1798,6 +1884,29 @@ Both are recoveries, not opinions about where a viewer should be. Both are silen
 
 **Where did a seek land?** Use `SeekEvent.landed(renderedTime:)` on `$seekEvents`. `await seek(to:)` returns no position, so a harness that records its own requested target reports an intention, not an outcome.
 
+### Starting a recording in progress from its beginning
+
+Set `liveJoinsAtPlaylistStart: true` and load the recording's live playlist through the ingest. The session then plays as if it had been tuned in when the recording started (AE#1090).
+
+```swift
+let reader = HLSLiveIngestReader(playlistURL: recordingPlaylistURL)
+try await engine.load(source: .custom(reader, formatHint: "mpegts"),
+                      options: LoadOptions(isLive: true, dvrWindowSeconds: 4 * 3600,
+                                           liveJoinsAtPlaylistStart: true))
+```
+
+The playlist has to list the whole recording. A DVR serves that for a recording that is still running: Plex's live session playlist with `offset=0`, for one, starts at `#EXT-X-MEDIA-SEQUENCE:0` and keeps growing. A live HLS URL the engine routes onto its own ingest takes the flag too.
+
+**What happens.** The join delivers the same few seconds an edge join would (8 s or more, see [Where a live start's seconds go](#where-a-live-starts-seconds-go)), so the first picture comes as fast as on any live channel. The rest of the backlog is fetched at 1x, one segment as the previous one is needed. The rewind window grows from the start of the recording, as far as `dvrWindowSeconds` and the disk budget allow.
+
+**It stays behind live.** Nothing past the playhead plus those few seconds has been fetched, so a seek forward ends at the session's own edge, not at the recording's. That is deliberate: fetching an hour of backlog at link speed would push the start out of the window before anyone watched it. For "jump to live", load again without the flag.
+
+**Limits.**
+
+- The ingest path only. `nativeRemoteHLS` keeps AVPlayer's own edge join and ignores the flag.
+- An in-engine reopen after an ingest failure resumes at the first segment the old reader had not delivered, not at the edge. A host retune is a new load and starts wherever the host's options say.
+- On a playlist that slides, the session runs about one window behind live. If the window ever slides past what the session still needs, it rejoins at the live edge with a discontinuity and logs `AE#1090: ... rejoined at the live edge`.
+
 ## Recording a live stream
 
 | Symbol | Notes |
@@ -1833,6 +1942,8 @@ The way out is the one under [Where the token rotates](#live-the-retune-request)
 - Published through `$recordingState` as `.failed`: conditions that only show up while writing, long after the call returned. `.diskFull`, `.writeFailed`, `.writeTooSlow`.
 
 **`.writeTooSlow`: the engine drops the recording, not the picture.** Writes go into a bounded queue that is drained off the demux thread. When that queue fills, the recording ends and says so. Otherwise the demux thread would wait on a slow disk and stall playback, and the engine does not make that trade.
+
+**A bad timestamp does not end the recording.** The TS muxer refuses a packet whose decode timestamp does not rise past the stream's last one. The writer lifts such a timestamp to the previous one plus one tick and logs the first repair. A packet the muxer still refuses is dropped, and only a long run of refusals ends the recording as `.writeFailed`.
 
 **A reset ends the recording.** When `liveSourceReset` fires, or the host calls `reloadAtCurrentPosition`, the file is closed cleanly and `$recordingState` publishes `.ended(.sourceReset)`.
 
@@ -1909,13 +2020,15 @@ release without retaining the analyzer.
 | --- | --- |
 | `videoGravity` | Fill mode of whichever layer is mounted (`AVPlayerLayer` or the software display layer). Settable; this is the aspect-fit / aspect-fill control. |
 | `AetherStillView`, `bindStillView(_:)`, `unbindStillView(_:)` | Holds the outgoing picture across an item swap, for a host that renders the native path through AVKit rather than `AetherPlayerView`. See [Held pictures across an audio switch](#held-pictures-across-an-audio-switch). |
+| `heldPictureFrameWaitSeconds` | The longest a native audio switch waits for the outgoing frame it holds. Default 0.5 s. See [Held pictures across an audio switch](#held-pictures-across-an-audio-switch). |
 | `nativePlayerLayer` | The engine's own `AVPlayerLayer`, for a host building `AVPictureInPictureController` around a layer rather than around `currentAVPlayer`. |
 | `$softwarePiPSource` | `SoftwarePiPSource` for sample-buffer PiP on the software path. See [Picture in Picture on the software path](#picture-in-picture-on-the-software-path). |
 | `$softwareDisplaySize` | The rectangle the software path's picture is shown at: the coded size under the decoder's pixel aspect. It follows the stream (not latched), so a mid-stream resolution change reshapes it. nil on every other path. |
 | `$activeUpscale` | `UpscaleStatus?`: what the low-resolution upscale stage (`LoadOptions.upscalesLowResolutionVideo`, #846) does for this session. See [Upscale status](#upscale-status). |
+| `$activeVideoProcessing` | `VideoProcessingStatus?`: what the picture processing (`LoadOptions.videoProcessing`, #957) does for this session. See [Picture processing status](#picture-processing-status). |
 | `sourceVideoWidth`, `sourceVideoHeight`, `sourceVideoPixelAspectRatio` | The source's CODED size, and the multiplier that turns it into the presented one (`width * ratio`), read once from the probe. See note 1. |
 | `pictureInPictureActive` | Host-set. Keeps the pipeline and the loopback server alive across a background transition, and keeps the software path decoding video for the window. |
-| `needsForegroundVideoRestore` | True after the background policy actually released the video item. Before play, restore with `reloadAtCurrentPosition(applying:)` and choose the transport intent you want. False when video was retained, or after stop/load. |
+| `needsForegroundVideoRestore` | True after the background policy actually released the video item (see [Background behaviour](#background-behaviour)). Before play, restore with `reloadAtCurrentPosition(applying:)` and choose the transport intent you want. False when video was retained, or after stop/load. |
 | `retainsVideoPipelineWhenBackgrounded` | Opt in to keeping a paused video pipeline through background suspension. Default false. Set before backgrounding. See [Background behaviour](#background-behaviour). |
 | `backgroundPlaybackEnabled`, `backgroundTeardownGraceSeconds` | Background audio policy. See note 2. |
 | `presentationAxisMap` | `PresentationAxisMap`: `sourceSeconds(forItemSeconds:)`, `itemSeconds(forSourceSeconds:)`, `shiftSeconds(atItemSeconds:)`, `seams` (each a `PresentationAxisMap.Seam` of `itemSeconds` and `shiftSeconds`), `isEmpty`. Readable off the main actor. See note 3. |
@@ -1923,7 +2036,7 @@ release without retaining the analyzer.
 | `setSoftwareVideoFrameTimeObserver(_:)`, `softwarePresentationTimebase` | The software-path equivalent: a `SoftwareVideoFrameTimeObserver` over `SoftwareVideoFrameTime` (`presentation`, `generation`), in ascending presentation order, on the same axis as the cues. `generation` moves on every renderer flush. |
 
 1. **Source size.** On `.remoteBypass` it comes from AVPlayer's item video track once that resolves, so it is the delivered size. The ratio is 1 on square pixels, and on a declared ratio the engine refuses (#290); it is never a guess. On the paths that draw, prefer what is on screen (`softwareDisplaySize`, `AVPlayerLayer.videoRect`) over recomputing it from these.
-2. **Background policy.** `backgroundPlaybackEnabled` defaults to `true` (iOS: PiP and background audio; tvOS: the PiP keepalive). The grace window (15 s default) lets a paused session survive a quick app switch. It applies on iOS only and is ignored on tvOS; 0 restores the immediate teardown.
+2. **Background policy.** `backgroundPlaybackEnabled` defaults to `true` (iOS: PiP and background audio; tvOS: the PiP keepalive). On iOS it also sets the native AVPlayer's `audiovisualBackgroundPlaybackPolicy` (`.continuesIfPossible` when on, `.automatic` when off), including on a player that already exists. Under `.automatic`, iOS pauses any item with video once the app leaves the foreground. The host still declares the `audio` background mode and a playback audio session. The grace window (15 s default) lets a paused session survive a quick app switch. It applies on iOS only and is ignored on tvOS; 0 restores the immediate teardown.
 3. **`presentationAxisMap`.** Cue times and `sourceTime` live on the source axis; `AVPlayerItem.currentTime()` lives on the item axis. They differ by the producer shift.
    - The property itself is never nil. Its three conversions return nil, not a guess, where no seam covers the position.
    - A host or test can also build its own: `init(seams:)`, `anchored(shiftSeconds:)` (one shift covering everything), `appendSeam(shiftSeconds:activatingAtItemSeconds:)`, and `maxSeams` (64; older seams are dropped beyond that).
@@ -1939,6 +2052,10 @@ An audio-track switch swaps the item in place, and `replaceCurrentItem` blanks t
   - With the trait, the frame is a 960-wide still decoded through the scrub stills' RPU reshaping.
   - Either way the switch waits for it (up to 3 s, with the outgoing picture paused meanwhile).
 - Other profiles hold their base layer.
+- **How long the native read waits.** The frame is read from the paused outgoing item, which answers in about 20 ms. The switch waits up to 0.5 s for that frame and swaps with nothing held when none arrives.
+  - Some apps' outputs vend no paused frame at all. After one read comes back empty, later switches only wait 0.15 s, until a read succeeds again. So a switch stands still for the full wait once, not every time.
+  - `heldPictureFrameWaitSeconds` changes the bound. 0 holds nothing on the native path, and values above 3 s are read as 3 s.
+  - The Dolby Vision bullet above and the software path are not affected.
 - Nothing is held in PiP or on external playback.
 
 ### Picture in Picture on the software path
@@ -1977,11 +2094,44 @@ An audio-track switch swaps the item in place, and `replaceCurrentItem` blanks t
 
 - **Republished with `degraded` true** when the stage keeps overrunning its frame budget, and a VideoToolbox + MetalFX stage drops MetalFX. Frames then go out at the VideoToolbox output size (`targetSize`), with the source's pixel aspect ratio.
   - The overrun is remembered for the process. A stage built later, whose MetalFX output is at least that large at a frame interval at least as short, starts degraded from the outset, without MetalFX. (Without a VideoToolbox pass it starts with `disabledReason` set instead.) It logs `[Upscale] starting ML only: ...`.
+- **Republished with `degraded` true and `mlScale` nil** when the VideoToolbox pass fails three times in a row and MetalFX is there: the stage carries on with MetalFX alone, from the source to the same `targetSize`. If the pass never delivered a frame, the device is taken to refuse it (an A12 Apple TV on tvOS 27.2 reports support and fails every pass), and later loads in the process plan without it.
 - **Republished with `disabledReason` set** if the stage cannot be built, or switches itself off: after repeated failures, or a sustained overrun when it has nothing left to drop. Frames are then delivered as decoded.
+
+### Picture processing status
+
+`$activeVideoProcessing` is published on the first processed frame, not when the load decides the route. nil while no processing runs, and cleared with the session.
+
+- It names the stages that run (`.toneMap`), the source peak the tone map starts from and which value set it (`sourcePeak`: `.mastering`, or `.maxCLL` when that is lower), and the target.
+- The source peak is the frame's own: a frame whose HDR10 metadata differs from the container's rebuilds the curve, logged as `[VideoProcessing] chain rebuilt ...`, and the status is republished with the new peak.
+- **Republished with `disabledReason` set** when the processing switches itself off (see [`videoProcessing`](#videoprocessing)). Frames are then delivered as decoded.
 
 ### Background behaviour
 
-`retainsVideoPipelineWhenBackgrounded` (default false; set before backgrounding):
+In the background the engine keeps a session only while something is still playing or showing. Everything else is released before the app can be suspended, and `needsForegroundVideoRestore` turns true.
+
+**What keeps a session in the background (iOS):**
+
+- Audio-only sessions, always.
+- A playing native video, for its audio, while `backgroundPlaybackEnabled` is on (AE#1080).
+- A playing software session, in audio-only mode, when it renders audio of its own.
+- An active PiP window.
+- A paused video, only with `retainsVideoPipelineWhenBackgrounded` (below).
+
+On tvOS only a PiP window (and the retention opt-in) keeps a video session; everything else is released at once.
+
+**A pause is a pause, whoever made it.** A paused video in the background is released after the grace window (`backgroundTeardownGraceSeconds`, 15 s by default). That holds for `pause()`, and also for a pause the system makes without the engine: AVPlayer pausing when AirPods are taken out, AVKit pausing from its own controls.
+
+**Loads and seeks wait.** A decision that falls into a `load()` or seek is made when it returns, never under it. That includes a pause pressed during a load, and a load the host starts in the background (next-episode autoplay, a playlist advance).
+
+**Phone calls and Siri.** A pause from an interruption is a pause like any other, so a paused video in the background is released after the grace window.
+
+- When the interruption ends inside that window and the system grants `.shouldResume`, the session resumes, native video in the background included.
+- A longer call finds the session released. It stays paused, and `needsForegroundVideoRestore` is true as after any background teardown.
+- With `backgroundPlaybackEnabled` off, the end of an interruption never restarts a video in the background.
+- On tvOS a video session is released at background entry, interruption or not.
+- Removing headphones, AirPods or another private output during the interruption cancels the resume, so the film does not come back on the speaker.
+
+**`retainsVideoPipelineWhenBackgrounded`** (default false; set before backgrounding):
 
 - By opting in, the host accepts that decoder sessions the system invalidated can still need `reloadAtCurrentPosition()`. In return it saves a rebuild when the pipeline survives.
 - It does not enable background playback. A retained session that resumes while still in the background gets the playing-session policy at that point: teardown with background playback off, software audio-only.
@@ -2002,7 +2152,7 @@ The engine can own the system Now-Playing card (lock screen, Control Center, the
 | `setNowPlayingInfo(_:)` | The item's identity (title, artist, album, artwork) for whichever route `load()` picks, on every platform. Elapsed, rate and duration come from the host; do not stage them. Pass an empty dictionary to clear. |
 | `setVideoNowPlayingInfo(_:)`, `setAudioNowPlayingInfo(_:)` | The same, for the video or the audio routes only. The video identity is cleared by `stop()`, the audio one is not. |
 | `setNowPlayingTrackCommands(next:previous:)` | Next and previous track handlers (a playlist or an album queue). nil for a direction that does not exist right now. While either is set the card shows track buttons instead of the skip pair. |
-| `nowPlayingCommandInterceptor` | Optional. Sees every remote command first (a `NowPlayingRemoteCommand`: play, pause, toggle, skip, change position, next, previous); return true when the host handled it. Use it for commands whose meaning depends on host state, such as play after the end of an item. |
+| `nowPlayingCommandInterceptor` | Optional. Sees every remote command first (a `NowPlayingRemoteCommand`: play, pause, toggle, skip, change position, next, previous); return true when the host handled it. Use it for commands whose meaning depends on host state, such as play after the end of an item. A skip or position change it leaves to the engine shows up in `seekEvents` with origin `.remoteCommand`, so a host that only wants to know about remote skips does not need to intercept them. |
 | `claimNowPlaying()` | Hands the shared surface to this engine when several engines publish there. See [Several engines in one process](#several-engines-in-one-process). |
 | `videoNowPlayingSession`, `audioNowPlayingSession` | The `MPNowPlayingSession` of the native video host and of the AVPlayer audio host. Declared on iOS, tvOS and visionOS only: a macOS host does not see these two members. nil on the software and FFmpeg hosts, and with no host. |
 | `setExternalMetadata(_:)` | AVKit's on-screen info pane on the video path. Also the base identity of a card the engine publishes on the shared center. Safe before `load()`; replayed at host creation. |
@@ -2070,7 +2220,8 @@ Routes published through an `MPNowPlayingSession` take no part: the system arbit
 
 - Off by default, and independent of `ownsVideoNowPlayingSession`, so the native path is untouched. A secondary role never takes it.
 - Identity comes from `setExternalMetadata`, overlaid by `setNowPlayingInfo` (or `setVideoNowPlayingInfo`).
-- `softwareNowPlayingActive` is true while the engine is publishing for the software host.
+- `softwareNowPlayingActive` is true while the engine is publishing for the software host. It turns true once the engine's command targets are on `MPRemoteCommandCenter.shared()`, so a host may replace some of them from its observer. It is false while the engine waits behind another one for the shared surface, and turns false again when it loses the surface or stops.
+- To answer a command yourself, `nowPlayingCommandInterceptor` is the simpler route: it sees each command before the engine and never fights over targets.
 
 The centers are process-wide. The engine writes `MPNowPlayingInfoCenter.default()` and registers its own targets on `MPRemoteCommandCenter.shared()`, as it does on every shared route. At stop it:
 
@@ -2085,7 +2236,8 @@ The centers are process-wide. The engine writes `MPNowPlayingInfoCenter.default(
 
 - **Route-sharing policy differs by platform (#116).** tvOS declares `.longFormAudio`, iOS declares `.default`. `.longFormAudio` marks the process as a long-form audio client. That pins `AVPictureInPictureController.isPictureInPicturePossible` to false for any PiP controller a host builds around the engine's player layer, which is why iOS does not use it. Hosts do not need to re-declare the session for PiP.
 - **Why not at launch (#24).** Activating at launch pins the route to whatever the HDMI link reports at that moment. With tvOS Continuous Audio Connection off, the link idles at stereo. The route would be negotiated to 2 channels and stay there, downmixing non-Atmos multichannel for the whole session.
-- **Who activates.** On the native video path the host's `AVPlayerViewController` activates the session per playback. The renderer paths (software decode, audio-only) activate it themselves, off the main actor and before their host is built (AE#538). A host that mounts the bare `AVPlayerLayer` (`nativePlayerLayer`) instead of an `AVPlayerViewController` must make sure the session is active at playback.
+- **Who activates.** On the native video path the host's `AVPlayerViewController` activates the session per playback. The renderer paths (software decode, audio-only) activate it themselves, off the main actor (AE#538). A host that mounts the bare `AVPlayerLayer` (`nativePlayerLayer`) instead of an `AVPlayerViewController` must make sure the session is active at playback.
+- **When a software video load activates (AE#1099).** After the play gate, the wait for the display mode switch, and before the first `play()` or the paused mount. The native path activates at `play()`, so both paths now negotiate the HDMI audio link with the panel already in its new mode. Before, the software path activated before it built its host, while the panel could still be switching. The silent Atmos stream that keeps a receiver in Atmos (`AtmosOutputActivator`) starts at the same point. A track reload has no play gate and still activates before its host is built. Audio-only loads activate before their host too.
 - **Stereo from the receiver.** An AVR that caches its HDMI EDID wrongly after standby can still report 2 channels and force a downmix. Power-cycling the receiver fixes it.
 - **Atmos is unaffected** either way: E-AC-3 with JOC ships as MAT 2.0 over a 2-channel carrier.
 
@@ -2121,8 +2273,9 @@ Two families: cache-backed stills from the active session (no second connection)
 | `scrubPreviewDrawsInView`, `showScrubPreview(atSeconds:in:)`, `AetherScrubPreviewView`, `ScrubPreviewPlacement` | The scrub preview for Dolby Vision without a displayable base layer. See [Scrub previews for Dolby Vision Profile 5](#scrub-previews-for-dolby-vision-profile-5). |
 | `scrubPreviewSourceGeneration` | A fresh `UUID` on every teardown, distinct across engine instances, so a host can fence a preview that resolved after its source went away. |
 | `clearResidentPreviewFrames()` | Cancels in-flight resident previews and drops their cached approximations; playback media is untouched. |
+| `releaseScrubPreviewDecoders()` | Closes every still decoder and returns once they are closed. Call it when a scrub ends. Cached stills stay. See [Memory while scrubbing](#memory-while-scrubbing). |
 
-1. **`scrubThumbnail`** works on single-connection sources where a second demuxer is refused (debrid / torrent links, IPTV accounts capped at one request). A native session decodes from its segment cache; a software session from its packet cache (VOD, AE#605) or its DVR packet ring (live, #544). A VOD target outside what is retained returns nil, not the nearest retained frame.
+1. **`scrubThumbnail`** works on single-connection sources where a second demuxer is refused (debrid / torrent links, IPTV accounts capped at one request). A native session decodes from its segment cache; a software session from its packet cache (VOD, AE#605) or its DVR packet ring (live, #544). A VOD target outside what is retained returns nil, not the nearest retained frame. A still whose session ended while it decoded (a `stop()`, a new `load()`) also returns nil, so a zap never puts the old item's picture on the new timeline.
 2. **The two variants** also serve software sessions. The live one reads the DVR packet ring (#544). The VOD one reads the packet cache its seeks land in (AE#605), from keyframe to target, on the same axis `seek(to:)` takes.
 
 **`supportsCacheBackedStills`** is true for any native session, a software live session, a software VOD session reading a remote source, and one playing a local file. False before load.
@@ -2140,6 +2293,16 @@ Two families: cache-backed stills from the active session (no second connection)
 - `refined: false` stops at the first decoded frame (cached per segment at the same width). `true` decodes toward the target. `refined` in the result means that decode reached the target, not that the two times are equal.
 - Missing, cancelled, replaced or stale work returns nil.
 - Decode is bounded at 750 ms and 900 packets per request.
+
+### Memory while scrubbing
+
+A still decoder costs memory in proportion to the video's size. On an Apple TV 4K one VideoToolbox decoder for 4K HEVC 10-bit holds 100 to 160 MB of reference frames, a 1080p one a quarter of that (AE#1059).
+
+- The engine keeps up to six recent segments ready for stills. Their open decoders share a budget of six 1080p pictures, so a 1080p title keeps all six open and a 4K title keeps one. The others close down to their cached still, and a repeat request at the same width is still answered from that cache.
+- Live and VOD sessions follow the same rules, and every still API shares the one list.
+- Before a decoder opens, the older ones close, so the budget holds at the peak and not only after it.
+- A resident segment's decoder closes by itself after 3 s without a request.
+- Call `releaseScrubPreviewDecoders()` when the scrub ends to close the rest at once.
 
 **The keyframe still ladder.** On a native VOD session, a position no resident segment covers is answered from the keyframe still ladder instead of nil. The ladder is a sparse set of keyframe stills the engine collects in the background.
 
@@ -2324,7 +2487,7 @@ These are counted from the metadata, like the `bed levels` log line, so an activ
 
 `EngineLog.registerSecret(_:)` names a value that must never be logged, such as an IPTV password the host holds. Every line that reaches os_log or the handler has it replaced, raw or percent-encoded, wherever it appears.
 
-- The engine already strips on its own: named parameters, `Bearer` / `Basic` credentials, userinfo, encoded payloads and the Xtream Codes path layout, also inside a URL carried percent-encoded in another URL's query. This call covers what only the host can know, such as a provider URL carrying the password as a bare path segment.
+- The engine already strips on its own: named parameters (also camelCase names such as `apiToken`), `Bearer` / `Basic` credentials, a request `Cookie` header whole, userinfo (up to its last `@`), encoded payloads and the Xtream Codes path layout, also inside a URL carried percent-encoded in another URL's query. This call covers what only the host can know, such as a provider URL carrying the password as a bare path segment.
 - Registrations are counted: a value registered twice stays redacted until it is unregistered twice.
 - Returns false for a value under four bytes.
 - `redacted(_:)` returns a line as the handler would receive it, for a line a host or tool prints itself next to the engine's.
@@ -2458,7 +2621,7 @@ What the values mean:
 
 **Direct `HLSVideoEngine` users** may call `sessionCacheStatus()` off the main thread, and receive lifecycle updates through `onSessionCacheStatusChanged`. `stop(reason:)` records the cleanup reason; the existing zero-argument `stop()` and its callback type remain available.
 
-**Cost and cleanup.** The engine reads its in-memory byte count off the main thread at the existing telemetry rate, without listing files on the UI thread. A successful cleanup removes the whole session UUID directory. A bounded sweep at startup removes abandoned sibling directories that qualify. It never takes over their bytes, and it is no offline or cross-launch cache.
+**Cost and cleanup.** The engine reads its in-memory byte count off the main thread at the existing telemetry rate, without listing files on the UI thread. A successful cleanup removes the whole session UUID directory. A bounded sweep at startup removes abandoned sibling directories that qualify. It never takes over their bytes, and it is no offline or cross-launch cache. The one exception within a process is the opt-in [kept segment cache](#keeping-the-segment-cache-across-a-stop).
 
 ### Whole-session segment storage admission
 
@@ -2474,6 +2637,38 @@ Both are per session, not a process-wide total. Two players with a 256 MiB cap c
 **When a write does not fit.** A writer blocked by the cap waits for playback to move on. It stops waiting when the session is cancelled or closed. A segment larger than the cap, or a write the reserve refuses, ends playback with `PlaybackErrorKind.storageExhausted`. Cancelling does not. Another process can still fill the volume between the measurement and the write.
 
 **Status fields.** `SessionCacheStatus` reports `hardLimitBytes`, `freeDiskReserveBytes`, `stagingBytes` and `rejectedDiskWrites`. `currentDiskBytes` is resident plus staging bytes, but staging is only counted while one of the two options is set, so with both off it equals the resident bytes. `diskAdmissionWaiting` is true while a writer waits for disk room. That is different from `producerParked`, which means the producer is waiting on the forward window.
+
+### Keeping the segment cache across a stop
+
+`LoadOptions.retainsSessionCacheAfterStop` (AE#1095) is for the viewer who leaves a title to its detail page and presses Resume a few minutes later. Without it `stop()` deletes the session's segments within a second, and the reopen fetches them again. With it the segments stay on disk, and the next `load()` of the same source serves them from there and fetches only what is missing. Off by default, and then nothing changes.
+
+Measured with `aetherctl play --host-calls stopreopen@25` on a 1080p MKV from an origin with 150 ms per response and 4 MB/s: the clock moved 0.71 to 0.81 s after the reopen, against 3.66 to 3.70 s without the option (three runs each).
+
+**What is kept.** At most one stopped session per process, in its own directory under `aether-segments/`, for as long as the process lives. Parking adds no disk writes: the files are moved, not copied. The embedded subtitles the session had read stay in RAM with it (kilobytes for text, at most the subtitle store's own caps for bitmap tracks).
+
+**When it is reused.** Only when all of these hold. Anything else deletes the kept session, and the load runs as it does today.
+
+- The URL is the same, and the `LoadOptions` are equal apart from `sourceDiagnosticsContext`. A different signature in a signed URL is a different source.
+- What the engine derives on top (display capabilities, the audio stream, the Dolby Vision handling, the audio delay and shaping) is the same.
+- The source gives the same segment plan.
+
+The new session takes the kept segments below the first one missing at or after its start position, and its producer starts there. Its first segment lands at once, and so does its clock.
+
+**A per-play id in the URL or the headers defeats it.** The URL is compared with every query item, and the options with every header in `httpHeaders`. A server API that puts a fresh session id into each play request (a `PlaySessionId` query item, a session header) makes every reopen a different source, and the log says `discarded the parked session … a load of another source` (or `the next load differs in its load options` for a header). For a Resume of the same item and version, hand the engine the URL and headers of the previous load, and keep the fresh id for the progress reports.
+
+**A file without a keyframe index.** On an MKV without Cues the start scans for keyframes until a 10 s cap and then cuts on a fixed grid. The kept session remembers that it hit the cap, and the next load of the same file (same byte size and duration) skips the scan instead of paying it again. The segment plan is still compared, so a file replaced under the same URL is caught there.
+
+**When it is deleted.**
+
+- A `load()` of any other source, or a load without the option.
+- The end of the process. After a crash or a kill, the stale sweep of the next session takes it an hour later.
+- `AetherEngine.discardRetainedSessionCache()`, for a host that knows the viewer will not return (signed out, switched profile). `AetherEngine.retainedSessionCacheBytes` reports the size, 0 when nothing is kept.
+
+**What never keeps a session.** Only the host's own `stop()` parks. An internal reload, a reroute, an audio switch, the next `load()` while playing, and a session that ended in `.error` delete the cache as before, so a reopen after a failure never gets the segments it may have failed on. Live, custom IO, `sequentialOrigin`, `nativeRemoteHLS` and the software path never park.
+
+### Per-frame benchmark
+
+`AetherEngine.runPerFrameBenchmarks(iterations:width:height:)` times the software path's work around each decoded frame on the device it runs on, and returns a `PerFrameBenchmarkReport` (device, OS, picture size, one `PerFrameBenchmarkResult` per case with min, median, p95, p99 and max in microseconds). Both are `Codable`, so a report can be saved and compared with a later build: `report.regressions(against: baseline, tolerance: 0.2)` returns one `PerFrameBenchmarkRegression` (case `name`, `reason`) per case that got slower than the tolerance and `PerFrameBenchmarkReport.regressionFloorMicroseconds`, or that ran in the baseline and is skipped or missing now. `width` and `height` set the picture of the metadata and frame chain cases; the upscale cases use fixed 480p, 720p and 1080p sources for a 3840x2160 display. It plays nothing and needs no session; call it on the main actor, away from playback, because it keeps the CPU, GPU and Neural Engine busy for several seconds (each VT super-resolution session takes about 4 s to start on an Apple TV). The cases and the regression rule are in [cli.md › bench](cli.md#bench).
 
 ## Optional components
 
@@ -2491,7 +2686,7 @@ Five parts of the engine are compiled only with their package trait, all off by 
 - It pauses on its own on a tvOS HDR10 panel without Dolby Vision.
 - See [dolby-vision-fel.md §7](dolby-vision-fel.md#7-curve-fold-on-the-native-route).
 
-**Without `DolbyVisionStillReshaping`**, a Profile 5 / 10.0 source yields no still instead of a wrong one. Its planes are IPT, which the standard path would read as YCbCr:
+**Without `DolbyVisionStillReshaping`**, a Profile 5 / 20 / 10.0 source yields no still instead of a wrong one. Its planes are IPT, which the standard path would read as YCbCr:
 
 - `scrubThumbnail`, `scrubPreviewFrame` and the extractor's stills return nil
 - `supportsCacheBackedStills` is false
@@ -2565,6 +2760,7 @@ A "tuning field" is one that `reloadAtCurrentPosition(applying:)` can correct on
 | `sessionCacheByteBudget` | nil | Optional byte request for the temporary VOD cache. See [Session cache budget and status](#session-cache-budget-and-status). |
 | `sessionCacheHardLimitBytes` | nil | Opt-in per-session disk cap for resident plus staging bytes on VOD loopback. See [Whole-session segment storage admission](#whole-session-segment-storage-admission). |
 | `sessionCacheFreeReserveBytes` | 0 | Opt-in free-volume reserve checked before segment writes; independent of the hard cap and also available to live sessions. See [Whole-session segment storage admission](#whole-session-segment-storage-admission). |
+| `retainsSessionCacheAfterStop` | false | Keep the segment cache after `stop()` and reuse it when the same source loads again, so a Resume serves from disk what the last session fetched. One kept session per process. See [Keeping the segment cache across a stop](#keeping-the-segment-cache-across-a-stop). |
 | `progressiveSegmentDelivery` | false | Serve each VOD loopback segment while it is being written. VOD only; ignored on live, `nativeRemoteHLS` and the software path. See note 2. |
 | `softwarePacketCacheStorage` | `.automatic` | `SoftwarePacketCacheStorage` picks where seekable software VOD stores compressed packets. The choice survives session reloads. See note 3. |
 | `generatesBackgroundScrubPreviews` | true | Build the sparse scrub-still ladder while the source is idle. Correctable through `reloadAtCurrentPosition(applying:)`. See note 4. |
@@ -2579,7 +2775,7 @@ A "tuning field" is one that `reloadAtCurrentPosition(applying:)` can correct on
    - `disk` opts into temporary files, with the existing safeguards for the volume and the multi-session budget. Disk can compete with tvOS flash I/O; choosing it is no performance recommendation.
    - `memory` uses the existing bounded purgeable-memory store. Played history in memory may disappear and then need a source seek.
    - Local files that bypass packet caching, live DVR, and native HLS are unchanged.
-4. **`generatesBackgroundScrubPreviews`.** Set false when the host shows no scrub previews; then no ladder step or ladder side reader is created. It is independent of `serveIFramePlaylist`. It does not turn off on-demand snapshots, held pictures across an item swap, or Dolby Vision compositor/reshaping. When true, all existing source eligibility and request-budget checks still apply.
+4. **`generatesBackgroundScrubPreviews`.** Set false when the host shows no scrub previews; then no ladder step or ladder side reader is created. With `serveIFramePlaylist` it also stops the rendition's prefetch (see [`serveIFramePlaylist`](#serveiframeplaylist)), so AVKit's thumbnails are then read only when AVKit asks. It does not turn off on-demand snapshots, held pictures across an item swap, or Dolby Vision compositor/reshaping. When true, all existing source eligibility and request-budget checks still apply.
 
 ### Live
 
@@ -2588,12 +2784,13 @@ A "tuning field" is one that `reloadAtCurrentPosition(applying:)` can correct on
 | `isLive` | false | Treat the source as live. Set it explicitly; duration-based auto-detection is too noisy. |
 | `dvrWindowSeconds` | nil | Timeshift window. nil means live-only, and `seek` does nothing. The window is a ceiling, not a guarantee. See note 1. |
 | `liveJoinProfile` | `.fastZap` | A `LiveJoinProfile`. `.fastZap` shrinks TARGETDURATION to the source GOP, plus headroom for one 1.5 x longer (AE#670), and bounds the first serve, so an IPTV join costs seconds instead of a full holdback. `.standard` always waits for the full `3 x TARGETDURATION` holdback (at least 18 s, 30 s on a 10 s GOP). See [Where a live start's seconds go](#where-a-live-starts-seconds-go). |
-| `liveStartupGraceSeconds` | nil | `.fastZap` loopback live joins only: the extra wait before the first serve, once a finalized window qualifies. See note 2. |
+| `liveStartupGraceSeconds` | nil (no wait) | `.fastZap` loopback live joins only: an extra wait before the first serve, once a finalized window qualifies. See note 2. |
 | `liveStartupSingleSegmentMinimumSeconds` | nil | `.fastZap` only: lets ONE finalized segment at least this long qualify to start the session, instead of waiting for a second one. See note 3. |
 | `liveDVRByteBudget` | nil | Disk budget in bytes for the software live DVR ring. nil keeps the default (a quarter of the free space, at most 2 GiB). Software route only. See note 4. |
 | `softwareDVRRetention` | nil | Opts the software live spool into `SoftwareDVRRetentionOptions` (`startupMaximumBytes`, `playbackCushionBytes`, `playbackCushionSeconds`), and with that into `setSoftwareLiveDVRLimits`. nil keeps the default spool. |
 | `clampsLiveResumeToWindow` | true | Whether `play()` may move a behind-live playhead by itself: a snap to the edge on a live-only source more than 45 s behind, or a landing above the retained floor when a DVR window has slid past it. `false` hands the whole decision to the host, which then also owns the eviction case. |
 | `liveEdgeCushionSeconds` | nil | How far behind the live edge a live session plays, in seconds. See [`liveEdgeCushionSeconds`](#liveedgecushionseconds). |
+| `liveJoinsAtPlaylistStart` | false | Joins a live HLS ingest at the oldest segment its playlist lists instead of near the edge, for "start from the beginning" on a recording in progress. See [Starting a recording in progress from its beginning](#starting-a-recording-in-progress-from-its-beginning). |
 | `liveJoinStartsImmediately` | true | Cuts AVPlayer's stall-avoidance wait short once at the live join, on an item that has reached `readyToPlay`, over a buffer that is non-empty and at least 1.5 s deep (AE#684). No host can reach this join wait otherwise. See [The tail after the first serve](#the-tail-after-the-first-serve-and-which-signal-survives-it). |
 | `liveBlockingReload` | nil (auto) | LL-HLS blocking-reload override for loopback live sessions. Auto decides from the observed upstream cadence, which is what keeps a bursty relay out of a `-15410` loop. |
 | `nativeRemoteHLS` | false | Hand a remote `master.m3u8` straight to AVPlayer: no demuxer probe, no loopback. Built for `isLive: true`; a remote HLS VOD URL reaches this route anyway (AE#154). The clock here is item time; see `clock.$sourceTime` (AE#616). |
@@ -2601,7 +2798,7 @@ A "tuning field" is one that `reloadAtCurrentPosition(applying:)` can correct on
 | `hostRetriesExhaustedLiveReplay` | `false` | The host owns the retry after a verified live replay exhausts the in-engine reopen: the engine publishes `liveSourceReplayExhausted` and holds production until `retryLiveSourceRecovery()`. `false` publishes `liveSourceReset` for the same exhaustion. |
 
 1. **`dvrWindowSeconds`.** The disk budget bounds what is actually kept: a quarter of the free space, at most 2 GiB unless `liveDVRByteBudget` lifts it on the software route. So a long window on a high-bitrate channel, or on a small volume, holds less than it asks for. With several engines running, each one's quarter comes from the free space the others have not claimed yet, so a tile added on a tight volume holds less history than the first one (AE#687).
-2. **`liveStartupGraceSeconds`.** nil uses the observed segment duration, clamped to 0.5 to 2 s. 0 serves (admits) as soon as the minimum media exists. nil or invalid values keep the automatic policy. The existing manifest deadline still bounds it. A shorter grace can rebuffer early on an irregular source.
+2. **`liveStartupGraceSeconds`.** nil, 0 and invalid values serve (admit) as soon as the minimum media exists. A positive value waits up to that long for a deeper first window, and ends early once the next keyframe cannot arrive inside it (AE#936). The manifest deadline still bounds it. Before 7.71 nil meant one observed segment duration, clamped to 0.5 to 2 s. That cost every raw MPEG-TS start 1 to 2 s and prevented no rebuffer ([measurements.md › Live join: the first-serve grace](measurements.md#live-join-the-first-serve-grace)).
 3. **`liveStartupSingleSegmentMinimumSeconds`.** On a long-GOP source, a second segment is another whole GOP of waiting. nil, nonpositive or non-finite values keep the two-segment minimum. A shallow first playlist can rebuffer if the next segment is late; that trade-off is the host's. `Scripts/test-long-gop-startup.sh` exercises it against paced long-GOP MPEG-TS on macOS AVPlayer.
 4. **`liveDVRByteBudget`.** An explicit value replaces the 2 GiB cap, for a window that has to hold hours of broadcast, such as a recording still in progress fed in as a live source. It is still clamped to a quarter of the free space the other sessions have not claimed, and never goes below the ring's 64 MiB playback minimum.
 
@@ -2614,6 +2811,7 @@ Neither live startup option (`liveStartupGraceSeconds`, `liveStartupSingleSegmen
 | `audioOnly` | false | Lean audio pipeline, no video machinery. Also set automatically when the probe finds no video stream. |
 | `audioBridgeMode` | `.surroundCompat` | Bridge encoder for codecs that cannot be stream-copied into fMP4. `.surroundCompat` uses EAC3 for a source with more than two channels, and FLAC for two or fewer (no surround to carry). `.lossless` uses FLAC up to 7.1 throughout and needs a sink that accepts multichannel LPCM. |
 | `objectAudioRendering` | `.off` | TrueHD Atmos and DTS:X with heights (#731), in a build with the object-audio traits. See [`objectAudioRendering`](#objectaudiorendering). |
+| `rendersDTSXObjectAudio` | true | `false` keeps DTS:X on the channel bridge while `objectAudioRendering` still renders TrueHD Atmos (#1060). See [`objectAudioRendering`](#objectaudiorendering). |
 | `confirmAtmos` | false | Confirms JOC per track in the background, and republishes `audioTracks` as tracks are confirmed. Never on the start path; skipped for live and forward-only readers. |
 | `preferredAudioLanguages` | empty | Audio pick for the first frame, from the engine's single probe. Ordered BCP-47 / ISO 639 tags; region and script are normalized and rank within one preference (#590). An explicit `audioSourceStreamIndex` still wins. |
 | `audioShaping` | `AudioShaping()` | Start the session with audio shaping in force (AE#923). Same value `setAudioShaping(_:)` reads and writes. |
@@ -2644,6 +2842,7 @@ Neither live startup option (`liveStartupGraceSeconds`, `liveStartupSingleSegmen
 | `panelIsInHDRMode` | false | **Host assertion** that the panel is presenting HDR right now. See [`panelIsInHDRMode`](#panelisinhdrmode). |
 | `attemptsHDRMasterOnUnprovenPanel` | true | Serve the HDR master to an HDR-eligible display whose panel state is unproven, and let AVFoundation's answer be the readout (AE#459). See [`attemptsHDRMasterOnUnprovenPanel`](#attemptshdrmasteronunprovenpanel). |
 | `panelPresentsDolbyVision` | false | **Host assertion** that this display presents Dolby Vision, for the platforms where the engine cannot observe it (AE#493). See [`panelPresentsDolbyVision`](#panelpresentsdolbyvision). |
+| `untaggedVideoColor` | `.standard` | An `UntaggedVideoColor`. `.hdr10` or `.hlg` shows a 10-bit stream with no colour description at all as HDR10 or HLG (AE#1103). See [`untaggedVideoColor`](#untaggedvideocolor). |
 | `omitCriteriaColorExtensions` | false | Diagnostic lever: leave colour out of `AVDisplayCriteria` so AVPlayer re-reads it from the bitstream. |
 | `keepDvh1TagWithoutDV` | false | Diagnostic lever: force dvh1 tags and a master playlist regardless of display capability. |
 | `stereoPresentation` | `.automatic` | How a 3D source is presented where the system shows stereo. See [`stereoPresentation`](#stereopresentation). |
@@ -2654,6 +2853,7 @@ Neither live startup option (`liveStartupGraceSeconds`, `liveStartupSingleSegmen
 | --- | --- | --- |
 | `dolbyVisionHandling` | `.automatic` | A `DolbyVisionHandling`. `.baseLayerOnly` presents the HDR10 / HLG base layer of a Dolby Vision source, and leaves Dolby Vision out of the container on every display. See [`dolbyVisionHandling`](#dolbyvisionhandling). |
 | `forceDolbyVisionOnNonDVDisplay` | false | **Experimental (AE#455).** Serve an HEVC Profile 8.1 source as Profile 5 on a display with no Dolby Vision of its own. See [`forceDolbyVisionOnNonDVDisplay`](#forcedolbyvisiononnondvdisplay). |
+| `preferHDR10PlusOverForcedDolbyVision` | false | Sodalite#245. A source that carries HDR10+ skips the `forceDolbyVisionOnNonDVDisplay` route and keeps its HDR10+. Set it when the panel takes HDR10+. See [`preferHDR10PlusOverForcedDolbyVision`](#preferhdr10plusoverforceddolbyvision). |
 | `preferDualLayerDolbyVision` | false | Opt in to composing Profile 7 FEL sources on the GPU. Not recommended for a distributed app. See [`preferDualLayerDolbyVision`](#preferduallayerdolbyvision). |
 | `foldsDolbyVisionFEL` | true | With the `DolbyVisionFelCurves` trait: fold a Profile 7 FEL source's enhancement layer into the Profile 8.1 RPU's luma curve. False keeps the plain conversion and its start speed (#1018). Ignored without the trait. See [dolby-vision-fel.md §7](dolby-vision-fel.md#7-curve-fold-on-the-native-route). |
 | `dualLayerRoute` | `DualLayerRoute.softwareHost` | Which route composes a Profile 7 FEL picture once `preferDualLayerDolbyVision` has taken the dual-layer route. See [`dualLayerRoute`](#duallayerroute). |
@@ -2666,8 +2866,10 @@ Neither live startup option (`liveStartupGraceSeconds`, `liveStartupSingleSegmen
 | `escalatesToSoftwarePath` | `true` | Whether a failing native session may be rebuilt once on the software path (AE#561). `false` surfaces the failure as `.error` instead, for a host with its own fallback ladder (AE#629). Correctable. See the note below. |
 | `upscalesLowResolutionVideo` | false | Opt in to upscaling SDR video below 1080p to the display's native pixel size (#846). See [`upscalesLowResolutionVideo`](#upscaleslowresolutionvideo). |
 | `upscaleScaler` | `.automatic` | The scaler that upscale stage runs. `.lineArt` is a 2x line-art network for animation that also takes 1080p and 10-bit SDR (AE#1039). See [`upscaleScaler`](#upscalescaler). |
+| `videoProcessing` | nil | A `VideoProcessingOptions`: tone map HDR10 titles brighter than the display to its peak (#957). nil is off. See [`videoProcessing`](#videoprocessing). |
 | `deinterlaceMode` | `.auto` | A `DeinterlaceMode` for the software path: the Metal / VideoToolbox graph with a CPU bwdif fallback, or `.software` to force the CPU path. |
 | `deinterlaceFieldRate` | `.field` | A `DeinterlaceFieldRate`: the hardware deinterlacer emits one frame per field (25i to 50p) or one per frame. The software fallback always runs at frame rate: doubling a CPU bwdif is the wrong trade, and a fallback should not jump to a higher cost. |
+| `inverseTelecine` | `.auto` | An `InverseTelecineMode` (#853) for hard-telecined film on the software path: `.auto` samples SD NTSC MPEG-2 at load and, on film, matches the fields back into 23.976 fps film frames and asks the display for 23.976 Hz; `.off` always deinterlaces; `.force` matches fields without the sample. Decided per load and kept for the session, see [formats › Inverse telecine](formats.md#inverse-telecine). A host that owns the display criteria (`displayCriteriaOwner = .host`) writes them before the decision exists; on a 59.94 Hz mode the film frames then show in a 3:2 rhythm, as before. |
 | `nativeVideoFrameDiagnostics` | false | Decoded-frame observation on SDR native loopback playback. See [Native video frame diagnostics and recovery](#native-video-frame-diagnostics-and-recovery). |
 | `nativeVideoFrameRecovery` | false | Bounded recovery when native output stops advancing. See [Native video frame diagnostics and recovery](#native-video-frame-diagnostics-and-recovery). |
 
@@ -2804,7 +3006,7 @@ tvOS sends either form to an Atmos receiver as Dolby MAT, and iOS plays either a
 **Which sources.** At 48 kHz, on OS 26+, only these:
 
 - TrueHD that FFmpeg marks Atmos
-- DTS-HD Master Audio whose first frames decode as DTS:X in its standard presentation, whatever FFmpeg's label. DTS:X renders only into `.l714` or `.l916`.
+- DTS-HD Master Audio whose first frames decode as DTS:X, whatever FFmpeg's label. DTS:X renders into `.l714` or `.l916`, and a smaller layout gets `.l714` (the receiver maps it onto its speakers).
 
 Anything else, or any failure to start, keeps `audioBridgeMode` (on the software host, the PCM decode).
 
@@ -2818,6 +3020,13 @@ Anything else, or any failure to start, keeps `audioBridgeMode` (on the software
 - It never prefers across a language or dub, and never over an explicit `audioSourceStreamIndex`.
 - It only applies where the bed can be rendered: a VOD video session, on the loopback route or the software host, on OS 26 or later.
 
+**Keeping DTS:X on the bridge.** `rendersDTSXObjectAudio = false` keeps every DTS track of the load on `audioBridgeMode`, while TrueHD Atmos still renders into the asked layout (#1060).
+
+- Use it when TrueHD Atmos should go into a small bed (5.1.2, say) but DTS:X should stay on the 7.1 bridge instead of becoming 7.1.4.
+- It holds for the whole load, so a viewer switching between a TrueHD Atmos track and a DTS-HD MA track needs no reload, and the host does not have to know before the first frame whether a DTS-HD MA track carries X.
+- The automatic audio pick then does not prefer a DTS:X track.
+- The default, `true`, renders both codecs as before. A `reloadAtCurrentPosition(applying:)` can change it.
+
 See [formats.md](formats.md#truehd-atmos-with-heights) and [DTS:X](formats.md#dtsx-with-heights).
 
 #### `serveIFramePlaylist`
@@ -2826,6 +3035,8 @@ Serves an I-frame rendition next to the master, so a stock `AVPlayerViewControll
 
 - One still per segment. An SDR source gets its own keyframes at full resolution. An HDR10, HLG or Dolby Vision source gets tone-mapped 640-pixel Motion JPEG stills, because AVKit shows no scrub thumbnail from a PQ or Dolby Vision keyframe.
 - Opens a second reader on the source.
+- Reads ahead while the link is idle. Every segment within 30 of the playhead's is read first, nearest first, then the coarse rungs of the still ladder. An HDR source's JPEG is built at the same time, so a thumbnail near the playhead is answered from the cache instead of after a read and a tone map. The prefetch runs under the still ladder's rules (15 s after the start, 30 s buffered, nothing else in flight on the origin) and stops with `generatesBackgroundScrubPreviews = false`. Inside the window it reads back to back as long as those hold; the coarse rungs after it keep one read every 2 s.
+- AVKit's requests come before the prefetch, and the newest request goes first. When the scrubber opens, AVKit asks for dozens of stills spread over the whole title (57 in one measurement); the still under the finger no longer waits behind them. A request AVKit gave up on (its connection closed) reads nothing. The ladder then shares the rendition's reader and cache instead of opening its own. The log says `[StillLadder] reading through the I-frame rendition`.
 - It is absent in these cases, and one log line says why:
   - live
   - sources whose segment boundaries are not keyframes (`planNotKeyframeAligned`)
@@ -2901,6 +3112,14 @@ How a 3D source is presented where the system shows stereo (visionOS; every othe
 - `.mono` plays 2D.
 - A stereo session declares `REQ-VIDEO-LAYOUT="CH-STEREO"` (EXT-X-VERSION 12), and a packed frame gets Apple's `vexu` in its sample entry.
 - Frame packing is signalled on HEVC only (AVPlayer refuses a packed H.264 init over HLS), so a packed H.264 frame plays 2D.
+- A stereo session that AVPlayer refuses at startup is rebuilt once in 2D, at the same position (`stereo: AVPlayer refused the 3D session at startup; rebuilding it in 2D` in the log). A `load()` still waiting follows the rebuild. The 2D session arms nothing, so it cannot loop.
+
+**Dolby Vision Profile 20** is Dolby Vision on MV-HEVC. Its base view is a Profile 5 base view with a Profile 5 RPU (the per-frame Dolby Vision metadata), and the second view sits in NAL units of its own layer.
+
+- In stereo it goes out as it is: `CODECS="dvh1.20.LL"`, the source's own record (profile 20, version 3.0), and `lhvC` in the init.
+- In 2D (every system but visionOS, or `.mono`) it is served as Profile 5: `CODECS="dvh1.05.LL"`, the record rewritten to profile 5. The second view stays in the samples and the decoder skips it.
+- The rewrite also sets the record's version to 1.0. VideoToolbox refuses a Profile 5 record that says 3.0 (`-12910`).
+- Not yet confirmed on a Vision Pro. The macOS 27 AVPlayer and the visionOS 27 simulator both refuse `dvh1.20` over HLS (`-12927` with `CH-STEREO`; macOS says `-11848` without it), while the same init and segments play as a local file on both. On such a refusal the session falls back to 2D (above), so the title still plays.
 - A tuning field: `reloadAtCurrentPosition(applying:)` carries a change.
 
 #### `dolbyVisionHandling`
@@ -2916,6 +3135,28 @@ How a 3D source is presented where the system shows stereo (visionOS; every othe
 
 See [formats.md](formats.md#dolby-vision-signaling).
 
+#### `untaggedVideoColor`
+
+Tells the engine what a video stream is when the stream says nothing about its colour (AE#1103). `.standard` is the default and keeps the engine's own reading, which is SDR shown as BT.709 (AE#654). `.hdr10` makes the stream BT.2020 / PQ and `.hlg` makes it BT.2020 / HLG, both with the BT.2020 non-constant-luminance matrix.
+
+**When to use it.** Some IPTV and re-encoded files are HDR10 with every tag stripped. They carry no VUI colour, no HDR SEI and no container colour, so nothing tells them from SDR and they play pale. A host that knows better sets the option, from its own check of the decoded frames or from a per-title "Force HDR" switch.
+
+**Applies only when all of these hold**, so it is safe to set for a whole library:
+
+- the stream is at least 10 bit,
+- primaries, transfer and matrix are all unspecified, in the bitstream and in the container,
+- the stream is not Dolby Vision. A container record rules it out, and so does a Dolby Vision RPU in the first video packets of an HEVC stream, which catches a Profile 5 without a record on every source type.
+
+A stream that declares even one of the three keeps its own description. The range stays as declared, and is limited where the stream says nothing.
+
+**What follows from it.** The demuxer writes the description into the stream's parameters right after the stream analysis, so every later reader sees the same answer. That covers the route, the display criteria, `VIDEO-RANGE`, the `colr` box of the native stream, the software path's frame tags, the session's scrub previews, `videoFormat` and `probe(url:options:)`. Every reopen and rebuild of the session carries it.
+
+- The log says `AE#1103 ... shown as hdr10` when it applied. A refusal because of Dolby Vision is logged too. A tagged or 8-bit stream only gets a verbose line, so a library-wide setting does not fill the host's log.
+- No HDR10 mastering metadata is invented. The display gets PQ without static metadata, as it would for an HDR10 encode that carries none.
+- A `FrameExtractor` the host builds itself opens the file as it is and does not know the option.
+
+**Correcting it.** A tuning field, correctable through `reloadAtCurrentPosition(applying:)` on a URL source, which re-runs `load()`. That is how a per-title switch takes effect on the playing title. On a custom `IOReader` source any change is refused with `SessionReloadRefusal.untaggedVideoColorNeedsFreshLoad`, because the in-place rebuild keeps the route and display criteria it chose for the old description. Call `load()` again there.
+
 #### `forceDolbyVisionOnNonDVDisplay`
 
 **Experimental (AE#455).** On a display with no Dolby Vision of its own, serve an HEVC Profile 8.1 source the way a Profile 5 source is served (`dvh1` sample entry, `dvcC` rewritten to profile 5 / compatibility 0, `CODECS="dvh1.05.LL"`). AVPlayer then applies the RPU itself, instead of handing the panel the HDR10 base layer with static metadata.
@@ -2923,6 +3164,17 @@ See [formats.md](formats.md#dolby-vision-signaling).
 - The bitstream is untouched; only the container's claim about it changes.
 - Ignored on a display that does Dolby Vision. Profile 8.1 only.
 - See [formats.md](formats.md#dolby-vision-signaling) for what it gains and what it risks.
+
+#### `preferHDR10PlusOverForcedDolbyVision`
+
+Lets a source's own HDR10+ win over the `forceDolbyVisionOnNonDVDisplay` route. Default false (Sodalite#245).
+
+Many Profile 8.1 remuxes also carry HDR10+ in their HDR10 base layer. The forced route hands the panel composed HDR10, so that HDR10+ never arrives. With this option on, such a source keeps the native Profile 8.1 route, and an HDR10+ panel gets the base layer with its HDR10+ metadata. A source without HDR10+ still takes the forced route.
+
+- **How the engine knows.** The load reads the first video packets before it picks the route (`[AetherEngine] Sodalite#245 HDR10+ head scan: found / none` in the log). Most of them are already queued from stream analysis, so it rarely costs a read. A seekable VOD only: a live load keeps the forced route.
+- **Why it is the host's call.** tvOS cannot report whether the panel takes HDR10+ (`AVPlayer.HDRMode` has no such value). On a panel with static HDR10 only, this option gives up the Dolby Vision composition for exactly the sources that carry HDR10+.
+- **Scope.** Read only where the forced route would apply: no Dolby Vision on the display, HEVC Profile 8.1 or 7, `dolbyVisionHandling == .automatic`.
+- A tuning field. A rebuild through `reloadAtCurrentPosition(applying:)` also counts HDR10+ that playback has seen since, so turning it on mid-session takes effect.
 
 #### `preferDualLayerDolbyVision`
 
@@ -3021,14 +3273,17 @@ The load logs one `[Upscale] taken: <source> -> <target> (<stages>)` / `[Upscale
 **It never stops playback.** A frame the stage cannot process is delivered as decoded.
 
 - **Building.** The stage is built off the main thread, because starting VideoToolbox super resolution loads its model on the Neural Engine (about 4 s cold on Apple TV). Until it is ready, frames are delivered as decoded. This is logged once as `[Upscale] passing frames through: stage still building`, then `[Upscale] stage built in ... ms`. A stage that cannot be built switches itself off like a failing one (`disabledReason` `stage not built: ...`).
-- **Overrun.** The frame budget is 90% of the frame interval, measured over 48 frames.
+- **Overrun.** The frame budget is 90% of the frame interval, measured over 48 frames. The time counted is how long each frame holds the decoder's thread: the stage keeps two frames on the GPU at once ([architecture-software.md › Two frames in flight on the GPU](architecture-software.md#two-frames-in-flight-on-the-gpu)).
   - It is that generous because the GPU lowers its clock until a steady load fills most of the interval. On an A15, work that takes 14 ms back to back reads 32 ms at 24 fps. A stricter budget would trip on the clock, not on a stage that really falls behind.
   - A sustained overrun first drops MetalFX where VideoToolbox super resolution also runs. This is logged once as `[Upscale] degraded: ...` and published as `UpscaleStatus.degraded`.
   - The overrun is remembered for the process. A later session or in-session rebuild that is at least as heavy and as fast starts without MetalFX.
+- **In the background (iOS).** iOS refuses GPU work while the app is in the background. Such a frame is delivered as decoded and is no failure (logged once as `[Upscale] GPU work not permitted in the background, passing frames through`).
+- **A failing VideoToolbox pass.** Three ML failures in a row drop the pass instead of switching the stage off: MetalFX takes the source to the same target (logged as `[Upscale] degraded: ML pass failed ...`). When the pass never delivered a frame, `FrameUpscaler.mlScaleFactors` offers no factor for the rest of the process, so later loads plan MetalFX alone. A stage with no MetalFX, or already on its VideoToolbox-only step, still switches off.
 - **Switching off.** Repeated failures, or an overrun with nothing left to drop, switch it off for the session (logged once, and published through `$activeUpscale`).
   - A stage that switched itself off stays off for the rest of the session, also across in-session rebuilds (audio switch, background return), and `$activeUpscale` keeps its `disabledReason`.
   - Its plan (source, ML output and target size) is remembered for the process, together with the source frame rate. A later load with the same plan, at that rate or faster, logs `[Upscale] not taken (the stage disabled itself for this plan earlier in this process)`.
 - **Timing log.** For the first ten 48-frame windows of each stage, it logs a per-step timing line (`[Upscale] timing: total ... ms (copy, ml, edge, metal wall / gpu, attach) over 48 frames at ... ms interval`).
+  - A host's Debug build compiles the engine without optimisation, and `copy` and `edge` are CPU steps, so they read higher there. `edge` on a 720p source reads about 5 ms on an Apple TV 4K (A15) in a Debug build and about 0.5 ms optimised (AE#1097). Judge a device's budget from a Release build.
 
 **Going back to native.** A URL VOD session that only the stage put on the software path goes back to the native path when the stage switches itself off. Once no load is in flight, it reloads at the current position (`reloadAtCurrentPosition()`, logged as `[Upscale] stage disabled on a session it alone put on the software path: ...`). A custom `IOReader` source and a live session stay on the software path, with frames delivered as decoded.
 
@@ -3069,6 +3324,55 @@ Which scaler the upscale stage runs while `upscalesLowResolutionVideo` is on (AE
 
 **Correcting it.** A tuning field, correctable through `reloadAtCurrentPosition(applying:)` on a URL source. On a custom `IOReader` source, switching it while `upscalesLowResolutionVideo` stays on is refused with `SessionReloadRefusal.upscaleRouteNeedsFreshLoad`, because the in-place rebuild keeps the session's plan.
 
+#### `videoProcessing`
+
+Opt in to picture processing for HDR10 titles brighter than the display (#957). A `VideoProcessingOptions` with one field, `targetPeakNits`: the display's peak luminance. nil (the default) is off.
+
+**What it costs.** A processed title plays on `SoftwarePlaybackHost`, not AVPlayer:
+
+- no AVPlayer Picture in Picture; the host presents `softwarePiPSource` instead
+- less over AirPlay: the receiver gets the sound alone, the picture stays on this device (a wireless route at load is not processed, see below)
+- an E-AC-3 Atmos (JOC) track plays as its channel bed, without the objects, because on tvOS only AVPlayer emits them
+
+**What it does.** Every decoded frame runs a BT.2390 tone map in the PQ domain (see [Picture processing](architecture-software.md#picture-processing)):
+
+- from the source peak (MaxCLL when it is known and below the mastering peak, else the mastering peak) to `targetPeakNits`
+- below the knee nothing changes; above it, highlights roll off into the target's top instead of clipping
+- the frame goes out with HDR10 metadata that says the target (mastering peak, and MaxCLL / MaxFALL mapped by the same curve), so the display does not tone map it again
+- needs tvOS / iOS / macOS 26; on the A12 Apple TV a 4K frame costs about 5.3 ms, which fits 59.94 fps ([measurements](measurements.md#tone-map-at-4k60-on-the-a12-ae957))
+
+Status is published as `$activeVideoProcessing`.
+
+**Not taken** for these; they keep their usual route:
+
+- Dolby Vision (the native route keeps Apple's Dolby Vision)
+- a source that is not HDR10 (SDR, HLG)
+- HDR10+ found before the route is decided (see below for HDR10+ found later)
+- a display that does not take HDR10, or a panel the load routes as SDR
+- a source whose container (or `hvcC` / `av1C`) declares no mastering display and no MaxCLL
+- a source peak at or below the target, or a target below a third of the source peak on the PQ scale (about 5 nit for a 1000 nit source)
+- a source that is not 8 or 10-bit 4:2:0, or whose coded size is unknown
+- any wireless AirPlay route, and a demuxed-audio live stream (as for the upscaler)
+- an OS before 26
+- a title the processing switched itself off for earlier in the process (see below)
+
+The load logs one `[VideoProcessing] taken: <size>, tone map <source> nit (<mastering|maxCLL>) to <target> nit, knee at <knee> nit` / `[VideoProcessing] not taken (<reason>)` line either way.
+
+**It never stops playback.** A frame the stage cannot process is delivered as decoded.
+
+- **Passing through.** A frame that is not PQ or not 4:2:0, or whose own metadata gives no curve to the target, is delivered as decoded, logged once as `[VideoProcessing] passing frames through: ...`. That is no failure.
+- **Overrun.** The same frame budget and window as the upscaler (see [`upscalesLowResolutionVideo`](#upscaleslowresolutionvideo)). A sustained overrun switches it off; there is no lighter step to drop to.
+- **In the background (iOS).** iOS refuses GPU work while the app is in the background. Such a frame is delivered as decoded and is no failure (logged once as `[VideoProcessing] GPU work not permitted in the background, passing frames through`).
+- **HDR10+.** HDR10+ metadata in a frame switches it off: the display applies HDR10+ to the picture it receives, which would then be mapped twice. The container does not declare HDR10+, so the load usually cannot see it before the first frames.
+- **Switching off.** Repeated failures, a sustained overrun or HDR10+ switch it off for the session (logged once as `[VideoProcessing] disabled: ...`, and published through `$activeVideoProcessing`).
+  - It stays off for the rest of the session, also across in-session rebuilds, and `$activeVideoProcessing` keeps its `disabledReason`.
+  - The title (size, declared metadata and target) is remembered for the process: with the source frame rate after an overrun or failures, at any rate after HDR10+. A later load it covers logs `[VideoProcessing] not taken (the processing disabled itself for this title earlier in this process)`.
+- **Timing log.** For the first ten 48-frame windows, it logs `[VideoProcessing] timing: ... ms mean over 48 frames at ... ms interval`.
+
+**Going back to native.** As for the upscaler: a URL VOD session that only the processing put on the software path reloads at the current position on the native path once it switches itself off (logged as `[VideoProcessing] processing disabled on a session it alone put on the software path: ...`). A custom `IOReader` source and a live session stay on the software path, with frames delivered as decoded.
+
+**Correcting it.** A tuning field, correctable through `reloadAtCurrentPosition(applying:)` on a URL source, which re-runs `load()` and decides the route again. On a custom `IOReader` source, turning it off is honoured in place. Turning it on, or changing `targetPeakNits` while it is on, is refused with `SessionReloadRefusal.videoProcessingRouteNeedsFreshLoad`.
+
 #### `autoplay`
 
 `autoplay` describes THIS MOUNT and nothing after it. The rebuilds a session makes on its own (`reloadAtCurrentPosition`, an option correction, the AirPlay LAN swap, an audio-delay change) come back in the transport state the session is in, not in this one.
@@ -3103,6 +3407,10 @@ So correcting it through `reloadAtCurrentPosition(applying:)` does nothing. Call
 | `AudioShapingState` | `.off`, `.applied`, `.unavailable`; see `$audioShapingState`. |
 | `UpscaleStatus` | `sourceSize` (the decoded size the stage receives), `mlScale` (the VideoToolbox super-resolution factor; nil when MetalFX alone scales), `targetSize` (the delivered size: the source's display aspect fitted into the display), `disabledReason` (set when the stage switched itself off mid-session), `degraded` (see note 3), `scaler` (the `UpscaleScaler` the stage runs). See `$activeUpscale`. |
 | `UpscaleScaler` | `.automatic` or `.lineArt`, the scaler `LoadOptions.upscaleScaler` selects. See [`upscaleScaler`](#upscalescaler). |
+| `VideoProcessingOptions` | `targetPeakNits`, the display's peak in nit. `LoadOptions.videoProcessing`; see [`videoProcessing`](#videoprocessing). |
+| `VideoProcessingStatus` | `stages` (`[VideoProcessingStage]`), `sourcePeakNits`, `sourcePeak` (a `ToneMapSourcePeak`), `targetPeakNits`, `disabledReason` (set when the processing switched itself off mid-session). See [Picture processing status](#picture-processing-status). |
+| `VideoProcessingStage` | `.toneMap`, the BT.2390 tone map. |
+| `ToneMapSourcePeak` | `.mastering` or `.maxCLL`: which of the source's values set the peak the tone map starts from. |
 | `AudioTapChannels` | `.downmix` (every channel summed) or `.dialogue` (the front-centre channel, falling back to the downmix on a source without one). |
 | `AudioTapBuffer` | `buffer` (`AVAudioPCMBuffer`), `sourceTime`, `discontinuity`, `channels` (what this buffer actually carries). Non-discontinuity buffers are strictly increasing and non-overlapping, which is what SpeechAnalyzer's input timeline requires. |
 | `LiveTelemetry` | The 1 Hz snapshot: bitrates, observed fps, dropped frames, cache and network bytes, A/V gap, RSS. |
@@ -3117,7 +3425,7 @@ So correcting it through `reloadAtCurrentPosition(applying:)` does nothing. Call
 
 1. **`TitleInfo`.** `id` is a position in the current scan. `playlist` and `titleSet` name the title on the disc, so store those to recognize a title at a later open.
 2. **`ChapterInfo`.** `discChapters` are relative to the title and reached through `selectChapter(id:)`. `mediaChapters` are on the 0-based `currentTime` / `seek(to:)` axis (the container start already subtracted): a host passes `startSeconds` straight to `seek(to:)`, and `selectChapter` does nothing for them.
-3. **`UpscaleStatus.degraded`** is true when the stage runs below its top step. Either a sustained overrun or missing MetalFX made it deliver the VideoToolbox output at its own size (which `targetSize` then is, with the source's pixel aspect ratio), or a line-art overrun fell back to the automatic scaler. It stays true when the stage later switches itself off.
+3. **`UpscaleStatus.degraded`** is true when the stage runs below its top step. Either a sustained overrun or missing MetalFX made it deliver the VideoToolbox output at its own size (which `targetSize` then is, with the source's pixel aspect ratio), a failing VideoToolbox pass left MetalFX alone at the same `targetSize` (`mlScale` nil), or a line-art overrun fell back to the automatic scaler. It stays true when the stage later switches itself off.
 
 **`SourceProbe` HDR flags.**
 

@@ -58,7 +58,7 @@ struct RateLimitedSourceReviveTests {
         OriginRequestBudget.shared.noteRefusal(for: meteredURL, status: 429)
 
         let engine = makeEngine()
-        engine.readErrorReviveGate = MuxerFailureReviveGate(maxAttempts: 2)
+        engine.readErrorReviveGate = ReviveBudget(maxAttempts: 2)
         engine.rateLimitReviveGate = RefusingSourceReviveBudget()
 
         engine.handleVODReadErrorExit(-1)
@@ -76,7 +76,7 @@ struct RateLimitedSourceReviveTests {
     func unmeteredExitKeepsTheOldBehaviour() {
 
         let engine = makeEngine()
-        engine.readErrorReviveGate = MuxerFailureReviveGate(maxAttempts: 0)
+        engine.readErrorReviveGate = ReviveBudget(maxAttempts: 0)
         let surfaced = Surfaced()
         engine.onVODSourceFailed = { code, reason, kind in surfaced.set(code, reason, kind) }
 
@@ -105,5 +105,24 @@ struct RateLimitedSourceReviveTests {
         #expect(delays == delays.sorted(), "the ladder must never step backwards")
         #expect(delays.last == 45, "past the ladder it holds at the widest step rather than growing forever")
         #expect(HLSVideoEngine.rateLimitReviveDelay(attempt: 0) == 3, "a nonsense attempt index still waits")
+    }
+
+    /// AE#1084: the VOD TS ingest's session URL is `aether-custom://source`, which no refusal is ever
+    /// booked under. The verdict reads the ingest's playlist origin instead, so a 509 there takes the
+    /// metered ladder rather than the two immediate attempts of the ordinary gate.
+    @Test("the ingest's refusal reaches the revive verdict through its playlist origin")
+    func ingestRefusalIsReadFromThePlaylistOrigin() {
+        OriginRequestBudget.shared.noteRefusal(for: meteredURL, status: 509)
+
+        let engine = HLSVideoEngine(url: URL(string: "aether-custom://source")!,
+                                    dvModeAvailable: false, sourceReopenableByURL: false,
+                                    refusalBooksURL: meteredURL)
+        engine.rateLimitReviveGate = RefusingSourceReviveBudget(budgetSeconds: 0)
+        let surfaced = Surfaced()
+        engine.onVODSourceFailed = { code, reason, kind in surfaced.set(code, reason, kind) }
+
+        engine.handleVODReadErrorExit(-1)
+
+        #expect(surfaced.kind == .sourceRateLimited)
     }
 }
