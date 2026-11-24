@@ -20,7 +20,7 @@ extension AetherEngine {
             probesize: options.probesize, maxAnalyzeDuration: options.maxAnalyzeDuration)
             .withSequentialOrigin(options.sequentialOrigin, declaredDuration: options.declaredDurationSeconds)
             .withHeldSourceConnection(options.heldSourceConnection)
-            .skippingAttachments(options.skipsContainerAttachments)
+            .skippingAttachments(!attachmentReadPlan.readsAtOpen)
             .withSourceOpenPolicy(options.sourceOpenPolicy)
             .withUntaggedVideoColor(options.untaggedVideoColor)
             .withDiagnosticContext(options.sourceDiagnosticsContext)
@@ -631,15 +631,17 @@ extension AetherEngine {
 
         // #316: sidecars declared at load time can only reach media selection through the playlist, so
         // when there are any, the engine writes a master of its own and AVPlayer opens that instead. The
-        // rewritten master's variants still point at the origin, so this changes nothing about where the
-        // media comes from. Any refusal (live, a playlist that will not rewrite, a slow origin) returns
-        // the origin URL and leaves the sidecars on the host overlay, which is the pre-#316 behaviour.
+        // segments still come from the origin. Only the variant playlist the stand-in already fetched is
+        // served from here (AE#1122, which also asks for the resume segment first). Any refusal (live,
+        // a playlist that will not rewrite, a slow origin) returns the origin URL and leaves the
+        // sidecars on the host overlay, which is the pre-#316 behaviour.
         //
         // AE#495: a host that answered the trust evaluator needs the media on a session the engine
         // owns, and the same stand-in does that. With sidecars it mounts a relay behind the
         // rewritten master, without them the relay stands alone.
         let playbackURL = try await prepareRemoteHLSStandIn(
-            originURL: url, options: options, expectedGeneration: bypassGeneration) ?? url
+            originURL: url, options: options, startPosition: startPosition,
+            expectedGeneration: bypassGeneration) ?? url
         // Audit LOAD-201: a stop() or zap during the stand-in's fetches owns the host now. Mounting and
         // playing on it would put this URL's sound on a torn-down player, or this item over the
         // successor's. A stand-in adopted before the zap is the successor's teardown to release.
@@ -687,9 +689,20 @@ extension AetherEngine {
                       // #334: the ceiling on silence this path never had. AVPlayer's "gave up" covers an
                       // origin that stops answering; it does not cover one that answers everything while
                       // AVFoundation builds no track, where nothing terminal is ever published.
-                      readinessDeadline: RemoteHLSReadinessDeadline.defaultBudgetSeconds,
+                      readinessDeadline: RemoteHLSReadinessDeadline.resolvedBudgetSeconds(
+                          requested: options.nativeRemoteHLSReadinessBudgetSeconds),
                       // No probe lists this route's audio, so the item's own tracks are the list.
                       readsBackAudioTracks: true))
+
+        // AE#984 R2: the injected renditions nobody picked were held so their extractions would not
+        // compete with the origin's start. Subscribed after `host.load`, which reset `isReady`, so a
+        // kept host's previous item cannot release them early.
+        if let provider = remoteHLSSubtitleProxy?.provider {
+            host.$isReady
+                .first { $0 }
+                .sink { _ in provider.releaseHeldFills() }
+                .store(in: &nativeCancellables)
+        }
 
         attachRemoteHLSCueClock(host: host, expectedGeneration: bypassGeneration)
 
@@ -701,6 +714,9 @@ extension AetherEngine {
         // VOD path triggers play() at the tail of load(); this lean path early-returns, so self-start here. AVKit drives match-content; automaticallyWaitsToMinimizeStalling handles play-before-ready. Without this call the item reaches readyToPlay but timeControlStatus stays .paused.
         // State stays .loading; flips to .playing only when timeControlStatus sink sees AVPlayer rendering.
         // #124: a paused mount skips the self-start; the wired isReady waypoint settles .loading -> .paused.
+        // AE#1110: no play gate on this route, so right before play() is the latest point there is.
+        await activateNativeAudioSession("remote HLS bypass, no play gate")
+        try checkLoadCurrent(bypassGeneration)
         if Self.loadPerformsAutostart(options) {
             host.play()
         }
@@ -764,6 +780,7 @@ extension AetherEngine {
     @MainActor
     private func prepareRemoteHLSStandIn(originURL: URL,
                                          options: LoadOptions,
+                                         startPosition: Double?,
                                          expectedGeneration: UInt64) async throws -> URL? {
         let mayNeedRelay = EngineTLS.serverTrustEvaluator != nil
             && originURL.scheme?.lowercased() == "https"
@@ -784,7 +801,8 @@ extension AetherEngine {
 
         let prepared = await RemoteHLSSubtitleProxy.prepare(
             originURL: originURL, tracks: tracks, httpHeaders: options.httpHeaders,
-            needsRelay: needsRelay, budgetSeconds: remoteHLSStandInBudgetSeconds)
+            needsRelay: needsRelay, resumeAt: options.isLive ? nil : startPosition,
+            budgetSeconds: remoteHLSStandInBudgetSeconds)
         // The playlist fetches suspend; a load()/stop() can have superseded this session meanwhile, and a
         // proxy nobody owns would keep its socket and decode task for the rest of the process.
         if loadGeneration != expectedGeneration { prepared?.tearDown() }
@@ -1243,9 +1261,7 @@ extension AetherEngine {
                     )
                     return
                 }
-                self.publishError(PlaybackErrorInfo(kind: kind,
-                                                    message: "\(reason) (code \(code))",
-                                                    underlyingCode: Int(code)))
+                self.publishError(HLSVideoEngine.VODSourceFailure(code: code, reason: reason, kind: kind).errorInfo)
             }
         }
         // prepareNativeSubtitles + non-bitmap text tracks: builds the native subtitle table; must be set before start().
@@ -1434,6 +1450,13 @@ extension AetherEngine {
         if loadGeneration != generation {
             session.stop(reason: .sourceChanged)
             try checkLoadCurrent(generation)
+        }
+        // A terminal failure surfaced during start(), before this session is installed, reaches no
+        // one through `onVODSourceFailed` (its identity check drops it). Fail the load with it
+        // instead of mounting a session that will never serve a segment.
+        if let failure = session.pendingVODSourceFailure {
+            session.stop(reason: .loadFailed)
+            throw failure
         }
         self.nativeVideoSession = session
         outputRouteHandedOver = true
@@ -2131,6 +2154,29 @@ extension AetherEngine {
         await activateRendererAudioSession(audioSourceStreamIndex: audioSourceStreamIndex)
     }
 
+    /// AE#1110: the native path's counterpart, for a host on the bare player layer that opted in with
+    /// `nativeAudioSessionActivationEnabled`. Runs after the play gate of a fresh load and of an in-place
+    /// reload, before `play()` or the paused mount. The remote HLS bypass has no gate and runs it right
+    /// before its own `play()`; an interruption that ends runs it before the resume. Goes through the same
+    /// queue as every other session transition, so a deactivation from a stop in between stays ordered.
+    func activateNativeAudioSession(_ occasion: String) async {
+        guard nativeAudioSessionActivationEnabled else { return }
+        #if DEBUG
+        nativeAudioActivationForTesting?()
+        #endif
+        EngineLog.emit("[AetherEngine] AE#1110: native path activates the audio session (\(occasion))",
+                       category: .engine)
+        #if os(iOS) || os(tvOS)
+        await enqueueAudioSessionTransition {
+            do { try AVAudioSession.sharedInstance().setActive(true) }
+            catch {
+                EngineLog.emit("[AetherEngine] AE#1110: native audio session activation error: \(error)",
+                               category: .engine)
+            }
+        }.value
+        #endif
+    }
+
     func loadSoftware(
         url: URL,
         sourceHTTPHeaders: [String: String] = [:],
@@ -2190,12 +2236,14 @@ extension AetherEngine {
         // and only a second write mid-session took effect.
         let host = SoftwarePlaybackHost(videoGravity: _videoGravity)
         let upscaleRebuild = UpscaleRouteDecision.forRebuild(
-            sessionPlan: sourceUpscalePlan, optionOn: loadedOptions.upscalesLowResolutionVideo,
+            sessionPlan: sourceUpscalePlan,
+            optionOn: sourceUpscalePlan.map { UpscaleSizePolicy(loadedOptions).covers($0) } ?? false,
             disabled: sourceUpscaleDisabled)
         host.configuredDVProfile = sourceDVProfile
         host.dolbyVisionHandling = resolvedDolbyVisionHandling(loadedOptions.dolbyVisionHandling)
         host.preferDualLayerDolbyVision = loadedOptions.preferDualLayerDolbyVision
         host.upscalePlan = upscaleRebuild.plan
+        host.upscaleSizePolicy = UpscaleSizePolicy(loadedOptions)
         let processingRebuild = VideoProcessingRouteDecision.forRebuild(
             sessionPlan: sourceVideoProcessingPlan, optionOn: loadedOptions.videoProcessing != nil,
             disabled: sourceVideoProcessingDisabled)
@@ -3117,6 +3165,7 @@ extension AetherEngine {
                 // Wait for pending AVKit display-criteria handshake before resuming (first frame must not hit a mid-transition panel).
                 // Ordinary reloads preserve criteria. Selective MEL reinspection may have refreshed
                 // them for a different title; a sole-writer host may also rewrite them on item swap.
+                let playGateEntry = DispatchTime.now()
                 await awaitingDisplaySwitch(generation: gen) {
                     await displayCriteria.waitForSwitch(
                         startGrace: Self.playGateGrace(
@@ -3129,6 +3178,9 @@ extension AetherEngine {
                         settleCap: loadedOptions.isLive ? .standard : .awaitObservedEnd,
                         isCurrent: { self.loadGeneration == gen })
                 }
+                try checkLoadCurrent(gen)
+                await activateNativeAudioSession(   // AE#1110
+                    "reload, after the play gate, held \(elapsedMs(since: playGateEntry))ms")
                 try checkLoadCurrent(gen)
                 if transportIntentUnderReconstruction ?? resumesPlaying { nativeHost?.play() }
                 else { nativeHost?.pause() }
@@ -3159,7 +3211,13 @@ extension AetherEngine {
                 category: .engine
             )
             activeAudioTrackIndex = previousAudioIndex
-            publishError(.audioTrackSwitchFailed, "Audio track switch failed: \(error.localizedDescription)", underlying: error)
+            // The rebuilt session failed while starting (a full disk, AE#1124): its kind says more than
+            // "the switch failed", and a host that retries the switch would only hit it again.
+            if let failure = error as? HLSVideoEngine.VODSourceFailure {
+                publishError(failure.errorInfo)
+            } else {
+                publishError(.audioTrackSwitchFailed, "Audio track switch failed: \(error.localizedDescription)", underlying: error)
+            }
             return error
         }
 

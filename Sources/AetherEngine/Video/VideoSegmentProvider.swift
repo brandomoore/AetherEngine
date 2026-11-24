@@ -930,7 +930,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// 8 absorbs AVPlayer's 5-7 segment speculative prefetch at 4 s segments (~32 s headroom)
     /// while keeping user-initiated 30+ s scrubs below the threshold. Tightened to 3 once;
     /// every AVPlayer prefetch above cache.max+3 cascaded into restarts and produced cache holes.
-    private static let forwardWaitWindow = 8
+    static let forwardWaitWindow = 8
 
     /// #50: re-asserting reposition wait. Sliced waits re-fire restart only when lastRestartIndex
     /// changed (orphan signature: #35 coalescer's single slot was overwritten by a newer scrub).
@@ -3603,6 +3603,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             // while A/V keeps loading, and a failed fill is answered at once. Reader-fed stores keep the wait.
             switch store.wholeProgramServe {
             case .retryLater:
+                store.noteRefusedWhilePending()
                 EngineLog.emit("[HLSVideoEngine] AE#984: whole-program subtitle .vtt ord=\(ordinal) requested before "
                                + "its sidecar is decoded; answering 404 so AVPlayer asks again", category: .hlsServer)
                 return nil
@@ -3639,6 +3640,16 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         stateLock.unlock()
         // AE#1052: a menu marker. No wait, no cues; AVKit fetches again when the marker becomes the display.
         if store.servesSilently { return WebVTTBuilder.segment(cues: [], segmentStart: start) }
+        // AE#984: a sidecar that failed has nothing coming, so it is served empty at once. One still
+        // decoding keeps the bounded wait below rather than the whole-program 404: a 404 on a selected
+        // rendition before `readyToPlay` fails the item after ~30 s (measured on the bypass), and the
+        // windowed shape is unmeasured. The select waits for the decode, so this is only reached when
+        // something else selected the rendition.
+        if store.wholeProgramServe == .failedFill {
+            return WebVTTBuilder.segment(cues: [], segmentStart: start)
+        }
+        // Its decode goes next, though: the request means the rendition is selected.
+        if store.wholeProgramServe == .retryLater { store.noteRefusedWhilePending() }
         // Sodalite#32: bounded, distance-aware readiness wait replacing the 25 s wait-for-isFinished. AVKit
         // caches an empty-served window forever, so waiting is worth it; but blocking every fetch on a store
         // that never finishes serialized the loopback connection AVPlayer also uses for video (device:

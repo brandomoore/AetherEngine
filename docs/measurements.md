@@ -330,9 +330,9 @@ Before the fix both read `clock re-anchored to first sample: anchor=9.984s (load
 
 `--paused` alone (no `play`) is not judged, but its ticks are the observable for the second half of the same report. A paused resume read `cur=0.00` until play, because the host published its still unarmed synchronizer over the anchor. It now reads `cur=17.30`.
 
-### `customio --live` spool (AE#445, AE#460, AE#461)
+### `customio --live` spool (AE#445, AE#460, AE#461, AE#1117)
 
-Measured: the custom-source live harness found that host reader callbacks ran on the pump's undrained thread (AE#445), and its reload arms showed two reloads that ignored what they were asked (AE#460, AE#461).
+Measured: the custom-source live harness found that host reader callbacks ran on the pump's undrained thread (AE#445), and its reload arms showed two reloads that ignored what they were asked (AE#460, AE#461). Its VOD arm showed that a closed recording read through a custom reader keeps nothing in the engine (AE#1117).
 
 Current rule: [cli.md › The `--live` spool](cli.md#the---live-spool-ae445).
 
@@ -345,6 +345,16 @@ Current rule: [cli.md › The `--live` spool](cli.md#the---live-spool-ae445).
 **`--reload-decode-path` before the AE#461 follow-up.** Before that follow-up, the `--reload-decode-path` run logged `#460: reload applying preferredDecodePath` and then `backend native -> native, decoder=VideoToolbox H264 (HW)`: accepted, named in the log, ignored.
 
 **`--host-carry` (AE#445 round 3).** Round 3's census on the reporter's device pinned his footprint to ONE `REALLOC`-tagged block, growing on an exact x1.25 ladder and holding every byte the session had consumed. That factor is Foundation's: `Data` grows a large buffer by `newLength >> 2`, while `av_fast_realloc` adds a sixteenth and FFmpeg's AVIO dynamic buffer a half. So the block is a Swift `Data`. The one `Data` shape that grows like that while its `count` stays tiny is a parse carry consumed from the front with `removeFirst`. That only advances the slice's lower bound and leaves the backing store holding everything below it.
+
+**`--vod-sequential` (AE#1117).** Measured on 2026-11-23 on a MacBook Pro (M1 Pro, macOS) with a debug `aetherctl` on 7.73.0+ (`87e30b4d`). The report was a 4 GB Apple TV killed near 2 GB after about 15 minutes of an IPTV catch-up that the host read itself and loaded as `.custom(reader, formatHint: "mpegts")` with `sequentialOrigin`. Its `memprobe` grew `mallocMB` about 2 MB/s, roughly twice the bytes muxed. The fixture had the reported stream's profile: 18 minutes of H.264 Main 1920x1080 at 50 fps plus AAC-LC stereo in MPEG-TS, 7.4 Mbit/s. The run took the reported path line for line (`uniform stride fallback ... sequential origin`, retention budget 2048 MiB, `effective video route = loopback`).
+
+| `memprobe` at t | Report: mallocMB | Report: physFP | Harness: mallocMB | Harness: physFP | Harness: cacheMB |
+|---|---|---|---|---|---|
+| 30 s | 233 | 361 MB | 13 | 66 MB | 51 |
+| about 600 s | 1327 | 1523 MB | 14 | 63 MB | 571 |
+| 931 s | 1917 | 2024 MB | 14 | 64 MB | 826 |
+
+876 MB went through the reader in 963 s and `physFP` stayed flat (ratio -0.01 against the bytes read). The segment cache lives on disk and is read back through `mmap`, so its `cacheMB` never shows up in `mallocMB`. On this path the engine retains nothing that grows with the stream, which puts a climb like the report's in the host's reader.
 
 ### `audiotap --software` (#400)
 
@@ -404,9 +414,40 @@ Samples were taken at the start position and, for the comparison below, at the m
 - Seek to first frame, eight seeks per run on S01E05, two runs each: the clock hold after a seek (`[AudioOutput] preroll ready after N ms`) took 69-77 ms median with inverse telecine and 43-45 ms without. The graph rebuilt in about 1 ms either way; `decimate` needs about five frames before its first picture.
 - Scrub stills (`scrubpreview --stills`, five positions): 2-10 ms each, the same with and without, because stills keep the plain deinterlacer.
 
+**The cadence filters on the GPU (AE#1108).** The GPU engine's chain with CPU `fieldmatch` and `decimate` before the upload, against `fieldmatch_videotoolbox` and `decimate_videotoolbox` after it. FFmpeg CLI on an M1, raw input (no decoder threads in the count), one filter thread, user plus system time per input frame, median of runs 2 to 5:
+
+| Source | CPU stages | GPU stages |
+|---|---|---|
+| 480i 3:2 film, clean | 1.8 ms CPU, 1.7 ms wall | 1.5 ms CPU, 2.6 ms wall |
+| 480i 3:2 film, noisy | 6.1 ms CPU, 6.3 ms wall | 1.8 ms CPU, 3.7 ms wall |
+| 576i 3:2 film | 2.3 ms CPU, 2.5 ms wall | 1.8 ms CPU, 3.2 ms wall |
+| 1080i 3:2 film | 11.5 ms CPU, 12.6 ms wall | 3.5 ms CPU, 7.3 ms wall |
+
+- The CPU time drops everywhere, most where `fieldmatch`'s comb test is expensive (grain, HD). The wall time grows on clean SD, because the filter thread waits for the GPU.
+- Counting user time alone, as the issue did on an M1 Max, understates the GPU chain's cost: the Metal submissions show up as system time (1.5 s against 0.4 s over 3000 frames of 576i).
+- With an MPEG-2 decode in the same process, the totals move by up to 0.6 ms from run to run, because the decoder's threads are counted too. The raw-input runs above repeat within 0.1 ms after the first.
+- Not measured on an Apple TV yet.
+
 ## Engine architecture
 
 Measurements behind [architecture.md](architecture.md), [architecture-native.md](architecture-native.md) and [architecture-software.md](architecture-software.md).
+
+### Deinterlace graph cost (AE#1112)
+
+Measured on 2026-11-23 on a MacBook Air (M1, macOS) with a release `aetherctl play`, FFmpegBuild 3.19.0, the default GPU engine. The figures are the steady `[Deinterlace] timing` windows of two runs per chain (the first window of a run includes the graph's start and reads a higher `max`). Per input frame, in ms.
+
+Current rule: [architecture-software.md › Deinterlace timing log](architecture-software.md#deinterlace-timing-log-ae1112).
+
+| Source | Chain | Out per 240 in | pull | transfer | decode | held | Input / output interval |
+|---|---|---|---|---|---|---|---|
+| 1080i MPEG-2, 29.97 (`testsrc2`, 15 Mbit/s) | `bwdif_videotoolbox`, field rate | 480 | 6.1-6.2 | 3.8-3.9 | 1.4-1.7 | 11.3-11.8 | 33.4 / 16.7 |
+| 480i MPEG-2, 3:2 telecined 23.976 film | GPU inverse telecine + `bwdif_videotoolbox` | 192 | 2.7-2.8 | 0.6-0.7 | 0.5 | 3.9 | 33.4 / 41.7 |
+| Same file, `--inverse-telecine off` | `bwdif_videotoolbox`, field rate | 480 | 2.6-2.7 | 1.7-1.8 | 0.7 | 5.0-5.2 | 33.4 / 16.7 |
+
+- `push` read 0.00-0.01 ms on every chain: the buffer source only queues, the graph runs in `pull`.
+- The copy out of FFmpeg's pool costs about a third of the graph at 1080i (3.9 ms for two output frames).
+- `decode` is this thread's wait in libavcodec, not the decode itself: MPEG-2 decodes on frame threads.
+- None of this is an Apple TV figure. The decoder thread's share of a 16.7 ms field interval is what an Apple TV log should be read against.
 
 ### Segment cutting by decode time
 
@@ -625,6 +666,36 @@ The band is the outer 8 output samples on every side (4 in chroma), rewritten as
 - On the A15 run (720p 25 fps, a Debug build with the fix), the full chain read 11.2 to 13.1 ms per window: `copy` 0.5 to 0.8, `ml` 6.2 to 7.2, `edge` 4.7 to 6.1, MetalFX 17 to 19 ms on the GPU. From these steps, the VideoToolbox-only step at 59.94 fps comes to about 13 ms against 15.01 ms, and MetalFX at 17 to 19 ms of GPU per frame still does not fit, as before.
 - The micro benchmark of the loop alone (M1, same sizes) read 18.8 ms unoptimised and 0.18 ms optimised before, 1.9 ms and 0.14 ms after, with identical output. `edgeBandIsABilinearScaleOfTheSource` holds the band to a plain bilinear reference in both planes.
 - Not measured: a 59.94 fps source on the device with the fix. The test server has no such title, and its "720p" NDR channel turned out to be 1080p.
+
+### Lanczos for 1080p
+
+Measured on 2026-11-23. The answer first: **an Apple TV 4K scales 1080p to a 4K display bilinearly, and Lanczos-3 scores 8.5 VMAF NEG above that over 13 test scenes, ahead of MetalFX spatial scaling.** That decided `upscalesFullHDVideo` and its scaler.
+
+Current rule: [api.md › upscalesFullHDVideo](api.md#upscalesfullhdvideo).
+
+**What the box does.** Wohnzimmer (A15, tvOS 27.2.1) showed a gray 1080p frame through `AVSampleBufferDisplayLayer` and the same frame as an x264 file through `AVPlayerLayer`. A 4K screenshot (`devicectl device capture screenshot`) was compared with each scaler's own output, after a lookup table from an unscaled 4K calibration shot (measurement floor about 44 dB). The screenshot matched a bilinear 2x at 43 to 51 dB PSNR and Lanczos at only 38 to 42 dB, on both paths.
+
+**Quality.** 13 clips from xiph.org (8 Netflix Chimera and El Fuente scenes, 5 SVT scenes), one 4K frame each, brought to 1080p and back to 4K. Luma, VMAF 4K NEG model (`vmaf_4k_v0.6.1neg`, which does not reward plain sharpening) and PSNR-Y, means:
+
+| Downscale to 1080p | Bilinear (the box) | Bicubic | MetalFX spatial | Lanczos-3 |
+|---|---|---|---|---|
+| Lanczos, VMAF NEG | 85.5 | 92.7 | 92.1 | 94.0 |
+| Bicubic, VMAF NEG | 83.8 | 90.9 | 92.1 | 92.8 |
+| Lanczos, PSNR-Y | 37.4 dB | 38.4 dB | 36.9 dB | 38.8 dB |
+
+- Lanczos was ahead of bilinear in every scene, by 4.0 (Dancers) to 12.9 VMAF (Aerial).
+- The clips are clean camera originals. Compressed Blu-ray or streaming sources have not been measured.
+
+**Cost on the A15.** A Metal kernel for 2x Lanczos-3 luma plus bilinear chroma, 1080p to 2160p, in a measurement app: 6.9 ms back to back, 5.9 ms paced at 24 fps and at 60 fps. MetalFX spatial took 8.6 ms back to back and 18 ms paced at 24 fps, without the Y'CbCr to RGB conversion it also needs. The engine's stage (two passes per plane, Lanczos chroma too) read 2.9 ms of GPU per frame on an M1 (`LanczosUpscalerTests`).
+
+**The stage on the A15**, Sodalite Release build on Wohnzimmer (tvOS 27.2.1), `[Upscale] timing` lines over 48-frame windows:
+
+| Title | Rate | GPU per frame | Thread held | Lost frames |
+|---|---|---|---|---|
+| 1920x1080 H.264, AC-3 | 25 fps | 7.7 to 8.2 ms | 3.0 to 3.2 ms | 0 |
+| 1920x1080 H.264, TrueHD Atmos rendered to a 5.1.2 PCM bed, Atmos activator on | 23.976 fps | 7.5 to 7.8 ms | 2.8 to 3.1 ms | 0 |
+
+Line art on the same box and source size reads 20 to 22 ms of GPU at 24 fps. The GPU times are paced readings, so the governor's lower clock is in them.
 
 ### Bed regression in a Debug build (AE#1106)
 
@@ -1003,6 +1074,21 @@ Current rule: [api.md › Cue retention](api.md#cue-retention).
 - **Later-only reach** (`maximumSubtitleAdvanceSeconds = 0`, later range in `maximumSubtitleDelaySeconds`). Measured with `aetherctl` over HTTP on a 70 s, 20 Mbit/s MKV with a PGS set every 3 s, at 48 s: later 60 / earlier 0 kept 16 decoded sets behind the playhead against 6 at a reach of 0, and its prefetch stayed in the landing role (parked after 5 packets), where a reach of 60 read the file to its end a second time (375 MB requested against 215 MB).
 - **The forward prefetch (AE#1015).** On a remote MKV or MP4 it downloads the video a second time: a minute of 1080p read 243.6 MB with an embedded SRT selected against 104.5 MB without.
 - **The bitmap landing role (AE#1022).** Measured on a 2.7 Mbit/s 1080p MKV over HTTP, four seeks: 168 MB against 87 MB without it, and 299 MB at the default reach.
+
+### A sidecar rendition picked before its file is in (AE#984)
+
+Measured with `aetherctl play --native-hls --sidecar en=<url> --subs en` on macOS against a local VOD origin: fMP4 HLS, 6 s segments, 300 s, the first segment 3 s late (a transcode spinning up), and the sidecar held by the origin.
+
+| Case | Before (`main` at dcbaa3b2) | After |
+| --- | --- | --- |
+| Picked at load, sidecar 40 s | Nine 404 retries, then the item fails at ~30 s (`-1100` / `-12938`) | Ready at ~3 s, the same as with an instant sidecar; rendition selected at 40.3 s, first cue presented at 41 s |
+| Picked at load, sidecar at once | Ready at ~3 s | Ready at ~3 s; selected 0.3 s after the pick |
+| Picked at 5 s, sidecar 100 s | Nine 404s; media buffer stops at 198 s; no cue is ever presented in the 150 s run | No 404; buffer fills to 288 s; rendition selected at 99 s, first cue at 101 s |
+| Loopback (`--host-calls nativesubs,nativerender@8` on a 60 s MP4), sidecar 25 s | Pre-fill gives up after 15 s with 0 cues; select refused and never retried | Pre-fill waits 16.8 s for the sidecar (59 cues); rendition selected |
+
+golfista's bare-AVPlayer runs on tvOS 27 and macOS 27 match the first and third rows (item failed at 30.3 s; stall at media 114 s with no resume).
+
+A sidecar that takes exactly 120 s sits on `SidecarTextFetch`'s 120 s idle budget. In one run it was cut off, the rendition stayed unselected, and playback carried on with the buffer filling to 300 s.
 
 ### API history notes
 

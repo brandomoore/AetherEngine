@@ -173,7 +173,7 @@ Precedence (highest first): `error > ended > idle > loading > stalled > seeking 
 
 A seek stays visible through `isSeeking` and `seekEvents`. The reader axis is visible nowhere else. On a source that delivers, nothing changes: the reader is `flowing` and a seek reads `.seeking`.
 
-**`.rebuffering`** is a buffer underrun on a healthy connection. Either AVPlayer is waiting to play, or a software pump (a read and feed loop on the software host) has paused its synchronizer (the clock that drives audio and video, see [architecture-software.md](architecture-software.md#software-decoder-pipeline)) to refill. The live feeder pauses at a dry ring, the on-demand loop when its audio lead is used up. `state` stays `.playing` throughout.
+**`.rebuffering`** is a buffer underrun on a healthy connection. Either AVPlayer is waiting to play, or a software pump (a read and feed loop on the software host) has paused its synchronizer (the clock that drives audio and video, see [architecture-software.md](architecture-software.md#software-decoder-pipeline)) to refill. The live feeder pauses at a dry ring, live without a DVR window at a dry source (AE#1121), the on-demand loop when its audio lead is used up. `state` stays `.playing` throughout.
 
 - The software host publishes its pumps' hold as `isRebuffering`. That is folded into `isBuffering` the same way the audio host's wait is, so the phase turns `.rebuffering` the moment the clock stops. A live source that merely pauses therefore reads `.rebuffering`, not `.playing` over a still picture ([history](measurements.md#live-pause-read-as-playing)).
 - When the software on-demand loop pauses, and how it resumes: [architecture-software.md, Rebuffering on the on-demand loop](architecture-software.md#rebuffering-on-the-on-demand-loop).
@@ -289,6 +289,7 @@ Bitmap subtitles (subtitles stored as images) are turned into text by OCR. Each 
 
 - `VNImageRequestHandler.perform` blocks while Vision works. Called directly from a Swift task, even `Task.detached`, it can exhaust the cooperative executor. So the embedded and sidecar OCR workers suspend during recognition instead of holding that executor.
 - One process-wide admission slot stays taken until the native call actually returns, including after cancellation. Cancelled callers still waiting in the queue leave without starting another thread.
+- The overlay's text reader (`recognizesBitmapSubtitleText`, AE#1114) goes through the same slot, so it never runs Vision next to the native worker.
 - Completed cues stay in the store. An embedded worker cancelled mid-batch invalidates that batch's advanced cursor (its read position), so selecting the track again collects the batch again instead of skipping unfinished cues.
 
 ## Dependencies

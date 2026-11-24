@@ -16,6 +16,7 @@ Contents:
 
 - [Software decoder pipeline](#software-decoder-pipeline)
   - [How a session reaches this host](#how-a-session-reaches-this-host)
+  - [Deinterlace timing log](#deinterlace-timing-log-ae1112)
   - [VP9 hardware decode](#vp9-hardware-decode) and [VideoToolbox output metadata](#videotoolbox-output-metadata)
   - [Clock and transport](#clock-and-transport) and [rebuffering on the on-demand loop](#rebuffering-on-the-on-demand-loop)
   - [Audio channel layout and timestamps](#audio-channel-layout-and-timestamps)
@@ -82,7 +83,7 @@ Source URL ──► Demuxer ──┬─► video decoder ──► [UpscalingF
 - One trigger is described in [AVC configuration changes](architecture-native.md#avc-configuration-changes).
 - `videoRoute` reports the move ([Effective video route](architecture.md#effective-video-route-videoroute)).
 
-**Inverse telecine on VOD.** Hard-telecined NTSC MPEG-2 film is sampled before the display criteria are written (`TelecineCadenceProbe`, #853). On film the deinterlace graph becomes `fieldmatch`, the deinterlacer for frames left combed, then `decimate` (on the GPU engine `decimate` runs before the upload, since it takes CPU frames only), and the session runs at 23.976 fps. See [formats › Inverse telecine](formats.md#inverse-telecine).
+**Inverse telecine on VOD.** Hard-telecined NTSC MPEG-2 film is sampled before the display criteria are written (`TelecineCadenceProbe`, #853). On film the deinterlace graph becomes `fieldmatch`, the deinterlacer for frames left combed, then `decimate`, and the session runs at 23.976 fps. On the GPU engine the two run after the upload as `fieldmatch_videotoolbox` and `decimate_videotoolbox` (AE#1108), with the CPU filters before the upload as the fallback. See [formats › Inverse telecine](formats.md#inverse-telecine).
 
 **Interlace check on VOD.** Interlaced H.264 comes here to be deinterlaced. On seekable VOD (#232) the declared field order is first checked against decoded frames (`InterlaceProbe`). The deinterlace filter engages on `AV_FRAME_FLAG_INTERLACED` alone. So if that flag never appears in a sample, the detour would do nothing, and the stream goes back to the native path.
 
@@ -90,6 +91,27 @@ Source URL ──► Demuxer ──┬─► video decoder ──► [UpscalingF
 
 - AV1 decode details and AV1 Dolby Vision: [formats.md, AV1](formats.md#av1) and [AV1 Dolby Vision](formats.md#av1-dolby-vision).
 - Atmos on this host: [Audio on the software host](#audio-on-the-software-host).
+
+### Deinterlace timing log (AE#1112)
+
+Every 240 input frames the decoder logs what the deinterlace graph cost its thread, inverse telecine included, since `fieldmatch` and `decimate` sit in the same graph:
+
+```
+[Deinterlace] timing: last 240 frames in, 192 out (bwdif_videotoolbox, inverse telecine GPU): push 0.00 ms, pull 2.74 ms, transfer 0.66 ms per input frame, max 13.48 ms; decode 0.54 ms; decoder thread held 3.95 ms per input frame against a 33.4 ms input / 41.7 ms output interval
+```
+
+- `builds` appears only when a graph was built in the window: the first frame, after a seek, at an inverse telecine cadence break. It gives the count and their total time, which also counts into `max` and `held`.
+- `push` is `av_buffersrc_add_frame_flags` (plus the check that the standing graph still fits the frame). It only queues the frame (no `AV_BUFFERSRC_FLAG_PUSH`), so it reads near zero.
+- `pull` is every `av_buffersink_get_frame` after it. The whole graph runs here: the upload, the GPU filters with their waits, and the CPU cadence filters.
+- `transfer` is the `VTPixelTransferSession` copy of each output frame out of FFmpeg's pool, on the GPU engine. The CPU engine shows `convert` instead, the `sws_scale` into a pixel buffer.
+- `max` is the worst single input frame's build, push, pulls and copies.
+- `out` counts every frame the graph returned, including second fields dropped for a missing timestamp on live TS, so the output interval reflects the graph's own rate.
+- `decode` is the time this thread spent in `avcodec_send_packet` and `avcodec_receive_frame`. Under frame threading most decoding happens on libavcodec's worker threads, so this is the wait, not the whole decode.
+- `held` is the sum. The input interval is the mean PTS step between pushed frames (a seek starts the measurement again, and a step over 1 s counts as a gap). The output interval scales it by frames in over frames out, so it reads half at field rate and 5/4 after `decimate`.
+- A frame that never reaches the graph (a failed push) and the last frames an end-of-stream drain pulls do not count.
+- The label names the filter and where inverse telecine runs (`GPU`, `CPU` or `off`), so a line reads without the `engaged` line a log ring may have dropped. A new chain starts a new window.
+
+Numbers from a Mac: [measurements.md › Deinterlace graph cost](measurements.md#deinterlace-graph-cost-ae1112).
 
 ### VP9 hardware decode
 
@@ -276,23 +298,24 @@ With `LoadOptions.upscalesLowResolutionVideo` (#846, AE#1039), `load()` asks `Up
 - the display is larger than the source,
 - not a wireless AirPlay route, and not a live session with demuxed audio.
 
-`upscaleScaler = .lineArt` also takes 10-bit and 1080p. A plan whose stage gave up earlier in this process (`UpscaleFailureMemory`) is not taken again at that rate or a faster one.
+`upscaleScaler = .lineArt` also takes 10-bit and 1080p. `upscalesFullHDVideo` takes sources larger than 1280x720 up to 1920x1080 (8 or 10-bit) for `.lanczos`; with both options on, the source's size picks the scaler (`UpscaleSizePolicy`), at load and on a mid-stream size change. A plan whose stage gave up earlier in this process (`UpscaleFailureMemory`) is not taken again at that rate or a faster one.
 
 **Where it runs.** A taken route moves the session to the software host, also when it would otherwise have played natively (`sourceSoftwareOnlyForUpscale`). The host wraps its decoder's frame handler (`UpscalingFrameHandler`), and `FrameUpscaler` runs on every decoded frame:
 
 - `.automatic`: VideoToolbox low-latency super resolution on the Neural Engine where the device offers a scale factor, then MetalFX Spatial to the target size.
 - `.lineArt`: Anime4K's 2x upscale and restore networks as Metal compute kernels (`LineArtShaderSource`), then a bilinear resample.
-- Both scaler routes dispatch whole Metal threadgroups and bounds-check edge pixels, including on GPUs without nonuniform threadgroups.
+- The automatic and line-art scalers dispatch whole Metal threadgroups and bounds-check edge pixels, including on GPUs without nonuniform threadgroups.
+- `.lanczos`: Lanczos-3 on the Y'CbCr planes, rows then columns, straight to the target (`LanczosPlaneScaler`, taps from `LanczosTaps`). No RGB texture and no colour arithmetic.
 - The stage returns nil whenever the original frame should go out instead. Its VideoToolbox session is built off the decode thread (about 4 s cold on Apple TV), and frames pass through unchanged until it is ready.
 
 **Budget.** Over a 48-frame window the stage's mean time must stay under 90% of the frame interval. The time counted is how long each frame holds the decoder's thread ([two frames in flight](#two-frames-in-flight-on-the-gpu)).
 
-- An overrun first drops one rung: MetalFX after an ML pass, or the line-art restore pass and then line art itself for the automatic scaler.
+- An overrun first drops one rung: MetalFX after an ML pass, or the line-art restore pass and then line art itself, for the automatic scaler (8-bit below 1080p with a VT pass) or Lanczos (everything else, `lineArtFallback`).
 - Three ML failures in a row drop the VideoToolbox pass: MetalFX alone to the same target (AE#957). If the pass never delivered a frame, `MLRefusalMemory` stops offering ML factors for the process. An A12 Apple TV on tvOS 27.2 reports VT super resolution and fails every pass ([measurements](measurements.md#upscale-stage-on-the-a12-ae957)).
 - A further overrun, or three failures in a row of anything else, disables the stage for the session.
 - If only the stage had put a URL VOD session on the software path, the session is then rebuilt on the native path (`upscaleDisableReturnsToNative`).
 
-`$activeUpscale` publishes what runs. See [api.md, `upscalesLowResolutionVideo`](api.md#upscaleslowresolutionvideo). To time each plan on a device, [`aetherctl bench`](cli.md#bench) runs the real stage (`UpscaleBenchmarkStage`) for 480p and 720p automatic, 720p MetalFX only, and both line-art rungs at 1080p.
+`$activeUpscale` publishes what runs. See [api.md, `upscalesLowResolutionVideo`](api.md#upscaleslowresolutionvideo). To time each plan on a device, [`aetherctl bench`](cli.md#bench) runs the real stage (`UpscaleBenchmarkStage`) for 480p and 720p automatic, 720p MetalFX only, both line-art rungs at 1080p, and Lanczos at 1080p.
 
 **The frame chain** (`FrameChain`, AE#957) is what the line-art scaler runs on. It turns the 4:2:0 frame into a half-float RGB texture, runs its stages, and turns the result back into the input's format at the target size, all in one command buffer.
 
@@ -565,9 +588,19 @@ Ordinary live software playback with audio uses `DirectLiveAudioReadAhead` on th
 
 - A forward-only memory FIFO lets audio move ahead of a full video renderer.
 - Bounded parking of compressed video, plus short consumer waits, keep already-read video ready to run when source I/O waits.
-- The timed waits apply only while video is parked. Otherwise the consumer sleeps until source data, EOF, a failure or cancellation wakes it.
+- The short waits apply only while video is parked (no wait when the parked head may decode, 10 ms otherwise). Without parked video the consumer sleeps until source data, EOF, a failure or cancellation wakes it, or until the running clock would reach the underrun point (see below).
 - Video decoding yields between packets, so it cannot drain a whole parked batch before available audio gets a turn.
-- The live clock never takes on VOD pause/rebuffer behaviour. The audio lead target is a ceiling, not a prefill required before start.
+- The audio lead target is a ceiling, not a prefill required before start.
+
+**Rebuffer on a dry source (AE#1121).** When the forward FIFO is empty and the audio lead falls under `underrunPauseLeadSeconds` (0.15 s), the loop pauses the clock and publishes `isRebuffering`. It resumes at `rebufferResumeLeadSeconds` (2 s). This is the DVR feeder's [edge rebuffer](#live-audio-look-ahead-and-edge-rebuffer) rule, with the empty FIFO standing in for the dry ring (`AudioLookaheadPolicy.directLiveClockAction`).
+
+- Without it, a source slower than real time let the clock run past every sample it had. Sound stopped, every late frame was dropped, and the phase stayed `.playing` until the host reloaded. Measured with `aetherctl play --live --sw` on a paced 1080p25 TS origin, a 6 s stall left audio and video 3.5 s behind the clock for the rest of the session, and an origin at 80 % speed lost 0.2 s per second without end. With the rule the stall costs one rebuffer, the 80 % origin one rebuffer every 10 s, and neither drops a frame.
+- Unlike the VOD loop there is no pause arm. A queue to read dryness off already separates a dry source from decode lag, and the live join starts with about 2.5 s of lead, so a source that delivers in exactly real time never comes near 0.15 s.
+- The consumer is the only thread that can pause the clock. While the clock runs, its wait on an empty source ends where the clock would reach the underrun point (`directLiveSourceWaitSeconds`), so a full stall is caught too. While the clock stands (paused, held for the rebuffer, not armed yet) the wait has no limit, so an empty source still does not poll. Background audio never takes the pause (it paces on its own renderer), so it sleeps the same way.
+- A host `play()` or `setRate` during the hold starts the clock while the hold is still on. Such a running clock is judged by the underrun rule again, so a source that is still dry pauses it once more.
+- A resume can come before 2 s of lead. A paused clock takes no video, so parked video fills its 4 MiB budget, and the loop lifts the hold rather than wait on a renderer that only a running clock drains. At high bitrates (around 20 Mbit/s) that budget holds about 1.5 s.
+- A clock that armed off video because the audio never produced a buffer (#337) has no lead to lose and never pauses.
+- There is no catch-up after the resume. A session that stalled plays behind the edge by the length of the stall, until a source reconnect lands at the edge again through the timeline fold.
 
 **Memory budgets.** The forward store and the parked-video queue use fixed in-memory pacing budgets, independent of `sessionCacheByteBudget`, free disk space and disk-retention claims.
 

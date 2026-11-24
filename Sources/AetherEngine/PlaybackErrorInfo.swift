@@ -217,6 +217,11 @@ extension AetherEngine {
             publishError(.authoredPlaybackIntervalUnsupported, engineError.localizedDescription)
             return
         }
+        // A native session that failed while starting already classified its failure.
+        if let failure = error as? HLSVideoEngine.VODSourceFailure {
+            publishError(failure.errorInfo)
+            return
+        }
         if let ingest = error as? HLSIngestError {
             switch ingest {
             case .playlistUnreachable(let status) where status > 0:

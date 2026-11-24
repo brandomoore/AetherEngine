@@ -289,6 +289,7 @@ extension AetherEngine {
     func installSidecarBitmapSource(_ source: SidecarBitmapSource, channel: SubtitleChannel,
                                     preparedDecoder: EmbeddedSubtitleDecoder? = nil) {
         sidecarBitmapSources[channel] = source
+        sidecarBitmapSourceEpochs[channel, default: 0] &+= 1   // AE#1114
         subtitleDrainTargets[channel] = SidecarBitmapSource.streamKey
         subtitleDrainDecoders[channel] = preparedDecoder
         subtitleDrainCursors[channel] = nil
@@ -1307,14 +1308,14 @@ extension AetherEngine {
 
     /// #271: the channel's retained array, bound once per drain tick. Reading it here and writing it
     /// back once at the end of the batch is what keeps `$subtitleCues` to one publication per tick.
-    private func retainedSubtitleCues(for channel: SubtitleChannel) -> [SubtitleCue] {
+    func retainedSubtitleCues(for channel: SubtitleChannel) -> [SubtitleCue] {
         switch channel {
         case .primary:   return subtitleCues
         case .secondary: return secondarySubtitleCues
         }
     }
 
-    private func publishRetainedSubtitleCues(_ cues: [SubtitleCue], for channel: SubtitleChannel) {
+    func publishRetainedSubtitleCues(_ cues: [SubtitleCue], for channel: SubtitleChannel) {
         switch channel {
         case .primary:   subtitleCues = cues
         case .secondary: secondarySubtitleCues = cues
@@ -1534,10 +1535,14 @@ extension AetherEngine {
         if case .image(let stampedImage) = stamped.body {
             for i in lower..<upper {
                 guard case .image(let otherImage) = cues[i].body else { continue }
-                if otherImage.position == stampedImage.position
-                    && otherImage.cgImage.width == stampedImage.cgImage.width
-                    && otherImage.cgImage.height == stampedImage.cgImage.height {
-                    cues[i] = stamped
+                if otherImage.isSameComposition(as: stampedImage) {
+                    // AE#1114: the same picture decoded again, so what was read in it still holds.
+                    // Dropping it here would make the host fall back to the image and pay Vision again.
+                    if stampedImage.recognizedText == nil, let read = otherImage.recognizedText {
+                        cues[i] = stamped.with(body: .image(stampedImage.with(recognizedText: read)))
+                    } else {
+                        cues[i] = stamped
+                    }
                     return true
                 }
             }
@@ -1798,21 +1803,14 @@ extension AetherEngine {
     /// (plain text, matching the WebVTT rendition), then markFinished so the .vtt handler can serve
     /// complete files and the overlay select can backfill instantly. No side demuxer, no pacing.
     func startExternalNativeStoreFill(session: HLSVideoEngine) {
-        externalNativeStoreFillTask?.cancel()
-        externalNativeStoreFillTask = nil
         let jobs = Self.externalSubtitleFillJobs(
             table: nativeSubtitleTrackTable,
             registry: externalSubtitleRegistry,
             stores: session.nativeSubtitleCueStoresForSession,
             defaultHeaders: loadedOptions.httpHeaders, mediaURL: loadedURL)
-        guard !jobs.isEmpty else { return }
-        jobs.forEach { $0.markPending() }
-        externalNativeStoreFillTask = BlockingWork.detached(priority: .utility) { [jobs] in
-            for job in jobs {
-                if Task.isCancelled { return }
-                await AetherEngine.runExternalSubtitleFill(job: job)
-            }
-        }
+        // Not held: on this path the sidecars are usually plain files, and a filled store also backfills
+        // the overlay instantly on select. A pick still moves its own to the front (AE#984).
+        externalNativeStoreFillQueue.start(jobs, holdingUnpicked: false)
     }
 
     /// #266: fill one container's stores from a single decode pass. A pass covering several streams
@@ -1833,6 +1831,8 @@ extension AetherEngine {
             }
             return
         }
+        // A preempted or torn-down fill: the queue decides what happens to its stores.
+        if Task.isCancelled { return }
         guard job.targets.count > 1 else {
             if !Task.isCancelled { job.targets.forEach { $0.store.markExternalFillFailed() } }
             EngineLog.emit("[AetherEngine] external native store fill failed: \(job.url.lastPathComponent)", category: .engine)
@@ -2813,6 +2813,22 @@ extension AetherEngine {
                                + "cues=\(store.cueCount) exit=\(exit) waited=\(waited)ms", category: .engine)
                 guard exit != "superseded" else { return }
                 prefilledCues = store.cueCount
+            } else if let store = nativeStore(atOrdinal: ordinal),
+                      store.wholeProgramServe == .retryLater || store.wholeProgramServe == .failedFill {
+                // AE#984 R2: a load-declared sidecar still decoding, or failed (the pick retries it). Its cues land all at once at the
+                // end, so the reader heuristic below would run into its 15 s deadline with nothing,
+                // refuse the select, and nothing re-selects later: no reader re-anchor fills this store.
+                // Wait for the decode itself instead, however long the server takes.
+                externalNativeStoreFillQueue.prioritize(store)
+                let began = Date()
+                let outcome = await Self.awaitInjectedRenditionSettled(
+                    serve: { store.wholeProgramServe },
+                    isCurrent: { [weak self] in generation == self?.nativeSubtitleSelectGeneration })
+                guard outcome != .superseded else { return }
+                EngineLog.emit("[AetherEngine] AE#984: native subtitle pre-fill waited for the sidecar of "
+                               + "ordinal=\(ordinal): \(outcome) cues=\(store.cueCount) "
+                               + "waited=\(Int(Date().timeIntervalSince(began) * 1000))ms", category: .engine)
+                prefilledCues = store.cueCount
             } else if let stores = nativeSubtitleReaderParams?.stores, ordinal < stores.count {
                 let store = stores[ordinal]
                 let target = currentTime + 240.0
@@ -3446,6 +3462,12 @@ extension AetherEngine {
     /// disambiguates it against the origin's names and every other sidecar, and escapes it), and
     /// `AVMediaSelectionOption.displayName` is the rendition's NAME attribute.
     /// A miss leaves the previous selection alone and says so rather than silently reporting success.
+    ///
+    /// AE#984 R2: the pick is published at once, but AVPlayer is handed the rendition only once its
+    /// sidecar is decoded. A selected rendition that answers "not yet" costs AVPlayer far more than a
+    /// late subtitle: picked before `readyToPlay` it delayed readiness by the whole wait and failed the
+    /// item after ~30 s (`-12938` HTTP 404); picked mid-play with a long wait it stopped loading media.
+    /// Measured by golfista on tvOS 27 and macOS 27 with a bare AVPlayer.
     func selectInjectedSubtitleRendition(id: Int, name: String) {
         guard let item = currentAVPlayer?.currentItem else { return }
         cancelSidecarTask()
@@ -3458,6 +3480,11 @@ extension AetherEngine {
         isSubtitleActive = true
         activeSubtitleTrackIndex = id
         isLoadingSubtitles = false
+        injectedRenditionSelectGeneration &+= 1
+        let generation = injectedRenditionSelectGeneration
+        let provider = remoteHLSSubtitleProxy?.provider
+        let ordinal = provider?.ordinal(forExternalID: id)
+        if let provider, let ordinal { provider.prioritizeFill(ordinal: ordinal) }
         Task { @MainActor in
             self.currentAVPlayer?.appliesMediaSelectionCriteriaAutomatically = false
             guard let group = try? await item.asset.loadMediaSelectionGroup(for: .legible) else { return }
@@ -3476,9 +3503,88 @@ extension AetherEngine {
                     category: .engine)
                 return
             }
-            item.select(group.options[index], in: group)
+            let option = group.options[index]
+            // The provider too: a background teardown (#597) can release the stand-in under a kept item.
+            let isCurrent = { [weak self] () -> Bool in
+                guard let self else { return false }
+                return generation == self.injectedRenditionSelectGeneration
+                    && self.activeSubtitleTrackIndex == id
+                    && self.currentAVPlayer?.currentItem === item
+                    && self.remoteHLSSubtitleProxy?.provider === provider
+            }
+            guard isCurrent() else { return }
+            var waited = false
+            if let provider, let ordinal,
+               let serve = provider.renditionServe(ordinal: ordinal),
+               serve == .retryLater || serve == .failedFill {
+                waited = true
+                // The previous pick stays off screen while this one decodes: showing it would read as
+                // the new choice having been ignored.
+                if let shown = item.currentMediaSelection.selectedMediaOption(in: group), shown != option {
+                    item.select(nil, in: group)
+                }
+                self.isLoadingSubtitles = true
+                EngineLog.emit(
+                    "[AetherEngine] AE#984: injected rendition \"\(name)\" waits for its sidecar before "
+                    + "AVPlayer sees it", category: .engine)
+                let began = Date()
+                let outcome = await Self.awaitInjectedRenditionSettled(
+                    serve: { provider.renditionServe(ordinal: ordinal) }, isCurrent: isCurrent)
+                guard outcome != .superseded else { return }
+                self.isLoadingSubtitles = false
+                let waitedSeconds = String(format: "%.1f", Date().timeIntervalSince(began))
+                if outcome == .failed {
+                    // Nothing to draw, and selecting it would hand AVPlayer an empty file it keeps for
+                    // the session. A later pick of the same track fetches the sidecar again. The pick
+                    // stays published, as on the overlay path when a sidecar decode fails.
+                    EngineLog.emit(
+                        "[AetherEngine] AE#984: the sidecar for injected rendition \"\(name)\" could not be "
+                        + "read after \(waitedSeconds)s; leaving it unselected", category: .engine)
+                    return
+                }
+                EngineLog.emit(
+                    "[AetherEngine] AE#984: sidecar for injected rendition \"\(name)\" ready after \(waitedSeconds)s",
+                    category: .engine)
+            }
+            let refused = provider.flatMap { p in ordinal.map { p.renditionWasRefused(ordinal: $0) } } ?? false
+            if waited || refused, item.currentMediaSelection.selectedMediaOption(in: group) == option {
+                // Something else selected it while it was pending, so AVPlayer may hold a 404 or an empty
+                // answer for it, and after enough 404s it stops asking. A deselect and reselect makes it
+                // fetch the file again (golfista: refetched within a second). A plain re-pick of a
+                // finished rendition AVPlayer already has skips this and stays a no-op.
+                item.select(nil, in: group)
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                guard isCurrent() else { return }
+            }
+            item.select(option, in: group)
             EngineLog.emit("[AetherEngine] #316: selected injected rendition \"\(name)\" for external id=\(id)",
                            category: .engine)
+        }
+    }
+
+    enum InjectedRenditionSettle: Equatable {
+        case ready, failed, superseded
+    }
+
+    /// AE#984 R2: wait until a picked rendition's sidecar is decoded or has failed. A store is polled
+    /// rather than observed because the wait is rare and its end is seconds to minutes away; the
+    /// quarter second it adds disappears next to that.
+    static func awaitInjectedRenditionSettled(
+        serve: () -> NativeSubtitleCueStore.WholeProgramServe?,
+        isCurrent: () -> Bool,
+        pollNanoseconds: UInt64 = 250_000_000
+    ) async -> InjectedRenditionSettle {
+        while true {
+            guard isCurrent() else { return .superseded }
+            switch serve() {
+            case .retryLater:
+                break
+            case .failedFill:
+                return .failed
+            case .complete, .waitForReader, nil:
+                return .ready
+            }
+            do { try await Task.sleep(nanoseconds: pollNanoseconds) } catch { return .superseded }
         }
     }
 
