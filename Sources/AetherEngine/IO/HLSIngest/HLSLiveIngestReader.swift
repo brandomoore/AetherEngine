@@ -76,12 +76,66 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     private let formatCondition = NSCondition()
     private var formatResolved = false
 
-    /// AES-128 key cache keyed by URI. FAST providers reuse one key per clip; lock is never held across the fetch (concurrent miss just refetches 16 bytes).
+    /// AES-128 key cache and in-flight fetch coalescing table keyed by URI. FAST providers reuse one
+    /// key per clip; lock is never held across the network fetch, and concurrent misses for the same
+    /// URI share one in-flight fetch instead of firing duplicate HTTP requests.
     private let keyCacheLock = NSLock()
     private var keyCache: [String: Data] = [:]
     private var keyCacheOrder: [String] = []
+    private var inFlightKeyFetches: [String: InFlightKeyFetch] = [:]
+    private var nextKeyFetchID: UInt64 = 0
+    private var keyCacheClosed = false
     /// The playlist window names only a handful of key URIs at once (audit NET-208).
     static let maximumCachedKeys = 16
+
+    /// Coalesced state for one in-flight AES-128 key fetch. Accessed exclusively under `keyCacheLock`;
+    /// continuations are always resumed outside the lock. Cancelling one waiter wakes only that waiter
+    /// without aborting the shared fetch that sibling segments still need; `close()` cancels the task.
+    private final class InFlightKeyFetch: @unchecked Sendable {
+        let id: UInt64
+        var task: Task<Void, Never>?
+        private var result: Result<Data, Error>?
+        private var waiters: [UInt64: CheckedContinuation<Data, Error>] = [:]
+        private var cancelledWaiters: Set<UInt64> = []
+        private var nextWaiterID: UInt64 = 0
+
+        init(id: UInt64) { self.id = id }
+
+        func reserveWaiterID() -> UInt64 {
+            nextWaiterID &+= 1
+            return nextWaiterID
+        }
+
+        func attachWaiter(_ waiterID: UInt64, continuation: CheckedContinuation<Data, Error>) -> Result<Data, Error>? {
+            if cancelledWaiters.remove(waiterID) != nil {
+                return .failure(CancellationError())
+            }
+            if let result {
+                return result
+            }
+            waiters[waiterID] = continuation
+            return nil
+        }
+
+        func cancelWaiter(_ waiterID: UInt64) -> CheckedContinuation<Data, Error>? {
+            if let continuation = waiters.removeValue(forKey: waiterID) {
+                return continuation
+            }
+            if result == nil {
+                cancelledWaiters.insert(waiterID)
+            }
+            return nil
+        }
+
+        func finish(with result: Result<Data, Error>) -> [CheckedContinuation<Data, Error>] {
+            guard self.result == nil else { return [] }
+            self.result = result
+            cancelledWaiters.removeAll()
+            let pending = Array(waiters.values)
+            waiters.removeAll()
+            return pending
+        }
+    }
 
     /// #177: bounded prefetch window. Serial fetch paid a connection + TTFB round-trip per segment
     /// with no bytes flowing, capping ingest near real-time on high-bitrate streams. Four in-flight
@@ -242,7 +296,14 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         let raceClosed = closed
         if !raceClosed { _companionAudioReader = companion }
         startLock.unlock()
-        if raceClosed { companion.close() }
+        if raceClosed {
+            companion.close()
+        } else if OriginRequestBudget.shared.limit(for: companion.budgetOriginURL) != 1 {
+            // Overlap the companion's playlist fetch, first segment, and format classification with
+            // the main video variant fetch, video join, and Demuxer.open. Skip eager start when the
+            // companion's origin is serialized to a single request slot so the video path keeps it.
+            companion.startIfNeeded()
+        }
     }
 
     public convenience init(playlistURL: URL) {
@@ -299,21 +360,39 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         startLock.withLock { _headerStore }?.current ?? httpHeaders
     }
 
-    /// Shared ephemeral URLSession pooled across live HLS ingest tunes (and companion audio readers)
-    /// so channel zaps reuse DNS, TCP sockets, and TLS session tickets instead of re-handshaking every time.
-    /// Individual fetches are cancelled via structured concurrency when `ingestTask` is cancelled on `close()`.
-    private static let sharedSession: URLSession = {
+    /// Process-wide connection headroom per origin for `sharedSession` (matching
+    /// `AVIOReader.longLivedConnectionsPerHost`, #450). Apple's default of 6 is shared across the
+    /// entire process: one channel with `maxConcurrentSegmentFetches` (4), playlist/key fetches, and
+    /// a `companionAudioReader` can exceed 6 on one origin, and 2 to 4 Multiview tiles need 16+.
+    /// Raising the pool ceiling stops a slow request on one tile from silently parking another
+    /// tile's startup playlist fetch. Per-origin concurrency limits remain enforced by
+    /// `OriginRequestBudget`.
+    static let sharedSessionConnectionsPerHost = 64
+
+    /// Configuration factory for `sharedSession`. Internal so tests can verify the exact shipped
+    /// pool settings directly.
+    static func makeSharedSessionConfiguration() -> URLSessionConfiguration {
         let config = URLSessionConfiguration.ephemeral
+        config.httpMaximumConnectionsPerHost = sharedSessionConnectionsPerHost
+        config.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         config.urlCache = nil
         config.httpCookieStorage = nil
         config.httpShouldSetCookies = false
         config.urlCredentialStorage = nil
         config.timeoutIntervalForRequest = 10
-        config.timeoutIntervalForResource = 30
         // 30s resource ceiling: one-shot fetches must fail fast so the host can fall back. The c7592ed no-ceiling lesson applies to long-lived stream connections, not bounded one-shot fetches.
-        return URLSession(
-            configuration: config, delegate: EngineTLS.sessionDelegate, delegateQueue: nil)
-    }()
+        config.timeoutIntervalForResource = 30
+        return config
+    }
+
+    /// Shared ephemeral URLSession pooled across live HLS ingest tunes (and companion audio readers)
+    /// so channel zaps reuse DNS, TCP sockets, and TLS session tickets instead of re-handshaking every time.
+    /// Individual fetches are cancelled via structured concurrency when `ingestTask` is cancelled on `close()`.
+    private static let sharedSession: URLSession = URLSession(
+        configuration: makeSharedSessionConfiguration(),
+        delegate: EngineTLS.sessionDelegate,
+        delegateQueue: nil
+    )
 
     init(playlistURL: URL, httpHeaders: [String: String] = [:], role: Role,
          credentialOrigin: URL? = nil,
@@ -352,6 +431,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         _companionAudioReader = nil
         startLock.unlock()
 
+        cancelInFlightKeyFetches(markClosed: true)
         companion?.close() // companion lifetime bound to main reader; engine closes only the reader it holds
         fifo.cancel()
         wakeFormatResolveWaiters() // prevent resolveSegmentFormatHint from sleeping its full bound when never started
@@ -378,6 +458,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
 
     private func runIngest() async {
         defer {
+            cancelInFlightKeyFetches(markClosed: false)
             wakeFormatResolveWaiters() // wake any pending format resolve regardless of exit path
         }
         do {
@@ -631,9 +712,10 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         }
     }
 
-    /// One in-flight prefetch: fetch plus (for AES-128 sources) inline decrypt. Decrypting in
-    /// flight is safe because the key cache tolerates concurrent misses; classification stays on
-    /// the ordered commit path (TS sync byte is only visible in plaintext).
+    /// One in-flight prefetch: fetch plus (for AES-128 sources) inline decrypt. When the key origin
+    /// allows concurrency and the key is not cached, the key fetch starts in parallel with the
+    /// segment download and coalesces with sibling tasks sharing the same key URI. Classification
+    /// stays on the ordered commit path (TS sync byte is only visible in plaintext).
     private func spawnFetch(
         into group: inout ThrowingTaskGroup<(Int, Data), Error>,
         index: Int,
@@ -641,10 +723,35 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         mediaURL: URL
     ) {
         group.addTask {
+            let crypt = item.segment.crypt
+            let keyURL = crypt.flatMap { HLSPlaylistParser.resolve(uri: $0.keyURI, against: mediaURL) }
+            let prefetchedKey: Task<Data, Error>?
+            if let keyURL,
+               OriginRequestBudget.shared.limit(for: keyURL) != 1,
+               !self.hasCachedKey(for: keyURL) {
+                prefetchedKey = Task { try await self.fetchKey(keyURL) }
+            } else {
+                prefetchedKey = nil
+            }
+            defer { prefetchedKey?.cancel() }
+
             let fetched = try await self.fetchSegment(item.url, duration: item.segment.duration,
                                                       byteRange: item.segment.byteRange)
-            guard !fetched.isEmpty, let crypt = item.segment.crypt else { return (index, fetched) }
-            return (index, try await self.decryptSegment(fetched, crypt: crypt, against: mediaURL))
+            guard !fetched.isEmpty, let crypt else { return (index, fetched) }
+            guard let keyURL else {
+                throw HLSIngestError.segmentDecryptFailed(reason: "unresolvable key URI")
+            }
+            let key: Data
+            if let prefetchedKey {
+                key = try await withTaskCancellationHandler {
+                    try await prefetchedKey.value
+                } onCancel: {
+                    prefetchedKey.cancel()
+                }
+            } else {
+                key = try await self.fetchKey(keyURL)
+            }
+            return (index, try self.decryptSegment(fetched, key: key, crypt: crypt))
         }
     }
 
@@ -1031,11 +1138,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         }
     }
 
-    private func decryptSegment(_ ciphertext: Data, crypt: HLSSegmentCrypt, against base: URL) async throws -> Data {
-        guard let keyURL = HLSPlaylistParser.resolve(uri: crypt.keyURI, against: base) else {
-            throw HLSIngestError.segmentDecryptFailed(reason: "unresolvable key URI")
-        }
-        let key = try await fetchKey(keyURL)
+    private func decryptSegment(_ ciphertext: Data, key: Data, crypt: HLSSegmentCrypt) throws -> Data {
         guard let plaintext = HLSSegmentDecryptor.decryptAES128CBC(ciphertext, key: key, iv: crypt.iv) else {
             throw HLSIngestError.segmentDecryptFailed(
                 reason: "AES-128-CBC failed (key=\(key.count)B iv=\(crypt.iv.count)B ct=\(ciphertext.count)B)"
@@ -1044,10 +1147,102 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         return plaintext
     }
 
-    private func fetchKey(_ url: URL) async throws -> Data {
-        let cacheKey = url.absoluteString
-        if let cached = keyCacheLock.withLock({ keyCache[cacheKey] }) { return cached }
+    private func hasCachedKey(for url: URL) -> Bool {
+        keyCacheLock.withLock { keyCache[url.absoluteString] != nil }
+    }
 
+    private func cancelInFlightKeyFetches(markClosed: Bool) {
+        let (pendingTasks, pendingWaiters): ([Task<Void, Never>], [CheckedContinuation<Data, Error>]) =
+            keyCacheLock.withLock {
+                if markClosed { keyCacheClosed = true }
+                let entries = Array(inFlightKeyFetches.values)
+                inFlightKeyFetches.removeAll()
+                let tasks = entries.compactMap(\.task)
+                let waiters = entries.flatMap { $0.finish(with: .failure(CancellationError())) }
+                return (tasks, waiters)
+            }
+        for keyTask in pendingTasks { keyTask.cancel() }
+        for continuation in pendingWaiters { continuation.resume(throwing: CancellationError()) }
+    }
+
+    private func awaitSharedKeyFetch(_ entry: InFlightKeyFetch, waiterID: UInt64) async throws -> Data {
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let immediate: Result<Data, Error>? = keyCacheLock.withLock {
+                    entry.attachWaiter(waiterID, continuation: continuation)
+                }
+                if let immediate {
+                    continuation.resume(with: immediate)
+                }
+            }
+        } onCancel: {
+            let cancelled: CheckedContinuation<Data, Error>? = keyCacheLock.withLock {
+                entry.cancelWaiter(waiterID)
+            }
+            cancelled?.resume(throwing: CancellationError())
+        }
+    }
+
+    /// Fetches and caches an AES-128 key, coalescing concurrent callers for the same URI onto a
+    /// single HTTP request. Failures are never cached and clear the in-flight entry so later attempts
+    /// retry cleanly. Internal for unit tests.
+    func fetchKey(_ url: URL) async throws -> Data {
+        try Task.checkCancellation()
+        let cacheKey = url.absoluteString
+
+        enum Lookup {
+            case cached(Data)
+            case inFlight(InFlightKeyFetch, UInt64)
+        }
+
+        let lookup: Lookup = try keyCacheLock.withLock {
+            if let cached = keyCache[cacheKey] {
+                return .cached(cached)
+            }
+            if keyCacheClosed {
+                throw CancellationError()
+            }
+            if let existing = inFlightKeyFetches[cacheKey] {
+                return .inFlight(existing, existing.reserveWaiterID())
+            }
+            nextKeyFetchID &+= 1
+            let fetchID = nextKeyFetchID
+            let entry = InFlightKeyFetch(id: fetchID)
+            let waiterID = entry.reserveWaiterID()
+            inFlightKeyFetches[cacheKey] = entry
+            let task = Task<Void, Never> { [self] in
+                let result: Result<Data, Error>
+                do {
+                    let data = try await self.fetchKeyUncached(url, cacheKey: cacheKey)
+                    result = .success(data)
+                } catch {
+                    result = .failure(error)
+                }
+                let waiters: [CheckedContinuation<Data, Error>] = self.keyCacheLock.withLock {
+                    if self.inFlightKeyFetches[cacheKey]?.id == fetchID {
+                        self.inFlightKeyFetches.removeValue(forKey: cacheKey)
+                    }
+                    return entry.finish(with: result)
+                }
+                for continuation in waiters {
+                    continuation.resume(with: result)
+                }
+            }
+            entry.task = task
+            return .inFlight(entry, waiterID)
+        }
+
+        switch lookup {
+        case .cached(let data):
+            return data
+        case .inFlight(let entry, let waiterID):
+            let data = try await awaitSharedKeyFetch(entry, waiterID: waiterID)
+            try Task.checkCancellation()
+            return data
+        }
+    }
+
+    private func fetchKeyUncached(_ url: URL, cacheKey: String) async throws -> Data {
         let data: Data
         let response: URLResponse
         do {

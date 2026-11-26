@@ -1221,6 +1221,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// AE#860: the open's response declared a disc image, or served `application/octet-stream` over
     /// a body with a volume signature at sector 16. winCond-guarded, set once by `open()`.
     private var openSuggestsDisc = false
+    /// Live HTTP open observed aligned MPEG-TS or M2TS sync bytes in the initial bytes already
+    /// received from the origin. winCond-guarded, set once by `open()`.
+    private var openLiveMPEGTSPrefix = false
     private var headSpanServeLogged = false
 
     // MARK: Fragment headers of a fragmented MP4
@@ -1675,6 +1678,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 close()
                 throw AVIOReaderError.dashManifest
             }
+            if isLive, gotData, Self.bodyBeginsWithMPEGTS(openPrefix) {
+                noteOpenedLiveMPEGTSPrefix(true)
+            }
             if !isLive, routesDiscMediaType, gotData {
                 let contentType = openResponseContentType
                 var discPrefix: [UInt8] = []
@@ -2043,6 +2049,22 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         winCond.unlock()
     }
 
+    /// True when `open()` on a live HTTP source verified aligned MPEG-TS (188-byte) or M2TS
+    /// (192-byte) sync bytes in the initial bytes already received from the origin. `Demuxer`
+    /// uses this to pass an explicit `mpegts` input format to `avformat_open_input` instead of
+    /// waiting for `av_probe_input_buffer2` to read a multi-kilobyte probe buffer.
+    var openedLiveMPEGTSPrefix: Bool {
+        winCond.lock()
+        defer { winCond.unlock() }
+        return openLiveMPEGTSPrefix
+    }
+
+    private func noteOpenedLiveMPEGTSPrefix(_ matched: Bool) {
+        winCond.lock()
+        openLiveMPEGTSPrefix = matched
+        winCond.unlock()
+    }
+
     /// How long the open waits for sector 16 of an `application/octet-stream` body (AE#860). The
     /// bytes are already on their way on the opening connection, so this is normally one window
     /// fill; a slower origin just goes unsniffed.
@@ -2088,6 +2110,33 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         let tag = Array("#EXTM3U".utf8)
         guard bytes.count - i >= tag.count else { return false }
         return Array(bytes[i..<(i + tag.count)]) == tag
+    }
+
+    /// True when a body's leading bytes carry aligned MPEG-TS (188-byte) or M2TS (192-byte,
+    /// 4-byte arrival timestamp + 188-byte TS packet) sync bytes (`0x47`). Requires at least
+    /// two sync markers at the packet stride (189 bytes for TS, 197 for M2TS) and verifies a
+    /// third sync marker whenever the prefix reaches it (377 bytes for TS, 389 for M2TS).
+    static func bodyBeginsWithMPEGTS(_ bytes: [UInt8]) -> Bool {
+        matchesMPEGTSSync(bytes, syncOffset: 0, packetStride: 188)
+            || matchesMPEGTSSync(bytes, syncOffset: 4, packetStride: 192)
+    }
+
+    private static func matchesMPEGTSSync(
+        _ bytes: [UInt8],
+        syncOffset: Int,
+        packetStride: Int
+    ) -> Bool {
+        let second = syncOffset + packetStride
+        guard bytes.count > second,
+              bytes[syncOffset] == 0x47,
+              bytes[second] == 0x47 else {
+            return false
+        }
+        let third = second + packetStride
+        if bytes.count > third, bytes[third] != 0x47 {
+            return false
+        }
+        return true
     }
 
     /// Under a single winCond critical section: snapshot whether the optimistic open-time

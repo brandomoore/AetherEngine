@@ -26,6 +26,10 @@ enum DemuxerOpenStage: Sendable {
 struct DemuxerOpenProfile: Sendable {
     var probesize: Int64
     var maxAnalyzeDuration: Int64
+    /// Cap on the frames `avformat_find_stream_info` reads to estimate frame rate on containers
+    /// with unreliable time bases (such as MPEG-TS, where FFmpeg's default `-1` reads 20 video
+    /// frames). `nil` keeps FFmpeg's default.
+    var fpsProbeSize: Int32? = nil
     var avioPrefetch: Bool
     var avioChunkSize: Int
     /// Per-chunk Range-request budget for the seekable (still-extraction) AVIO path.
@@ -172,6 +176,22 @@ struct DemuxerOpenProfile: Sendable {
         avioMaxRetries: 3,
         skipStreamInfo: false
     )
+
+    /// Live playback open profile: bounds `avformat_find_stream_info` for realtime streams while
+    /// keeping `.playback` AVIO tuning and decoder-backed parameter probing.
+    ///
+    /// `maxAnalyzeDuration` (5 s) stays strictly above `TransportStreamHeaderWait.releaseAfterNanoseconds`
+    /// (2.5 s) so missing-PMT multi-program transport streams still release cleanly.
+    /// `fpsProbeSize` (6) cuts FFmpeg's default 20-frame MPEG-TS `tb_unreliable` wait to 6 frames
+    /// while preserving frame-rate and interlaced `field_order` probing.
+    static let livePlayback: DemuxerOpenProfile = {
+        var profile = playback.withProbeBudget(
+            probesize: 5 * 1024 * 1024,
+            maxAnalyzeDuration: 5 * 1_000_000
+        )
+        profile.fpsProbeSize = 6
+        return profile
+    }()
 
     static let stillExtraction = DemuxerOpenProfile(
         probesize: 2 * 1024 * 1024,
@@ -1044,20 +1064,11 @@ public final class Demuxer: @unchecked Sendable {
         )
         reader.onNetworkPhaseChanged = onNetworkPhaseChanged
         reader.playIntentProvider = playIntentProvider
-        let filenameHint = Self.liveFilenameHint(for: url, isLive: isLive)
         do {
-            try openWithProvider(reader, filenameHint: filenameHint, isLive: isLive)
+            try openWithProvider(reader, isLive: isLive)
         } catch AVIOReaderError.dashManifest {
             try openDASH(manifestURL: url, extraHeaders: extraHeaders)
         }
-    }
-
-    /// Returns a sanitized extension-only filename hint for live MPEG-TS URLs so FFmpeg's
-    /// `av_probe_input_buffer2` can recognize `mpegts` without reading multi-packet probe buffers.
-    static func liveFilenameHint(for url: URL, isLive: Bool) -> String? {
-        guard isLive else { return nil }
-        let ext = url.pathExtension.lowercased()
-        return ["ts", "m2ts", "mts"].contains(ext) ? "stream.\(ext)" : nil
     }
 
     /// AE#859: an MPEG-DASH manifest by URL extension, opened as DASH without a first look at the body.
@@ -1110,7 +1121,6 @@ public final class Demuxer: @unchecked Sendable {
     private func openWithProvider(
         _ provider: AVIOProvider,
         inputFormat: UnsafePointer<AVInputFormat>? = nil,
-        filenameHint: String? = nil,
         isLive: Bool = false
     ) throws {
         // Audit DMX-102: the provider is published BEFORE it connects, under the same lock that
@@ -1234,9 +1244,18 @@ public final class Demuxer: @unchecked Sendable {
             av_dict_set(&opts, "codec_whitelist", "aether_no_decoders", 0)
         }
         if fragmentRandomAccess != nil { av_dict_set(&opts, "lazy_frag_index", "1", 0) }
-        // Pass only a sanitized extension hint (e.g. "stream.ts") when available; because pb is
-        // already bound, avformat_open_input never opens it and only feeds it to av_probe_input_buffer2.
-        let ret = avformat_open_input(&ctxPtr, filenameHint, inputFormat, &opts)
+        // URL is nil because pb is already bound. When a live HTTP open verified aligned MPEG-TS
+        // or M2TS sync bytes in its initial prefix, pass an explicit mpegts input format so
+        // avformat_open_input skips av_probe_input_buffer2's multi-kilobyte probe read.
+        let resolvedInputFormat: UnsafePointer<AVInputFormat>?
+        if let inputFormat {
+            resolvedInputFormat = inputFormat
+        } else if isLive, (provider as? AVIOReader)?.openedLiveMPEGTSPrefix == true {
+            resolvedInputFormat = av_find_input_format("mpegts")
+        } else {
+            resolvedInputFormat = nil
+        }
+        let ret = avformat_open_input(&ctxPtr, nil, resolvedInputFormat, &opts)
         av_dict_free(&opts)
         guard ret == 0 else {
             formatContext = nil
@@ -1279,6 +1298,9 @@ public final class Demuxer: @unchecked Sendable {
     private func applyProbeBudget(_ ctx: UnsafeMutablePointer<AVFormatContext>) {
         ctx.pointee.probesize = openProfile.probesize
         ctx.pointee.max_analyze_duration = openProfile.maxAnalyzeDuration
+        if let fpsProbeSize = openProfile.fpsProbeSize {
+            ctx.pointee.fps_probe_size = fpsProbeSize
+        }
         // Installed unconditionally: a local input's URLContext copies the callback at open, so the
         // input byte budget could not reach it later.
         ctx.pointee.interrupt_callback = AVIOInterruptCB(

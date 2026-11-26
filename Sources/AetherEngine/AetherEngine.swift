@@ -3049,7 +3049,14 @@ public final class AetherEngine: ObservableObject {
 
     /// In-flight probe demuxer. Registered before the detached open so stopInternal can markClosed() it:
     /// without this, player dismissal/channel zapping left the probe reconnecting through subsequent sessions.
-    private var inFlightProbeDemuxer: Demuxer?
+    private(set) var inFlightProbeDemuxer: Demuxer?
+    /// Test seam: suspends `awaitAudioSessionCategoryConfigured()` so tests can deterministically
+    /// exercise startup probe overlap and early supersession on every platform.
+    var audioSessionCategoryWaitForTesting: (@MainActor () async -> Void)?
+    /// Test seam: called when the startup `probeTask` finishes unwinding (success or failure).
+    var probeTaskCompletedForTesting: (@Sendable () -> Void)?
+    /// Test seam: called right after `probe.close()` in the early-supersession cleanup path.
+    var earlySupersededProbeCloseObserverForTesting: (@Sendable () -> Void)?
 
     // A replacement may reuse this reader only after the inspection and its close have joined.
     @MainActor
@@ -3106,10 +3113,8 @@ public final class AetherEngine: ObservableObject {
             handling: resolvedDolbyVisionHandling(options.dolbyVisionHandling, foldsFEL: options.foldsDolbyVisionFEL),
             codecID: codecpar.codec_id, dvProfile: config?.profile, dvBlCompatID: config?.blCompatID,
             colorTransfer: codecpar.color_trc, colorMatrix: codecpar.color_space)
-        let capabilities = Self.reloadDisplayCapabilities(
-            observedAtLoad: sessionObservedDisplayCaps,
-            hostAssertsDolbyVision: options.panelPresentsDolbyVision,
-            readNow: { Self.displayCapabilities })
+        let capabilities = reloadDisplayCapabilities(
+            hostAssertsDolbyVision: options.panelPresentsDolbyVision)
         let format = Self.effectiveVideoFormat(
             detected: sourceVideoFormat, stream: stream,
             capabilities: baseLayer ? capabilities.withoutDolbyVision() : capabilities)
@@ -4833,6 +4838,10 @@ public final class AetherEngine: ObservableObject {
     /// category again: a host that switches the mode afterwards (music playback setting `.default`)
     /// keeps it, as it did when the declaration ran once at init. A failed attempt is retried.
     func awaitAudioSessionCategoryConfigured() async {
+        if let wait = audioSessionCategoryWaitForTesting {
+            await wait()
+            return
+        }
         #if os(iOS) || os(tvOS)
         await SharedOutputCoordinator.shared.configureAudioSessionCategory {
             Self.configureAudioSessionCategory()
@@ -5444,7 +5453,9 @@ public final class AetherEngine: ObservableObject {
         // despite the async signature; a detached task's value introduces a real background hop,
         // and BlockingWork keeps that hop off the cooperative pool while the open blocks.
         let probeProfile = playbackOpenProfile(options: options)
-        let probeTask = BlockingWork.detached(priority: .userInitiated) { [probe, source, options, probeProfile] in
+        let onProbeTaskCompleted = probeTaskCompletedForTesting
+        let probeTask = BlockingWork.detached(priority: .userInitiated) { [probe, source, options, probeProfile, onProbeTaskCompleted] in
+            defer { onProbeTaskCompleted?() }
             // Caller-bounded find_stream_info budget (#68); nil keeps the .playback default. This probe
             // demuxer is reused as the session demuxer, so the cap lands on the open that actually pays it.
             switch source {
@@ -5462,11 +5473,18 @@ public final class AetherEngine: ObservableObject {
         // now overlapped with probeTask's network open.
         await awaitAudioSessionCategoryConfigured()
         // Audit CORE-6: if a superseding load arrived while awaiting category configuration, abort
-        // this probe before publishing anything.
+        // this probe before publishing anything. Detach probe.close() after probeTask unwinds so an
+        // already-opened probe does not deallocate and close synchronously on MainActor.
         do {
             try checkLoadCurrent(gen)
         } catch {
             probe.markClosed()
+            let onProbeClose = earlySupersededProbeCloseObserverForTesting
+            BlockingWork.detached { [probe, probeTask, onProbeClose] in
+                _ = try? await probeTask.value
+                probe.close()
+                onProbeClose?()
+            }
             throw error
         }
         // AE#493: what this session takes the display to be. Observed while probeTask is in flight,
@@ -6934,6 +6952,7 @@ public final class AetherEngine: ObservableObject {
                         // blocks nothing else, and the panel is dark until it ends either way. Live keeps the
                         // standard cap: a zap must not sit behind a panel handshake.
                         settleCap: options.isLive ? .standard : .awaitObservedEnd,
+                        creditElapsedSinceWrite: options.engineWritesDisplayCriteria && !options.awaitsInboundCriteriaWrite,
                         isCurrent: { self.loadGeneration == gen })
                 }
                 try checkLoadCurrent(gen)
