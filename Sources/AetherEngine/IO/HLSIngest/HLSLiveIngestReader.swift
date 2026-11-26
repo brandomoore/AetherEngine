@@ -30,7 +30,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     /// Wider than the VOD reader's 2 MB: a live window with hours of DVR at short segments is a
     /// legitimately long playlist, and this one is refetched every few seconds rather than once.
     static let maximumPlaylistBytes = 8 * 1024 * 1024
-    private let session: URLSession
+    let session: URLSession
     private var ingestTask: Task<Void, Never>?
     private let startLock = NSLock()
     private var started = false
@@ -299,6 +299,22 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         startLock.withLock { _headerStore }?.current ?? httpHeaders
     }
 
+    /// Shared ephemeral URLSession pooled across live HLS ingest tunes (and companion audio readers)
+    /// so channel zaps reuse DNS, TCP sockets, and TLS session tickets instead of re-handshaking every time.
+    /// Individual fetches are cancelled via structured concurrency when `ingestTask` is cancelled on `close()`.
+    private static let sharedSession: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.urlCache = nil
+        config.httpCookieStorage = nil
+        config.httpShouldSetCookies = false
+        config.urlCredentialStorage = nil
+        config.timeoutIntervalForRequest = 10
+        config.timeoutIntervalForResource = 30
+        // 30s resource ceiling: one-shot fetches must fail fast so the host can fall back. The c7592ed no-ceiling lesson applies to long-lived stream connections, not bounded one-shot fetches.
+        return URLSession(
+            configuration: config, delegate: EngineTLS.sessionDelegate, delegateQueue: nil)
+    }()
+
     init(playlistURL: URL, httpHeaders: [String: String] = [:], role: Role,
          credentialOrigin: URL? = nil,
          diagnosticContext: SourceNetworkDiagnostics.Context? = SourceNetworkDiagnostics.context,
@@ -309,12 +325,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         self.httpHeaders = httpHeaders
         self.credentialOrigin = credentialOrigin ?? playlistURL
         self.role = role
-        let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 10
-        config.timeoutIntervalForResource = 30
-        // 30s resource ceiling: one-shot fetches must fail fast so the host can fall back. The c7592ed no-ceiling lesson applies to long-lived stream connections, not bounded one-shot fetches.
-        self.session = URLSession(
-            configuration: config, delegate: EngineTLS.sessionDelegate, delegateQueue: nil)
+        self.session = Self.sharedSession
     }
 
     // MARK: - IOReader
@@ -344,9 +355,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         companion?.close() // companion lifetime bound to main reader; engine closes only the reader it holds
         fifo.cancel()
         wakeFormatResolveWaiters() // prevent resolveSegmentFormatHint from sleeping its full bound when never started
-        if !wasStarted {
-            session.invalidateAndCancel() // sole owner when ingest never launched; runIngest's defer owns it otherwise
-        }
+        _ = wasStarted
     }
 
     public func cancel() {
@@ -369,7 +378,6 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
 
     private func runIngest() async {
         defer {
-            session.invalidateAndCancel()
             wakeFormatResolveWaiters() // wake any pending format resolve regardless of exit path
         }
         do {

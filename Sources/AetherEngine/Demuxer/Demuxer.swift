@@ -1044,11 +1044,20 @@ public final class Demuxer: @unchecked Sendable {
         )
         reader.onNetworkPhaseChanged = onNetworkPhaseChanged
         reader.playIntentProvider = playIntentProvider
+        let filenameHint = Self.liveFilenameHint(for: url, isLive: isLive)
         do {
-            try openWithProvider(reader, isLive: isLive)
+            try openWithProvider(reader, filenameHint: filenameHint, isLive: isLive)
         } catch AVIOReaderError.dashManifest {
             try openDASH(manifestURL: url, extraHeaders: extraHeaders)
         }
+    }
+
+    /// Returns a sanitized extension-only filename hint for live MPEG-TS URLs so FFmpeg's
+    /// `av_probe_input_buffer2` can recognize `mpegts` without reading multi-packet probe buffers.
+    static func liveFilenameHint(for url: URL, isLive: Bool) -> String? {
+        guard isLive else { return nil }
+        let ext = url.pathExtension.lowercased()
+        return ["ts", "m2ts", "mts"].contains(ext) ? "stream.\(ext)" : nil
     }
 
     /// AE#859: an MPEG-DASH manifest by URL extension, opened as DASH without a first look at the body.
@@ -1101,6 +1110,7 @@ public final class Demuxer: @unchecked Sendable {
     private func openWithProvider(
         _ provider: AVIOProvider,
         inputFormat: UnsafePointer<AVInputFormat>? = nil,
+        filenameHint: String? = nil,
         isLive: Bool = false
     ) throws {
         // Audit DMX-102: the provider is published BEFORE it connects, under the same lock that
@@ -1224,7 +1234,9 @@ public final class Demuxer: @unchecked Sendable {
             av_dict_set(&opts, "codec_whitelist", "aether_no_decoders", 0)
         }
         if fragmentRandomAccess != nil { av_dict_set(&opts, "lazy_frag_index", "1", 0) }
-        let ret = avformat_open_input(&ctxPtr, nil, inputFormat, &opts)
+        // Pass only a sanitized extension hint (e.g. "stream.ts") when available; because pb is
+        // already bound, avformat_open_input never opens it and only feeds it to av_probe_input_buffer2.
+        let ret = avformat_open_input(&ctxPtr, filenameHint, inputFormat, &opts)
         av_dict_free(&opts)
         guard ret == 0 else {
             formatContext = nil
