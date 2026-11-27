@@ -25,6 +25,9 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     /// The URL the host gave `httpHeaders` for. A companion inherits its parent's, since its own
     /// playlist URL is one the master named (audit NET-7).
     let credentialOrigin: URL
+    /// For `.companionAudio`, the parent main reader's `budgetOriginURL` so capped origin slots can
+    /// be partitioned cleanly across the video and audio pipelines.
+    private let partnerOriginURL: URL?
     private let role: Role
     private let fifo = ByteFIFO(capacity: 16 * 1024 * 1024)
     /// Wider than the VOD reader's 2 MB: a live window with hours of DVR at short segments is a
@@ -91,7 +94,8 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
 
     /// Coalesced state for one in-flight AES-128 key fetch. Accessed exclusively under `keyCacheLock`;
     /// continuations are always resumed outside the lock. Cancelling one waiter wakes only that waiter
-    /// without aborting the shared fetch that sibling segments still need; `close()` cancels the task.
+    /// while sibling segments still wait on the shared fetch; cancelling the last active waiter aborts
+    /// the fetch task too so a hung key URI does not hold an origin slot after every segment gave up.
     private final class InFlightKeyFetch: @unchecked Sendable {
         let id: UInt64
         var task: Task<Void, Never>?
@@ -99,11 +103,13 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         private var waiters: [UInt64: CheckedContinuation<Data, Error>] = [:]
         private var cancelledWaiters: Set<UInt64> = []
         private var nextWaiterID: UInt64 = 0
+        private var activeWaiters = 0
 
         init(id: UInt64) { self.id = id }
 
         func reserveWaiterID() -> UInt64 {
             nextWaiterID &+= 1
+            activeWaiters += 1
             return nextWaiterID
         }
 
@@ -118,19 +124,23 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
             return nil
         }
 
-        func cancelWaiter(_ waiterID: UInt64) -> CheckedContinuation<Data, Error>? {
+        func cancelWaiter(_ waiterID: UInt64) -> (continuation: CheckedContinuation<Data, Error>?, shouldAbortTask: Bool) {
+            guard result == nil else { return (nil, false) }
             if let continuation = waiters.removeValue(forKey: waiterID) {
-                return continuation
+                activeWaiters = max(0, activeWaiters - 1)
+                return (continuation, activeWaiters == 0)
             }
-            if result == nil {
-                cancelledWaiters.insert(waiterID)
+            if cancelledWaiters.insert(waiterID).inserted {
+                activeWaiters = max(0, activeWaiters - 1)
+                return (nil, activeWaiters == 0)
             }
-            return nil
+            return (nil, false)
         }
 
         func finish(with result: Result<Data, Error>) -> [CheckedContinuation<Data, Error>] {
             guard self.result == nil else { return [] }
             self.result = result
+            activeWaiters = 0
             cancelledWaiters.removeAll()
             let pending = Array(waiters.values)
             waiters.removeAll()
@@ -145,10 +155,31 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
 
     /// AE#678: the prefetch window narrowed to the origin's request budget. A host that declares
     /// `maxConcurrentSourceRequests = 1` for a single-connection provider meant every request this
-    /// reader makes, and four parallel segment fetches were four connections to it.
-    static func segmentFetchConcurrency(budgetLimit: Int?) -> Int {
+    /// reader makes, and four parallel segment fetches were four connections to it. When main video
+    /// and a demuxed companion audio reader share a multi-slot capped origin, partition the cap across
+    /// both pipelines so their combined segment fetches stay within `budgetLimit`.
+    static func segmentFetchConcurrency(
+        budgetLimit: Int?,
+        sharesOriginWithPartner: Bool = false,
+        role: Role = .mainVideo
+    ) -> Int {
         guard let budgetLimit else { return maxConcurrentSegmentFetches }
-        return max(1, min(maxConcurrentSegmentFetches, budgetLimit))
+        let effectiveLimit = effectiveReaderSlotLimit(
+            budgetLimit: budgetLimit,
+            sharesOriginWithPartner: sharesOriginWithPartner,
+            role: role
+        ) ?? maxConcurrentSegmentFetches
+        return max(1, min(maxConcurrentSegmentFetches, effectiveLimit))
+    }
+
+    static func effectiveReaderSlotLimit(
+        budgetLimit: Int?,
+        sharesOriginWithPartner: Bool,
+        role: Role
+    ) -> Int? {
+        guard let budgetLimit else { return nil }
+        guard sharesOriginWithPartner, budgetLimit > 1 else { return max(1, budgetLimit) }
+        return role == .mainVideo ? (budgetLimit + 1) / 2 : budgetLimit / 2
     }
 
     /// The URL the host loaded, which is what `OriginRequestBudget` keys the declared ceiling on.
@@ -418,6 +449,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
 
     init(playlistURL: URL, httpHeaders: [String: String] = [:], role: Role,
          credentialOrigin: URL? = nil,
+         partnerOriginURL: URL? = nil,
          diagnosticContext: SourceNetworkDiagnostics.Context? = SourceNetworkDiagnostics.context,
          followsSessionHeaders: Bool = false) {
         self.followsSessionHeaders = followsSessionHeaders
@@ -425,6 +457,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         self.playlistURL = playlistURL
         self.httpHeaders = httpHeaders
         self.credentialOrigin = credentialOrigin ?? playlistURL
+        self.partnerOriginURL = partnerOriginURL
         self.role = role
         self.session = Self.sharedSession
     }
@@ -646,6 +679,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         } catch let error as HLSIngestError {
             startLock.withLock { _terminalFailure = error }
             EngineLog.emit("[HLSIngest] terminal: \(error)", category: .engine)
+            closeCompanionOnTerminalFailure()
             fifo.cancel()
         } catch {
             if Task.isCancelled || (error as? URLError)?.code == .cancelled {
@@ -653,8 +687,13 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
             }
             startLock.withLock { _terminalFailure = error }
             EngineLog.emit("[HLSIngest] terminal (transport): \(error.localizedDescription)", category: .engine)
+            closeCompanionOnTerminalFailure()
             fifo.cancel()
         }
+    }
+
+    private func closeCompanionOnTerminalFailure() {
+        startLock.withLock { _companionAudioReader }?.close()
     }
 
     /// #177: bounded prefetch pipeline over one batch of fresh segments. Up to
@@ -678,8 +717,19 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
             }
             return (segment, url)
         }
+        let budgetLimit = OriginRequestBudget.shared.limit(for: mediaURL)
+        let sharesPartner = hasActiveSharedOriginPartner(for: mediaURL)
+        let readerSlotLimit = Self.effectiveReaderSlotLimit(
+            budgetLimit: budgetLimit,
+            sharesOriginWithPartner: sharesPartner,
+            role: role
+        )
         let window = Self.segmentFetchConcurrency(
-            budgetLimit: OriginRequestBudget.shared.limit(for: mediaURL))
+            budgetLimit: budgetLimit,
+            sharesOriginWithPartner: sharesPartner,
+            role: role
+        )
+        let batchSegmentConcurrency = min(window, resolved.count)
         return try await withThrowingTaskGroup(of: (Int, Data).self) { group -> Bool in
             var nextToSpawn = 0
             var nextToCommit = 0
@@ -693,7 +743,14 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
                 while nextToSpawn < resolved.count,
                       nextToSpawn < nextToCommit + window,
                       isDue(nextToSpawn) {
-                    spawnFetch(into: &group, index: nextToSpawn, item: resolved[nextToSpawn], mediaURL: mediaURL)
+                    spawnFetch(
+                        into: &group,
+                        index: nextToSpawn,
+                        item: resolved[nextToSpawn],
+                        mediaURL: mediaURL,
+                        readerSlotLimit: readerSlotLimit,
+                        batchSegmentConcurrency: batchSegmentConcurrency
+                    )
                     nextToSpawn += 1
                 }
             }
@@ -738,6 +795,38 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         }
     }
 
+    private func hasActiveSharedOriginPartner(for mediaURL: URL) -> Bool {
+        switch role {
+        case .mainVideo:
+            guard let companion = startLock.withLock({ _companionAudioReader }),
+                  !companion.isIngestClosed else {
+                return false
+            }
+            return OriginRequestBudget.shared.sharesBudget(between: mediaURL, and: companion.budgetOriginURL)
+        case .companionAudio:
+            guard let partnerOriginURL else { return false }
+            return OriginRequestBudget.shared.sharesBudget(between: mediaURL, and: partnerOriginURL)
+        }
+    }
+
+    static func allowsSpeculativeKeyOverlap(
+        readerOriginURL: URL,
+        mediaURL: URL,
+        keyURL: URL,
+        readerSlotLimit: Int?,
+        batchSegmentConcurrency: Int
+    ) -> Bool {
+        guard allowsSpeculativeOverlap(readerOriginURL: readerOriginURL, targetURL: keyURL) else {
+            return false
+        }
+        if let readerSlotLimit,
+           OriginRequestBudget.shared.sharesBudget(between: mediaURL, and: keyURL),
+           batchSegmentConcurrency >= readerSlotLimit {
+            return false
+        }
+        return true
+    }
+
     /// One in-flight prefetch: fetch plus (for AES-128 sources) inline decrypt. When the key origin
     /// allows concurrency and the key is not cached, the key fetch starts in parallel with the
     /// segment download and coalesces with sibling tasks sharing the same key URI. Classification
@@ -746,14 +835,22 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         into group: inout ThrowingTaskGroup<(Int, Data), Error>,
         index: Int,
         item: (segment: HLSMediaSegment, url: URL),
-        mediaURL: URL
+        mediaURL: URL,
+        readerSlotLimit: Int?,
+        batchSegmentConcurrency: Int
     ) {
         group.addTask {
             let crypt = item.segment.crypt
             let keyURL = crypt.flatMap { HLSPlaylistParser.resolve(uri: $0.keyURI, against: mediaURL) }
             let prefetchedKey: Task<Data, Error>?
             if let keyURL,
-               Self.allowsSpeculativeOverlap(readerOriginURL: self.budgetOriginURL, targetURL: keyURL),
+               Self.allowsSpeculativeKeyOverlap(
+                   readerOriginURL: self.budgetOriginURL,
+                   mediaURL: mediaURL,
+                   keyURL: keyURL,
+                   readerSlotLimit: readerSlotLimit,
+                   batchSegmentConcurrency: batchSegmentConcurrency
+               ),
                !self.hasCachedKey(for: keyURL) {
                 prefetchedKey = Task { try await self.fetchKey(keyURL) }
             } else {
@@ -871,7 +968,8 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
                 )
                 let companion = HLSLiveIngestReader(
                     playlistURL: audioURL, httpHeaders: currentHeaders, role: .companionAudio,
-                    credentialOrigin: credentialOrigin, diagnosticContext: diagnosticContext,
+                    credentialOrigin: credentialOrigin, partnerOriginURL: budgetOriginURL,
+                    diagnosticContext: diagnosticContext,
                     followsSessionHeaders: followsSessionHeaders)
                 if let store = startLock.withLock({ _headerStore }) { companion.adoptSessionHeaderStore(store) }
                 installCompanion(companion)
@@ -1193,7 +1291,11 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         for continuation in pendingWaiters { continuation.resume(throwing: CancellationError()) }
     }
 
-    private func awaitSharedKeyFetch(_ entry: InFlightKeyFetch, waiterID: UInt64) async throws -> Data {
+    private func awaitSharedKeyFetch(
+        _ entry: InFlightKeyFetch,
+        waiterID: UInt64,
+        cacheKey: String
+    ) async throws -> Data {
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 let immediate: Result<Data, Error>? = keyCacheLock.withLock {
@@ -1204,9 +1306,19 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
                 }
             }
         } onCancel: {
-            let cancelled: CheckedContinuation<Data, Error>? = keyCacheLock.withLock {
-                entry.cancelWaiter(waiterID)
-            }
+            let (cancelled, taskToAbort): (CheckedContinuation<Data, Error>?, Task<Void, Never>?) =
+                keyCacheLock.withLock {
+                    let outcome = entry.cancelWaiter(waiterID)
+                    guard outcome.shouldAbortTask else {
+                        return (outcome.continuation, nil)
+                    }
+                    if inFlightKeyFetches[cacheKey]?.id == entry.id {
+                        inFlightKeyFetches.removeValue(forKey: cacheKey)
+                    }
+                    _ = entry.finish(with: .failure(CancellationError()))
+                    return (outcome.continuation, entry.task)
+                }
+            taskToAbort?.cancel()
             cancelled?.resume(throwing: CancellationError())
         }
     }
@@ -1264,7 +1376,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         case .cached(let data):
             return data
         case .inFlight(let entry, let waiterID):
-            let data = try await awaitSharedKeyFetch(entry, waiterID: waiterID)
+            let data = try await awaitSharedKeyFetch(entry, waiterID: waiterID, cacheKey: cacheKey)
             try Task.checkCancellation()
             return data
         }
@@ -1300,4 +1412,5 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     }
 
     var cachedKeyCount: Int { keyCacheLock.withLock { keyCache.count } }
+    var inFlightKeyFetchCount: Int { keyCacheLock.withLock { inFlightKeyFetches.count } }
 }

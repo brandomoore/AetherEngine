@@ -177,16 +177,34 @@ struct DemuxerOpenProfile: Sendable {
         skipStreamInfo: false
     )
 
-    /// Live playback open profile: bounds `avformat_find_stream_info` for realtime streams while
-    /// keeping `.playback` AVIO tuning and decoder-backed parameter probing.
+    /// Live playback open profile for raw HTTP streams and general custom readers that may join
+    /// mid-GOP without segment-boundary alignment.
     ///
-    /// `maxAnalyzeDuration` (5 s) stays strictly above `TransportStreamHeaderWait.releaseAfterNanoseconds`
-    /// (2.5 s) so missing-PMT multi-program transport streams still release cleanly.
     /// `fpsProbeSize` (6) cuts FFmpeg's default 20-frame MPEG-TS `tb_unreliable` wait to 6 frames
-    /// while preserving frame-rate and interlaced `field_order` probing.
+    /// on healthy streams while preserving frame-rate and interlaced `field_order` probing.
+    /// `probesize` (32 MiB) and `maxAnalyzeDuration` (15 s) stay wide enough to reach the first
+    /// in-band SPS/PPS + IDR keyframe across 10 s GOPs, high-bitrate broadcast/UHD streams, and
+    /// 6 s late TV PMTs (`MissingPMTLiveOpenTests`) so `videoStreamIndex` does not come back `-1`
+    /// and misroute a live video channel onto `.audio`, while still bounding dead-PID live streams
+    /// 4x tighter than VOD's 60 s ceiling.
     static let livePlayback: DemuxerOpenProfile = {
         var profile = playback.withProbeBudget(
-            probesize: 5 * 1024 * 1024,
+            probesize: 32 * 1024 * 1024,
+            maxAnalyzeDuration: 15 * 1_000_000
+        )
+        profile.fpsProbeSize = 6
+        return profile
+    }()
+
+    /// Live HLS ingest open profile (`HLSLiveIngestReader` and its companion audio rendition),
+    /// where joined media segments start at segment boundaries with PAT/PMT + IDR at the head.
+    ///
+    /// `maxAnalyzeDuration` (5 s) stays strictly above `TransportStreamHeaderWait.releaseAfterNanoseconds`
+    /// (2.5 s) so missing-PMT multi-program transport streams still release cleanly, and `8 MiB`
+    /// covers `fpsProbeSize` (6 frames) even on high-bitrate UHD segments.
+    static let liveHLSIngest: DemuxerOpenProfile = {
+        var profile = playback.withProbeBudget(
+            probesize: 8 * 1024 * 1024,
             maxAnalyzeDuration: 5 * 1_000_000
         )
         profile.fpsProbeSize = 6

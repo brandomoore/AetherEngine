@@ -806,6 +806,15 @@ final class OriginRequestBudget: @unchecked Sendable {
         return origins[headLocked(raw)]?.limit
     }
 
+    /// True when `lhs` and `rhs` resolve to the same origin budget bucket (directly or through a
+    /// recorded redirect chain).
+    func sharesBudget(between lhs: URL, and rhs: URL) -> Bool {
+        guard let leftRaw = Self.originKey(for: lhs),
+              let rightRaw = Self.originKey(for: rhs) else { return false }
+        lock.lock(); defer { lock.unlock() }
+        return headLocked(leftRaw) == headLocked(rightRaw)
+    }
+
     /// True when this origin is down to one request at a time. The reader asks this to switch OFF
     /// its speculative parallel paths rather than queue them: a detour block, the tail prefetch and
     /// the staggered probe fan all exist to overlap with the pump, and overlapping is the one thing

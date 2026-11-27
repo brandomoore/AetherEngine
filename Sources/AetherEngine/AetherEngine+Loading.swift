@@ -22,10 +22,21 @@ extension AetherEngine {
             readNow: { Self.displayCapabilities })
     }
 
+    nonisolated static func basePlaybackOpenProfile(
+        isLive: Bool,
+        isHLSLiveIngest: Bool
+    ) -> DemuxerOpenProfile {
+        guard isLive else { return .playback }
+        return isHLSLiveIngest ? .liveHLSIngest : .livePlayback
+    }
+
     /// The open profile every playback open uses (the probe, the loaders and the reload rebuild), so a
     /// new profile field reaches all of them. Audit LOAD-R202.
     func playbackOpenProfile(options: LoadOptions) -> DemuxerOpenProfile {
-        let profile: DemuxerOpenProfile = options.isLive ? .livePlayback : .playback
+        let profile = Self.basePlaybackOpenProfile(
+            isLive: options.isLive,
+            isHLSLiveIngest: customReader is HLSLiveIngestReader
+        )
         return profile.withProbeBudget(
             probesize: options.probesize, maxAnalyzeDuration: options.maxAnalyzeDuration)
             .withSequentialOrigin(options.sequentialOrigin, declaredDuration: options.declaredDurationSeconds)

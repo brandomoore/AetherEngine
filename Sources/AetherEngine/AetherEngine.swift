@@ -3058,6 +3058,16 @@ public final class AetherEngine: ObservableObject {
     /// Test seam: called right after `probe.close()` in the early-supersession cleanup path.
     var earlySupersededProbeCloseObserverForTesting: (@Sendable () -> Void)?
 
+    /// Stops background live-ingest polling when `load()` fails into `.error` without running
+    /// `stopInternal()`. Always closes an eagerly started companion audio reader; also closes the
+    /// main `HLSLiveIngestReader` when the engine created it for its own reroute.
+    private func closeFailedLoadLiveIngest() {
+        (customReader as? LiveIngestSourceInfo)?.companionAudioReader?.close()
+        if let ingest = customReader as? HLSLiveIngestReader, ingest.followsSessionHeaders {
+            ingest.close()
+        }
+    }
+
     // A replacement may reuse this reader only after the inspection and its close have joined.
     @MainActor
     final class ReopenedSourceInspection {
@@ -5663,6 +5673,7 @@ public final class AetherEngine: ObservableObject {
         }
         if enhancementInspectionFailed, let failure = probeFailure {
             // Never hand a possibly interrupted parser to a playback host or reopen it silently.
+            closeFailedLoadLiveIngest()
             probe.markClosed()
             BlockingWork.detached { [probe] in probe.close() }
             publishLoadFailure(failure)
@@ -5677,6 +5688,7 @@ public final class AetherEngine: ObservableObject {
 
         // Custom sources have no URL to reopen from: a failed probe is fatal.
         if case .custom(let reader, _) = source, !probeOpened {
+            closeFailedLoadLiveIngest()
             // The engine's own live HLS ingest knows why it handed the probe nothing: its playlist
             // was refused or could not be reached. That is the source's answer, typed as an HTTP
             // reader's is (`publishLoadFailure`), not a stream the probe could not read: a host that
@@ -5797,6 +5809,7 @@ public final class AetherEngine: ObservableObject {
         isSourceSeekable = probeOpened ? probe.isSourceSeekable : nil
         if options.nativeSourcePlaybackRange != nil,
            !probeOpened || probe.videoStreamIndex < 0 || !probe.isSourceSeekable {
+            closeFailedLoadLiveIngest()
             probe.markClosed()
             BlockingWork.detached { [probe] in probe.close() }
             let failure = AetherEngineError.authoredPlaybackIntervalUnsupported
@@ -6014,6 +6027,7 @@ public final class AetherEngine: ObservableObject {
                 throw CancellationError()
             } catch {
                 if loadGeneration != gen { throw CancellationError() }
+                closeFailedLoadLiveIngest()
                 publishLoadFailure(error)
                 throw error
             }
@@ -6701,6 +6715,7 @@ public final class AetherEngine: ObservableObject {
                dvProfile: correctedDVProfile ?? dvConfig.profile,
                dvBlCompatID: dvConfig.blCompatID,
                presentsDolbyVisionBaseLayer: presentsDolbyVisionBaseLayer) {
+            closeFailedLoadLiveIngest()
             probe.markClosed()
             BlockingWork.detached { [probe] in probe.close() }
             let profileLabel = detectedCodecID == AV_CODEC_ID_AV1 ? "10.0" : "5"
@@ -6718,7 +6733,7 @@ public final class AetherEngine: ObservableObject {
         if useSoftwarePath, options.isLive,
            (customReader as? LiveIngestSourceInfo)?.companionAudioReader != nil,
            probe.audioStreamIndex < 0 {
-            (customReader as? LiveIngestSourceInfo)?.companionAudioReader?.close()
+            closeFailedLoadLiveIngest()
             probe.markClosed()
             BlockingWork.detached { [probe] in probe.close() }
             EngineLog.emit(
@@ -6732,7 +6747,7 @@ public final class AetherEngine: ObservableObject {
 
         do {
             if options.nativeSourcePlaybackRange != nil, useSoftwarePath {
-                (customReader as? LiveIngestSourceInfo)?.companionAudioReader?.close()
+                closeFailedLoadLiveIngest()
                 probe.markClosed()
                 BlockingWork.detached { [probe] in probe.close() }
                 throw AetherEngineError.authoredPlaybackIntervalUnsupported
@@ -7042,6 +7057,7 @@ public final class AetherEngine: ObservableObject {
                 _ = try await load(source: .url(hlsURL), startPosition: startPosition, options: rerouted)
                 return nil
             }
+            closeFailedLoadLiveIngest()
             publishLoadFailure(error)
             throw error
         }

@@ -15,29 +15,41 @@ struct LiveDemuxerProbeBudgetTests {
         #expect(playback.skipStreamInfo == false)
     }
 
-    @Test("livePlayback profile bounds probe budget while staying above the missing-PMT release window")
+    @Test("livePlayback and liveHLSIngest profiles preserve raw mid-GOP headroom while bounding HLS ingest")
     func livePlaybackProfileBoundsAndInvariants() {
         let live = DemuxerOpenProfile.livePlayback
+        let liveHLS = DemuxerOpenProfile.liveHLSIngest
         let playback = DemuxerOpenProfile.playback
 
-        #expect(live.probesize == 5 * 1024 * 1024)
-        #expect(live.maxAnalyzeDuration == 5 * 1_000_000)
+        // Raw mid-GOP live TS / custom readers keep enough ceiling for 10 s GOPs and 6 s late PMTs.
+        #expect(live.probesize == 32 * 1024 * 1024)
+        #expect(live.maxAnalyzeDuration == 15 * 1_000_000)
         #expect(live.fpsProbeSize == 6)
         #expect(live.allowsProbeDecoding == true)
         #expect(live.skipStreamInfo == false)
 
-        // maxAnalyzeDuration is in microseconds (AV_TIME_BASE = 1_000_000); releaseAfterNanoseconds is in ns.
-        let analyzeDurationNanoseconds = UInt64(live.maxAnalyzeDuration) * 1_000
-        #expect(analyzeDurationNanoseconds > TransportStreamHeaderWait.releaseAfterNanoseconds)
+        // Keyframe-aligned HLS live ingest uses the tighter 8 MiB / 5 s ceiling while staying
+        // strictly above the 2.5 s missing-PMT release window.
+        #expect(liveHLS.probesize == 8 * 1024 * 1024)
+        #expect(liveHLS.maxAnalyzeDuration == 5 * 1_000_000)
+        #expect(liveHLS.fpsProbeSize == 6)
+        #expect(liveHLS.allowsProbeDecoding == true)
+        #expect(liveHLS.skipStreamInfo == false)
 
-        // AVIO tuning stays identical to .playback.
-        #expect(live.avioPrefetch == playback.avioPrefetch)
-        #expect(live.avioChunkSize == playback.avioChunkSize)
-        #expect(live.avioRequestTimeout == playback.avioRequestTimeout)
-        #expect(live.avioMaxRetries == playback.avioMaxRetries)
+        // maxAnalyzeDuration is in microseconds (AV_TIME_BASE = 1_000_000); releaseAfterNanoseconds is in ns.
+        #expect(UInt64(live.maxAnalyzeDuration) * 1_000 > TransportStreamHeaderWait.releaseAfterNanoseconds)
+        #expect(UInt64(liveHLS.maxAnalyzeDuration) * 1_000 > TransportStreamHeaderWait.releaseAfterNanoseconds)
+
+        // AVIO tuning stays identical to .playback on both live profiles.
+        for candidate in [live, liveHLS] {
+            #expect(candidate.avioPrefetch == playback.avioPrefetch)
+            #expect(candidate.avioChunkSize == playback.avioChunkSize)
+            #expect(candidate.avioRequestTimeout == playback.avioRequestTimeout)
+            #expect(candidate.avioMaxRetries == playback.avioMaxRetries)
+        }
     }
 
-    @Test("playbackOpenProfile selects .playback for VOD and .livePlayback for live")
+    @Test("playbackOpenProfile selects .playback for VOD, .livePlayback for raw live, and .liveHLSIngest for HLS ingest")
     @MainActor
     func playbackOpenProfileSelectsByLiveFlag() throws {
         let engine = try AetherEngine()
@@ -55,6 +67,11 @@ struct LiveDemuxerProbeBudgetTests {
         #expect(liveProfile.probesize == DemuxerOpenProfile.livePlayback.probesize)
         #expect(liveProfile.maxAnalyzeDuration == DemuxerOpenProfile.livePlayback.maxAnalyzeDuration)
         #expect(liveProfile.fpsProbeSize == 6)
+
+        let hlsIngestProfile = AetherEngine.basePlaybackOpenProfile(isLive: true, isHLSLiveIngest: true)
+        #expect(hlsIngestProfile.probesize == DemuxerOpenProfile.liveHLSIngest.probesize)
+        #expect(hlsIngestProfile.maxAnalyzeDuration == DemuxerOpenProfile.liveHLSIngest.maxAnalyzeDuration)
+        #expect(hlsIngestProfile.fpsProbeSize == 6)
     }
 
     @Test("playbackOpenProfile honors explicit probesize and maxAnalyzeDuration overrides on live and VOD")
@@ -94,16 +111,33 @@ struct LiveDemuxerProbeBudgetTests {
         #expect(liveSession.openProfile.probesize == DemuxerOpenProfile.livePlayback.probesize)
         #expect(liveSession.openProfile.maxAnalyzeDuration == DemuxerOpenProfile.livePlayback.maxAnalyzeDuration)
         #expect(liveSession.openProfile.fpsProbeSize == 6)
+        #expect(liveSession.companionOpenProfile.probesize == DemuxerOpenProfile.livePlayback.probesize)
+
+        let companion = HLSLiveIngestReader(playlistURL: URL(string: "http://127.0.0.1:9/audio.m3u8")!)
+        defer { companion.close() }
+        let liveSessionWithCompanion = HLSVideoEngine(
+            url: url,
+            isLiveSession: true,
+            companionAudioReader: companion
+        )
+        #expect(liveSessionWithCompanion.openProfile.probesize == DemuxerOpenProfile.livePlayback.probesize)
+        #expect(liveSessionWithCompanion.companionOpenProfile.probesize == DemuxerOpenProfile.liveHLSIngest.probesize)
+        #expect(liveSessionWithCompanion.companionOpenProfile.maxAnalyzeDuration == DemuxerOpenProfile.liveHLSIngest.maxAnalyzeDuration)
+        #expect(liveSessionWithCompanion.companionOpenProfile.fpsProbeSize == 6)
 
         let overriddenLiveSession = HLSVideoEngine(
             url: url,
             isLiveSession: true,
+            companionAudioReader: companion,
             probesize: 3 * 1024 * 1024,
             maxAnalyzeDuration: 4 * 1_000_000
         )
         #expect(overriddenLiveSession.openProfile.probesize == 3 * 1024 * 1024)
         #expect(overriddenLiveSession.openProfile.maxAnalyzeDuration == 4 * 1_000_000)
         #expect(overriddenLiveSession.openProfile.fpsProbeSize == 6)
+        #expect(overriddenLiveSession.companionOpenProfile.probesize == 3 * 1024 * 1024)
+        #expect(overriddenLiveSession.companionOpenProfile.maxAnalyzeDuration == 4 * 1_000_000)
+        #expect(overriddenLiveSession.companionOpenProfile.fpsProbeSize == 6)
     }
 
     @Test("Demuxer.open with livePlayback opens TinyTransportStreamFixture cleanly as mpegts")

@@ -341,7 +341,7 @@ private struct PacedOpen {
         }
 
         let opening = Task { await openOffTheTestThread(demuxer, url: url,
-                                                        profile: .playback.withReaderLabel(marker)) }
+                                                        profile: .livePlayback.withReaderLabel(marker)) }
         _ = await opening.value
 
         let line = try #require(capture.matching("open timings (\(marker))").first,

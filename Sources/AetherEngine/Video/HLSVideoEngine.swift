@@ -1352,6 +1352,17 @@ public final class HLSVideoEngine: @unchecked Sendable {
             .withSourceOpenPolicy(sourceOpenPolicy)
             .withUntaggedVideoColor(untaggedVideoColor)
             .withDiagnosticContext(diagnosticContext)
+        let companionBaseProfile: DemuxerOpenProfile = companionAudioReader is HLSLiveIngestReader
+            ? .liveHLSIngest
+            : baseOpenProfile
+        self.companionOpenProfile = companionBaseProfile.withProbeBudget(
+            probesize: probesize, maxAnalyzeDuration: maxAnalyzeDuration)
+            .withSequentialOrigin(sequentialOrigin, declaredDuration: declaredDurationSeconds)
+            .withHeldSourceConnection(heldSourceConnection)
+            .skippingAttachments()
+            .withSourceOpenPolicy(sourceOpenPolicy)
+            .withUntaggedVideoColor(untaggedVideoColor)
+            .withDiagnosticContext(diagnosticContext)
         self.dvModeAvailable = dvModeAvailable
         self.displaySupportsHDR = displaySupportsHDR
         self.keepDvh1TagWithoutDV = keepDvh1TagWithoutDV
@@ -1515,7 +1526,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         }
         let side = Demuxer()
         do {
-            try side.open(reader: companion, formatHint: formatHint, profile: openProfile, isLive: true)
+            try side.open(reader: companion, formatHint: formatHint, profile: companionOpenProfile, isLive: true)
         } catch {
             throw HLSVideoEngineError.openFailed(reason: "demuxed-audio companion open failed (\(error))")
         }
@@ -1600,11 +1611,14 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Consumed in `start()`; unconsumed instances are closed by `stop()`.
     private var preopenedDemuxer: Demuxer?
 
-    /// Open profile carrying the probe budget (#68) for the fallback open, companion audio open,
-    /// and live reopen: `.livePlayback` for live sessions and `.playback` for VOD, unless the
-    /// caller set `LoadOptions.probesize` / `maxAnalyzeDuration`. Read in the `+LiveReopen`
-    /// extension, so it cannot be file-private.
+    /// Open profile carrying the probe budget (#68) for the fallback open and live reopen:
+    /// `.livePlayback` for live sessions and `.playback` for VOD, unless the caller set
+    /// `LoadOptions.probesize` / `maxAnalyzeDuration`. Read in the `+LiveReopen` extension, so it
+    /// cannot be file-private.
     let openProfile: DemuxerOpenProfile
+    /// Open profile for `openCompanionAudio`: `.liveHLSIngest` when backed by `HLSLiveIngestReader`
+    /// (with caller overrides preserved), matching `openProfile` otherwise.
+    let companionOpenProfile: DemuxerOpenProfile
     /// #377: opt-in held source transport, carried onto every open this session makes itself.
     let heldSourceConnection: Bool
 
@@ -2379,8 +2393,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
             do {
                 audioDem = try openCompanionAudio(companion)
             } catch let error as HLSVideoEngineError {
-                guard let muxedFallback else { throw error }
                 companion.close()
+                guard let muxedFallback else { throw error }
                 EngineLog.emit(
                     "[HLSVideoEngine] demuxed-audio companion unusable (\(error)); keeping the audio "
                     + "muxed into the variant (stream \(muxedFallback.audioStreamIndex))",
