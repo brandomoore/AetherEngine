@@ -177,8 +177,8 @@ struct DemuxerOpenProfile: Sendable {
         skipStreamInfo: false
     )
 
-    /// Live playback open profile for raw HTTP streams and general custom readers that may join
-    /// mid-GOP without segment-boundary alignment.
+    /// Live playback open profile for sources that may join mid-GOP. This includes raw streams,
+    /// custom readers, and HLS ingest: joining at a segment boundary does not guarantee an IDR.
     ///
     /// `fpsProbeSize` (6) cuts FFmpeg's default 20-frame MPEG-TS `tb_unreliable` wait to 6 frames
     /// on healthy streams while preserving frame-rate and interlaced `field_order` probing.
@@ -196,13 +196,10 @@ struct DemuxerOpenProfile: Sendable {
         return profile
     }()
 
-    /// Live HLS ingest open profile (`HLSLiveIngestReader` and its companion audio rendition),
-    /// where joined media segments start at segment boundaries with PAT/PMT + IDR at the head.
-    ///
-    /// `maxAnalyzeDuration` (5 s) stays strictly above `TransportStreamHeaderWait.releaseAfterNanoseconds`
-    /// (2.5 s) so missing-PMT multi-program transport streams still release cleanly, and `8 MiB`
-    /// covers `fpsProbeSize` (6 frames) even on high-bitrate UHD segments.
-    static let liveHLSIngest: DemuxerOpenProfile = {
+    /// Tighter live HLS probe for an explicit audio-only load or a companion audio rendition,
+    /// where routing does not depend on finding video parameters at the next keyframe.
+    /// The 5 s analysis ceiling stays above the 2.5 s missing-PMT release window.
+    static let liveHLSAudioIngest: DemuxerOpenProfile = {
         var profile = playback.withProbeBudget(
             probesize: 8 * 1024 * 1024,
             maxAnalyzeDuration: 5 * 1_000_000

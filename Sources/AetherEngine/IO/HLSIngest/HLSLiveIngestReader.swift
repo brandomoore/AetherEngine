@@ -179,7 +179,8 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     ) -> Int? {
         guard let budgetLimit else { return nil }
         guard sharesOriginWithPartner, budgetLimit > 1 else { return max(1, budgetLimit) }
-        return role == .mainVideo ? (budgetLimit + 1) / 2 : budgetLimit / 2
+        let half = budgetLimit / 2
+        return role == .mainVideo ? half + budgetLimit % 2 : half
     }
 
     /// The URL the host loaded, which is what `OriginRequestBudget` keys the declared ceiling on.
@@ -710,26 +711,30 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     private func ingestSegmentBatch(_ segments: [HLSMediaSegment], mediaURL: URL,
                                     dueTimes: [Double]? = nil,
                                     onDelivered: (Int) -> Void = { _ in }) async throws -> Bool {
-        // Resolve every URI upfront so an unresolvable one throws before any fetch is spawned.
-        let resolved: [(segment: HLSMediaSegment, url: URL)] = try segments.map { segment in
+        // Resolve request origins before choosing the window. A bad segment URI fails the batch;
+        // a bad key URI still matters only if its segment is present.
+        let resolved: [(segment: HLSMediaSegment, url: URL, keyURL: URL?)] = try segments.map { segment in
             guard let url = HLSPlaylistParser.resolve(uri: segment.uri, against: mediaURL) else {
                 throw HLSIngestError.playlistInvalid(reason: "unresolvable segment URI")
             }
-            return (segment, url)
+            let keyURL = segment.crypt.flatMap { HLSPlaylistParser.resolve(uri: $0.keyURI, against: mediaURL) }
+            return (segment, url, keyURL)
         }
-        let budgetLimit = OriginRequestBudget.shared.limit(for: mediaURL)
-        let sharesPartner = hasActiveSharedOriginPartner(for: mediaURL)
-        let readerSlotLimit = Self.effectiveReaderSlotLimit(
-            budgetLimit: budgetLimit,
-            sharesOriginWithPartner: sharesPartner,
-            role: role
-        )
-        let window = Self.segmentFetchConcurrency(
-            budgetLimit: budgetLimit,
-            sharesOriginWithPartner: sharesPartner,
-            role: role
-        )
-        let batchSegmentConcurrency = min(window, resolved.count)
+        let budget = OriginRequestBudget.shared
+        func concurrency(for url: URL) -> Int {
+            guard let limit = budget.limit(for: url) else { return Self.maxConcurrentSegmentFetches }
+            return Self.segmentFetchConcurrency(
+                budgetLimit: limit, sharesOriginWithPartner: hasActiveSharedOriginPartner(for: url), role: role
+            )
+        }
+        // A task can make one request at a time to any capped origin, including an off-playlist
+        // key host. Bound the whole window by the tightest cap so even distinct cold keys fit.
+        var window = concurrency(for: mediaURL)
+        for item in resolved {
+            if window == 1 { break }
+            window = min(window, concurrency(for: item.url))
+            if let keyURL = item.keyURL { window = min(window, concurrency(for: keyURL)) }
+        }
         return try await withThrowingTaskGroup(of: (Int, Data).self) { group -> Bool in
             var nextToSpawn = 0
             var nextToCommit = 0
@@ -746,10 +751,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
                     spawnFetch(
                         into: &group,
                         index: nextToSpawn,
-                        item: resolved[nextToSpawn],
-                        mediaURL: mediaURL,
-                        readerSlotLimit: readerSlotLimit,
-                        batchSegmentConcurrency: batchSegmentConcurrency
+                        item: resolved[nextToSpawn]
                     )
                     nextToSpawn += 1
                 }
@@ -795,61 +797,43 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         }
     }
 
-    private func hasActiveSharedOriginPartner(for mediaURL: URL) -> Bool {
+    private func hasActiveSharedOriginPartner(for url: URL) -> Bool {
         switch role {
         case .mainVideo:
             guard let companion = startLock.withLock({ _companionAudioReader }),
                   !companion.isIngestClosed else {
                 return false
             }
-            return OriginRequestBudget.shared.sharesBudget(between: mediaURL, and: companion.budgetOriginURL)
+            return OriginRequestBudget.shared.sharesBudget(between: url, and: companion.budgetOriginURL)
         case .companionAudio:
             guard let partnerOriginURL else { return false }
-            return OriginRequestBudget.shared.sharesBudget(between: mediaURL, and: partnerOriginURL)
+            return OriginRequestBudget.shared.sharesBudget(between: url, and: partnerOriginURL)
         }
     }
 
-    static func allowsSpeculativeKeyOverlap(
-        readerOriginURL: URL,
-        mediaURL: URL,
-        keyURL: URL,
-        readerSlotLimit: Int?,
-        batchSegmentConcurrency: Int
-    ) -> Bool {
-        guard allowsSpeculativeOverlap(readerOriginURL: readerOriginURL, targetURL: keyURL) else {
-            return false
-        }
-        if let readerSlotLimit,
-           OriginRequestBudget.shared.sharesBudget(between: mediaURL, and: keyURL),
-           batchSegmentConcurrency >= readerSlotLimit {
-            return false
-        }
-        return true
+    static func allowsSpeculativeKeyOverlap(readerOriginURL: URL, segmentURL: URL, keyURL: URL) -> Bool {
+        let budget = OriginRequestBudget.shared
+        // Spare room for one key is not enough when every concurrent segment can have a
+        // different key URI. Keep capped requests sequential within each segment task.
+        guard budget.limit(for: segmentURL) == nil, budget.limit(for: keyURL) == nil else { return false }
+        return !budget.isPaced(segmentURL)
+            && allowsSpeculativeOverlap(readerOriginURL: readerOriginURL, targetURL: keyURL)
     }
 
-    /// One in-flight prefetch: fetch plus (for AES-128 sources) inline decrypt. When the key origin
-    /// allows concurrency and the key is not cached, the key fetch starts in parallel with the
+    /// One in-flight prefetch: fetch plus (for AES-128 sources) inline decrypt. When both origins
+    /// allow overlap and the key is not cached, the key fetch starts in parallel with the
     /// segment download and coalesces with sibling tasks sharing the same key URI. Classification
     /// stays on the ordered commit path (TS sync byte is only visible in plaintext).
     private func spawnFetch(
         into group: inout ThrowingTaskGroup<(Int, Data), Error>,
         index: Int,
-        item: (segment: HLSMediaSegment, url: URL),
-        mediaURL: URL,
-        readerSlotLimit: Int?,
-        batchSegmentConcurrency: Int
+        item: (segment: HLSMediaSegment, url: URL, keyURL: URL?)
     ) {
         group.addTask {
-            let crypt = item.segment.crypt
-            let keyURL = crypt.flatMap { HLSPlaylistParser.resolve(uri: $0.keyURI, against: mediaURL) }
             let prefetchedKey: Task<Data, Error>?
-            if let keyURL,
+            if let keyURL = item.keyURL,
                Self.allowsSpeculativeKeyOverlap(
-                   readerOriginURL: self.budgetOriginURL,
-                   mediaURL: mediaURL,
-                   keyURL: keyURL,
-                   readerSlotLimit: readerSlotLimit,
-                   batchSegmentConcurrency: batchSegmentConcurrency
+                   readerOriginURL: self.budgetOriginURL, segmentURL: item.url, keyURL: keyURL
                ),
                !self.hasCachedKey(for: keyURL) {
                 prefetchedKey = Task { try await self.fetchKey(keyURL) }
@@ -860,8 +844,8 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
 
             let fetched = try await self.fetchSegment(item.url, duration: item.segment.duration,
                                                       byteRange: item.segment.byteRange)
-            guard !fetched.isEmpty, let crypt else { return (index, fetched) }
-            guard let keyURL else {
+            guard !fetched.isEmpty, let crypt = item.segment.crypt else { return (index, fetched) }
+            guard let keyURL = item.keyURL else {
                 throw HLSIngestError.segmentDecryptFailed(reason: "unresolvable key URI")
             }
             let key: Data
@@ -943,6 +927,9 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         case .media(let media):
             return (finalURL, media) // direct media playlist: reuse parsed result
         case .master(let master):
+            // An audio rendition URI must name a media playlist. Only the main reader
+            // may resolve a master and install a companion.
+            guard role == .mainVideo else { throw HLSIngestError.demuxedAudioNotSupported }
             guard let best = master.variants.max(by: { $0.bandwidth < $1.bandwidth }),
                   let url = HLSPlaylistParser.resolve(uri: best.uri, against: finalURL) else {
                 throw HLSIngestError.playlistInvalid(reason: "no usable variant")

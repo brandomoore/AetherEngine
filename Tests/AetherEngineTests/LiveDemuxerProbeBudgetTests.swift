@@ -15,33 +15,31 @@ struct LiveDemuxerProbeBudgetTests {
         #expect(playback.skipStreamInfo == false)
     }
 
-    @Test("livePlayback and liveHLSIngest profiles preserve raw mid-GOP headroom while bounding HLS ingest")
+    @Test("Live video has mid-GOP headroom; audio-only HLS ingest keeps the tighter budget")
     func livePlaybackProfileBoundsAndInvariants() {
         let live = DemuxerOpenProfile.livePlayback
-        let liveHLS = DemuxerOpenProfile.liveHLSIngest
+        let liveHLSAudio = DemuxerOpenProfile.liveHLSAudioIngest
         let playback = DemuxerOpenProfile.playback
 
-        // Raw mid-GOP live TS / custom readers keep enough ceiling for 10 s GOPs and 6 s late PMTs.
+        // Live video, including HLS, keeps enough ceiling for 10 s GOPs and 6 s late PMTs.
         #expect(live.probesize == 32 * 1024 * 1024)
         #expect(live.maxAnalyzeDuration == 15 * 1_000_000)
         #expect(live.fpsProbeSize == 6)
         #expect(live.allowsProbeDecoding == true)
         #expect(live.skipStreamInfo == false)
 
-        // Keyframe-aligned HLS live ingest uses the tighter 8 MiB / 5 s ceiling while staying
-        // strictly above the 2.5 s missing-PMT release window.
-        #expect(liveHLS.probesize == 8 * 1024 * 1024)
-        #expect(liveHLS.maxAnalyzeDuration == 5 * 1_000_000)
-        #expect(liveHLS.fpsProbeSize == 6)
-        #expect(liveHLS.allowsProbeDecoding == true)
-        #expect(liveHLS.skipStreamInfo == false)
+        #expect(liveHLSAudio.probesize == 8 * 1024 * 1024)
+        #expect(liveHLSAudio.maxAnalyzeDuration == 5 * 1_000_000)
+        #expect(liveHLSAudio.fpsProbeSize == 6)
+        #expect(liveHLSAudio.allowsProbeDecoding == true)
+        #expect(liveHLSAudio.skipStreamInfo == false)
 
         // maxAnalyzeDuration is in microseconds (AV_TIME_BASE = 1_000_000); releaseAfterNanoseconds is in ns.
         #expect(UInt64(live.maxAnalyzeDuration) * 1_000 > TransportStreamHeaderWait.releaseAfterNanoseconds)
-        #expect(UInt64(liveHLS.maxAnalyzeDuration) * 1_000 > TransportStreamHeaderWait.releaseAfterNanoseconds)
+        #expect(UInt64(liveHLSAudio.maxAnalyzeDuration) * 1_000 > TransportStreamHeaderWait.releaseAfterNanoseconds)
 
         // AVIO tuning stays identical to .playback on both live profiles.
-        for candidate in [live, liveHLS] {
+        for candidate in [live, liveHLSAudio] {
             #expect(candidate.avioPrefetch == playback.avioPrefetch)
             #expect(candidate.avioChunkSize == playback.avioChunkSize)
             #expect(candidate.avioRequestTimeout == playback.avioRequestTimeout)
@@ -49,9 +47,9 @@ struct LiveDemuxerProbeBudgetTests {
         }
     }
 
-    @Test("playbackOpenProfile selects .playback for VOD, .livePlayback for raw live, and .liveHLSIngest for HLS ingest")
+    @Test("playbackOpenProfile selects .playback for VOD, .livePlayback for live, and .liveHLSAudioIngest for audio-only live HLS")
     @MainActor
-    func playbackOpenProfileSelectsByLiveFlag() throws {
+    func playbackOpenProfileSelectsByLiveAndAudioOnly() throws {
         let engine = try AetherEngine()
 
         var vodOptions = LoadOptions()
@@ -68,10 +66,10 @@ struct LiveDemuxerProbeBudgetTests {
         #expect(liveProfile.maxAnalyzeDuration == DemuxerOpenProfile.livePlayback.maxAnalyzeDuration)
         #expect(liveProfile.fpsProbeSize == 6)
 
-        let hlsIngestProfile = AetherEngine.basePlaybackOpenProfile(isLive: true, isHLSLiveIngest: true)
-        #expect(hlsIngestProfile.probesize == DemuxerOpenProfile.liveHLSIngest.probesize)
-        #expect(hlsIngestProfile.maxAnalyzeDuration == DemuxerOpenProfile.liveHLSIngest.maxAnalyzeDuration)
-        #expect(hlsIngestProfile.fpsProbeSize == 6)
+        let hlsAudioProfile = AetherEngine.basePlaybackOpenProfile(isLive: true, isHLSAudioOnly: true)
+        #expect(hlsAudioProfile.probesize == DemuxerOpenProfile.liveHLSAudioIngest.probesize)
+        #expect(hlsAudioProfile.maxAnalyzeDuration == DemuxerOpenProfile.liveHLSAudioIngest.maxAnalyzeDuration)
+        #expect(hlsAudioProfile.fpsProbeSize == 6)
     }
 
     @Test("playbackOpenProfile honors explicit probesize and maxAnalyzeDuration overrides on live and VOD")
@@ -98,7 +96,7 @@ struct LiveDemuxerProbeBudgetTests {
         #expect(liveProfile.fpsProbeSize == 6)
     }
 
-    @Test("HLSVideoEngine threads livePlayback vs playback onto openProfile and honors overrides")
+    @Test("HLSVideoEngine keeps the smaller live HLS companion audio budget and honors overrides on both opens")
     func hlsVideoEngineSelectsOpenProfileByLiveSession() {
         let url = URL(string: "https://origin.example/live/stream.ts")!
 
@@ -121,8 +119,8 @@ struct LiveDemuxerProbeBudgetTests {
             companionAudioReader: companion
         )
         #expect(liveSessionWithCompanion.openProfile.probesize == DemuxerOpenProfile.livePlayback.probesize)
-        #expect(liveSessionWithCompanion.companionOpenProfile.probesize == DemuxerOpenProfile.liveHLSIngest.probesize)
-        #expect(liveSessionWithCompanion.companionOpenProfile.maxAnalyzeDuration == DemuxerOpenProfile.liveHLSIngest.maxAnalyzeDuration)
+        #expect(liveSessionWithCompanion.companionOpenProfile.probesize == DemuxerOpenProfile.liveHLSAudioIngest.probesize)
+        #expect(liveSessionWithCompanion.companionOpenProfile.maxAnalyzeDuration == DemuxerOpenProfile.liveHLSAudioIngest.maxAnalyzeDuration)
         #expect(liveSessionWithCompanion.companionOpenProfile.fpsProbeSize == 6)
 
         let overriddenLiveSession = HLSVideoEngine(
@@ -138,6 +136,48 @@ struct LiveDemuxerProbeBudgetTests {
         #expect(overriddenLiveSession.companionOpenProfile.probesize == 3 * 1024 * 1024)
         #expect(overriddenLiveSession.companionOpenProfile.maxAnalyzeDuration == 4 * 1_000_000)
         #expect(overriddenLiveSession.companionOpenProfile.fpsProbeSize == 6)
+    }
+
+    @Test("Live HLS ingest resolves video parameters when the first keyframe is more than 5 s after joining")
+    @MainActor
+    func liveHLSProbeResolvesVideoAfterMidGOPJoin() async throws {
+        let ts = try LongGOPTransportStreamFixture.data()
+        let origin = try #require(RangeFilesOrigin())
+        defer { origin.stop() }
+        // PAT-aligned byte offsets near 2, 6, 10 and 14 s of the fixture. The first two
+        // segments have no SPS/PPS or IDR, and the third carries the first IDR after the join.
+        origin.serve("/seg0.ts", ts.subdata(in: 18_800..<55_084), contentType: "video/mp2t")
+        origin.serve("/seg1.ts", ts.subdata(in: 55_084..<93_248), contentType: "video/mp2t")
+        origin.serve("/seg2.ts", ts.subdata(in: 93_248..<129_344), contentType: "video/mp2t")
+        let playlist = """
+        #EXTM3U
+        #EXT-X-TARGETDURATION:4
+        #EXT-X-MEDIA-SEQUENCE:1
+        #EXTINF:4.0,
+        seg0.ts
+        #EXTINF:4.0,
+        seg1.ts
+        #EXTINF:4.0,
+        seg2.ts
+        #EXT-X-ENDLIST
+
+        """
+        origin.serve("/live.m3u8", Data(playlist.utf8), contentType: "application/vnd.apple.mpegurl")
+        let url = try #require(URL(string: "\(origin.baseURL)/live.m3u8"))
+        let engine = try AetherEngine()
+        defer { engine.stop() }
+        var options = LoadOptions()
+        options.isLive = true
+        options.autoplay = false
+        // This fixture is progressive. Avoid depending on native player startup; assert what the
+        // engine's routing probe learned, before either playback path examines the stream.
+        options.preferredDecodePath = .software
+        let probe = try #require(try await engine.load(url: url, options: options))
+        #expect(engine.customReader is HLSLiveIngestReader)
+        #expect(probe.videoCodecName == "h264")
+        #expect(probe.videoWidth == 32)
+        #expect(probe.videoHeight == 32)
+        #expect(engine.sourceVideoScan == .progressive)
     }
 
     @Test("Demuxer.open with livePlayback opens TinyTransportStreamFixture cleanly as mpegts")

@@ -905,6 +905,67 @@ struct HLSLiveIngestStartupOptimizationTests {
         }
     }
 
+    @Test("A master returned by the audio rendition cannot spawn a grandchild or break muxed fallback")
+    func companionMasterIsRejectedWithoutGrandchildrenAndKeepsMuxedAudio() async throws {
+        // Both links in the nested master are unserved (404), so even an unfixed reader cannot recurse indefinitely.
+        let audioMaster = Data("""
+        #EXTM3U
+        #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="nested",NAME="English",DEFAULT=YES,URI="grandchild.m3u8"
+        #EXT-X-STREAM-INF:BANDWIDTH=128000,AUDIO="nested"
+        nested-variant.m3u8
+        """.utf8)
+        let videoPlaylist = Data("""
+        #EXTM3U
+        #EXT-X-TARGETDURATION:2
+        #EXTINF:2.0,
+        v1.ts
+        #EXT-X-ENDLIST
+        """.utf8)
+        let origin = try #require(GatedHLSOrigin(routes: [
+            "/master.m3u8": .init(status: 200, body: Self.demuxedMasterPlaylist),
+            "/video.m3u8": .init(status: 200, body: videoPlaylist),
+            "/audio.m3u8": .init(status: 200, body: audioMaster),
+            "/v1.ts": .init(status: 200, body: Self.muxedVideoAudioTSData),
+        ]))
+        defer { origin.stop() }
+
+        let reader = HLSLiveIngestReader(playlistURL: origin.url("/master.m3u8"))
+        defer { reader.close() }
+        let profile = DemuxerOpenProfile.livePlayback.withProbeBudget(probesize: 4 * 1024, maxAnalyzeDuration: 500_000)
+        let preopened = try await BlockingWork.detached {
+            let dem = Demuxer()
+            try dem.open(reader: reader, formatHint: "mpegts", profile: profile, isLive: true)
+            return dem
+        }.value
+        let muxedAudioIndex = preopened.audioStreamIndex
+        try #require(muxedAudioIndex >= 0)
+        let companion = try #require(reader.companionAudioReader as? HLSLiveIngestReader)
+
+        let hint = await BlockingWork.detached { companion.resolveSegmentFormatHint() }.value
+        #expect(hint == nil)
+        #expect(companion.terminalError == .demuxedAudioNotSupported)
+        #expect(companion.companionAudioReader == nil)
+        #expect(reader.terminalError == nil)
+
+        let session = HLSVideoEngine(
+            url: URL(string: "aether-custom://source")!,
+            isLiveSession: true,
+            preopenedDemuxer: preopened,
+            sourceReopenableByURL: false,
+            companionAudioReader: companion
+        )
+        defer { session.stop() }
+        try await BlockingWork.detached { try session.prepare() }.value
+        #expect(companion.isIngestClosed)
+        #expect(session.activeAudioSourceStreamIndex == muxedAudioIndex)
+
+        for path in ["/master.m3u8", "/video.m3u8", "/v1.ts", "/audio.m3u8"] {
+            #expect(origin.hitCount(for: path) == 1)
+        }
+        #expect(origin.hitCount(for: "/nested-variant.m3u8") == 0)
+        #expect(origin.hitCount(for: "/grandchild.m3u8") == 0)
+    }
+
     @Test("HLSVideoEngine muxed-audio fallback closes unusable companion and lets joinIsSpent settle")
     func hlsVideoEngineMuxedFallbackClosesCompanionAndSettlesJoinIsSpent() async throws {
         let muxedSeg = Self.muxedVideoAudioTSData
@@ -1111,7 +1172,7 @@ struct HLSLiveIngestStartupOptimizationTests {
             let reader = HLSLiveIngestReader(playlistURL: origin.url("/master.m3u8"))
             defer { reader.close() }
 
-            let fastProbeProfile = DemuxerOpenProfile.liveHLSIngest.withProbeBudget(
+            let fastProbeProfile = DemuxerOpenProfile.livePlayback.withProbeBudget(
                 probesize: 4 * 1024,
                 maxAnalyzeDuration: 500_000
             )
@@ -1180,6 +1241,106 @@ struct HLSLiveIngestStartupOptimizationTests {
         let recovered = try await reader.fetchKey(keyURL)
         #expect(recovered == keyBytes)
         #expect(origin.hitCount(for: "/hung-key.bin") == 2)
+    }
+
+    @Test("Int.max origin slots split between main video and companion without overflow")
+    func effectiveReaderSlotLimitSplitsIntMaxWithoutOverflow() {
+        let main = HLSLiveIngestReader.effectiveReaderSlotLimit(
+            budgetLimit: Int.max, sharesOriginWithPartner: true, role: .mainVideo
+        )
+        let companion = HLSLiveIngestReader.effectiveReaderSlotLimit(
+            budgetLimit: Int.max, sharesOriginWithPartner: true, role: .companionAudio
+        )
+        #expect(main == Int.max / 2 + 1)
+        #expect(companion == Int.max / 2)
+    }
+
+    @Test("rotating AES-128 keys do not overcommit a three-slot origin", arguments: [false, true])
+    func rotatingAES128KeysRespectThreeSlotOrigin(separatePlaylistOrigin: Bool) async throws {
+        let key1 = Data(repeating: 0x71, count: 16)
+        let key2 = Data(repeating: 0x72, count: 16)
+        let iv = Data(repeating: 0, count: 15) + Data([1])
+        let plaintext1 = Self.makeTSSegment(tag: 0x11)
+        let plaintext2 = Self.makeTSSegment(tag: 0x22)
+        let origin = try #require(GatedHLSOrigin(
+            routes: [
+                "/e1.ts": .init(status: 200, body: Self.encryptAES128CBC(plaintext1, key: key1, iv: iv)),
+                "/e2.ts": .init(status: 200, body: Self.encryptAES128CBC(plaintext2, key: key2, iv: iv)),
+                "/key1.bin": .init(status: 200, body: key1),
+                "/key2.bin": .init(status: 200, body: key2),
+            ],
+            hold: ["/e1.ts", "/e2.ts", "/key1.bin", "/key2.bin"]
+        ))
+        defer { origin.stop() }
+        let playlistOrigin: GatedHLSOrigin
+        if separatePlaylistOrigin {
+            playlistOrigin = try #require(GatedHLSOrigin(routes: [:]))
+        } else {
+            playlistOrigin = origin
+        }
+        defer { if separatePlaylistOrigin { playlistOrigin.stop() } }
+        let segmentURL = origin.url("/e1.ts")
+        let keyURL = origin.url("/key1.bin")
+        let playlistURL = playlistOrigin.url("/enc.m3u8")
+        playlistOrigin.setRoute("/enc.m3u8", status: 200, body: Data("""
+        #EXTM3U
+        #EXT-X-VERSION:3
+        #EXT-X-TARGETDURATION:2
+        #EXT-X-MEDIA-SEQUENCE:1
+        #EXT-X-KEY:METHOD=AES-128,URI="\(keyURL.absoluteString)",IV=0x00000000000000000000000000000001
+        #EXTINF:2.0,
+        \(segmentURL.absoluteString)
+        #EXT-X-KEY:METHOD=AES-128,URI="\(origin.url("/key2.bin").absoluteString)",IV=0x00000000000000000000000000000001
+        #EXTINF:2.0,
+        \(origin.url("/e2.ts").absoluteString)
+        #EXT-X-ENDLIST
+        """.utf8))
+
+        let budget = OriginRequestBudget.shared
+        budget.setHostLimit(3, for: segmentURL)
+        defer { budget.setHostLimit(nil, for: segmentURL) }
+        #expect(!HLSLiveIngestReader.allowsSpeculativeKeyOverlap(
+            readerOriginURL: playlistURL, segmentURL: segmentURL, keyURL: keyURL
+        ))
+        if separatePlaylistOrigin {
+            // Either actual request origin can be capped while the playlist origin is uncapped.
+            #expect(!HLSLiveIngestReader.allowsSpeculativeKeyOverlap(
+                readerOriginURL: playlistURL, segmentURL: segmentURL, keyURL: playlistURL
+            ))
+            #expect(!HLSLiveIngestReader.allowsSpeculativeKeyOverlap(
+                readerOriginURL: playlistURL, segmentURL: playlistURL, keyURL: keyURL
+            ))
+        }
+
+        let reader = HLSLiveIngestReader(playlistURL: playlistURL)
+        defer { reader.close() }
+        let drain = AsyncDrain(reader)
+        func bothSegmentsStarted() -> Bool {
+            origin.hitCount(for: "/e1.ts") > 0 && origin.hitCount(for: "/e2.ts") > 0
+        }
+        func keyStarted() -> Bool {
+            origin.hitCount(for: "/key1.bin") > 0 || origin.hitCount(for: "/key2.bin") > 0
+        }
+        // If the old speculative keys win the first two slots, one segment cannot even start.
+        try await waitFor { bothSegmentsStarted() || keyStarted() || drain.isDone }
+        try #require(bothSegmentsStarted(), "A key request displaced one of the two segment requests")
+        let keyOverlapped = try await waitFor(upTo: .milliseconds(200)) { keyStarted() }
+        try #require(!keyOverlapped, "No key request should start while both segment responses are held")
+
+        origin.release("/e2.ts")
+        try await waitFor { origin.hitCount(for: "/key2.bin") > 0 || drain.isDone }
+        #expect(origin.hitCount(for: "/key1.bin") == 0)
+        origin.release("/key2.bin")
+        try await waitFor { reader.cachedKeyCount >= 1 || drain.isDone }
+        #expect(drain.data.isEmpty)
+
+        origin.releaseAll()
+        try await waitFor { drain.isDone }
+        #expect(reader.terminalError == nil)
+        #expect(drain.data == plaintext1 + plaintext2)
+        #expect(origin.hitCount(for: "/key1.bin") == 1)
+        #expect(origin.hitCount(for: "/key2.bin") == 1)
+        #expect((budget.snapshot(for: segmentURL)?.peakInflight ?? Int.max) <= 3)
     }
 
     @Test("multi-slot capped origins partition companion concurrency and avoid speculative key overcommit")

@@ -1353,7 +1353,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             .withUntaggedVideoColor(untaggedVideoColor)
             .withDiagnosticContext(diagnosticContext)
         let companionBaseProfile: DemuxerOpenProfile = companionAudioReader is HLSLiveIngestReader
-            ? .liveHLSIngest
+            ? .liveHLSAudioIngest
             : baseOpenProfile
         self.companionOpenProfile = companionBaseProfile.withProbeBudget(
             probesize: probesize, maxAnalyzeDuration: maxAnalyzeDuration)
@@ -1616,7 +1616,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// `LoadOptions.probesize` / `maxAnalyzeDuration`. Read in the `+LiveReopen` extension, so it
     /// cannot be file-private.
     let openProfile: DemuxerOpenProfile
-    /// Open profile for `openCompanionAudio`: `.liveHLSIngest` when backed by `HLSLiveIngestReader`
+    /// Open profile for `openCompanionAudio`: `.liveHLSAudioIngest` when backed by `HLSLiveIngestReader`
     /// (with caller overrides preserved), matching `openProfile` otherwise.
     let companionOpenProfile: DemuxerOpenProfile
     /// #377: opt-in held source transport, carried onto every open this session makes itself.
