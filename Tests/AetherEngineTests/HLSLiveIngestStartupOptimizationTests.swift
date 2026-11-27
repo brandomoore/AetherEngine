@@ -510,4 +510,508 @@ struct HLSLiveIngestStartupOptimizationTests {
         #expect(drain.data == plaintext)
         #expect(origin.hitCount(for: "/good-key.bin") == 1)
     }
+
+    // MARK: - Companion lifecycle, joinIsSpent, and OriginRequestBudget edge cases
+
+    private static var liveTwoSegmentVideoPlaylist: Data {
+        Data("""
+        #EXTM3U
+        #EXT-X-VERSION:3
+        #EXT-X-TARGETDURATION:6
+        #EXT-X-MEDIA-SEQUENCE:1
+        #EXTINF:6.0,
+        v1.ts
+        #EXTINF:6.0,
+        v2.ts
+        """.utf8)
+    }
+
+    private static var liveTwoSegmentAudioPlaylist: Data {
+        Data("""
+        #EXTM3U
+        #EXT-X-VERSION:3
+        #EXT-X-TARGETDURATION:6
+        #EXT-X-MEDIA-SEQUENCE:1
+        #EXTINF:6.0,
+        a1.ts
+        #EXTINF:6.0,
+        a2.ts
+        """.utf8)
+    }
+
+    /// 2 s 16x16 2 fps H.264 + 48 kHz mono AAC MPEG-TS segment for live muxed-variant tests.
+    private static var muxedVideoAudioTSData: Data {
+        let b64 = """
+        R0AREABC8CUAAcEAAP8B/wAB/IAUSBIBBkZGbXBlZwlTZXJ2aWNlMDF3fEPK////////////////
+        ////////////////////////////////////////////////////////////////////////////
+        ////////////////////////////////////////////////////////////////////////////
+        //////////////////////9HQAAQAACwDQABwQAAAAHwACqxBLL/////////////////////////
+        ////////////////////////////////////////////////////////////////////////////
+        ////////////////////////////////////////////////////////////////////////////
+        /////////////////////////////////////////////0dQABAAArAXAAHBAADhAPAAG+EA8AAP
+        4QHwAC9EuZv/////////////////////////////////////////////////////////////////
+        ////////////////////////////////////////////////////////////////////////////
+        ////////////////////////////////////////////////////////////////////R0EAMAdQ
+        AAB+zH4AAAAB4AAAgIAFIQAH52EAAAABCfAAAAABZ0LACtp7ARAAAAMAEAAAAwBA8SJqAAAAAWjO
+        AZcgAAABBgX//03cRem95tlIt5Ys2CDZI+7veDI2NCAtIGNvcmUgMTY1IHIzMjIyIGIzNTYwNWEg
+        LSBILjI2NC9NUEVHLTQgQVZDIGNvZGVjIC0gQ29weWxlZnQgMjAwMy0yMDI1IC0gaHR0cDovL3d3
+        dy52aWRlb2xhbi5HAQARb3JnL3gyNjQuaHRtbCAtIG9wdGlvbnM6IGNhYmFjPTAgcmVmPTEgZGVi
+        bG9jaz0wOjA6MCBhbmFseXNlPTA6MCBtZT1kaWEgc3VibWU9MCBwc3k9MSBwc3lfcmQ9MS4wMDow
+        LjAwIG1peGVkX3JlZj0wIG1lX3JhbmdlPTE2IGNocm9tYV9tZT0xIHRyZWxsaXM9MCA4eDhkY3Q9
+        MCBjcW09MCBkZWFkem9uZT0yMSwxMSBmYXN0X0cBABJwc2tpcD0xIGNocm9tYV9xcF9vZmZzZXQ9
+        MCB0aHJlYWRzPTEgbG9va2FoZWFkX3RocmVhZHM9MSBzbGljZWRfdGhyZWFkcz0wIG5yPTAgZGVj
+        aW1hdGU9MSBpbnRlcmxhY2VkPTAgYmx1cmF5X2NvbXBhdD0wIGNvbnN0cmFpbmVkX2ludHJhPTAg
+        YmZyYW1lcz0wIHdlaWdodHA9MCBrZXlpbnQ9MiBrZXlpbnRfbWluPTIgc2NlRwEAM0EA////////
+        ////////////////////////////////////////////////////////////////////////////
+        /25lY3V0PTAgaW50cmFfcmVmcmVzaD0wIHJjPWNyZiBtYnRyZWU9MCBjcmY9NTEuMCBxY29tcD0w
+        LjYwIHFwbWluPTAgcXBtYXg9NjkgcXBzdGVwPTQgaXBfcmF0aW89MS40MCBhcT0wAIAAAAFliIQ6
+        JigAFcBHQQEwAUAAAAHAANKAgAUhAAfYYf/xTEADX/zcAExhdmM2My4xLjEwMgACMEAO//FMQAF/
+        /AEYIAf/8UxAAX/8ARggB//xTEABf/wBGCAH//FMQAF//AEYIAf/8UxAAX/8ARggB//xTEABf/wB
+        GCAH//FMQAF//AEYIAf/8UxAAX/8ARggB//xTEABf/wBGCAH//FMQAF//AEYIAf/8UxAAX/8ARgg
+        B//xTEABf/wBGCAH//FMQAF//AEYIEcBATGVAP//////////////////////////////////////
+        ////////////////////////////////////////////////////////////////////////////
+        ////////////////////////////////////////////////////////////////////////////
+        //////8H//FMQAF//AEYIAf/8UxAAX/8ARggB//xTEABf/wBGCAHR0EANJoQAADWsH4A////////
+        ////////////////////////////////////////////////////////////////////////////
+        ////////////////////////////////////////////////////////////////////////////
+        ////////////////////////////////////AAAB4AAAgIAFIQALRvEAAAABCfAAAAABQZogEqVH
+        QQEyAUAAAAHAAMOAgAUhAAnXYf/xTEABf/wBGCAH//FMQAF//AEYIAf/8UxAAX/8ARggB//xTEAB
+        f/wBGCAH//FMQAF//AEYIAf/8UxAAX/8ARggB//xTEABf/wBGCAH//FMQAF//AEYIAf/8UxAAX/8
+        ARggB//xTEABf/wBGCAH//FMQAF//AEYIAf/8UxAAX/8ARggB//xTEABf/wBGCAH//FMQAF//AEY
+        IAf/8UxAAX/8ARggB//xTEcBATOkAP//////////////////////////////////////////////
+        ////////////////////////////////////////////////////////////////////////////
+        ////////////////////////////////////////////////////////////////////////////
+        //////////////////9AAX/8ARggB//xTEABf/wBGCAHR0AAEQAAsA0AAcEAAAAB8AAqsQSy////
+        ////////////////////////////////////////////////////////////////////////////
+        ////////////////////////////////////////////////////////////////////////////
+        //////////////////////////////////////////////////////////////////9HUAARAAKw
+        FwABwQAA4QDwABvhAPAAD+EB8AAvRLmb////////////////////////////////////////////
+        ////////////////////////////////////////////////////////////////////////////
+        ////////////////////////////////////////////////////////////////////////////
+        /////////////0dBADVzUAABLpR+AP//////////////////////////////////////////////
+        ////////////////////////////////////////////////////////////////////////////
+        /////////////////////wAAAeAAAICABSEADaaBAAAAAQnwAAAAAWdCwAraewEQAAADABAAAAMA
+        QPEiagAAAAFozgGXIAAAAWWIggMomKAAID+AR0EBNAFAAAABwADDgIAFIQAL1mH/8UxAAX/8ARgg
+        B//xTEABf/wBGCAH//FMQAF//AEYIAf/8UxAAX/8ARggB//xTEABf/wBGCAH//FMQAF//AEYIAf/
+        8UxAAX/8ARggB//xTEABf/wBGCAH//FMQAF//AEYIAf/8UxAAX/8ARggB//xTEABf/wBGCAH//FM
+        QAF//AEYIAf/8UxAAX/8ARggB//xTEABf/wBGCAH//FMQAF//AEYIAf/8UxHAQE1pAD/////////
+        ////////////////////////////////////////////////////////////////////////////
+        ////////////////////////////////////////////////////////////////////////////
+        ////////////////////////////////////////////////////////QAF//AEYIAf/8UxAAX/8
+        ARggB0dBATYBQAAAAcAAw4CABSEADdVh//FMQAF//AEYIAf/8UxAAX/8ARggB//xTEABf/wBGCAH
+        //FMQAF//AEYIAf/8UxAAX/8ARggB//xTEABf/wBGCAH//FMQAF//AEYIAf/8UxAAX/8ARggB//x
+        TEABf/wBGCAH//FMQAF//AEYIAf/8UxAAX/8ARggB//xTEABf/wBGCAH//FMQAF//AEYIAf/8UxA
+        AX/8ARggB//xTEABf/wBGCAH//FMRwEBN6QA////////////////////////////////////////
+        ////////////////////////////////////////////////////////////////////////////
+        ////////////////////////////////////////////////////////////////////////////
+        /////////////////////////0ABf/wBGCAH//FMQAF//AEYIAdHQQA2mhAAAYZ4fgD/////////
+        ////////////////////////////////////////////////////////////////////////////
+        ////////////////////////////////////////////////////////////////////////////
+        //////////////////////////////////8AAAHgAACAgAUhABEGEQAAAAEJ8AAAAAFBmiASpUdB
+        ATgBQAAAAcAAw4CABSEAD9Rh//FMQAF//AEYIAf/8UxAAX/8ARggB//xTEABf/wBGCAH//FMQAF/
+        /AEYIAf/8UxAAX/8ARggB//xTEABf/wBGCAH//FMQAF//AEYIAf/8UxAAX/8ARggB//xTEABf/wB
+        GCAH//FMQAF//AEYIAf/8UxAAX/8ARggB//xTEABf/wBGCAH//FMQAF//AEYIAf/8UxAAX/8ARgg
+        B//xTEABf/wBGCAH//FMRwEBOaQA////////////////////////////////////////////////
+        ////////////////////////////////////////////////////////////////////////////
+        ////////////////////////////////////////////////////////////////////////////
+        /////////////////0ABf/wBGCAH//FMQAF//AEYIAdHQQE6O0D/////////////////////////
+        ////////////////////////////////////////////////////AAABwAB2gIAFIQAR02H/8UxA
+        AX/8ARggB//xTEABf/wBGCAH//FMQAF//AEYIAf/8UxAAX/8ARggB//xTEABf/wBGCAH//FMQAF/
+        /AEYIAf/8UxAAX/8ARggB//xTEABf/wBGCAH//FMQAF//AEYIAf/8UxAAX/8ARggBw==
+        """
+        return Data(base64Encoded: b64, options: .ignoreUnknownCharacters)!
+    }
+
+    @Test("eagerly started companion with no attached consumer does not block main joinIsSpent")
+    func unreadEagerCompanionDoesNotBlockMainJoinIsSpent() async throws {
+        let v1 = Self.makeTSSegment(tag: 1)
+        let v2 = Self.makeTSSegment(tag: 2)
+        let a1 = Self.makeTSSegment(tag: 11)
+        let a2 = Self.makeTSSegment(tag: 12)
+        let origin = try #require(GatedHLSOrigin(
+            routes: [
+                "/master.m3u8": .init(status: 200, body: Self.demuxedMasterPlaylist),
+                "/video.m3u8": .init(status: 200, body: Self.liveTwoSegmentVideoPlaylist),
+                "/audio.m3u8": .init(status: 200, body: Self.liveTwoSegmentAudioPlaylist),
+                "/v1.ts": .init(status: 200, body: v1),
+                "/v2.ts": .init(status: 200, body: v2),
+                "/a1.ts": .init(status: 200, body: a1),
+                "/a2.ts": .init(status: 200, body: a2),
+            ],
+            hold: ["/a2.ts"]
+        ))
+        defer { origin.stop() }
+
+        let reader = HLSLiveIngestReader(playlistURL: origin.url("/master.m3u8"))
+        defer { reader.close() }
+
+        // Drain without an expectedBytes cap so the consumer parks on the live FIFO after v1 + v2.
+        let mainDrain = AsyncDrain(reader)
+
+        try await waitFor {
+            mainDrain.data.count == v1.count + v2.count
+                && origin.hitCount(for: "/a1.ts") >= 1
+                && origin.hitCount(for: "/a2.ts") >= 1
+                && reader.pumpJoinState.parked
+        }
+        let companion = try #require(reader.companionAudioReader as? HLSLiveIngestReader)
+        #expect(origin.isHeld("/a2.ts"))
+        #expect(!companion.pumpJoinState.committed)
+        #expect(!companion.pumpJoinState.started, "eager prefetch without a consumer must not count as active")
+        #expect(reader.joinIsSpent)
+    }
+
+    @Test("closing a companion on muxed-audio fallback unblocks joinIsSpent and frees buffered bytes")
+    func closedCompanionOnMuxedFallbackUnblocksJoinIsSpentAndFreesBuffer() async throws {
+        let v1 = Self.makeTSSegment(tag: 1)
+        let v2 = Self.makeTSSegment(tag: 2)
+        let a1 = Self.makeTSSegment(tag: 11)
+        let a2 = Self.makeTSSegment(tag: 12)
+
+        // Case 1: consumer attaches via resolveSegmentFormatHint while a2.ts is held (join uncommitted,
+        // a1.ts already buffered in FIFO), then companion.close() runs on fallback.
+        do {
+            let origin = try #require(GatedHLSOrigin(
+                routes: [
+                    "/master.m3u8": .init(status: 200, body: Self.demuxedMasterPlaylist),
+                    "/video.m3u8": .init(status: 200, body: Self.liveTwoSegmentVideoPlaylist),
+                    "/audio.m3u8": .init(status: 200, body: Self.liveTwoSegmentAudioPlaylist),
+                    "/v1.ts": .init(status: 200, body: v1),
+                    "/v2.ts": .init(status: 200, body: v2),
+                    "/a1.ts": .init(status: 200, body: a1),
+                    "/a2.ts": .init(status: 200, body: a2),
+                ],
+                hold: ["/a2.ts"]
+            ))
+            defer { origin.stop() }
+
+            let reader = HLSLiveIngestReader(playlistURL: origin.url("/master.m3u8"))
+            defer { reader.close() }
+
+            let mainDrain = AsyncDrain(reader)
+            try await waitFor {
+                mainDrain.data.count == v1.count + v2.count
+                    && reader.companionAudioReader != nil
+                    && reader.pumpJoinState.parked
+            }
+            let companion = try #require(reader.companionAudioReader as? HLSLiveIngestReader)
+            #expect(companion.resolveSegmentFormatHint() == "mpegts")
+            try await waitFor { companion.bufferedByteCount == a1.count }
+
+            // While the attached companion is still open and waiting on held a2.ts, joinIsSpent is false.
+            #expect(companion.pumpJoinState.started)
+            #expect(!companion.pumpJoinState.committed)
+            #expect(!reader.joinIsSpent)
+
+            // Simulate HLSVideoEngine muxed-audio fallback closing the unusable companion.
+            companion.close()
+            #expect(companion.isIngestClosed)
+            #expect(companion.bufferedByteCount == 0)
+            #expect(!companion.pumpJoinState.started)
+            #expect(reader.joinIsSpent)
+        }
+
+        // Case 2: companion fails before committing its join batch (404 audio playlist -> nil format hint).
+        do {
+            let origin = try #require(GatedHLSOrigin(
+                routes: [
+                    "/master.m3u8": .init(status: 200, body: Self.demuxedMasterPlaylist),
+                    "/video.m3u8": .init(status: 200, body: Self.liveTwoSegmentVideoPlaylist),
+                    "/audio.m3u8": .init(status: 404, body: Data()),
+                    "/v1.ts": .init(status: 200, body: v1),
+                    "/v2.ts": .init(status: 200, body: v2),
+                ]
+            ))
+            defer { origin.stop() }
+
+            let reader = HLSLiveIngestReader(playlistURL: origin.url("/master.m3u8"))
+            defer { reader.close() }
+
+            let mainDrain = AsyncDrain(reader)
+            try await waitFor {
+                mainDrain.data.count == v1.count + v2.count
+                    && reader.companionAudioReader != nil
+                    && reader.pumpJoinState.parked
+            }
+            let companion = try #require(reader.companionAudioReader as? HLSLiveIngestReader)
+            #expect(companion.resolveSegmentFormatHint() == nil)
+            companion.close()
+            #expect(companion.isIngestClosed)
+            #expect(reader.joinIsSpent)
+        }
+    }
+
+    @Test("paced origins and cross-host single-slot master playlists skip speculative overlap")
+    func pacedAndCrossHostSerialOriginsSkipSpeculativeOverlap() async throws {
+        // 1. Paced origin disarms speculative overlap even when concurrency limit > 1.
+        // Use dedicated GatedHLSOrigin ports rather than OriginRequestBudget.resetForTesting()
+        // so parallel tests keep their per-origin host limits intact.
+        let pacedOrigin = try #require(GatedHLSOrigin(routes: [:]))
+        let unpacedOrigin = try #require(GatedHLSOrigin(routes: [:]))
+        defer {
+            pacedOrigin.stop()
+            unpacedOrigin.stop()
+        }
+        let pacedURL = pacedOrigin.url("/master.m3u8")
+        let targetURL = unpacedOrigin.url("/audio.m3u8")
+        let pin = OriginRequestBudget.shared.pinQuietPeriodCapForTesting(5)
+        defer { pin.release() }
+        OriginRequestBudget.shared.noteRefusal(for: pacedURL, status: 429, retryAfter: nil)
+        #expect(OriginRequestBudget.shared.isPaced(pacedURL))
+        #expect(!HLSLiveIngestReader.allowsSpeculativeOverlap(readerOriginURL: pacedURL, targetURL: targetURL))
+        #expect(!HLSLiveIngestReader.allowsSpeculativeOverlap(readerOriginURL: targetURL, targetURL: pacedURL))
+
+        // 2. Cross-host master playlist: host limit 1 on master origin suppresses eager companion fetch
+        // on a separate rendition host while video is held.
+        let v1 = Self.makeTSSegment(tag: 1)
+        let a1 = Self.makeTSSegment(tag: 11)
+        let mediaOrigin = try #require(GatedHLSOrigin(
+            routes: [
+                "/video.m3u8": .init(status: 200, body: Self.twoSegmentVideoPlaylist),
+                "/audio.m3u8": .init(status: 200, body: Self.twoSegmentAudioPlaylist),
+                "/v1.ts": .init(status: 200, body: v1),
+                "/v2.ts": .init(status: 200, body: v1),
+                "/a1.ts": .init(status: 200, body: a1),
+                "/a2.ts": .init(status: 200, body: a1),
+            ],
+            hold: ["/v1.ts"]
+        ))
+        defer { mediaOrigin.stop() }
+
+        let crossHostMaster = Data("""
+        #EXTM3U
+        #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="English",DEFAULT=YES,AUTOSELECT=YES,URI="\(mediaOrigin.url("/audio.m3u8").absoluteString)"
+        #EXT-X-STREAM-INF:BANDWIDTH=2000000,AUDIO="aud"
+        \(mediaOrigin.url("/video.m3u8").absoluteString)
+        """.utf8)
+        let portalOrigin = try #require(GatedHLSOrigin(
+            routes: [
+                "/master.m3u8": .init(status: 200, body: crossHostMaster),
+            ]
+        ))
+        defer { portalOrigin.stop() }
+
+        let masterURL = portalOrigin.url("/master.m3u8")
+        OriginRequestBudget.shared.setHostLimit(1, for: masterURL)
+        defer { OriginRequestBudget.shared.setHostLimit(nil, for: masterURL) }
+
+        let reader = HLSLiveIngestReader(playlistURL: masterURL)
+        defer { reader.close() }
+
+        let mainDrain = AsyncDrain(reader)
+        try await waitFor {
+            mediaOrigin.hitCount(for: "/v1.ts") >= 1 && reader.companionAudioReader != nil
+        }
+
+        let audioRequestedEagerly = try await waitFor(upTo: .milliseconds(200)) {
+            mediaOrigin.hitCount(for: "/audio.m3u8") > 0
+        }
+        #expect(!audioRequestedEagerly)
+        #expect(mediaOrigin.hitCount(for: "/audio.m3u8") == 0)
+
+        mediaOrigin.release("/v1.ts")
+        try await waitFor { mainDrain.isDone }
+        #expect(mediaOrigin.hitCount(for: "/audio.m3u8") == 0)
+    }
+
+    @Test("software and audio-only live loads close an eagerly started companion audio reader")
+    @MainActor
+    func softwareAndAudioOnlyLiveLoadsCloseEagerCompanion() async throws {
+        let muxedSeg = Self.muxedVideoAudioTSData
+        let audioSeg = Self.makeTSSegment(tag: 21)
+        let origin = try #require(GatedHLSOrigin(
+            routes: [
+                "/master.m3u8": .init(status: 200, body: Self.demuxedMasterPlaylist),
+                "/video.m3u8": .init(status: 200, body: Self.liveTwoSegmentVideoPlaylist),
+                "/audio.m3u8": .init(status: 200, body: Self.liveTwoSegmentAudioPlaylist),
+                "/v1.ts": .init(status: 200, body: muxedSeg),
+                "/v2.ts": .init(status: 200, body: muxedSeg),
+                "/a1.ts": .init(status: 200, body: audioSeg),
+                "/a2.ts": .init(status: 200, body: audioSeg),
+            ]
+        ))
+        defer { origin.stop() }
+
+        // 1. Live muxed variant routed to software decode closes the unused companion reader.
+        do {
+            let engine = try AetherEngine()
+            defer { engine.stop() }
+            let reader = HLSLiveIngestReader(playlistURL: origin.url("/master.m3u8"))
+            defer { reader.close() }
+
+            var options = LoadOptions()
+            options.isLive = true
+            options.autoplay = false
+            options.preferredDecodePath = .software
+
+            _ = try await engine.load(source: .custom(reader, formatHint: "mpegts"), options: options)
+            let companion = try #require(reader.companionAudioReader as? HLSLiveIngestReader)
+            #expect(engine.playbackBackend == .software)
+            #expect(companion.isIngestClosed)
+            #expect(companion.bufferedByteCount == 0)
+        }
+
+        // 2. Live muxed variant routed to audio-only playback closes the unused companion reader.
+        do {
+            let engine = try AetherEngine()
+            defer { engine.stop() }
+            let reader = HLSLiveIngestReader(playlistURL: origin.url("/master.m3u8"))
+            defer { reader.close() }
+
+            var options = LoadOptions()
+            options.isLive = true
+            options.autoplay = false
+            options.audioOnly = true
+
+            _ = try await engine.load(source: .custom(reader, formatHint: "mpegts"), options: options)
+            let companion = try #require(reader.companionAudioReader as? HLSLiveIngestReader)
+            #expect(engine.playbackBackend == .audio)
+            #expect(companion.isIngestClosed)
+            #expect(companion.bufferedByteCount == 0)
+        }
+
+        // 3. Video-only live variant with companion audio routed to software fast-fails and closes the companion.
+        do {
+            let videoOnlySeg = TinyTransportStreamFixture.data
+            let videoOnlyOrigin = try #require(GatedHLSOrigin(
+                routes: [
+                    "/master.m3u8": .init(status: 200, body: Self.demuxedMasterPlaylist),
+                    "/video.m3u8": .init(status: 200, body: Self.liveTwoSegmentVideoPlaylist),
+                    "/audio.m3u8": .init(status: 200, body: Self.liveTwoSegmentAudioPlaylist),
+                    "/v1.ts": .init(status: 200, body: videoOnlySeg),
+                    "/v2.ts": .init(status: 200, body: videoOnlySeg),
+                    "/a1.ts": .init(status: 200, body: audioSeg),
+                    "/a2.ts": .init(status: 200, body: audioSeg),
+                ]
+            ))
+            defer { videoOnlyOrigin.stop() }
+
+            let engine = try AetherEngine()
+            defer { engine.stop() }
+            let reader = HLSLiveIngestReader(playlistURL: videoOnlyOrigin.url("/master.m3u8"))
+            defer { reader.close() }
+
+            var options = LoadOptions()
+            options.isLive = true
+            options.autoplay = false
+            options.preferredDecodePath = .software
+
+            await #expect(throws: HLSIngestError.self) {
+                _ = try await engine.load(source: .custom(reader, formatHint: "mpegts"), options: options)
+            }
+            let companion = try #require(reader.companionAudioReader as? HLSLiveIngestReader)
+            #expect(companion.isIngestClosed)
+            #expect(companion.bufferedByteCount == 0)
+        }
+    }
+
+    @Test("HLSVideoEngine muxed-audio fallback closes unusable companion and lets joinIsSpent settle")
+    func hlsVideoEngineMuxedFallbackClosesCompanionAndSettlesJoinIsSpent() async throws {
+        let muxedSeg = Self.muxedVideoAudioTSData
+        let singleLiveVideoPlaylist = Data("""
+        #EXTM3U
+        #EXT-X-VERSION:3
+        #EXT-X-TARGETDURATION:12
+        #EXT-X-MEDIA-SEQUENCE:1
+        #EXTINF:12.0,
+        v1.ts
+        """.utf8)
+        let origin = try #require(GatedHLSOrigin(
+            routes: [
+                "/master.m3u8": .init(status: 200, body: Self.demuxedMasterPlaylist),
+                "/video.m3u8": .init(status: 200, body: singleLiveVideoPlaylist),
+                "/audio.m3u8": .init(status: 404, body: Data()),
+                "/v1.ts": .init(status: 200, body: muxedSeg),
+            ]
+        ))
+        defer { origin.stop() }
+
+        let reader = HLSLiveIngestReader(playlistURL: origin.url("/master.m3u8"))
+        defer { reader.close() }
+
+        // Bound probe below the 4-frame fixture length so find_stream_info returns immediately
+        // without parking until the live ingest stall counter cancels the FIFO.
+        let fastProbeProfile = DemuxerOpenProfile.livePlayback.withProbeBudget(
+            probesize: 4 * 1024,
+            maxAnalyzeDuration: 500_000
+        )
+        let preopened = try await BlockingWork.detached {
+            let dem = Demuxer()
+            try dem.open(reader: reader, formatHint: "mpegts", profile: fastProbeProfile, isLive: true)
+            return dem
+        }.value
+        let companion = try #require(reader.companionAudioReader as? HLSLiveIngestReader)
+
+        let session = HLSVideoEngine(
+            url: URL(string: "aether-custom://source")!,
+            isLiveSession: true,
+            liveStartupSingleSegmentMinimumSeconds: 0.5,
+            liveCutTargetSeconds: 0.5,
+            liveCadenceObservation: { [weak reader] in reader?.observedLiveCadenceSeconds },
+            liveJoinSpentObservation: { [weak reader] in reader?.joinIsSpent },
+            preopenedDemuxer: preopened,
+            sourceReopenableByURL: false,
+            companionAudioReader: companion
+        )
+        defer { session.stop() }
+
+        _ = try await BlockingWork.detached {
+            try session.start()
+        }.value
+
+        #expect(companion.isIngestClosed)
+        #expect(companion.bufferedByteCount == 0)
+        try await waitFor { reader.joinIsSpent }
+    }
+
+    @Test("AES-128 key fetch falls back to serial after segment download when origin is single-slot")
+    func aes128KeyFetchFallsBackToSerialWhenOriginIsSingleSlot() async throws {
+        let keyBytes = Data((0..<16).map { UInt8($0 + 0x50) })
+        let ivBytes = Data(repeating: 0, count: 15) + Data([1])
+        let plaintext = TinyTransportStreamFixture.data
+        let ciphertext = Self.encryptAES128CBC(plaintext, key: keyBytes, iv: ivBytes)
+
+        let playlist = Data("""
+        #EXTM3U
+        #EXT-X-VERSION:3
+        #EXT-X-TARGETDURATION:2
+        #EXT-X-MEDIA-SEQUENCE:1
+        #EXT-X-KEY:METHOD=AES-128,URI="key.bin",IV=0x00000000000000000000000000000001
+        #EXTINF:2.0,
+        e1.ts
+        #EXT-X-ENDLIST
+        """.utf8)
+
+        let origin = try #require(GatedHLSOrigin(
+            routes: [
+                "/enc.m3u8": .init(status: 200, body: playlist),
+                "/e1.ts": .init(status: 200, body: ciphertext),
+                "/key.bin": .init(status: 200, body: keyBytes),
+            ],
+            hold: ["/e1.ts"]
+        ))
+        defer { origin.stop() }
+
+        let playlistURL = origin.url("/enc.m3u8")
+        OriginRequestBudget.shared.setHostLimit(1, for: playlistURL)
+        defer { OriginRequestBudget.shared.setHostLimit(nil, for: playlistURL) }
+
+        let reader = HLSLiveIngestReader(playlistURL: playlistURL)
+        defer { reader.close() }
+
+        let drain = AsyncDrain(reader)
+        try await waitFor { origin.hitCount(for: "/e1.ts") >= 1 }
+
+        let keyRequestedWhileSegmentHeld = try await waitFor(upTo: .milliseconds(200)) {
+            origin.hitCount(for: "/key.bin") > 0
+        }
+        #expect(!keyRequestedWhileSegmentHeld)
+        #expect(origin.hitCount(for: "/key.bin") == 0)
+
+        origin.release("/e1.ts")
+        try await waitFor { drain.isDone }
+        #expect(reader.terminalError == nil)
+        #expect(drain.data == plaintext)
+        #expect(origin.hitCount(for: "/key.bin") == 1)
+    }
 }

@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 @testable import AetherEngine
 
@@ -212,5 +213,18 @@ struct DisplayCriteriaBriefGraceCreditTests {
             budgetMs: 120
         )
         #expect(verdict == .started(.inGateFlagOnly))
+    }
+
+    @Test("Both software and native play gates credit elapsed time since engine criteria write")
+    func bothPlayGatesCreditElapsedTimeSinceEngineCriteriaWrite() throws {
+        let engineFile = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/AetherEngine/AetherEngine.swift")
+        let source = try String(contentsOf: engineFile, encoding: .utf8)
+        let expected = "creditElapsedSinceWrite: options.engineWritesDisplayCriteria && !options.awaitsInboundCriteriaWrite"
+        let matches = source.components(separatedBy: expected).count - 1
+        #expect(matches == 2, "expected both the software and native play-gate waitForSwitch sites to pass creditElapsedSinceWrite")
     }
 }

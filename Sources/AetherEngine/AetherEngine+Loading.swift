@@ -2210,6 +2210,9 @@ extension AetherEngine {
             }
             throw AetherEngineError.authoredPlaybackIntervalUnsupported
         }
+        // Software playback never merges a live companion audio rendition; close any unconsumed
+        // companion reader on reload/escalation paths as well as initial load.
+        (customReader as? LiveIngestSourceInfo)?.companionAudioReader?.close()
         sessionCacheStatusToken &+= 1
         diagnostics.sessionCacheStatus = .inactive
         let deinterlaceMode = loadedOptions.deinterlaceMode

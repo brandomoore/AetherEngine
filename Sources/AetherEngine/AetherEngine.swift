@@ -5897,6 +5897,9 @@ public final class AetherEngine: ObservableObject {
         //     (required for custom sources).
         let hasVideoStream = probeOpened && probe.videoStreamIndex >= 0
         if Self.shouldUseAudioOnlyPath(audioOnlyRequested: options.audioOnly, probeOpened: probeOpened, hasVideoStream: hasVideoStream) {
+            // Audio-only routes never open a companion side demuxer; stop any eagerly started
+            // companion audio reader so it does not keep polling or buffering unread audio.
+            (customReader as? LiveIngestSourceInfo)?.companionAudioReader?.close()
             // #361: this path is decided before the panel handshake and never runs one, so the route
             // checkpoint credits both.
             recordStartupCheckpoint(.routed, generation: startupGen)
@@ -6715,6 +6718,7 @@ public final class AetherEngine: ObservableObject {
         if useSoftwarePath, options.isLive,
            (customReader as? LiveIngestSourceInfo)?.companionAudioReader != nil,
            probe.audioStreamIndex < 0 {
+            (customReader as? LiveIngestSourceInfo)?.companionAudioReader?.close()
             probe.markClosed()
             BlockingWork.detached { [probe] in probe.close() }
             EngineLog.emit(
@@ -6728,11 +6732,15 @@ public final class AetherEngine: ObservableObject {
 
         do {
             if options.nativeSourcePlaybackRange != nil, useSoftwarePath {
+                (customReader as? LiveIngestSourceInfo)?.companionAudioReader?.close()
                 probe.markClosed()
                 BlockingWork.detached { [probe] in probe.close() }
                 throw AetherEngineError.authoredPlaybackIntervalUnsupported
             }
             if useSoftwarePath {
+                // Side-audio merge is native-only; when the variant also carries muxed audio and
+                // routes software, close any eagerly started companion before panel settle or decode.
+                (customReader as? LiveIngestSourceInfo)?.companionAudioReader?.close()
                 if !panelRoutingSettled {
                     try await settlePanelRouting(ownsProbe: true)
                 }
@@ -6803,6 +6811,7 @@ public final class AetherEngine: ObservableObject {
                                 || options.awaitsInboundCriteriaWrite
                         ),
                         settleCap: options.isLive ? .standard : .awaitObservedEnd,
+                        creditElapsedSinceWrite: options.engineWritesDisplayCriteria && !options.awaitsInboundCriteriaWrite,
                         isCurrent: { self.loadGeneration == gen })
                 }
                 try checkLoadCurrent(gen)

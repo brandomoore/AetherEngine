@@ -34,6 +34,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     private var ingestTask: Task<Void, Never>?
     private let startLock = NSLock()
     private var started = false
+    private var consumerAttached = false
     private var closed = false
     // All _-prefixed vars are protected by startLock.
     private var _terminalFailure: Error?
@@ -195,11 +196,15 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         return true
     }
 
-    /// One reader's half of `joinIsSpent`: whether its ingest ever started, whether its join batch
-    /// is committed, and whether it is empty with its consumer parked on it.
+    /// One reader's half of `joinIsSpent`: whether a consumer is reading an open ingest, whether its
+    /// join batch is committed, and whether it is empty with its consumer parked on it. Eager prefetch
+    /// before a consumer attaches (`consumerAttached == false`) and closed companions (`closed == true`,
+    /// such as after a muxed-audio fallback) do not count against the pump's join seal.
     var pumpJoinState: (started: Bool, committed: Bool, parked: Bool) {
-        let (isStarted, committed) = startLock.withLock { (started, _joinBatchCommitted) }
-        return (isStarted, committed, fifo.isEmptyWithReaderParked)
+        let (activeConsumer, committed) = startLock.withLock {
+            (started && consumerAttached && !closed, _joinBatchCommitted)
+        }
+        return (activeConsumer, committed, fifo.isEmptyWithReaderParked)
     }
 
     /// AE#684: the fact is the PUMP's, not one reader's. With a demuxed audio rendition the cutter
@@ -246,7 +251,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
 
     /// Blocks (bounded by `formatResolveTimeout`) until the first segment is classified. Classification happens before any FIFO byte, so the demuxer that opens immediately after reads from byte 0. Returns nil when the ingest went terminal or timed out.
     public func resolveSegmentFormatHint() -> String? {
-        startIfNeeded()
+        startIfNeeded(attachingConsumer: true)
         let deadline = Date().addingTimeInterval(Self.formatResolveTimeout)
         formatCondition.lock()
         while !formatResolved, Date() < deadline {
@@ -298,12 +303,29 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         startLock.unlock()
         if raceClosed {
             companion.close()
-        } else if OriginRequestBudget.shared.limit(for: companion.budgetOriginURL) != 1 {
+        } else if Self.allowsSpeculativeOverlap(
+            readerOriginURL: budgetOriginURL,
+            targetURL: companion.budgetOriginURL
+        ) {
             // Overlap the companion's playlist fetch, first segment, and format classification with
-            // the main video variant fetch, video join, and Demuxer.open. Skip eager start when the
-            // companion's origin is serialized to a single request slot so the video path keeps it.
-            companion.startIfNeeded()
+            // the main video variant fetch, video join, and Demuxer.open. Skip eager start when
+            // either origin is serialized to a single request slot or actively paced after a refusal.
+            companion.startIfNeeded(attachingConsumer: false)
         }
+    }
+
+    /// True when `OriginRequestBudget` allows speculative parallel requests for `targetURL` on this
+    /// reader: neither `readerOriginURL` nor `targetURL` is serialized to a single slot or actively
+    /// request-rate paced after a refusal.
+    static func allowsSpeculativeOverlap(readerOriginURL: URL, targetURL: URL) -> Bool {
+        let budget = OriginRequestBudget.shared
+        if budget.requiresSerialRequests(readerOriginURL) || budget.isPaced(readerOriginURL) {
+            return false
+        }
+        if budget.requiresSerialRequests(targetURL) || budget.isPaced(targetURL) {
+            return false
+        }
+        return true
     }
 
     public convenience init(playlistURL: URL) {
@@ -411,7 +433,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
 
     public func read(_ buffer: UnsafeMutablePointer<UInt8>?, size: Int32) -> Int32 {
         guard let buffer, size > 0 else { return -1 }
-        startIfNeeded()
+        startIfNeeded(attachingConsumer: true)
         let n = fifo.read(into: buffer, maxLength: Int(size))
         return Int32(n)
     }
@@ -445,10 +467,14 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
 
     // MARK: - Ingest loop
 
-    private func startIfNeeded() {
+    private func startIfNeeded(attachingConsumer: Bool) {
         startLock.lock()
         defer { startLock.unlock() }
-        guard !started, !closed else { return }
+        guard !closed else { return }
+        if attachingConsumer {
+            consumerAttached = true
+        }
+        guard !started else { return }
         started = true
         // Strong capture: the ingest loop must keep the reader and FIFO alive until close() cancels it.
         ingestTask = BlockingWork.detached(priority: .userInitiated) { [self] in
@@ -727,7 +753,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
             let keyURL = crypt.flatMap { HLSPlaylistParser.resolve(uri: $0.keyURI, against: mediaURL) }
             let prefetchedKey: Task<Data, Error>?
             if let keyURL,
-               OriginRequestBudget.shared.limit(for: keyURL) != 1,
+               Self.allowsSpeculativeOverlap(readerOriginURL: self.budgetOriginURL, targetURL: keyURL),
                !self.hasCachedKey(for: keyURL) {
                 prefetchedKey = Task { try await self.fetchKey(keyURL) }
             } else {
@@ -1053,6 +1079,8 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     static let refusalStatuses: Set<Int> = [429, 503, 509]
 
     private var isClosed: Bool { startLock.withLock { closed } }
+    var isIngestClosed: Bool { isClosed }
+    var bufferedByteCount: Int { fifo.queuedByteCount }
 
     /// Applies the configured origin headers to every ingest fetch, credentials only where the host's
     /// origin is (audit NET-7), and a segment's sub-range when it has one. Internal for the
