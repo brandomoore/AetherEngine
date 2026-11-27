@@ -317,20 +317,20 @@ struct LiveStartupFastPathTests {
 
     // MARK: - Live HLS ingest session pooling
 
-    @Test("HLSLiveIngestReader pools an ephemeral stateless URLSession across tunes")
-    func liveIngestReadersReuseSharedEphemeralSession() throws {
+    @Test("HLSLiveIngestReader isolates ephemeral URLSessions across tunes")
+    func liveIngestReadersIsolateEphemeralSessions() throws {
         let urlA = try #require(URL(string: "http://127.0.0.1:9/channelA.m3u8"))
         let urlB = try #require(URL(string: "http://127.0.0.1:9/channelB.m3u8"))
         let readerA = HLSLiveIngestReader(playlistURL: urlA)
         let readerB = HLSLiveIngestReader(playlistURL: urlB)
 
-        #expect(readerA.session === readerB.session)
+        #expect(readerA.session !== readerB.session)
         #expect(readerA.session.configuration.urlCache == nil)
-        #expect(readerA.session.configuration.httpCookieStorage == nil)
-        #expect(readerA.session.configuration.httpShouldSetCookies == false)
+        #expect(readerA.session.configuration.httpCookieStorage != nil)
+        #expect(readerA.session.configuration.httpShouldSetCookies)
         #expect(readerA.session.configuration.urlCredentialStorage == nil)
 
-        // Closing one reader must not invalidate the pooled session used by subsequent tunes.
+        // Closing one reader must not invalidate another tune's session.
         readerA.close()
         let task = readerB.session.dataTask(with: urlB)
         task.cancel()

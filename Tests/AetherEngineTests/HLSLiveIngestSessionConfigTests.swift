@@ -3,13 +3,7 @@ import Foundation
 import Testing
 @testable import AetherEngine
 
-/// Regression coverage for `HLSLiveIngestReader`'s process-wide `sharedSession`:
-/// - `httpMaximumConnectionsPerHost` must provide headroom well above Apple's default of 6 so
-///   companion audio readers and Multiview tiles do not starve one another on a single origin.
-/// - `requestCachePolicy` and ephemeral storage settings must disable caching, cookies, and
-///   credential storage, matching `AVIOReader.makeSessionConfig` and `HLSVODIngestReader`.
-/// - Closing one reader must cancel only its own tasks and leave `sharedSession` usable by
-///   concurrent and subsequent readers.
+/// Tune-scoped cookie continuity, isolation and connection headroom.
 @Suite("Live HLS ingest shared session configuration", .offCooperativePool, .timeLimit(.minutes(3)))
 struct HLSLiveIngestSessionConfigTests {
 
@@ -76,6 +70,12 @@ struct HLSLiveIngestSessionConfigTests {
 
             let body: Data
             let contentType: String
+            let hasCookie = head.lowercased().contains("\r\ncookie: tune=active\r\n")
+            if (path == "/media.m3u8" && hasCookie) || (path.hasPrefix("/seg") && !hasCookie) {
+                let refusal = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                _ = refusal.withCString { write(conn, $0, strlen($0)) }
+                return
+            }
             if path == "/media.m3u8" {
                 body = playlistBody
                 contentType = "application/vnd.apple.mpegurl"
@@ -91,6 +91,7 @@ struct HLSLiveIngestSessionConfigTests {
             }
 
             let header = "HTTP/1.1 200 OK\r\nContent-Type: \(contentType)\r\n"
+                + (path == "/media.m3u8" ? "Set-Cookie: tune=active; Path=/\r\n" : "")
                 + "Content-Length: \(body.count)\r\nConnection: close\r\n\r\n"
             _ = header.withCString { write(conn, $0, strlen($0)) }
             body.withUnsafeBytes { raw in
@@ -156,8 +157,8 @@ struct HLSLiveIngestSessionConfigTests {
         #expect(config.httpMaximumConnectionsPerHost >= 32)
         #expect(config.requestCachePolicy == .reloadIgnoringLocalAndRemoteCacheData)
         #expect(config.urlCache == nil)
-        #expect(config.httpCookieStorage == nil)
-        #expect(config.httpShouldSetCookies == false)
+        #expect(config.httpCookieStorage != nil)
+        #expect(config.httpShouldSetCookies)
         #expect(config.urlCredentialStorage == nil)
         #expect(config.timeoutIntervalForRequest == 10)
         #expect(config.timeoutIntervalForResource == 30)
@@ -168,14 +169,14 @@ struct HLSLiveIngestSessionConfigTests {
         #expect(liveConfig.httpMaximumConnectionsPerHost == HLSLiveIngestReader.sharedSessionConnectionsPerHost)
         #expect(liveConfig.requestCachePolicy == .reloadIgnoringLocalAndRemoteCacheData)
         #expect(liveConfig.urlCache == nil)
-        #expect(liveConfig.httpCookieStorage == nil)
-        #expect(liveConfig.httpShouldSetCookies == false)
+        #expect(liveConfig.httpCookieStorage != nil)
+        #expect(liveConfig.httpShouldSetCookies)
         #expect(liveConfig.urlCredentialStorage == nil)
         #expect(liveConfig.timeoutIntervalForRequest == 10)
         #expect(liveConfig.timeoutIntervalForResource == 30)
     }
 
-    @Test("readers share one URLSession and closing one does not invalidate it for others")
+    @Test("tunes retain playlist cookies for segments without sending them on another tune")
     func closingOneReaderLeavesSharedSessionUsable() async throws {
         let segments = [Self.makeTSSegment(1), Self.makeTSSegment(2)]
         let expected = segments.reduce(Data(), +)
@@ -190,7 +191,7 @@ struct HLSLiveIngestSessionConfigTests {
             concurrent.close()
         }
 
-        #expect(first.session === concurrent.session)
+        #expect(first.session !== concurrent.session)
         let fresh = try #require(first.makeFreshMainReader())
         defer { fresh.close() }
         #expect(fresh.session === first.session)
@@ -208,7 +209,7 @@ struct HLSLiveIngestSessionConfigTests {
 
         let subsequent = HLSLiveIngestReader(playlistURL: playlistURL)
         defer { subsequent.close() }
-        #expect(subsequent.session === first.session)
+        #expect(subsequent.session !== first.session)
 
         let subsequentData = try await Self.drain(subsequent, expectedBytes: expected.count)
         #expect(subsequentData == expected)

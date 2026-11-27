@@ -898,6 +898,21 @@ final class OriginRequestBudget: @unchecked Sendable {
         return origins[headLocked(raw)]?.limit
     }
 
+    /// Acquire distinct buckets in the same order across readers. Always account for the
+    /// destination, plus any capped or paced parent (for example an IPTV portal).
+    func admissionOrigins(for destination: URL, parents: [URL]) -> [URL] {
+        lock.lock(); defer { lock.unlock() }
+        var buckets: [String: URL] = [:]
+        for url in [destination] + parents {
+            guard let raw = Self.originKey(for: url) else { continue }
+            let key = headLocked(raw)
+            if url == destination || origins[key]?.limit != nil || origins[key]?.quietUntil != nil {
+                buckets[key] = url
+            }
+        }
+        return buckets.keys.sorted().compactMap { buckets[$0] }
+    }
+
     /// True when `lhs` and `rhs` resolve to the same origin budget bucket (directly or through a
     /// recorded redirect chain).
     func sharesBudget(between lhs: URL, and rhs: URL) -> Bool {

@@ -2024,6 +2024,50 @@ struct HLSLiveIngestStartupOptimizationTests {
         #expect(origin.hitCount(for: "/a2.ts") == 0)
     }
 
+    @Test("long batches check each distinct origin once per window decision")
+    func distinctOriginsForLongBatch() {
+        let root = URL(string: "https://cdn.example")!
+        let segments = (0..<4096).map { root.appendingPathComponent("\($0).ts") }
+        let key = URL(string: "https://keys.example/key")!
+        #expect(HLSLiveIngestReader.distinctBatchOrigins(segments + [key, key]) == [segments[0], key])
+    }
+
+    @Test("a free portal slot cannot bypass a full CDN")
+    func fullCDNBlocksPortalSegment() async throws {
+        let bytes = Self.makeTSSegment(tag: 4)
+        let cdn = try #require(GatedHLSOrigin(routes: ["/v.ts": .init(status: 200, body: bytes)]))
+        defer { cdn.stop() }
+        let segment = cdn.url("/v.ts")
+        let playlist = Data("""
+        #EXTM3U
+        #EXT-X-TARGETDURATION:2
+        #EXTINF:2,
+        \(segment.absoluteString)
+        #EXT-X-ENDLIST
+        """.utf8)
+        let portal = try #require(GatedHLSOrigin(routes: ["/m.m3u8": .init(status: 200, body: playlist)]))
+        defer { portal.stop() }
+        let url = portal.url("/m.m3u8")
+        let budget = OriginRequestBudget.shared
+        budget.setHostLimit(1, for: url)
+        budget.setHostLimit(2, for: segment)
+        defer { budget.setHostLimit(nil, for: url); budget.setHostLimit(nil, for: segment) }
+        let first = try #require(budget.tryAcquire(for: segment, label: "holder"))
+        defer { budget.release(first) }
+        var second = budget.tryAcquire(for: segment, label: "holder")
+        defer { budget.release(second) }
+        let reader = HLSLiveIngestReader(playlistURL: url)
+        defer { reader.close() }
+        let drain = AsyncDrain(reader)
+        try await waitFor { budget.snapshot(for: segment)?.waiting == 1 }
+        #expect(cdn.hitCount(for: "/v.ts") == 0)
+        budget.release(second)
+        second = nil
+        try await waitFor { drain.isDone }
+        #expect(drain.data == bytes)
+        #expect(budget.snapshot(for: segment)?.peakInflight == 2)
+    }
+
     @Test("cross-host capped portal enforces concurrency ceiling across uncapped media origin")
     func crossHostCappedPortalEnforcesBudgetAcrossUncappedMediaOrigin() async throws {
         let budget = OriginRequestBudget.shared

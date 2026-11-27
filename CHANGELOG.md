@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- **Keep live HLS playlist cookies private to each tune.** Segments and keys can use cookies issued by the playlist. Cross-host requests reserve both portal and CDN capacity, and long playlists check each distinct origin rather than every segment when scheduling downloads.
 - **Fix live HLS startup on long-GOP video and request-limited origins.** Live video keeps the 50 MiB probe allowance so a high-bitrate HEVC channel can find its dimensions after a mid-GOP join. Interlaced video can also be identified when a segment starts between keyframes. Audio and video requests, including rotating AES keys, respect a shared origin's cap even when the playlists are on different hosts. Invalid audio rendition playlists cannot start nested readers, and a host request limit of `Int.max` no longer crashes a demuxed-audio tune.
 - **Keep upscaling running on first-generation Apple TV 4K.** The line-art and
   automatic scaler kernels no longer require nonuniform Metal threadgroups.
