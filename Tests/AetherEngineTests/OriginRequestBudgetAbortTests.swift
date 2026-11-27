@@ -258,15 +258,18 @@ struct OriginRequestBudgetAbortTests {
         let raceBudget = OriginRequestBudget()
         raceBudget.setHostLimit(1, for: target)
         let raceHeld = raceBudget.acquire(for: target, label: "holder", timeout: 1)
+        let raceAborted = Flag()
         let raceSignal = OriginRequestBudget.AbortSignal()
         let raceOutcome = Result()
         Thread.detachNewThread {
             raceOutcome.finish(raceBudget.acquire(
-                for: target, label: "waiter", timeout: 120, abortSignal: raceSignal
+                for: target, label: "waiter", timeout: 120,
+                abortSignal: raceSignal, shouldAbort: { raceAborted.value }
             ))
         }
         try await waitFor { raceBudget.snapshot(for: target)?.waiting == 1 }
 
+        raceAborted.set()
         raceBudget.release(raceHeld)
         raceSignal.abort()
         try await waitFor { raceOutcome.done }

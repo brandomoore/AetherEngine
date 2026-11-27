@@ -456,6 +456,7 @@ extension AetherEngine {
             category: .engine)
         let teardownStart = DispatchTime.now()
         stopInternal(resetDisplayCriteria: false, keepNativeHost: true, keepCustomReader: true)
+        closeLiveIngestForBackground()
         releaseSubtitleProxyForBackground()
         // Session torn down; host will reload + repause on foreground return.
         state = .paused
@@ -466,6 +467,13 @@ extension AetherEngine {
             + "\(String(format: "%.0f", teardownMs))ms; the audio session and the native host "
             + "shell stay",
             category: .engine)
+    }
+
+    /// Closes forward-only live ingest readers on background teardown while keeping `customReader`
+    /// attached so `isCustomSource`, `loadedURL`, and `customSourceIsSeekable` stay preserved (AE#526).
+    private func closeLiveIngestForBackground() {
+        (customReader as? LiveIngestSourceInfo)?.companionAudioReader?.close()
+        (customReader as? HLSLiveIngestReader)?.close()
     }
 
     /// AE#597: `stopInternal` does not touch the proxy, so without this its loopback socket rides
@@ -585,6 +593,7 @@ extension AetherEngine {
             EngineLog.emit("[AetherEngine] background grace assertion expired early, synchronous teardown (#127)", category: .engine)
             captureBackgroundTeardownSelection()   // #357, as in teardownVideoForBackground
             stopInternal(resetDisplayCriteria: false, keepNativeHost: true, keepCustomReader: true)
+            closeLiveIngestForBackground()
             releaseSubtitleProxyForBackground()
             state = .paused
         }

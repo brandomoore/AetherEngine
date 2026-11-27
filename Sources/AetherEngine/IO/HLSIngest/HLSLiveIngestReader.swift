@@ -86,6 +86,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     }
 
     private let role: Role
+    private let allowsCompanionAudio: Bool
     private let fifo = ByteFIFO(capacity: 16 * 1024 * 1024)
     /// Wider than the VOD reader's 2 MB: a live window with hours of DVR at short segments is a
     /// legitimately long playlist, and this one is refetched every few seconds rather than once.
@@ -447,7 +448,8 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         guard role == .mainVideo else { return nil }
         let fresh = HLSLiveIngestReader(playlistURL: playlistURL, httpHeaders: currentHeaders, role: .mainVideo,
                                         diagnosticContext: diagnosticContext,
-                                        followsSessionHeaders: followsSessionHeaders)
+                                        followsSessionHeaders: followsSessionHeaders,
+                                        allowsCompanionAudio: false)
         if let store = startLock.withLock({ _headerStore }) { fresh.adoptSessionHeaderStore(store) }
         fresh.budgetSlotWaitSecondsForTesting = budgetSlotWaitSecondsForTesting
         fresh.setJoinCushion(joinCushionSeconds)
@@ -517,6 +519,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     private init(playlistURL: URL, httpHeaders: [String: String] = [:], role: Role,
                  credentialOrigin: URL? = nil,
                  partnerCoordination: PartnerCoordination?,
+                 allowsCompanionAudio: Bool = true,
                  diagnosticContext: SourceNetworkDiagnostics.Context? = SourceNetworkDiagnostics.context,
                  followsSessionHeaders: Bool = false) {
         self.followsSessionHeaders = followsSessionHeaders
@@ -526,6 +529,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         self.credentialOrigin = credentialOrigin ?? playlistURL
         self._partnerCoordination = partnerCoordination
         self.role = role
+        self.allowsCompanionAudio = allowsCompanionAudio
         self.session = Self.sharedSession
     }
 
@@ -533,7 +537,8 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
                      credentialOrigin: URL? = nil,
                      partnerOriginURL: URL? = nil,
                      diagnosticContext: SourceNetworkDiagnostics.Context? = SourceNetworkDiagnostics.context,
-                     followsSessionHeaders: Bool = false) {
+                     followsSessionHeaders: Bool = false,
+                     allowsCompanionAudio: Bool = true) {
         let coordination: PartnerCoordination?
         if let partnerOriginURL {
             let seeded = PartnerCoordination()
@@ -548,6 +553,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
             role: role,
             credentialOrigin: credentialOrigin,
             partnerCoordination: coordination,
+            allowsCompanionAudio: allowsCompanionAudio,
             diagnosticContext: diagnosticContext,
             followsSessionHeaders: followsSessionHeaders
         )
@@ -578,7 +584,6 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         ingestTask = nil
         task?.cancel()
         let companion = _companionAudioReader
-        _companionAudioReader = nil
         let coordination = _partnerCoordination
         let budgetAborts = Array(_activeBudgetAborts.values)
         _activeBudgetAborts.removeAll()
@@ -594,8 +599,8 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     }
 
     public func cancel() {
-        // CAVEAT: FIFO cancel is permanent (all subsequent reads return -1), which violates the IOReader "unblock only" contract. Safe because forward-only sources never re-enter read after cancel; if that ever changes, this fires immediately.
-        fifo.cancel()
+        // CAVEAT: FIFO cancel is permanent (all subsequent reads return -1), which violates the IOReader "unblock only" contract. Safe because forward-only sources never re-enter read after cancel; delegate to close() so ingestTask, active budget waits, in-flight key fetches, and any companion are aborted immediately too.
+        close()
     }
 
     // MARK: - Ingest loop
@@ -823,7 +828,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
             return (segment, url, keyURL)
         }
         partnerCoordination?.record(
-            [mediaURL] + resolved.map(\.url) + resolved.compactMap(\.keyURL),
+            [credentialOrigin, budgetOriginURL, mediaURL] + resolved.map(\.url) + resolved.compactMap(\.keyURL),
             for: role
         )
         let budget = OriginRequestBudget.shared
@@ -838,7 +843,10 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         func currentWindow() -> Int {
             // A task can make one request at a time to any capped origin, including an off-playlist
             // key host. Bound the whole window by the tightest cap so even distinct cold keys fit.
-            var window = concurrency(for: mediaURL)
+            var window = min(
+                concurrency(for: credentialOrigin),
+                min(concurrency(for: budgetOriginURL), concurrency(for: mediaURL))
+            )
             for item in resolved {
                 if window == 1 { break }
                 window = min(window, concurrency(for: item.url))
@@ -918,17 +926,33 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         if role == .mainVideo,
            let companion = startLock.withLock({ _companionAudioReader }),
            !companion.isIngestClosed {
-            return OriginRequestBudget.shared.sharesBudget(between: url, and: companion.budgetOriginURL)
+            let budget = OriginRequestBudget.shared
+            return budget.sharesBudget(between: url, and: companion.budgetOriginURL)
+                || budget.sharesBudget(between: url, and: companion.credentialOrigin)
         }
         return false
     }
 
-    static func allowsSpeculativeKeyOverlap(readerOriginURL: URL, segmentURL: URL, keyURL: URL) -> Bool {
+    static func allowsSpeculativeKeyOverlap(
+        credentialOriginURL: URL? = nil,
+        readerOriginURL: URL,
+        segmentURL: URL,
+        keyURL: URL
+    ) -> Bool {
         let budget = OriginRequestBudget.shared
         // Spare room for one key is not enough when every concurrent segment can have a
         // different key URI. Keep capped requests sequential within each segment task.
-        guard budget.limit(for: segmentURL) == nil, budget.limit(for: keyURL) == nil else { return false }
-        return !budget.isPaced(segmentURL)
+        if let credentialOriginURL,
+           budget.limit(for: credentialOriginURL) != nil || budget.isPaced(credentialOriginURL) {
+            return false
+        }
+        guard budget.limit(for: readerOriginURL) == nil,
+              budget.limit(for: segmentURL) == nil,
+              budget.limit(for: keyURL) == nil else {
+            return false
+        }
+        return !budget.isPaced(readerOriginURL)
+            && !budget.isPaced(segmentURL)
             && allowsSpeculativeOverlap(readerOriginURL: readerOriginURL, targetURL: keyURL)
     }
 
@@ -945,7 +969,10 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
             let prefetchedKey: Task<Data, Error>?
             if let keyURL = item.keyURL,
                Self.allowsSpeculativeKeyOverlap(
-                   readerOriginURL: self.budgetOriginURL, segmentURL: item.url, keyURL: keyURL
+                   credentialOriginURL: self.credentialOrigin,
+                   readerOriginURL: self.budgetOriginURL,
+                   segmentURL: item.url,
+                   keyURL: keyURL
                ),
                !self.hasCachedKey(for: keyURL) {
                 prefetchedKey = Task { try await self.fetchKey(keyURL) }
@@ -1046,7 +1073,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
                 throw HLSIngestError.playlistInvalid(reason: "no usable variant")
             }
             // Demuxed-audio variant: companion reader ingests the rendition playlist for the side demuxer (ARD-style channels). Installed before this function returns so the ordering guarantee holds.
-            if let group = best.audioGroupID, master.demuxedAudioGroupIDs.contains(group) {
+            if allowsCompanionAudio, let group = best.audioGroupID, master.demuxedAudioGroupIDs.contains(group) {
                 let groupRenditions = master.audioRenditions.filter { $0.groupID == group }
                 // DEFAULT=YES is the provider's pick; first entry is the fallback (groups with URI entries are non-empty by construction).
                 guard let rendition = groupRenditions.first(where: { $0.isDefault })
@@ -1065,8 +1092,8 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
                     category: .engine
                 )
                 let coordination = PartnerCoordination()
-                coordination.record([playlistURL, finalURL, url], for: .mainVideo)
-                coordination.record([audioURL], for: .companionAudio)
+                coordination.record([credentialOrigin, playlistURL, finalURL, url], for: .mainVideo)
+                coordination.record([credentialOrigin, audioURL], for: .companionAudio)
                 let alreadyClosed = startLock.withLock { () -> Bool in
                     if closed { return true }
                     _partnerCoordination = coordination
@@ -1082,7 +1109,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
                     followsSessionHeaders: followsSessionHeaders)
                 if let store = startLock.withLock({ _headerStore }) { companion.adoptSessionHeaderStore(store) }
                 companion.budgetSlotWaitSecondsForTesting = budgetSlotWaitSecondsForTesting
-                installCompanion(companion, mainOrigins: [playlistURL, finalURL, url])
+                installCompanion(companion, mainOrigins: [credentialOrigin, playlistURL, finalURL, url])
             }
             // AE#359: the variant's SUBTITLES group, resolved to absolute playlist URLs and published as
             // metadata. Nothing is fetched here; the host decides whether a subtitle track is ever wanted.
@@ -1264,6 +1291,27 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         }
     }
 
+    /// Picks the tightest capped or paced admission origin among the request URL, this reader's own
+    /// playlist origin, and the inherited credential origin without folding unrelated hosts together.
+    private func budgetAdmissionURL(for url: URL) -> URL {
+        let budget = OriginRequestBudget.shared
+        let candidates = [url, budgetOriginURL, credentialOrigin]
+        var tightest: (url: URL, limit: Int)?
+        for candidate in candidates {
+            guard let limit = budget.limit(for: candidate) else { continue }
+            if tightest == nil || limit < tightest!.limit {
+                tightest = (candidate, limit)
+            }
+        }
+        if let tightest {
+            return tightest.url
+        }
+        for candidate in candidates where budget.isPaced(candidate) {
+            return candidate
+        }
+        return url
+    }
+
     /// AE#678: every ingest request is charged to `OriginRequestBudget` like the reader's and the relay's,
     /// so the host's declared ceiling, and a ceiling or pacer learned from another path's refusal, bind
     /// this path too. Its own refusals are not charged (see below). The slot wait blocks, so it runs on
@@ -1274,6 +1322,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     ) async throws -> (Data, URLResponse) {
         try Task.checkCancellation()
         guard !isClosed else { throw CancellationError() }
+        let admissionURL = budgetAdmissionURL(for: url)
         let abortSignal = OriginRequestBudget.AbortSignal()
         let abortID = try registerBudgetAbort(abortSignal)
         let slotWait = budgetSlotWaitSecondsForTesting ?? Self.budgetSlotWaitSeconds
@@ -1284,7 +1333,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
                 await withCheckedContinuation { continuation in
                     Thread.detachNewThread { [weak self] in
                         let acquired = OriginRequestBudget.shared.acquire(
-                            for: url,
+                            for: admissionURL,
                             label: label,
                             timeout: slotWait,
                             overcommit: .pacerOnly,
@@ -1303,7 +1352,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         guard !isClosed, !abortSignal.isAborted else { throw CancellationError() }
         // Playlists on different hosts can still send both readers to the same segment or key
         // origin. Its admission timeout is a transport failure, not permission to send anyway.
-        if ticket == nil, OriginRequestBudget.originKey(for: url) != nil {
+        if ticket == nil, OriginRequestBudget.originKey(for: admissionURL) != nil {
             throw URLError(.timedOut)
         }
         let (data, response) = try await fetch()

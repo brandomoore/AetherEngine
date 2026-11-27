@@ -811,15 +811,19 @@ struct HLSLiveIngestStartupOptimizationTests {
             mediaOrigin.hitCount(for: "/v1.ts") >= 1 && reader.companionAudioReader != nil
         }
 
-        let audioRequestedEagerly = try await waitFor(upTo: .milliseconds(200)) {
-            mediaOrigin.hitCount(for: "/audio.m3u8") > 0
+        let speculativeWorkStarted = try await waitFor(upTo: .milliseconds(200)) {
+            mediaOrigin.hitCount(for: "/audio.m3u8") > 0 || mediaOrigin.hitCount(for: "/v2.ts") > 0
         }
-        #expect(!audioRequestedEagerly)
+        #expect(!speculativeWorkStarted)
         #expect(mediaOrigin.hitCount(for: "/audio.m3u8") == 0)
+        #expect(mediaOrigin.hitCount(for: "/v2.ts") == 0)
 
         mediaOrigin.release("/v1.ts")
         try await waitFor { mainDrain.isDone }
+        #expect(reader.terminalError == nil)
+        #expect(mainDrain.data == v1 + v1)
         #expect(mediaOrigin.hitCount(for: "/audio.m3u8") == 0)
+        #expect(OriginRequestBudget.shared.snapshot(for: masterURL)?.peakInflight == 1)
     }
 
     @Test("software and audio-only live loads close an eagerly started companion audio reader")
@@ -1899,5 +1903,338 @@ struct HLSLiveIngestStartupOptimizationTests {
         #expect(reader.terminalError == .playlistUnreachable(status: 403))
         #expect(saturatedOrigin.hitCount(for: "/seg1.ts") == 0)
         #expect(budget.snapshot(for: seg1URL)?.inflight == 2)
+    }
+
+    @Test("reader.cancel() aborts ingestTask, wakes a 30s budget slot wait, and closes eager companion")
+    func cancelAbortsIngestBudgetWaitAndCompanion() async throws {
+        let a1 = Self.makeTSSegment(tag: 11)
+        let a2 = Self.makeTSSegment(tag: 12)
+        let segOrigin = try #require(GatedHLSOrigin(
+            routes: [
+                "/v1.ts": .init(status: 200, body: Self.makeTSSegment(tag: 1)),
+            ]
+        ))
+        defer { segOrigin.stop() }
+
+        let companionOrigin = try #require(GatedHLSOrigin(
+            routes: [
+                "/audio.m3u8": .init(status: 200, body: Self.liveTwoSegmentAudioPlaylist),
+                "/a1.ts": .init(status: 200, body: a1),
+                "/a2.ts": .init(status: 200, body: a2),
+            ],
+            hold: ["/a1.ts"]
+        ))
+        defer { companionOrigin.stop() }
+
+        let segURL = segOrigin.url("/v1.ts")
+        let videoPlaylist = Data("""
+        #EXTM3U
+        #EXT-X-VERSION:3
+        #EXT-X-TARGETDURATION:4
+        #EXT-X-MEDIA-SEQUENCE:1
+        #EXTINF:4.0,
+        \(segURL.absoluteString)
+        #EXT-X-ENDLIST
+        """.utf8)
+        let masterPlaylist = Data("""
+        #EXTM3U
+        #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="English",DEFAULT=YES,AUTOSELECT=YES,URI="\(companionOrigin.url("/audio.m3u8").absoluteString)"
+        #EXT-X-STREAM-INF:BANDWIDTH=2000000,AUDIO="aud"
+        video.m3u8
+        """.utf8)
+        let masterOrigin = try #require(GatedHLSOrigin(
+            routes: [
+                "/master.m3u8": .init(status: 200, body: masterPlaylist),
+                "/video.m3u8": .init(status: 200, body: videoPlaylist),
+            ],
+            hold: ["/video.m3u8"]
+        ))
+        defer { masterOrigin.stop() }
+
+        let budget = OriginRequestBudget.shared
+        budget.setHostLimit(1, for: segURL)
+        defer { budget.setHostLimit(nil, for: segURL) }
+        let held = try #require(budget.tryAcquire(for: segURL, label: "holder"))
+        defer { budget.release(held) }
+
+        let reader = HLSLiveIngestReader(playlistURL: masterOrigin.url("/master.m3u8"))
+        defer { reader.close() }
+        #expect(reader.budgetSlotWaitSecondsForTesting == nil)
+
+        let drain = AsyncDrain(reader)
+        try await waitFor {
+            masterOrigin.hitCount(for: "/video.m3u8") >= 1
+                && companionOrigin.hitCount(for: "/a1.ts") >= 1
+                && reader.companionAudioReader != nil
+        }
+        let companion = try #require(reader.companionAudioReader as? HLSLiveIngestReader)
+
+        // Release the video playlist so mainVideo parks in the real 30s OriginRequestBudget wait.
+        masterOrigin.release("/video.m3u8")
+        try await waitFor { budget.snapshot(for: segURL)?.waiting == 1 }
+
+        reader.cancel()
+        try await waitFor {
+            reader.isIngestClosed
+                && companion.isIngestClosed
+                && budget.snapshot(for: segURL)?.waiting == 0
+                && drain.isDone
+        }
+        // Idempotent second cancel preserves already-published metadata.
+        reader.cancel()
+        #expect(reader.upstreamTargetDuration == 4)
+        #expect(reader.terminalError == nil)
+        #expect(segOrigin.hitCount(for: "/v1.ts") == 0)
+        #expect(budget.snapshot(for: segURL)?.inflight == 1)
+    }
+
+    @Test("makeFreshMainReader() suppresses companion audio creation on demuxed master playlists")
+    func makeFreshMainReaderSuppressesCompanionAudio() async throws {
+        let v1 = Self.makeTSSegment(tag: 1)
+        let v2 = Self.makeTSSegment(tag: 2)
+        let a1 = Self.makeTSSegment(tag: 11)
+        let a2 = Self.makeTSSegment(tag: 12)
+        let origin = try #require(GatedHLSOrigin(
+            routes: [
+                "/master.m3u8": .init(status: 200, body: Self.demuxedMasterPlaylist),
+                "/video.m3u8": .init(status: 200, body: Self.twoSegmentVideoPlaylist),
+                "/audio.m3u8": .init(status: 200, body: Self.twoSegmentAudioPlaylist),
+                "/v1.ts": .init(status: 200, body: v1),
+                "/v2.ts": .init(status: 200, body: v2),
+                "/a1.ts": .init(status: 200, body: a1),
+                "/a2.ts": .init(status: 200, body: a2),
+            ]
+        ))
+        defer { origin.stop() }
+
+        let initial = HLSLiveIngestReader(playlistURL: origin.url("/master.m3u8"))
+        defer { initial.close() }
+        let fresh = try #require(initial.makeFreshMainReader())
+        defer { fresh.close() }
+
+        let drain = AsyncDrain(fresh)
+        try await waitFor { drain.isDone }
+
+        #expect(fresh.terminalError == nil)
+        #expect(fresh.resolveSegmentFormatHint() == "mpegts")
+        #expect(drain.data == v1 + v2)
+        #expect(fresh.companionAudioReader == nil)
+        #expect(origin.hitCount(for: "/audio.m3u8") == 0)
+        #expect(origin.hitCount(for: "/a1.ts") == 0)
+        #expect(origin.hitCount(for: "/a2.ts") == 0)
+    }
+
+    @Test("cross-host capped portal enforces concurrency ceiling across uncapped media origin")
+    func crossHostCappedPortalEnforcesBudgetAcrossUncappedMediaOrigin() async throws {
+        let budget = OriginRequestBudget.shared
+
+        // Case 1: portalOrigin limit 1 (200 OK master -> uncapped mediaOrigin with AES-128 video + demuxed audio).
+        do {
+            let vKey = Data((0..<16).map { UInt8($0 + 0x10) })
+            let aKey = Data((0..<16).map { UInt8($0 + 0x20) })
+            let iv = Data(repeating: 0, count: 15) + Data([1])
+            let vPlain = Self.makeTSSegment(tag: 1)
+            let aPlain = Self.makeTSSegment(tag: 11)
+            let vCipher = Self.encryptAES128CBC(vPlain, key: vKey, iv: iv)
+            let aCipher = Self.encryptAES128CBC(aPlain, key: aKey, iv: iv)
+
+            let encryptedVideoPlaylist = Data("""
+            #EXTM3U
+            #EXT-X-VERSION:3
+            #EXT-X-TARGETDURATION:4
+            #EXT-X-MEDIA-SEQUENCE:1
+            #EXT-X-KEY:METHOD=AES-128,URI="vkey.bin",IV=0x00000000000000000000000000000001
+            #EXTINF:4.0,
+            v1.ts
+            #EXTINF:4.0,
+            v2.ts
+            #EXT-X-ENDLIST
+            """.utf8)
+            let encryptedAudioPlaylist = Data("""
+            #EXTM3U
+            #EXT-X-VERSION:3
+            #EXT-X-TARGETDURATION:2
+            #EXT-X-MEDIA-SEQUENCE:1
+            #EXT-X-KEY:METHOD=AES-128,URI="akey.bin",IV=0x00000000000000000000000000000001
+            #EXTINF:2.0,
+            a1.ts
+            #EXTINF:2.0,
+            a2.ts
+            #EXT-X-ENDLIST
+            """.utf8)
+
+            let mediaOrigin = try #require(GatedHLSOrigin(
+                routes: [
+                    "/video.m3u8": .init(status: 200, body: encryptedVideoPlaylist),
+                    "/audio.m3u8": .init(status: 200, body: encryptedAudioPlaylist),
+                    "/vkey.bin": .init(status: 200, body: vKey),
+                    "/akey.bin": .init(status: 200, body: aKey),
+                    "/v1.ts": .init(status: 200, body: vCipher),
+                    "/v2.ts": .init(status: 200, body: vCipher),
+                    "/a1.ts": .init(status: 200, body: aCipher),
+                    "/a2.ts": .init(status: 200, body: aCipher),
+                ],
+                hold: ["/v1.ts", "/a1.ts"]
+            ))
+            defer { mediaOrigin.stop() }
+
+            let crossHostMaster = Data("""
+            #EXTM3U
+            #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="English",DEFAULT=YES,AUTOSELECT=YES,URI="\(mediaOrigin.url("/audio.m3u8").absoluteString)"
+            #EXT-X-STREAM-INF:BANDWIDTH=2000000,AUDIO="aud"
+            \(mediaOrigin.url("/video.m3u8").absoluteString)
+            """.utf8)
+            let portalOrigin = try #require(GatedHLSOrigin(
+                routes: [
+                    "/master.m3u8": .init(status: 200, body: crossHostMaster),
+                ]
+            ))
+            defer { portalOrigin.stop() }
+
+            let masterURL = portalOrigin.url("/master.m3u8")
+            budget.setHostLimit(1, for: masterURL)
+            defer { budget.setHostLimit(nil, for: masterURL) }
+
+            #expect(!HLSLiveIngestReader.allowsSpeculativeKeyOverlap(
+                credentialOriginURL: masterURL,
+                readerOriginURL: mediaOrigin.url("/audio.m3u8"),
+                segmentURL: mediaOrigin.url("/a1.ts"),
+                keyURL: mediaOrigin.url("/akey.bin")
+            ))
+
+            let reader = HLSLiveIngestReader(playlistURL: masterURL)
+            defer { reader.close() }
+
+            let mainDrain = AsyncDrain(reader)
+            try await waitFor {
+                mediaOrigin.hitCount(for: "/v1.ts") == 1 && reader.companionAudioReader != nil
+            }
+            let companion = try #require(reader.companionAudioReader as? HLSLiveIngestReader)
+
+            // Start companion draining concurrently; it must park on the 1-slot portalOrigin budget
+            // while v1.ts is held, and mainVideo must not start v2.ts or vkey.bin.
+            let audioDrain = AsyncDrain(companion)
+            try await waitFor { budget.snapshot(for: masterURL)?.waiting == 1 }
+
+            let overlappedWhileV1Held = try await waitFor(upTo: .milliseconds(200)) {
+                mediaOrigin.hitCount(for: "/v2.ts") > 0
+                    || mediaOrigin.hitCount(for: "/vkey.bin") > 0
+                    || mediaOrigin.hitCount(for: "/audio.m3u8") > 0
+                    || mediaOrigin.hitCount(for: "/a1.ts") > 0
+                    || mediaOrigin.hitCount(for: "/akey.bin") > 0
+            }
+            #expect(!overlappedWhileV1Held)
+            #expect(mediaOrigin.hitCount(for: "/v2.ts") == 0)
+            #expect(mediaOrigin.hitCount(for: "/vkey.bin") == 0)
+            #expect(mediaOrigin.hitCount(for: "/audio.m3u8") == 0)
+
+            mediaOrigin.release("/v1.ts")
+            try await waitFor { mediaOrigin.hitCount(for: "/a1.ts") == 1 }
+
+            // While companionAudio holds a1.ts, it must not speculatively overlap akey.bin or a2.ts.
+            let audioOverlappedWhileA1Held = try await waitFor(upTo: .milliseconds(200)) {
+                mediaOrigin.hitCount(for: "/akey.bin") > 0 || mediaOrigin.hitCount(for: "/a2.ts") > 0
+            }
+            #expect(!audioOverlappedWhileA1Held)
+            #expect(mediaOrigin.hitCount(for: "/akey.bin") == 0)
+            #expect(mediaOrigin.hitCount(for: "/a2.ts") == 0)
+
+            mediaOrigin.release("/a1.ts")
+            try await waitFor { mainDrain.isDone && audioDrain.isDone }
+
+            #expect(reader.terminalError == nil)
+            #expect(companion.terminalError == nil)
+            #expect(mainDrain.data == vPlain + vPlain)
+            #expect(audioDrain.data == aPlain + aPlain)
+            #expect(mediaOrigin.hitCount(for: "/vkey.bin") == 1)
+            #expect(mediaOrigin.hitCount(for: "/akey.bin") == 1)
+            #expect(budget.snapshot(for: masterURL)?.peakInflight == 1)
+        }
+
+        // Case 2: portalOrigin limit 2 partitions 1 slot each to mainVideo and companionAudio,
+        // keeps peakInflight <= 2, and returns both slots to mainVideo once companion closes.
+        do {
+            let v1 = Self.makeTSSegment(tag: 1)
+            let v2 = Self.makeTSSegment(tag: 2)
+            let v3 = Self.makeTSSegment(tag: 3)
+            let a1 = Self.makeTSSegment(tag: 11)
+            let a2 = Self.makeTSSegment(tag: 12)
+            let threeSegmentVideoPlaylist = Data("""
+            #EXTM3U
+            #EXT-X-VERSION:3
+            #EXT-X-TARGETDURATION:4
+            #EXT-X-MEDIA-SEQUENCE:1
+            #EXTINF:4.0,
+            v1.ts
+            #EXTINF:4.0,
+            v2.ts
+            #EXTINF:4.0,
+            v3.ts
+            #EXT-X-ENDLIST
+            """.utf8)
+            let mediaOrigin = try #require(GatedHLSOrigin(
+                routes: [
+                    "/video.m3u8": .init(status: 200, body: threeSegmentVideoPlaylist),
+                    "/audio.m3u8": .init(status: 200, body: Self.twoSegmentAudioPlaylist),
+                    "/v1.ts": .init(status: 200, body: v1),
+                    "/v2.ts": .init(status: 200, body: v2),
+                    "/v3.ts": .init(status: 200, body: v3),
+                    "/a1.ts": .init(status: 200, body: a1),
+                    "/a2.ts": .init(status: 200, body: a2),
+                ],
+                hold: ["/v1.ts", "/v2.ts", "/v3.ts", "/a1.ts", "/a2.ts"]
+            ))
+            defer { mediaOrigin.stop() }
+
+            let crossHostMaster = Data("""
+            #EXTM3U
+            #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="English",DEFAULT=YES,AUTOSELECT=YES,URI="\(mediaOrigin.url("/audio.m3u8").absoluteString)"
+            #EXT-X-STREAM-INF:BANDWIDTH=2000000,AUDIO="aud"
+            \(mediaOrigin.url("/video.m3u8").absoluteString)
+            """.utf8)
+            let portalOrigin = try #require(GatedHLSOrigin(
+                routes: [
+                    "/master.m3u8": .init(status: 200, body: crossHostMaster),
+                ]
+            ))
+            defer { portalOrigin.stop() }
+
+            let masterURL = portalOrigin.url("/master.m3u8")
+            budget.setHostLimit(2, for: masterURL)
+            defer { budget.setHostLimit(nil, for: masterURL) }
+
+            let reader = HLSLiveIngestReader(playlistURL: masterURL)
+            defer { reader.close() }
+
+            let mainDrain = AsyncDrain(reader)
+            try await waitFor {
+                mediaOrigin.hitCount(for: "/v1.ts") >= 1
+                    && mediaOrigin.hitCount(for: "/a1.ts") >= 1
+                    && reader.companionAudioReader != nil
+            }
+
+            let secondSegmentsStarted = try await waitFor(upTo: .milliseconds(200)) {
+                mediaOrigin.hitCount(for: "/v2.ts") > 0 || mediaOrigin.hitCount(for: "/a2.ts") > 0
+            }
+            #expect(!secondSegmentsStarted)
+            #expect((budget.snapshot(for: masterURL)?.peakInflight ?? Int.max) <= 2)
+
+            let companion = try #require(reader.companionAudioReader as? HLSLiveIngestReader)
+            companion.close()
+            mediaOrigin.release("/a1.ts")
+            mediaOrigin.release("/a2.ts")
+            mediaOrigin.release("/v1.ts")
+
+            try await waitFor {
+                mediaOrigin.hitCount(for: "/v2.ts") >= 1 && mediaOrigin.hitCount(for: "/v3.ts") >= 1
+            }
+            #expect((budget.snapshot(for: masterURL)?.peakInflight ?? Int.max) <= 2)
+
+            mediaOrigin.releaseAll()
+            try await waitFor { mainDrain.isDone }
+            #expect(reader.terminalError == nil)
+            #expect(mainDrain.data == v1 + v2 + v3)
+            #expect((budget.snapshot(for: masterURL)?.peakInflight ?? Int.max) <= 2)
+        }
     }
 }

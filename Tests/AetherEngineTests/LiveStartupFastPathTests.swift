@@ -337,4 +337,241 @@ struct LiveStartupFastPathTests {
         readerB.close()
         #expect(task.state == .canceling || task.state == .completed)
     }
+
+    // MARK: - Live ingest lifecycle cleanup
+
+    private static var demuxedLiveMasterPlaylist: Data {
+        Data("""
+        #EXTM3U
+        #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="English",DEFAULT=YES,AUTOSELECT=YES,URI="audio.m3u8"
+        #EXT-X-STREAM-INF:BANDWIDTH=2000000,AUDIO="aud"
+        video.m3u8
+        """.utf8)
+    }
+
+    private static var demuxedLiveVideoPlaylist: Data {
+        Data("""
+        #EXTM3U
+        #EXT-X-VERSION:3
+        #EXT-X-TARGETDURATION:6
+        #EXT-X-MEDIA-SEQUENCE:1
+        #EXTINF:6.0,
+        v1.ts
+        #EXTINF:6.0,
+        v2.ts
+        """.utf8)
+    }
+
+    private static var demuxedLiveAudioPlaylist: Data {
+        Data("""
+        #EXTM3U
+        #EXT-X-VERSION:3
+        #EXT-X-TARGETDURATION:6
+        #EXT-X-MEDIA-SEQUENCE:1
+        #EXTINF:6.0,
+        a1.ts
+        #EXTINF:6.0,
+        a2.ts
+        """.utf8)
+    }
+
+    /// 2 s 16x16 2 fps H.264 + 48 kHz mono AAC MPEG-TS segment for live companion audio tests.
+    private static var muxedVideoAudioTSData: Data {
+        let b64 = """
+        R0AREABC8CUAAcEAAP8B/wAB/IAUSBIBBkZGbXBlZwlTZXJ2aWNlMDF3fEPK////////////////
+        ////////////////////////////////////////////////////////////////////////////
+        ////////////////////////////////////////////////////////////////////////////
+        //////////////////////9HQAAQAACwDQABwQAAAAHwACqxBLL/////////////////////////
+        ////////////////////////////////////////////////////////////////////////////
+        ////////////////////////////////////////////////////////////////////////////
+        /////////////////////////////////////////////0dQABAAArAXAAHBAADhAPAAG+EA8AAP
+        4QHwAC9EuZv/////////////////////////////////////////////////////////////////
+        ////////////////////////////////////////////////////////////////////////////
+        ////////////////////////////////////////////////////////////////////R0EAMAdQ
+        AAB+zH4AAAAB4AAAgIAFIQAH52EAAAABCfAAAAABZ0LACtp7ARAAAAMAEAAAAwBA8SJqAAAAAWjO
+        AZcgAAABBgX//03cRem95tlIt5Ys2CDZI+7veDI2NCAtIGNvcmUgMTY1IHIzMjIyIGIzNTYwNWEg
+        LSBILjI2NC9NUEVHLTQgQVZDIGNvZGVjIC0gQ29weWxlZnQgMjAwMy0yMDI1IC0gaHR0cDovL3d3
+        dy52aWRlb2xhbi5HAQARb3JnL3gyNjQuaHRtbCAtIG9wdGlvbnM6IGNhYmFjPTAgcmVmPTEgZGVi
+        bG9jaz0wOjA6MCBhbmFseXNlPTA6MCBtZT1kaWEgc3VibWU9MCBwc3k9MSBwc3lfcmQ9MS4wMDow
+        LjAwIG1peGVkX3JlZj0wIG1lX3JhbmdlPTE2IGNocm9tYV9tZT0xIHRyZWxsaXM9MCA4eDhkY3Q9
+        MCBjcW09MCBkZWFkem9uZT0yMSwxMSBmYXN0X0cBABJwc2tpcD0xIGNocm9tYV9xcF9vZmZzZXQ9
+        MCB0aHJlYWRzPTEgbG9va2FoZWFkX3RocmVhZHM9MSBzbGljZWRfdGhyZWFkcz0wIG5yPTAgZGVj
+        aW1hdGU9MSBpbnRlcmxhY2VkPTAgYmx1cmF5X2NvbXBhdD0wIGNvbnN0cmFpbmVkX2ludHJhPTAg
+        YmZyYW1lcz0wIHdlaWdodHA9MCBrZXlpbnQ9MiBrZXlpbnRfbWluPTIgc2NlRwEAM0EA////////
+        ////////////////////////////////////////////////////////////////////////////
+        /25lY3V0PTAgaW50cmFfcmVmcmVzaD0wIHJjPWNyZiBtYnRyZWU9MCBjcmY9NTEuMCBxY29tcD0w
+        LjYwIHFwbWluPTAgcXBtYXg9NjkgcXBzdGVwPTQgaXBfcmF0aW89MS40MCBhcT0wAIAAAAFliIQ6
+        JigAFcBHQQEwAUAAAAHAANKAgAUhAAfYYf/xTEADX/zcAExhdmM2My4xLjEwMgACMEAO//FMQAF/
+        /AEYIAf/8UxAAX/8ARggB//xTEABf/wBGCAH//FMQAF//AEYIAf/8UxAAX/8ARggB//xTEABf/wB
+        GCAH//FMQAF//AEYIAf/8UxAAX/8ARggB//xTEABf/wBGCAH//FMQAF//AEYIAf/8UxAAX/8ARgg
+        B//xTEABf/wBGCAH//FMQAF//AEYIEcBATGVAP//////////////////////////////////////
+        ////////////////////////////////////////////////////////////////////////////
+        ////////////////////////////////////////////////////////////////////////////
+        //////8H//FMQAF//AEYIAf/8UxAAX/8ARggB//xTEABf/wBGCAHR0AAEQAAsA0AAcEAAAAB8AAq
+        sQSy////////////////////////////////////////////////////////////////////////
+        ////////////////////////////////////////////////////////////////////////////
+        //////////////////////////////////////////////////////////////9HUAARAAKwFwAB
+        wQAA4QDwABvhAPAAD+EB8AAvRLmb////////////////////////////////////////////////
+        ////////////////////////////////////////////////////////////////////////////
+        ////////////////////////////////////////////////////////////////////////////
+        /////////0dQABAAArAXAAHBAADhAPAAG+EA8AAP4QHwAC9EuZv/////////////////////////
+        ////////////////////////////////////////////////////////////////////////////
+        ////////////////////////////////////////////////////////////////////////////
+        ////////////////////////////////////R0EBMAdQAAB+zH4AAAAB4AAAgIAFIQALRvEAAAAB
+        CfAAAAABQZogEqVHQQEyAUAAAAHAAMOAgAUhAAnXYf/xTEABf/wBGCAH//FMQAF//AEYIAf/8UxA
+        AX/8ARggB//xTEABf/wBGCAH//FMQAF//AEYIAf/8UxAAX/8ARggB//xTEABf/wBGCAH//FMQAF/
+        /AEYIAf/8UxAAX/8ARggB//xTEABf/wBGCAH//FMQAF//AEYIAf/8UxAAX/8ARggB//xTEABf/wB
+        GCAH//FMQAF//AEYIAf/8UxAAX/8ARggB//xTEcBATOkAP//////////////////////////////
+        ////////////////////////////////////////////////////////////////////////////
+        ////////////////////////////////////////////////////////////////////////////
+        //////////////////////////////////9AAX/8ARggB//xTEABf/wBGCAHR0AAEQAAsA0AAcEA
+        AAAB8AAqsQSy////////////////////////////////////////////////////////////////
+        ////////////////////////////////////////////////////////////////////////////
+        //////////////////////////////////////////////////////////////////////9HUAAR
+        AAKwFwABwQAA4QDwABvhAPAAD+EB8AAvRLmb////////////////////////////////////////
+        ////////////////////////////////////////////////////////////////////////////
+        ////////////////////////////////////////////////////////////////////////////
+        /////////////////0dBADVzUAABLpR+AP//////////////////////////////////////////
+        ////////////////////////////////////////////////////////////////////////////
+        /////////////////////////wAAAeAAAICABSEADaaBAAAAAQnwAAAAAWdCwAraewEQAAADABAA
+        AAMAQPEiagAAAAFozgGXIAAAAWWIggMomKAAID+AR0EBNAFAAAABwADDgIAFIQAL1mH/8UxAAX/8
+        ARggB//xTEABf/wBGCAH//FMQAF//AEYIAf/8UxAAX/8ARggB//xTEABf/wBGCAH//FMQAF//AEY
+        IAf/8UxAAX/8ARggB//xTEABf/wBGCAH//FMQAF//AEYIAf/8UxAAX/8ARggB//xTEABf/wBGCAH
+        //FMQAF//AEYIAf/8UxAAX/8ARggB//xTEABf/wBGCAH//FMQAF//AEYIAf/8UxHAQE1pAD////
+        ////////////////////////////////////////////////////////////////////////////
+        ////////////////////////////////////////////////////////////////////////////
+        ////////////////////////////////////////////////////////////QAF//AEYIAf/8UxA
+        AX/8ARggB0dBATYBQAAAAcAAw4CABSEADdVh//FMQAF//AEYIAf/8UxAAX/8ARggB//xTEABf/wB
+        GCAH//FMQAF//AEYIAf/8UxAAX/8ARggB//xTEABf/wBGCAH//FMQAF//AEYIAf/8UxAAX/8ARgg
+        B//xTEABf/wBGCAH//FMQAF//AEYIAf/8UxAAX/8ARggB//xTEABf/wBGCAH//FMQAF//AEYIAf/
+        8UxAAX/8ARggB//xFMRwEBN6QA//////////////////////////////////////////////////
+        ////////////////////////////////////////////////////////////////////////////
+        ///////////////////////////////////////////////////////////////0ABf/wBGCAH//
+        FMQAF//AEYIAdHQQA2mhAAAYZ4fgD///////////////////////////////////////////////
+        ////////////////////////////////////////////////////////////////////////////
+        ////////////////////////////AAAB4AAAgIAFIQABEGEQAAAAEJ8AAAAAFBmiASpUdBATgBQA
+        AAAcAAw4CABSEAD9Rh//FMQAF//AEYIAf/8UxAAX/8ARggB//xTEABf/wBGCAH//FMQAF//AEYIA
+        f/8UxAAX/8ARggB//xTEABf/wBGCAH//FMQAF//AEYIAf/8UxAAX/8ARggB//xTEABf/wBGCAH//
+        FMQAF//AEYIAf/8UxAAX/8ARggB//xTEABf/wBGCAH//FMQAF//AEYIAf/8UxAAX/8ARggB//xTE
+        ABf/wBGCAH//FMRwEBOaQA//////////////////////////////////////////////////////
+        ////////////////////////////////////////////////////////////////////////////
+        ///////////////////////////////////////////0ABf/wBGCAH//FMQAF//AEYIAdHQQE6O0
+        D///////////////////////////////////////////////////////////////////////////
+        //AAABwAB2gIAFIQAR02H/8UxAAX/8ARggB//xTEABf/wBGCAH//FMQAF//AEYIAf/8UxAAX/8AR
+        ggB//xTEABf/wBGCAH//FMQAF//AEYIAf/8UxAAX/8ARggB//xTEABf/wBGCAH//FMQAF//AEYIA
+        f/8UxAAX/8ARggBw==
+        """
+        return Data(base64Encoded: b64, options: .ignoreUnknownCharacters)!
+    }
+
+    @Test("failed load with host-supplied HLSLiveIngestReader closes main and companion readers")
+    @MainActor
+    func failedLoadWithHostSuppliedLiveIngestClosesMainAndCompanion() async throws {
+        let videoSeg = TinyTransportStreamFixture.data
+        let audioSeg = Self.muxedVideoAudioTSData
+        let origin = try #require(LivePrefixOrigin { path in
+            switch path {
+            case "/master.m3u8":
+                return .init(contentType: "application/vnd.apple.mpegurl", body: Self.demuxedLiveMasterPlaylist)
+            case "/video.m3u8":
+                return .init(contentType: "application/vnd.apple.mpegurl", body: Self.demuxedLiveVideoPlaylist)
+            case "/audio.m3u8":
+                return .init(contentType: "application/vnd.apple.mpegurl", body: Self.demuxedLiveAudioPlaylist)
+            case "/v1.ts", "/v2.ts":
+                return .init(contentType: "video/mp2t", body: videoSeg)
+            case "/a1.ts", "/a2.ts":
+                return .init(contentType: "video/mp2t", body: audioSeg)
+            default:
+                return .init(status: 404, contentType: "text/plain", body: Data())
+            }
+        })
+        defer { origin.stop() }
+
+        let engine = try AetherEngine()
+        defer { engine.stop() }
+        let reader = HLSLiveIngestReader(playlistURL: try origin.url("/master.m3u8"))
+        defer { reader.close() }
+        #expect(!reader.followsSessionHeaders)
+
+        let options = LoadOptions(
+            suppressDisplayCriteria: true,
+            isLive: true,
+            autoplay: false,
+            preferredDecodePath: .software
+        )
+        await #expect(throws: HLSIngestError.demuxedAudioNotSupported) {
+            _ = try await engine.load(source: .custom(reader, formatHint: "mpegts"), options: options)
+        }
+        #expect(reader.isIngestClosed)
+        let companion = try #require(reader.companionAudioReader as? HLSLiveIngestReader)
+        #expect(companion.isIngestClosed)
+    }
+
+    @Test("background pipeline release closes live ingest readers and preserves customSourceNotSeekable refusal")
+    @MainActor
+    func backgroundReleaseClosesLiveIngestAndKeepsReloadRefusal() async throws {
+        let seg = try LongGOPTransportStreamFixture.data()
+        let videoPlaylist = Data("""
+        #EXTM3U
+        #EXT-X-VERSION:3
+        #EXT-X-TARGETDURATION:32
+        #EXT-X-MEDIA-SEQUENCE:1
+        #EXTINF:32.0,
+        v1.ts
+        """.utf8)
+        let audioPlaylist = Data("""
+        #EXTM3U
+        #EXT-X-VERSION:3
+        #EXT-X-TARGETDURATION:32
+        #EXT-X-MEDIA-SEQUENCE:1
+        #EXTINF:32.0,
+        a1.ts
+        """.utf8)
+        let origin = try #require(LivePrefixOrigin { path in
+            switch path {
+            case "/master.m3u8":
+                return .init(contentType: "application/vnd.apple.mpegurl", body: Self.demuxedLiveMasterPlaylist)
+            case "/video.m3u8":
+                return .init(contentType: "application/vnd.apple.mpegurl", body: videoPlaylist)
+            case "/audio.m3u8":
+                return .init(contentType: "application/vnd.apple.mpegurl", body: audioPlaylist)
+            case "/v1.ts", "/a1.ts":
+                return .init(contentType: "video/mp2t", body: seg)
+            default:
+                return .init(status: 404, contentType: "text/plain", body: Data())
+            }
+        })
+        defer { origin.stop() }
+
+        let engine = try AetherEngine()
+        defer { engine.stop() }
+        let reader = HLSLiveIngestReader(playlistURL: try origin.url("/master.m3u8"))
+        defer { reader.close() }
+
+        let options = LoadOptions(
+            suppressDisplayCriteria: true,
+            isLive: true,
+            liveStartupSingleSegmentMinimumSeconds: 0.5,
+            autoplay: false
+        )
+        _ = try await engine.load(source: .custom(reader, formatHint: "mpegts"), options: options)
+        let companion = try #require(reader.companionAudioReader as? HLSLiveIngestReader)
+        #expect(engine.playbackBackend == .native)
+        #expect(!reader.isIngestClosed)
+        #expect(!companion.isIngestClosed)
+
+        engine.releaseVideoPipelineForBackground()
+        #expect(reader.isIngestClosed)
+        #expect(companion.isIngestClosed)
+        #expect(engine.state == .paused)
+
+        let thrown = await #expect(throws: AetherEngineError.self) {
+            try await engine.reloadAtCurrentPosition()
+        }
+        guard case .sessionNotReloadable(let refusal) = thrown else {
+            Issue.record("expected sessionNotReloadable(.customSourceNotSeekable), got \(String(describing: thrown))")
+            return
+        }
+        #expect(refusal == .customSourceNotSeekable)
+    }
 }

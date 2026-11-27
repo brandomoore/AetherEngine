@@ -3059,13 +3059,11 @@ public final class AetherEngine: ObservableObject {
     var earlySupersededProbeCloseObserverForTesting: (@Sendable () -> Void)?
 
     /// Stops background live-ingest polling when `load()` fails into `.error` without running
-    /// `stopInternal()`. Always closes an eagerly started companion audio reader; also closes the
-    /// main `HLSLiveIngestReader` when the engine created it for its own reroute.
+    /// `stopInternal()`. Closes any `HLSLiveIngestReader` (both engine-created and host-supplied,
+    /// whose one-shot FIFO is spent by the failed open) and any eagerly started companion audio reader.
     private func closeFailedLoadLiveIngest() {
         (customReader as? LiveIngestSourceInfo)?.companionAudioReader?.close()
-        if let ingest = customReader as? HLSLiveIngestReader, ingest.followsSessionHeaders {
-            ingest.close()
-        }
+        (customReader as? HLSLiveIngestReader)?.close()
     }
 
     // A replacement may reuse this reader only after the inspection and its close have joined.
