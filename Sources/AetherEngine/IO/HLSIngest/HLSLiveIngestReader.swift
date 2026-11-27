@@ -25,9 +25,66 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     /// The URL the host gave `httpHeaders` for. A companion inherits its parent's, since its own
     /// playlist URL is one the master named (audit NET-7).
     let credentialOrigin: URL
-    /// For `.companionAudio`, the parent main reader's `budgetOriginURL` so capped origin slots can
-    /// be partitioned cleanly across the video and audio pipelines.
-    private let partnerOriginURL: URL?
+    /// Tracks active origins and open state for a main video reader and its companion audio reader.
+    /// Kept behind its own lock so queries snapshot URLs and release the lock before calling into
+    /// `OriginRequestBudget`.
+    private final class PartnerCoordination: @unchecked Sendable {
+        private struct RoleState {
+            var isOpen = true
+            var originsByKey: [String: URL] = [:]
+        }
+
+        private let lock = NSLock()
+        private var mainVideo = RoleState()
+        private var companionAudio = RoleState()
+
+        private func state(for role: Role) -> RoleState {
+            switch role {
+            case .mainVideo: return mainVideo
+            case .companionAudio: return companionAudio
+            }
+        }
+
+        private func updateState(for role: Role, _ mutate: (inout RoleState) -> Void) {
+            switch role {
+            case .mainVideo: mutate(&mainVideo)
+            case .companionAudio: mutate(&companionAudio)
+            }
+        }
+
+        func record(_ urls: [URL], for role: Role) {
+            let keyed = urls.compactMap { url -> (String, URL)? in
+                guard let key = OriginRequestBudget.originKey(for: url) else { return nil }
+                return (key, url)
+            }
+            guard !keyed.isEmpty else { return }
+            lock.withLock {
+                updateState(for: role) { state in
+                    for (key, url) in keyed where state.originsByKey[key] == nil {
+                        state.originsByKey[key] = url
+                    }
+                }
+            }
+        }
+
+        func markClosed(role: Role) {
+            lock.withLock {
+                updateState(for: role) { state in
+                    state.isOpen = false
+                }
+            }
+        }
+
+        func partnerOriginsIfOpen(for callerRole: Role) -> [URL] {
+            let partnerRole: Role = callerRole == .mainVideo ? .companionAudio : .mainVideo
+            return lock.withLock {
+                let partner = state(for: partnerRole)
+                guard partner.isOpen else { return [] }
+                return Array(partner.originsByKey.values)
+            }
+        }
+    }
+
     private let role: Role
     private let fifo = ByteFIFO(capacity: 16 * 1024 * 1024)
     /// Wider than the VOD reader's 2 MB: a live window with hours of DVR at short segments is a
@@ -40,6 +97,10 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     private var consumerAttached = false
     private var closed = false
     // All _-prefixed vars are protected by startLock.
+    private var _partnerCoordination: PartnerCoordination?
+    private var _activeBudgetAborts: [UInt64: OriginRequestBudget.AbortSignal] = [:]
+    private var _nextBudgetAbortID: UInt64 = 0
+    private var _budgetSlotWaitSecondsForTesting: TimeInterval?
     private var _terminalFailure: Error?
     /// Written before any segment byte reaches the FIFO; first write wins.
     private var _upstreamTargetDuration: Double?
@@ -323,7 +384,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         startLock.withLock { _joinPoint }
     }
 
-    private func installCompanion(_ companion: HLSLiveIngestReader) {
+    private func installCompanion(_ companion: HLSLiveIngestReader, mainOrigins: [URL]) {
         companion.setJoinCushion(joinCushionSeconds)
         // The companion never reopens on its own, and the engine builds no reopen for a session that
         // has one (`ingestReopenFactory`), so a `.sequence` resume never reaches here. Only the first
@@ -335,15 +396,19 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         startLock.unlock()
         if raceClosed {
             companion.close()
-        } else if Self.allowsSpeculativeOverlap(
-            readerOriginURL: budgetOriginURL,
-            targetURL: companion.budgetOriginURL
-        ) {
+        } else if mainOrigins.allSatisfy({
+            Self.allowsSpeculativeOverlap(readerOriginURL: $0, targetURL: companion.budgetOriginURL)
+        }) {
             // Overlap the companion's playlist fetch, first segment, and format classification with
             // the main video variant fetch, video join, and Demuxer.open. Skip eager start when
-            // either origin is serialized to a single request slot or actively paced after a refusal.
+            // any main or companion origin is serialized to a single request slot or actively paced.
             companion.startIfNeeded(attachingConsumer: false)
         }
+    }
+
+    var budgetSlotWaitSecondsForTesting: TimeInterval? {
+        get { startLock.withLock { _budgetSlotWaitSecondsForTesting } }
+        set { startLock.withLock { _budgetSlotWaitSecondsForTesting = newValue } }
     }
 
     /// True when `OriginRequestBudget` allows speculative parallel requests for `targetURL` on this
@@ -384,6 +449,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
                                         diagnosticContext: diagnosticContext,
                                         followsSessionHeaders: followsSessionHeaders)
         if let store = startLock.withLock({ _headerStore }) { fresh.adoptSessionHeaderStore(store) }
+        fresh.budgetSlotWaitSecondsForTesting = budgetSlotWaitSecondsForTesting
         fresh.setJoinCushion(joinCushionSeconds)
         // AE#1090: a session behind the edge picks up where this reader stopped delivering. The bytes
         // still in the dead FIFO are lost either way, which is a few seconds at 1x pacing, against the
@@ -448,19 +514,47 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         delegateQueue: nil
     )
 
-    init(playlistURL: URL, httpHeaders: [String: String] = [:], role: Role,
-         credentialOrigin: URL? = nil,
-         partnerOriginURL: URL? = nil,
-         diagnosticContext: SourceNetworkDiagnostics.Context? = SourceNetworkDiagnostics.context,
-         followsSessionHeaders: Bool = false) {
+    private init(playlistURL: URL, httpHeaders: [String: String] = [:], role: Role,
+                 credentialOrigin: URL? = nil,
+                 partnerCoordination: PartnerCoordination?,
+                 diagnosticContext: SourceNetworkDiagnostics.Context? = SourceNetworkDiagnostics.context,
+                 followsSessionHeaders: Bool = false) {
         self.followsSessionHeaders = followsSessionHeaders
         self.diagnosticContext = diagnosticContext
         self.playlistURL = playlistURL
         self.httpHeaders = httpHeaders
         self.credentialOrigin = credentialOrigin ?? playlistURL
-        self.partnerOriginURL = partnerOriginURL
+        self._partnerCoordination = partnerCoordination
         self.role = role
         self.session = Self.sharedSession
+    }
+
+    convenience init(playlistURL: URL, httpHeaders: [String: String] = [:], role: Role,
+                     credentialOrigin: URL? = nil,
+                     partnerOriginURL: URL? = nil,
+                     diagnosticContext: SourceNetworkDiagnostics.Context? = SourceNetworkDiagnostics.context,
+                     followsSessionHeaders: Bool = false) {
+        let coordination: PartnerCoordination?
+        if let partnerOriginURL {
+            let seeded = PartnerCoordination()
+            seeded.record([partnerOriginURL], for: .mainVideo)
+            coordination = seeded
+        } else {
+            coordination = nil
+        }
+        self.init(
+            playlistURL: playlistURL,
+            httpHeaders: httpHeaders,
+            role: role,
+            credentialOrigin: credentialOrigin,
+            partnerCoordination: coordination,
+            diagnosticContext: diagnosticContext,
+            followsSessionHeaders: followsSessionHeaders
+        )
+    }
+
+    private var partnerCoordination: PartnerCoordination? {
+        startLock.withLock { _partnerCoordination }
     }
 
     // MARK: - IOReader
@@ -485,8 +579,13 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         task?.cancel()
         let companion = _companionAudioReader
         _companionAudioReader = nil
+        let coordination = _partnerCoordination
+        let budgetAborts = Array(_activeBudgetAborts.values)
+        _activeBudgetAborts.removeAll()
         startLock.unlock()
 
+        for abortSignal in budgetAborts { abortSignal.abort() }
+        coordination?.markClosed(role: role)
         cancelInFlightKeyFetches(markClosed: true)
         companion?.close() // companion lifetime bound to main reader; engine closes only the reader it holds
         fifo.cancel()
@@ -518,11 +617,13 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
 
     private func runIngest() async {
         defer {
+            partnerCoordination?.markClosed(role: role)
             cancelInFlightKeyFetches(markClosed: false)
             wakeFormatResolveWaiters() // wake any pending format resolve regardless of exit path
         }
         do {
             let (resolvedURL, seedPlaylist) = try await resolveMediaPlaylistURL()
+            partnerCoordination?.record([playlistURL, resolvedURL], for: role)
             var mediaURL = resolvedURL
             // A media playlist the host's URL led to directly (through redirects, as an IPTV panel's
             // tokenized session URL), which that URL can lead to afresh when the session expires.
@@ -543,6 +644,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
                 } else {
                     let (fetched, refreshedURL) = try await refreshMediaPlaylist(
                         mediaURL, canReresolve: mediaURLIsReresolvable)
+                    partnerCoordination?.record([refreshedURL], for: role)
                     mediaURL = refreshedURL
                     media = fetched
                 }
@@ -720,6 +822,10 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
             let keyURL = segment.crypt.flatMap { HLSPlaylistParser.resolve(uri: $0.keyURI, against: mediaURL) }
             return (segment, url, keyURL)
         }
+        partnerCoordination?.record(
+            [mediaURL] + resolved.map(\.url) + resolved.compactMap(\.keyURL),
+            for: role
+        )
         let budget = OriginRequestBudget.shared
         func concurrency(for url: URL) -> Int {
             guard let limit = budget.limit(for: url) else { return Self.maxConcurrentSegmentFetches }
@@ -727,13 +833,18 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
                 budgetLimit: limit, sharesOriginWithPartner: hasActiveSharedOriginPartner(for: url), role: role
             )
         }
-        // A task can make one request at a time to any capped origin, including an off-playlist
-        // key host. Bound the whole window by the tightest cap so even distinct cold keys fit.
-        var window = concurrency(for: mediaURL)
-        for item in resolved {
-            if window == 1 { break }
-            window = min(window, concurrency(for: item.url))
-            if let keyURL = item.keyURL { window = min(window, concurrency(for: keyURL)) }
+        // Recompute dynamically so mid-batch origin discovery or closure on the partner reader
+        // updates slot partitioning on the very next spawn.
+        func currentWindow() -> Int {
+            // A task can make one request at a time to any capped origin, including an off-playlist
+            // key host. Bound the whole window by the tightest cap so even distinct cold keys fit.
+            var window = concurrency(for: mediaURL)
+            for item in resolved {
+                if window == 1 { break }
+                window = min(window, concurrency(for: item.url))
+                if let keyURL = item.keyURL { window = min(window, concurrency(for: keyURL)) }
+            }
+            return window
         }
         return try await withThrowingTaskGroup(of: (Int, Data).self) { group -> Bool in
             var nextToSpawn = 0
@@ -746,7 +857,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
             }
             func spawnDue() {
                 while nextToSpawn < resolved.count,
-                      nextToSpawn < nextToCommit + window,
+                      nextToSpawn < nextToCommit + currentWindow(),
                       isDue(nextToSpawn) {
                     spawnFetch(
                         into: &group,
@@ -798,17 +909,18 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     }
 
     private func hasActiveSharedOriginPartner(for url: URL) -> Bool {
-        switch role {
-        case .mainVideo:
-            guard let companion = startLock.withLock({ _companionAudioReader }),
-                  !companion.isIngestClosed else {
-                return false
-            }
-            return OriginRequestBudget.shared.sharesBudget(between: url, and: companion.budgetOriginURL)
-        case .companionAudio:
-            guard let partnerOriginURL else { return false }
-            return OriginRequestBudget.shared.sharesBudget(between: url, and: partnerOriginURL)
+        if let coordination = partnerCoordination {
+            let partnerURLs = coordination.partnerOriginsIfOpen(for: role)
+            guard !partnerURLs.isEmpty else { return false }
+            let budget = OriginRequestBudget.shared
+            return partnerURLs.contains { budget.sharesBudget(between: url, and: $0) }
         }
+        if role == .mainVideo,
+           let companion = startLock.withLock({ _companionAudioReader }),
+           !companion.isIngestClosed {
+            return OriginRequestBudget.shared.sharesBudget(between: url, and: companion.budgetOriginURL)
+        }
+        return false
     }
 
     static func allowsSpeculativeKeyOverlap(readerOriginURL: URL, segmentURL: URL, keyURL: URL) -> Bool {
@@ -848,16 +960,15 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
             guard let keyURL = item.keyURL else {
                 throw HLSIngestError.segmentDecryptFailed(reason: "unresolvable key URI")
             }
-            let key: Data
-            if let prefetchedKey {
-                key = try await withTaskCancellationHandler {
-                    try await prefetchedKey.value
-                } onCancel: {
-                    prefetchedKey.cancel()
+            let key = try await self.fetchKeyForSegment(keyURL, initialAttempt: prefetchedKey.map { task in
+                {
+                    try await withTaskCancellationHandler {
+                        try await task.value
+                    } onCancel: {
+                        task.cancel()
+                    }
                 }
-            } else {
-                key = try await self.fetchKey(keyURL)
-            }
+            })
             return (index, try self.decryptSegment(fetched, key: key, crypt: crypt))
         }
     }
@@ -953,13 +1064,25 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
                     + "starting companion reader on \(audioURL.lastPathComponent)",
                     category: .engine
                 )
+                let coordination = PartnerCoordination()
+                coordination.record([playlistURL, finalURL, url], for: .mainVideo)
+                coordination.record([audioURL], for: .companionAudio)
+                let alreadyClosed = startLock.withLock { () -> Bool in
+                    if closed { return true }
+                    _partnerCoordination = coordination
+                    return false
+                }
+                if alreadyClosed {
+                    coordination.markClosed(role: .mainVideo)
+                }
                 let companion = HLSLiveIngestReader(
                     playlistURL: audioURL, httpHeaders: currentHeaders, role: .companionAudio,
-                    credentialOrigin: credentialOrigin, partnerOriginURL: budgetOriginURL,
+                    credentialOrigin: credentialOrigin, partnerCoordination: coordination,
                     diagnosticContext: diagnosticContext,
                     followsSessionHeaders: followsSessionHeaders)
                 if let store = startLock.withLock({ _headerStore }) { companion.adoptSessionHeaderStore(store) }
-                installCompanion(companion)
+                companion.budgetSlotWaitSecondsForTesting = budgetSlotWaitSecondsForTesting
+                installCompanion(companion, mainOrigins: [playlistURL, finalURL, url])
             }
             // AE#359: the variant's SUBTITLES group, resolved to absolute playlist URLs and published as
             // metadata. Nothing is fetched here; the host decides whether a subtitle track is ever wanted.
@@ -1125,23 +1248,59 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
     }
 
+    private func registerBudgetAbort(_ abortSignal: OriginRequestBudget.AbortSignal) throws -> UInt64 {
+        try startLock.withLock {
+            if closed { throw CancellationError() }
+            _nextBudgetAbortID &+= 1
+            let id = _nextBudgetAbortID
+            _activeBudgetAborts[id] = abortSignal
+            return id
+        }
+    }
+
+    private func unregisterBudgetAbort(_ id: UInt64) {
+        startLock.withLock {
+            _ = _activeBudgetAborts.removeValue(forKey: id)
+        }
+    }
+
     /// AE#678: every ingest request is charged to `OriginRequestBudget` like the reader's and the relay's,
     /// so the host's declared ceiling, and a ceiling or pacer learned from another path's refusal, bind
-    /// this path too. Its own refusals are not charged (see below). The slot wait blocks, so it runs off
-    /// the cooperative pool; no ticket is ever held across another acquire.
+    /// this path too. Its own refusals are not charged (see below). The slot wait blocks, so it runs on
+    /// a dedicated thread instead of the cooperative or GCD global pools; no ticket is ever held across
+    /// another acquire.
     private func budgeted(
         _ url: URL, label: String, _ fetch: () async throws -> (Data, URLResponse)
     ) async throws -> (Data, URLResponse) {
-        let ticket: OriginRequestBudget.Ticket? = await withCheckedContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                continuation.resume(returning: OriginRequestBudget.shared.acquire(
-                    for: url, label: label, timeout: Self.budgetSlotWaitSeconds, allowOvercommit: false,
-                    shouldAbort: { self?.isClosed ?? true }))
+        try Task.checkCancellation()
+        guard !isClosed else { throw CancellationError() }
+        let abortSignal = OriginRequestBudget.AbortSignal()
+        let abortID = try registerBudgetAbort(abortSignal)
+        let slotWait = budgetSlotWaitSecondsForTesting ?? Self.budgetSlotWaitSeconds
+        let ticket: OriginRequestBudget.Ticket?
+        do {
+            defer { unregisterBudgetAbort(abortID) }
+            ticket = await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    Thread.detachNewThread { [weak self] in
+                        let acquired = OriginRequestBudget.shared.acquire(
+                            for: url,
+                            label: label,
+                            timeout: slotWait,
+                            overcommit: .pacerOnly,
+                            abortSignal: abortSignal,
+                            shouldAbort: { abortSignal.isAborted || (self?.isClosed ?? true) }
+                        )
+                        continuation.resume(returning: acquired)
+                    }
+                }
+            } onCancel: {
+                abortSignal.abort()
             }
         }
         defer { OriginRequestBudget.shared.release(ticket) }
         try Task.checkCancellation()
-        guard !isClosed else { throw CancellationError() }
+        guard !isClosed, !abortSignal.isAborted else { throw CancellationError() }
         // Playlists on different hosts can still send both readers to the same segment or key
         // origin. Its admission timeout is a transport failure, not permission to send anyway.
         if ticket == nil, OriginRequestBudget.originKey(for: url) != nil {
@@ -1166,7 +1325,9 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         return (data, response)
     }
 
-    static let budgetSlotWaitSeconds: TimeInterval = 10
+    // Matches `makeSharedSessionConfiguration().timeoutIntervalForResource` (30 s) so a healthy
+    // slow segment on a 1-slot or Multiview-shared origin never trips an early 10 s admission timeout.
+    static let budgetSlotWaitSeconds: TimeInterval = 30
     static let refusalStatuses: Set<Int> = [429, 503, 509]
 
     private var isClosed: Bool { startLock.withLock { closed } }
@@ -1313,6 +1474,56 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
                 }
             taskToAbort?.cancel()
             cancelled?.resume(throwing: CancellationError())
+        }
+    }
+
+    /// Bounded segment-level key retry for transient errors, refusals (429/503/509), and admission
+    /// timeouts while keeping `fetchKey(_:)` itself single-attempt.
+    private func fetchKeyForSegment(
+        _ url: URL,
+        initialAttempt: (() async throws -> Data)? = nil
+    ) async throws -> Data {
+        let startedAt = Date()
+        var budget = Self.unreachableRetryBudget
+        var attempt = 0
+        while true {
+            if Task.isCancelled || isClosed { throw CancellationError() }
+            var status: Int?
+            let lastFailure: Error
+            do {
+                if attempt == 0, let initialAttempt {
+                    return try await initialAttempt()
+                }
+                return try await fetchKey(url)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch let error as HLSIngestError {
+                if Task.isCancelled || isClosed { throw error }
+                switch error {
+                case .segmentDecryptFailed:
+                    throw error
+                case .playlistUnreachable(let code):
+                    if (400..<500).contains(code) && code != 429 && code != 408 {
+                        throw error
+                    }
+                    status = code
+                    lastFailure = error
+                default:
+                    throw error
+                }
+            } catch {
+                if Task.isCancelled || (error as? URLError)?.code == .cancelled || isClosed {
+                    throw error
+                }
+                lastFailure = error
+            }
+            attempt += 1
+            let delay = attempt <= 2 ? 0.5 * Double(attempt) : Self.retryWait(retryAfter: nil)
+            budget = max(budget, Self.retryBudget(forStatus: status))
+            guard Date().addingTimeInterval(delay) < startedAt.addingTimeInterval(budget) else {
+                throw lastFailure
+            }
+            try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
         }
     }
 

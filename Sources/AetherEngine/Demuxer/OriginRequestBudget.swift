@@ -175,6 +175,63 @@ final class OriginRequestBudget: @unchecked Sendable {
         var waiting: Int
     }
 
+    enum OvercommitPolicy: Sendable {
+        /// Proceed (counted in `inflight`) if either the pacer or the concurrency-slot wait expires.
+        case allow
+        /// Return `nil` if either the pacer wait or the concurrency-slot wait expires.
+        case never
+        /// Never exceed `limit` when all concurrency slots stay full past `timeout` (return `nil`),
+        /// but if `waitForPacerToken` spends `timeout` (`case .spent`), fall through to the
+        /// concurrency-slot check so a free slot (`inflight < limit`, or `limit == nil`) is still granted
+        /// instead of failing an unbooked origin on pacer delay alone.
+        case pacerOnly
+    }
+
+    /// Thread-safe abort signal that wakes any parked pacer or concurrency-slot wait immediately on `abort()`.
+    final class AbortSignal: @unchecked Sendable {
+        private let lock = NSLock()
+        private var aborted = false
+        private var waiters: [DispatchSemaphore] = []
+
+        init() {}
+
+        var isAborted: Bool {
+            lock.lock(); defer { lock.unlock() }
+            return aborted
+        }
+
+        func abort() {
+            lock.lock()
+            if aborted {
+                lock.unlock()
+                return
+            }
+            aborted = true
+            let toSignal = waiters
+            waiters.removeAll()
+            lock.unlock()
+            for waiter in toSignal {
+                waiter.signal()
+            }
+        }
+
+        /// Registers `semaphore` to be signalled on `abort()`. Returns `false` if already aborted
+        /// so the caller avoids parking.
+        fileprivate func register(_ semaphore: DispatchSemaphore) -> Bool {
+            lock.lock(); defer { lock.unlock() }
+            if aborted { return false }
+            waiters.append(semaphore)
+            return true
+        }
+
+        fileprivate func unregister(_ semaphore: DispatchSemaphore) {
+            lock.lock(); defer { lock.unlock() }
+            if let index = waiters.firstIndex(where: { $0 === semaphore }) {
+                waiters.remove(at: index)
+            }
+        }
+    }
+
     private struct OriginState {
         var inflight = 0
         var peakInflight = 0
@@ -358,12 +415,12 @@ final class OriginRequestBudget: @unchecked Sendable {
         case passed(milliseconds: Double)
         /// `timeout` measured from `started` ran out first.
         case spent
-        /// The caller's `shouldAbort` fired before a token was taken. Nothing was consumed.
+        /// The caller's `abortSignal` or `shouldAbort` fired before a token was taken. Nothing was consumed.
         case aborted
     }
 
     /// Wait until this origin's pacer allows one more request, or until `timeout` measured from
-    /// `started` runs out, or until `shouldAbort` says the caller no longer wants it (audit DMX-112:
+    /// `started` runs out, or until `abortSignal`/`shouldAbort` says the caller no longer wants it (audit DMX-112:
     /// a pump parked here for a session that has been torn down must not take the next session's
     /// token, so the check comes before a token is consumed, every slice).
     ///
@@ -373,11 +430,16 @@ final class OriginRequestBudget: @unchecked Sendable {
     /// every other path behind it for the whole quiet period, and a suite full of readers doing that
     /// blocked enough threads that unrelated tests could not get one.
     private func waitForPacerToken(raw: String, label: String, started: DispatchTime,
-                                   timeout: TimeInterval, shouldAbort: (() -> Bool)?) -> PacerWait {
+                                   timeout: TimeInterval, abortSignal: AbortSignal?,
+                                   shouldAbort: (() -> Bool)?) -> PacerWait {
         var pacingStarted: DispatchTime?
         let sleeper = DispatchSemaphore(value: 0)
+        if let abortSignal, !abortSignal.register(sleeper) {
+            return .aborted
+        }
+        defer { abortSignal?.unregister(sleeper) }
         while true {
-            if shouldAbort?() == true { return .aborted }
+            if abortSignal?.isAborted == true || shouldAbort?() == true { return .aborted }
             let instant = now()
             lock.lock()
             let key = headLocked(raw)
@@ -419,6 +481,7 @@ final class OriginRequestBudget: @unchecked Sendable {
             // moves without the wall clock cannot shorten a wait already entered.
             let slice = min(remaining, max(0.001, min(waitNeeded, Self.pacerWaitSliceSeconds)))
             _ = sleeper.wait(timeout: .now() + slice)
+            if abortSignal?.isAborted == true || shouldAbort?() == true { return .aborted }
         }
     }
 
@@ -435,50 +498,66 @@ final class OriginRequestBudget: @unchecked Sendable {
     /// Take a slot for one request against `url`, waiting up to `timeout` when the origin is
     /// capped and full, or after a refusal while its request-rate pacer has no token.
     ///
-    /// Always returns a ticket. A caller that could not be given room within its budget gets one
-    /// with `granted == false` and proceeds: the budget is a throttle over an origin's tolerance,
-    /// not a correctness barrier, and blocking a read forever to honour a guess about someone
-    /// else's rate limiter trades a slow session for a dead one. The un-granted case is counted
-    /// and logged, because a budget that is being routinely overrun is worth seeing.
+    /// By default (`overcommit: .allow` via `allowOvercommit: true`), a caller that could not be
+    /// given room within its budget gets a ticket with `granted == false` and proceeds: the budget
+    /// is a throttle over an origin's tolerance, not a correctness barrier, and blocking a read
+    /// forever to honour a guess about someone else's rate limiter trades a slow session for a dead
+    /// one. The un-granted case is counted and logged, because a budget that is being routinely
+    /// overrun is worth seeing.
     ///
-    /// `shouldAbort` (audit DMX-112) is polled once per `pacerWaitSliceSeconds` in both waits, and a
-    /// caller that has been torn down while parked gets nil back with nothing consumed: no pacer
+    /// `abortSignal` wakes any parked pacer or concurrency-slot wait immediately on `abort()`,
+    /// whereas `shouldAbort` (audit DMX-112) is polled once per `pacerWaitSliceSeconds`. Either way,
+    /// a caller that has been torn down while parked gets nil back with nothing consumed: no pacer
     /// token, no slot, and its place in the FIFO given up, so it cannot take what the next session
     /// is waiting for. nil is also what an unkeyable URL returns, so a caller that passes
-    /// `shouldAbort` tells the two apart by asking its own abort state.
-    /// `allowOvercommit: false` returns nil when the wait budget is spent. Metadata discovery
-    /// uses this mode so its fallback requests cannot exceed an origin's known concurrency limit.
+    /// `abortSignal` or `shouldAbort` tells the two apart by asking its own abort state.
+    /// `overcommit` (or `allowOvercommit: false`, which maps to `.never`) controls timeout behavior:
+    /// `.never` refuses both pacer and concurrency overcommit, while `.pacerOnly` falls through on
+    /// pacer timeout so a free concurrency slot can still be granted without exceeding `limit`.
     func acquire(for url: URL, label: String, timeout: TimeInterval,
                  allowOvercommit: Bool = true,
+                 overcommit: OvercommitPolicy? = nil,
+                 abortSignal: AbortSignal? = nil,
                  shouldAbort: (() -> Bool)? = nil) -> Ticket? {
+        if abortSignal?.isAborted == true || shouldAbort?() == true { return nil }
         guard let raw = Self.originKey(for: url) else { return nil }
 
+        let policy = overcommit ?? (allowOvercommit ? .allow : .never)
         let started = DispatchTime.now()
         // Rate before concurrency. The two rules bind different things and only this order lets a
         // caller wait for the rate rule without holding the concurrency one.
         let pacedMs: Double
         switch waitForPacerToken(raw: raw, label: label, started: started,
-                                 timeout: timeout, shouldAbort: shouldAbort) {
+                                 timeout: timeout, abortSignal: abortSignal,
+                                 shouldAbort: shouldAbort) {
         case .aborted:
             return nil
         case .passed(let milliseconds):
             pacedMs = milliseconds
         case .spent:
-            guard allowOvercommit else { return nil }
-            // The pacer alone spent the caller's budget. Proceed uncounted-for, the same answer the
-            // slot timeout below gives, and stay honest about being on the link.
-            lock.lock()
-            let spentKey = headLocked(raw)
-            var spent = origins[spentKey] ?? OriginState()
-            spent.inflight += 1
-            spent.peakInflight = max(spent.peakInflight, spent.inflight)
-            origins[spentKey] = spent
-            lock.unlock()
-            let waitedMs = Self.elapsedSeconds(from: started, to: DispatchTime.now()) * 1_000
-            EngineLog.emit(
-                "[OriginBudget] \(label) proceeded without waiting the pacer out after "
-                + "\(Int(waitedMs))ms", category: .demux)
-            return Ticket(key: raw, label: label, waitedMs: waitedMs, granted: false)
+            switch policy {
+            case .never:
+                return nil
+            case .allow:
+                // The pacer alone spent the caller's budget. Proceed uncounted-for, the same answer the
+                // slot timeout below gives, and stay honest about being on the link.
+                lock.lock()
+                let spentKey = headLocked(raw)
+                var spent = origins[spentKey] ?? OriginState()
+                spent.inflight += 1
+                spent.peakInflight = max(spent.peakInflight, spent.inflight)
+                origins[spentKey] = spent
+                lock.unlock()
+                let waitedMs = Self.elapsedSeconds(from: started, to: DispatchTime.now()) * 1_000
+                EngineLog.emit(
+                    "[OriginBudget] \(label) proceeded without waiting the pacer out after "
+                    + "\(Int(waitedMs))ms", category: .demux)
+                return Ticket(key: raw, label: label, waitedMs: waitedMs, granted: false)
+            case .pacerOnly:
+                // Fall through so an unbooked or non-full origin can still grant a free concurrency
+                // slot instead of failing on pacer delay alone.
+                pacedMs = Self.elapsedSeconds(from: started, to: DispatchTime.now()) * 1_000
+            }
         }
 
         lock.lock()
@@ -499,16 +578,29 @@ final class OriginRequestBudget: @unchecked Sendable {
         // What the pacer already spent comes off the slot's budget, so the caller's total wait is
         // the one figure it asked for rather than that figure per gate.
         let slotBudget = max(0, timeout - Self.elapsedSeconds(from: started, to: DispatchTime.now()))
+        let checkAbort: (() -> Bool)? = (abortSignal != nil || shouldAbort != nil)
+            ? { (abortSignal?.isAborted == true) || (shouldAbort?() == true) }
+            : nil
         var signalled = false
         var aborted = false
-        if let shouldAbort {
-            let deadline = DispatchTime.now() + slotBudget
-            while true {
-                let slice = min(Self.elapsedSeconds(from: DispatchTime.now(), to: deadline),
-                                Self.pacerWaitSliceSeconds)
-                if semaphore.wait(timeout: .now() + slice) == .success { signalled = true; break }
-                if shouldAbort() { aborted = true; break }
-                if DispatchTime.now() >= deadline { break }
+        if let checkAbort {
+            if let abortSignal, !abortSignal.register(semaphore) {
+                aborted = true
+            } else {
+                defer { abortSignal?.unregister(semaphore) }
+                let deadline = DispatchTime.now() + slotBudget
+                while true {
+                    if checkAbort() { aborted = true; break }
+                    let remaining = Self.elapsedSeconds(from: DispatchTime.now(), to: deadline)
+                    let slice = shouldAbort != nil ? min(remaining, Self.pacerWaitSliceSeconds) : remaining
+                    if semaphore.wait(timeout: .now() + slice) == .success {
+                        if checkAbort() { aborted = true; break }
+                        signalled = true
+                        break
+                    }
+                    if checkAbort() { aborted = true; break }
+                    if DispatchTime.now() >= deadline { break }
+                }
             }
         } else {
             signalled = semaphore.wait(timeout: .now() + slotBudget) == .success
@@ -546,13 +638,13 @@ final class OriginRequestBudget: @unchecked Sendable {
         var timedOut = origins[keyNow] ?? OriginState()
         if let i = timedOut.waiters.firstIndex(where: { $0 === semaphore }) {
             timedOut.waiters.remove(at: i)
-            if !allowOvercommit {
+            if policy != .allow {
                 origins[keyNow] = timedOut
                 lock.unlock()
                 return nil
             }
             timedOut.inflight += 1   // proceeding anyway; stay honest about what is on the link
-        } else if !allowOvercommit {
+        } else if policy != .allow {
             // The release raced the deadline and already granted this caller a real slot.
             lock.unlock()
             return Ticket(key: raw, label: label, waitedMs: waitedMs, granted: true)
