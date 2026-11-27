@@ -3049,7 +3049,22 @@ public final class AetherEngine: ObservableObject {
 
     /// In-flight probe demuxer. Registered before the detached open so stopInternal can markClosed() it:
     /// without this, player dismissal/channel zapping left the probe reconnecting through subsequent sessions.
-    private var inFlightProbeDemuxer: Demuxer?
+    private(set) var inFlightProbeDemuxer: Demuxer?
+    /// Test seam: suspends `awaitAudioSessionCategoryConfigured()` so tests can deterministically
+    /// exercise startup probe overlap and early supersession on every platform.
+    var audioSessionCategoryWaitForTesting: (@MainActor () async -> Void)?
+    /// Test seam: called when the startup `probeTask` finishes unwinding (success or failure).
+    var probeTaskCompletedForTesting: (@Sendable () -> Void)?
+    /// Test seam: called right after `probe.close()` in the early-supersession cleanup path.
+    var earlySupersededProbeCloseObserverForTesting: (@Sendable () -> Void)?
+
+    /// Stops background live-ingest polling when `load()` fails into `.error` without running
+    /// `stopInternal()`. Closes any `HLSLiveIngestReader` (both engine-created and host-supplied,
+    /// whose one-shot FIFO is spent by the failed open) and any eagerly started companion audio reader.
+    private func closeFailedLoadLiveIngest() {
+        (customReader as? LiveIngestSourceInfo)?.companionAudioReader?.close()
+        (customReader as? HLSLiveIngestReader)?.close()
+    }
 
     // A replacement may reuse this reader only after the inspection and its close have joined.
     @MainActor
@@ -3106,10 +3121,8 @@ public final class AetherEngine: ObservableObject {
             handling: resolvedDolbyVisionHandling(options.dolbyVisionHandling, foldsFEL: options.foldsDolbyVisionFEL),
             codecID: codecpar.codec_id, dvProfile: config?.profile, dvBlCompatID: config?.blCompatID,
             colorTransfer: codecpar.color_trc, colorMatrix: codecpar.color_space)
-        let capabilities = Self.reloadDisplayCapabilities(
-            observedAtLoad: sessionObservedDisplayCaps,
-            hostAssertsDolbyVision: options.panelPresentsDolbyVision,
-            readNow: { Self.displayCapabilities })
+        let capabilities = reloadDisplayCapabilities(
+            hostAssertsDolbyVision: options.panelPresentsDolbyVision)
         let format = Self.effectiveVideoFormat(
             detected: sourceVideoFormat, stream: stream,
             capabilities: baseLayer ? capabilities.withoutDolbyVision() : capabilities)
@@ -4833,6 +4846,10 @@ public final class AetherEngine: ObservableObject {
     /// category again: a host that switches the mode afterwards (music playback setting `.default`)
     /// keeps it, as it did when the declaration ran once at init. A failed attempt is retried.
     func awaitAudioSessionCategoryConfigured() async {
+        if let wait = audioSessionCategoryWaitForTesting {
+            await wait()
+            return
+        }
         #if os(iOS) || os(tvOS)
         await SharedOutputCoordinator.shared.configureAudioSessionCategory {
             Self.configureAudioSessionCategory()
@@ -5310,17 +5327,15 @@ public final class AetherEngine: ObservableObject {
         softwareClockSessionZero = nil
         subtitleCueDiagnosticBudget = .init()
 
-        // #114: guarantee the AVAudioSession category is declared off-main before any branch
-        // below can activate the session: AVKit on the native/remote-HLS paths, activateRendererAudioSession()
-        // on the SW and audio paths. Only the first load in the process does any work here.
-        await awaitAudioSessionCategoryConfigured()
-        // Audit CORE-6: the first suspension point. Two loads issued back to back right after init
-        // both wait on the same category task, and the older one must not resume as the current one.
-        try checkLoadCurrent(gen)
-
         // nativeRemoteHLS: skip probe + loopback; play HLS URL directly with AVPlayer (Jellyfin already serves HLS).
         // Routed before the probe because we never demux the m3u8.
         if options.nativeRemoteHLS {
+            // #114: guarantee the AVAudioSession category is declared off-main before any branch
+            // below can activate the session (only the first load in the process does work here).
+            await awaitAudioSessionCategoryConfigured()
+            // Audit CORE-6: the first suspension point. Two loads issued back to back right after init
+            // both wait on the same category task, and the older one must not resume as the current one.
+            try checkLoadCurrent(gen)
             // AE#990: a finite MPEG-TS playlist the session is to decode in software moves onto the
             // seekable ingest, which is also where the AE#561 escalation of a refused mount lands.
             if options.preferredDecodePath == .software, case .url(let playlistURL) = source,
@@ -5372,6 +5387,28 @@ public final class AetherEngine: ObservableObject {
             return nil
         }
 
+        if options.isLive, !options.nativeRemoteHLS, case .url(let livePlaylistURL) = source,
+           RemoteHLSMediaSelection.isKnownLivePlaylist(livePlaylistURL) {
+            EngineLog.emit(
+                "[AetherEngine] AE#678: known HLS playlist URL on the live path; straight onto the "
+                + "live-ingest reader, no raw probe",
+                category: .engine
+            )
+            continueStartupAcrossReroute()
+            return try await load(
+                source: .custom(
+                    HLSLiveIngestReader.engineIngest(playlistURL: livePlaylistURL,
+                                                     httpHeaders: loadedOptions.httpHeaders,
+                                                     diagnosticContext: loadedOptions.sourceDiagnosticsContext),
+                    formatHint: "mpegts"
+                ),
+                startPosition: startPosition,
+                options: loadedOptions,
+                audioSourceStreamIndex: audioSourceStreamIndex,
+                discTitleID: discTitleID
+            )
+        }
+
         // 1. Probe: detect format, frame rate, and track metadata.
         //    HLSVideoEngine re-opens internally; the double-open keeps the failure-mode matrix small.
         var detectedFormat: VideoFormat = .sdr
@@ -5401,44 +5438,6 @@ public final class AetherEngine: ObservableObject {
         // is a second read `stopInternal` cannot abort, so a superseded load can return from it after
         // its successor's prologue and would write this source's geometry over the reset.
         var probedGeometry: (width: Int32, height: Int32, pixelAspect: Double?)?
-        // AE#493: what this session takes the display to be. The observed table is what the platform
-        // could answer; the session table adds what the host asserted, because Dolby Vision has no
-        // public capability API on macOS and eligibility deliberately does not claim it. Composed once,
-        // so the format clamp below and the served DV route cannot disagree about the same display.
-        let observedDisplayCaps = Self.displayCapabilities
-        let sessionDisplayCaps = observedDisplayCaps.assertingDolbyVision(options.panelPresentsDolbyVision)
-        // What the clamp below and the served route are about to read, stated once per load. Every question
-        // this table decides (why a source resolved to SDR, why a panel was asked for one format and not
-        // another, why a route went media-direct) was previously answered by inference from the outcome,
-        // and a per-mode false is an assertion the platform made, not an absence of information (AE#493).
-        EngineLog.emit(
-            "[DisplayCapabilities] observed: hdr=\(observedDisplayCaps.supportsHDR) "
-            + "hdr10=\(observedDisplayCaps.supportsHDR10) hlg=\(observedDisplayCaps.supportsHLG) "
-            + "dv=\(observedDisplayCaps.supportsDolbyVision)"
-            + (options.panelPresentsDolbyVision ? " (session dv asserted true)" : ""),
-            category: .session
-        )
-        if options.isLive, !options.nativeRemoteHLS, case .url(let livePlaylistURL) = source,
-           RemoteHLSMediaSelection.isKnownLivePlaylist(livePlaylistURL) {
-            EngineLog.emit(
-                "[AetherEngine] AE#678: known HLS playlist URL on the live path; straight onto the "
-                + "live-ingest reader, no raw probe",
-                category: .engine
-            )
-            continueStartupAcrossReroute()
-            return try await load(
-                source: .custom(
-                    HLSLiveIngestReader.engineIngest(playlistURL: livePlaylistURL,
-                                                     httpHeaders: loadedOptions.httpHeaders,
-                                                     diagnosticContext: loadedOptions.sourceDiagnosticsContext),
-                    formatHint: "mpegts"
-                ),
-                startPosition: startPosition,
-                options: loadedOptions,
-                audioSourceStreamIndex: audioSourceStreamIndex,
-                discTitleID: discTitleID
-            )
-        }
         let probe = Demuxer()
         // Register so stopInternal can markClosed(): avformat_open_input/find_stream_info can block for the
         // full AVIOReader reconnect budget (device repro: a 500-looping channel kept reconnecting across three
@@ -5455,28 +5454,63 @@ public final class AetherEngine: ObservableObject {
                 self?.recordStartupCheckpoint(StartupCheckpoint(openStage: stage), generation: startupGen)
             }
         }
+        // Start network open + demux probe immediately so AVAudioSession category setup (#114) and
+        // DisplayCapabilities IPC (~195 ms cold) overlap with the origin's TCP/HTTP TTFB instead of
+        // adding dead air in front of the first packet.
+        // AetherEngine#10: a @MainActor async body without a suspension point blocks the main thread
+        // despite the async signature; a detached task's value introduces a real background hop,
+        // and BlockingWork keeps that hop off the cooperative pool while the open blocks.
+        let probeProfile = playbackOpenProfile(options: options)
+        let onProbeTaskCompleted = probeTaskCompletedForTesting
+        let probeTask = BlockingWork.detached(priority: .userInitiated) { [probe, source, options, probeProfile, onProbeTaskCompleted] in
+            defer { onProbeTaskCompleted?() }
+            // Caller-bounded find_stream_info budget (#68); nil keeps the .playback default. This probe
+            // demuxer is reused as the session demuxer, so the cap lands on the open that actually pays it.
+            switch source {
+            case .url(let u):
+                // isLive configures the AVIOReader for endless-feed mode; must be set at open time because
+                // the probe demuxer is reused as the session demuxer (avformat_open_input runs only once).
+                try probe.open(url: u, extraHeaders: options.httpHeaders, profile: probeProfile, isLive: options.isLive, selectTitleID: discTitleID)
+            case .custom(let reader, let formatHint):
+                // isLive suppresses SEEK_END duration estimate on forward-only live readers; same open-time requirement.
+                try probe.open(reader: reader, formatHint: formatHint, profile: probeProfile, isLive: options.isLive, selectTitleID: discTitleID)
+            }
+        }
+        // #114: guarantee the AVAudioSession category is declared off-main before any branch
+        // below can activate the session. Only the first load in the process does work here,
+        // now overlapped with probeTask's network open.
+        await awaitAudioSessionCategoryConfigured()
+        // Audit CORE-6: if a superseding load arrived while awaiting category configuration, abort
+        // this probe before publishing anything. Detach probe.close() after probeTask unwinds so an
+        // already-opened probe does not deallocate and close synchronously on MainActor.
+        do {
+            try checkLoadCurrent(gen)
+        } catch {
+            probe.markClosed()
+            let onProbeClose = earlySupersededProbeCloseObserverForTesting
+            BlockingWork.detached { [probe, probeTask, onProbeClose] in
+                _ = try? await probeTask.value
+                probe.close()
+                onProbeClose?()
+            }
+            throw error
+        }
+        // AE#493: what this session takes the display to be. Observed while probeTask is in flight,
+        // so the format clamp below and the served DV route cannot disagree about the same display.
+        let observedDisplayCaps = Self.displayCapabilities
+        let sessionDisplayCaps = observedDisplayCaps.assertingDolbyVision(options.panelPresentsDolbyVision)
+        EngineLog.emit(
+            "[DisplayCapabilities] observed: hdr=\(observedDisplayCaps.supportsHDR) "
+            + "hdr10=\(observedDisplayCaps.supportsHDR10) hlg=\(observedDisplayCaps.supportsHLG) "
+            + "dv=\(observedDisplayCaps.supportsDolbyVision)"
+            + (options.panelPresentsDolbyVision ? " (session dv asserted true)" : ""),
+            category: .session
+        )
         var probeOpened = false
         var probeFailure: Error?
         var enhancementInspectionFailed = false
         do {
-            // Detach avformat_open_input + find_stream_info off @MainActor (~6 s on a slow CDN).
-            // AetherEngine#10: a @MainActor async body without a suspension point blocks the main thread
-            // despite the async signature; a detached task's value introduces a real background hop,
-            // and BlockingWork keeps that hop off the cooperative pool while the open blocks.
-            let probeProfile = playbackOpenProfile(options: options)
-            try await BlockingWork.detached(priority: .userInitiated) { [probe, source, options, probeProfile] in
-                // Caller-bounded find_stream_info budget (#68); nil keeps the .playback default. This probe
-                // demuxer is reused as the session demuxer, so the cap lands on the open that actually pays it.
-                switch source {
-                case .url(let u):
-                    // isLive configures the AVIOReader for endless-feed mode; must be set at open time because
-                    // the probe demuxer is reused as the session demuxer (avformat_open_input runs only once).
-                    try probe.open(url: u, extraHeaders: options.httpHeaders, profile: probeProfile, isLive: options.isLive, selectTitleID: discTitleID)
-                case .custom(let reader, let formatHint):
-                    // isLive suppresses SEEK_END duration estimate on forward-only live readers; same open-time requirement.
-                    try probe.open(reader: reader, formatHint: formatHint, profile: probeProfile, isLive: options.isLive, selectTitleID: discTitleID)
-                }
-            }.value
+            try await probeTask.value
             probeOpened = true
             let videoIdx = probe.videoStreamIndex
             if videoIdx >= 0, let stream = probe.stream(at: videoIdx) {
@@ -5637,6 +5671,7 @@ public final class AetherEngine: ObservableObject {
         }
         if enhancementInspectionFailed, let failure = probeFailure {
             // Never hand a possibly interrupted parser to a playback host or reopen it silently.
+            closeFailedLoadLiveIngest()
             probe.markClosed()
             BlockingWork.detached { [probe] in probe.close() }
             publishLoadFailure(failure)
@@ -5651,6 +5686,7 @@ public final class AetherEngine: ObservableObject {
 
         // Custom sources have no URL to reopen from: a failed probe is fatal.
         if case .custom(let reader, _) = source, !probeOpened {
+            closeFailedLoadLiveIngest()
             // The engine's own live HLS ingest knows why it handed the probe nothing: its playlist
             // was refused or could not be reached. That is the source's answer, typed as an HTTP
             // reader's is (`publishLoadFailure`), not a stream the probe could not read: a host that
@@ -5771,6 +5807,7 @@ public final class AetherEngine: ObservableObject {
         isSourceSeekable = probeOpened ? probe.isSourceSeekable : nil
         if options.nativeSourcePlaybackRange != nil,
            !probeOpened || probe.videoStreamIndex < 0 || !probe.isSourceSeekable {
+            closeFailedLoadLiveIngest()
             probe.markClosed()
             BlockingWork.detached { [probe] in probe.close() }
             let failure = AetherEngineError.authoredPlaybackIntervalUnsupported
@@ -5871,6 +5908,9 @@ public final class AetherEngine: ObservableObject {
         //     (required for custom sources).
         let hasVideoStream = probeOpened && probe.videoStreamIndex >= 0
         if Self.shouldUseAudioOnlyPath(audioOnlyRequested: options.audioOnly, probeOpened: probeOpened, hasVideoStream: hasVideoStream) {
+            // Audio-only routes never open a companion side demuxer; stop any eagerly started
+            // companion audio reader so it does not keep polling or buffering unread audio.
+            (customReader as? LiveIngestSourceInfo)?.companionAudioReader?.close()
             // #361: this path is decided before the panel handshake and never runs one, so the route
             // checkpoint credits both.
             recordStartupCheckpoint(.routed, generation: startupGen)
@@ -5985,6 +6025,7 @@ public final class AetherEngine: ObservableObject {
                 throw CancellationError()
             } catch {
                 if loadGeneration != gen { throw CancellationError() }
+                closeFailedLoadLiveIngest()
                 publishLoadFailure(error)
                 throw error
             }
@@ -6672,6 +6713,7 @@ public final class AetherEngine: ObservableObject {
                dvProfile: correctedDVProfile ?? dvConfig.profile,
                dvBlCompatID: dvConfig.blCompatID,
                presentsDolbyVisionBaseLayer: presentsDolbyVisionBaseLayer) {
+            closeFailedLoadLiveIngest()
             probe.markClosed()
             BlockingWork.detached { [probe] in probe.close() }
             let profileLabel = detectedCodecID == AV_CODEC_ID_AV1 ? "10.0" : "5"
@@ -6689,6 +6731,7 @@ public final class AetherEngine: ObservableObject {
         if useSoftwarePath, options.isLive,
            (customReader as? LiveIngestSourceInfo)?.companionAudioReader != nil,
            probe.audioStreamIndex < 0 {
+            closeFailedLoadLiveIngest()
             probe.markClosed()
             BlockingWork.detached { [probe] in probe.close() }
             EngineLog.emit(
@@ -6702,11 +6745,15 @@ public final class AetherEngine: ObservableObject {
 
         do {
             if options.nativeSourcePlaybackRange != nil, useSoftwarePath {
+                closeFailedLoadLiveIngest()
                 probe.markClosed()
                 BlockingWork.detached { [probe] in probe.close() }
                 throw AetherEngineError.authoredPlaybackIntervalUnsupported
             }
             if useSoftwarePath {
+                // Side-audio merge is native-only; when the variant also carries muxed audio and
+                // routes software, close any eagerly started companion before panel settle or decode.
+                (customReader as? LiveIngestSourceInfo)?.companionAudioReader?.close()
                 if !panelRoutingSettled {
                     try await settlePanelRouting(ownsProbe: true)
                 }
@@ -6777,6 +6824,7 @@ public final class AetherEngine: ObservableObject {
                                 || options.awaitsInboundCriteriaWrite
                         ),
                         settleCap: options.isLive ? .standard : .awaitObservedEnd,
+                        creditElapsedSinceWrite: options.engineWritesDisplayCriteria && !options.awaitsInboundCriteriaWrite,
                         isCurrent: { self.loadGeneration == gen })
                 }
                 try checkLoadCurrent(gen)
@@ -6926,6 +6974,7 @@ public final class AetherEngine: ObservableObject {
                         // blocks nothing else, and the panel is dark until it ends either way. Live keeps the
                         // standard cap: a zap must not sit behind a panel handshake.
                         settleCap: options.isLive ? .standard : .awaitObservedEnd,
+                        creditElapsedSinceWrite: options.engineWritesDisplayCriteria && !options.awaitsInboundCriteriaWrite,
                         isCurrent: { self.loadGeneration == gen })
                 }
                 try checkLoadCurrent(gen)
@@ -7006,6 +7055,7 @@ public final class AetherEngine: ObservableObject {
                 _ = try await load(source: .url(hlsURL), startPosition: startPosition, options: rerouted)
                 return nil
             }
+            closeFailedLoadLiveIngest()
             publishLoadFailure(error)
             throw error
         }

@@ -1793,15 +1793,16 @@ The optional `AetherEngineSMB` product plays media off an SMB share (SMB 2.0.2 a
 
 ### HLS live ingest
 
-A live HLS upstream can be ingested directly via `HLSLiveIngestReader` (a public forward-only `IOReader`), with no media server in the data path.
+A live HLS upstream can be ingested directly via `HLSLiveIngestReader` (a public forward-only `IOReader`), with no media server in the data path. A video segment need not start at a keyframe, so the ingest uses the same probe budget as raw live video before choosing the playback path. Audio rendition URIs must name media playlists, not another master playlist.
 
-- **Prefetch (#177).** Segments are fetched through a bounded prefetch pipeline: up to 4 in flight, committed to the byte stream strictly in playlist order. So the connection and TTFB (time to first byte) latency of each segment overlaps with the others, and high-bitrate channels buffer ahead of real time.
+- **Cookies.** Each tune has a private in-memory cookie store. Its audio rendition and live reopen reuse that store; a different tune starts empty.
+- **Prefetch (#177).** Segments are fetched through a bounded prefetch pipeline: up to 4 in flight, committed to the byte stream strictly in playlist order. Requests count against both the destination and a capped playlist origin, including when companion audio uses a different host. So the connection and TTFB (time to first byte) latency of each segment overlaps with the others, and high-bitrate channels buffer ahead of real time.
 - **Supported:**
   - MPEG-TS segments, whole or as `EXT-X-BYTERANGE` sub-ranges of one resource (fetched with a `Range` request; an origin that answers 200 has the sub-range cut from the whole body),
   - demuxed-audio variants (`EXT-X-MEDIA` audio groups, fetched by a companion reader and merged by DTS), on the native path only. The rendition is the session's audio even when the variant's segments carry audio of their own, as RFC 8216 asks and AVPlayer does. The software path has no side-audio merge and keeps the variant's muxed audio,
   - packed-audio renditions (raw ADTS framed by ID3 timestamps),
   - AES-128 clear-key segments (below).
-- **AES-128.** Clear-key segments (`EXT-X-KEY:METHOD=AES-128`, the standard FAST-channel scheme) are decrypted in-line by `HLSSegmentDecryptor`. The key is fetched once per clip and memoised, and each segment is decrypted (AES-128-CBC / PKCS7) before demux. This is standard HLS clear-key, not FairPlay / Widevine.
+- **AES-128.** Clear-key segments (`EXT-X-KEY:METHOD=AES-128`, the standard FAST-channel scheme) are decrypted in-line by `HLSSegmentDecryptor`. The key is fetched once per clip and memoised, and each segment is decrypted (AES-128-CBC / PKCS7) before demux. When the segment or key origin has a request cap, each segment fetch finishes before its key request starts. This is standard HLS clear-key, not FairPlay / Widevine.
 - **Refused** with a typed `HLSIngestError`, so the host can fall back to a server-mediated URL: SAMPLE-AES, keyless AES-128 (no `URI`), fMP4 playlists (`EXT-X-MAP`), and a key-fetch / decrypt failure.
 
 ### Server-side ad insertion (SSAI)

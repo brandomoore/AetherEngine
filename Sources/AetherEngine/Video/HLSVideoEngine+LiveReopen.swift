@@ -1256,6 +1256,8 @@ extension HLSVideoEngine {
                     }
                     freshReader = vend.reader
                     try dem.open(reader: vend.reader, formatHint: vend.formatHint, profile: openProfile, isLive: true)
+                    // Live reopen reuses the muxed producer layout and never attaches a companion side demuxer.
+                    (vend.reader as? LiveIngestSourceInfo)?.companionAudioReader?.close()
                 case .none:
                     return  // handlePumpFinished already delegated this exit to host retune
                 }
@@ -1265,6 +1267,7 @@ extension HLSVideoEngine {
                     category: .session
                 )
                 dem.close()
+                (freshReader as? LiveIngestSourceInfo)?.companionAudioReader?.close()
                 freshReader?.close()
                 continue
             }
@@ -1276,11 +1279,13 @@ extension HLSVideoEngine {
                     category: .session
                 )
                 dem.close()
+                (freshReader as? LiveIngestSourceInfo)?.companionAudioReader?.close()
                 freshReader?.close()
                 continue
             }
             guard reopenedTrackLayoutMatches(dem, failedProducer: failedProducer) else {
                 dem.close()
+                (freshReader as? LiveIngestSourceInfo)?.companionAudioReader?.close()
                 freshReader?.close()
                 // Saved muxer parameters and packet timestamps cannot describe a new layout.
                 if currentProducerIs(failedProducer) {

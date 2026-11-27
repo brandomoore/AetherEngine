@@ -13,10 +13,32 @@ extension AetherEngine {
         hostIndex >= 0 ? Int(hostIndex) : requested.map { Int($0) }
     }
 
+    /// AE#535: rebuild-path display capabilities, carrying the load's observed table and falling
+    /// back to a live read only when no load preceded the rebuild.
+    func reloadDisplayCapabilities(hostAssertsDolbyVision: Bool) -> DisplayCapabilities {
+        Self.reloadDisplayCapabilities(
+            observedAtLoad: sessionObservedDisplayCaps,
+            hostAssertsDolbyVision: hostAssertsDolbyVision,
+            readNow: { Self.displayCapabilities })
+    }
+
+    nonisolated static func basePlaybackOpenProfile(
+        isLive: Bool,
+        isHLSAudioOnly: Bool
+    ) -> DemuxerOpenProfile {
+        guard isLive else { return .playback }
+        return isHLSAudioOnly ? .liveHLSAudioIngest : .livePlayback
+    }
+
     /// The open profile every playback open uses (the probe, the loaders and the reload rebuild), so a
     /// new profile field reaches all of them. Audit LOAD-R202.
     func playbackOpenProfile(options: LoadOptions) -> DemuxerOpenProfile {
-        DemuxerOpenProfile.playback.withProbeBudget(
+        // Before probing, only an explicit audio-only request makes video parameters unnecessary.
+        let profile = Self.basePlaybackOpenProfile(
+            isLive: options.isLive,
+            isHLSAudioOnly: options.audioOnly && customReader is HLSLiveIngestReader
+        )
+        return profile.withProbeBudget(
             probesize: options.probesize, maxAnalyzeDuration: options.maxAnalyzeDuration)
             .withSequentialOrigin(options.sequentialOrigin, declaredDuration: options.declaredDurationSeconds)
             .withHeldSourceConnection(options.heldSourceConnection)
@@ -2200,6 +2222,9 @@ extension AetherEngine {
             }
             throw AetherEngineError.authoredPlaybackIntervalUnsupported
         }
+        // Software playback never merges a live companion audio rendition; close any unconsumed
+        // companion reader on reload/escalation paths as well as initial load.
+        (customReader as? LiveIngestSourceInfo)?.companionAudioReader?.close()
         sessionCacheStatusToken &+= 1
         diagnostics.sessionCacheStatus = .inactive
         let deinterlaceMode = loadedOptions.deinterlaceMode
@@ -2837,7 +2862,9 @@ extension AetherEngine {
         lastRequiresDeinterlaceWarmup = preservedRequiresDeinterlaceWarmup
         lastInverseTelecine = preservedInverseTelecine
         await drainReopenedSourceInspection()
-        guard loadGeneration == gen, !Task.isCancelled else { return nil }
+        // Audit LIF-204: stopInternal already tore down the session, so a cancelled caller still owns
+        // this rebuild; only a newer generation supersedes it.
+        guard loadGeneration == gen else { return nil }
 
         // Custom sources: no URL to reopen; rebuild on the retained reader. Demuxer opens at byte 0; loadSoftware/loadNative seek to startPosition.
         // Preserve the caller's probe budget (#68) across the reopen so an audio/title switch doesn't re-incur the full find_stream_info cost the caller paid to avoid.
@@ -3093,10 +3120,8 @@ extension AetherEngine {
                         + " eligible=\(sessionDisplayEligibleForHDR) refusedLatch=\(Self.panelRefusedHDRMaster))",
                         category: .session)
                 }
-                let reloadDisplayCaps = Self.reloadDisplayCapabilities(
-                    observedAtLoad: sessionObservedDisplayCaps,
-                    hostAssertsDolbyVision: loadedOptions.panelPresentsDolbyVision,
-                    readNow: { Self.displayCapabilities })
+                let reloadDisplayCaps = reloadDisplayCapabilities(
+                    hostAssertsDolbyVision: loadedOptions.panelPresentsDolbyVision)
                 // Read a second time for the log alone, never for the route: this is the one place the
                 // revoked answer can be SEEN, and without the line a rebuild that kept its HDR route looks
                 // the same as one that never met the window.

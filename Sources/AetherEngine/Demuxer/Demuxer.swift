@@ -26,6 +26,10 @@ enum DemuxerOpenStage: Sendable {
 struct DemuxerOpenProfile: Sendable {
     var probesize: Int64
     var maxAnalyzeDuration: Int64
+    /// Cap on the frames `avformat_find_stream_info` reads to estimate frame rate on containers
+    /// with unreliable time bases (such as MPEG-TS, where FFmpeg's default `-1` reads 20 video
+    /// frames). `nil` keeps FFmpeg's default.
+    var fpsProbeSize: Int32? = nil
     var avioPrefetch: Bool
     var avioChunkSize: Int
     /// Per-chunk Range-request budget for the seekable (still-extraction) AVIO path.
@@ -172,6 +176,32 @@ struct DemuxerOpenProfile: Sendable {
         avioMaxRetries: 3,
         skipStreamInfo: false
     )
+
+    /// Live playback open profile for sources that may join mid-GOP. This includes raw streams,
+    /// custom readers, and HLS ingest: joining at a segment boundary does not guarantee an IDR.
+    ///
+    /// `fpsProbeSize` (6) cuts FFmpeg's default 20-frame MPEG-TS `tb_unreliable` wait to 6 frames
+    /// on healthy streams while preserving frame-rate and interlaced `field_order` probing.
+    /// Keep playback's byte allowance: a 36 Mb/s HEVC join can need over 32 MiB before the
+    /// next parameter sets supply the dimensions required by the segment muxer.
+    static let livePlayback: DemuxerOpenProfile = {
+        var profile = playback
+        profile.maxAnalyzeDuration = 15 * 1_000_000
+        profile.fpsProbeSize = 6
+        return profile
+    }()
+
+    /// Tighter live HLS probe for an explicit audio-only load or a companion audio rendition,
+    /// where routing does not depend on finding video parameters at the next keyframe.
+    /// The 5 s analysis ceiling stays above the 2.5 s missing-PMT release window.
+    static let liveHLSAudioIngest: DemuxerOpenProfile = {
+        var profile = playback.withProbeBudget(
+            probesize: 8 * 1024 * 1024,
+            maxAnalyzeDuration: 5 * 1_000_000
+        )
+        profile.fpsProbeSize = 6
+        return profile
+    }()
 
     static let stillExtraction = DemuxerOpenProfile(
         probesize: 2 * 1024 * 1024,
@@ -1224,7 +1254,18 @@ public final class Demuxer: @unchecked Sendable {
             av_dict_set(&opts, "codec_whitelist", "aether_no_decoders", 0)
         }
         if fragmentRandomAccess != nil { av_dict_set(&opts, "lazy_frag_index", "1", 0) }
-        let ret = avformat_open_input(&ctxPtr, nil, inputFormat, &opts)
+        // URL is nil because pb is already bound. When a live HTTP open verified aligned MPEG-TS
+        // or M2TS sync bytes in its initial prefix, pass an explicit mpegts input format so
+        // avformat_open_input skips av_probe_input_buffer2's multi-kilobyte probe read.
+        let resolvedInputFormat: UnsafePointer<AVInputFormat>?
+        if let inputFormat {
+            resolvedInputFormat = inputFormat
+        } else if isLive, (provider as? AVIOReader)?.openedLiveMPEGTSPrefix == true {
+            resolvedInputFormat = av_find_input_format("mpegts")
+        } else {
+            resolvedInputFormat = nil
+        }
+        let ret = avformat_open_input(&ctxPtr, nil, resolvedInputFormat, &opts)
         av_dict_free(&opts)
         guard ret == 0 else {
             formatContext = nil
@@ -1267,6 +1308,9 @@ public final class Demuxer: @unchecked Sendable {
     private func applyProbeBudget(_ ctx: UnsafeMutablePointer<AVFormatContext>) {
         ctx.pointee.probesize = openProfile.probesize
         ctx.pointee.max_analyze_duration = openProfile.maxAnalyzeDuration
+        if let fpsProbeSize = openProfile.fpsProbeSize {
+            ctx.pointee.fps_probe_size = fpsProbeSize
+        }
         // Installed unconditionally: a local input's URLContext copies the callback at open, so the
         // input byte budget could not reach it later.
         ctx.pointee.interrupt_callback = AVIOInterruptCB(

@@ -85,7 +85,14 @@ final class DisplayCriteriaController {
     /// AE#950: how the panel's cadence just before a write related to the rate that write asked for, keyed
     /// by the arm generation of that write so a later gate without a write of its own cannot read it.
     /// `switchInFlight` is the system's in-progress flag read just before that write (AE#950 round 2).
-    private var preWriteRelation: (armGeneration: Int, relation: PanelRateRelation, switchInFlight: Bool)?
+    /// `writtenAtNanos` is the uptime timestamp of the write, used to credit elapsed load time against
+    /// `.brief` Stage 1 grace.
+    private var preWriteRelation: (
+        armGeneration: Int,
+        relation: PanelRateRelation,
+        switchInFlight: Bool,
+        writtenAtNanos: UInt64
+    )?
     /// AE#950: which load the running pre-write reading belongs to (`beginPreWriteCadence`).
     private var preWriteCadenceToken = 0
 
@@ -154,6 +161,24 @@ final class DisplayCriteriaController {
             case .full:  1000
             }
         }
+    }
+
+    /// Remaining Stage 1 start grace at gate entry when the engine wrote criteria synchronously before load.
+    ///
+    /// Only `.brief` with `creditElapsedSinceWrite == true` and a matching write timestamp receives credit.
+    /// `.skip`, `.full`, AVKit sole-writer sessions, and host-owned writes keep `startGrace.budgetMs`
+    /// unchanged. Clock skew (`gateEntryNanos < writtenAtNanos`) clamps elapsed time to 0 via `elapsedMs`.
+    nonisolated static func effectiveStartGraceMs(
+        startGrace: StartGrace,
+        creditElapsedSinceWrite: Bool,
+        writtenAtNanos: UInt64?,
+        gateEntryNanos: UInt64
+    ) -> Int {
+        guard startGrace == .brief, creditElapsedSinceWrite, let writtenAtNanos else {
+            return startGrace.budgetMs
+        }
+        let elapsed = elapsedMs(fromNanos: writtenAtNanos, toNanos: gateEntryNanos)
+        return max(0, startGrace.budgetMs - elapsed)
     }
 
     /// Stage 2's ceiling: long enough that an unobservable DV switch does not gate the first frame the way
@@ -460,6 +485,44 @@ final class DisplayCriteriaController {
         if startNotificationFired { return .inGate }
         guard switchInProgress else { return nil }
         return isFirstPoll ? .preGate : .inGateFlagOnly
+    }
+
+    /// Outcome of one Stage 1 poll.
+    enum Stage1PollVerdict: Equatable {
+        /// Mode-switch end or allowed EDR headroom settled the gate during Stage 1.
+        case settled
+        /// A switch start was observed; hand off to Stage 2 with this signal.
+        case started(StartSignal)
+        /// Nothing observed yet and Stage 1 budget remains; sleep one poll tick and check again.
+        case pollAgain
+        /// Nothing observed and Stage 1 budget is spent; exit Stage 1 without sleeping further.
+        case noSwitch
+    }
+
+    /// Pure Stage 1 per-poll decision.
+    ///
+    /// Stage 1 always runs one immediate poll on gate entry (`isFirstPoll == true`), even when
+    /// `budgetMs == 0` because elapsed-time credit already exhausted `.brief`. An active
+    /// `isDisplayModeSwitchInProgress == true` on entry still classifies as `.preGate` and enters Stage 2,
+    /// while an idle panel returns `.noSwitch` with zero sleep ticks.
+    nonisolated static func stage1PollVerdict(
+        isFirstPoll: Bool,
+        hasNewEnd: Bool,
+        headroomSettles: Bool,
+        startNotificationFired: Bool,
+        switchInProgress: Bool,
+        elapsedMs: Int,
+        budgetMs: Int
+    ) -> Stage1PollVerdict {
+        if hasNewEnd || headroomSettles { return .settled }
+        if let signal = classifyStart(
+            isFirstPoll: isFirstPoll,
+            startNotificationFired: startNotificationFired,
+            switchInProgress: switchInProgress
+        ) {
+            return .started(signal)
+        }
+        return isBudgetSpent(elapsedMs: elapsedMs, budgetMs: budgetMs) ? .noSwitch : .pollAgain
     }
 
     /// What the observation already knows when the gate opens (#339). The observers are armed at the
@@ -955,8 +1018,9 @@ final class DisplayCriteriaController {
         // three device runs in Sodalite#49 never saw an end for a switch that was already over.
         let switchInFlight = displayManager.isDisplayModeSwitchInProgress
         observation.arm()
-        preWriteRelation = (observation.snapshot().generation, preWrite, switchInFlight)
         displayManager.preferredDisplayCriteria = criteria
+        let writtenAtNanos = DispatchTime.now().uptimeNanoseconds
+        preWriteRelation = (observation.snapshot().generation, preWrite, switchInFlight, writtenAtNanos)
         Self.writers.setObject(self, forKey: displayManager)
         didApply = true
         lastCriteriaWasHDR = isHDR
@@ -1111,6 +1175,7 @@ final class DisplayCriteriaController {
     func waitForSwitch(startGrace: StartGrace = .full,
                        consumesRecord: Bool = true,
                        settleCap: SettleCap = .standard,
+                       creditElapsedSinceWrite: Bool = false,
                        isCurrent: () -> Bool = { true }) async {
         #if os(tvOS)
         guard startGrace != .skip else { return }
@@ -1225,7 +1290,11 @@ final class DisplayCriteriaController {
         // this write's: wait it out, take it off the record, and give the write's own switch the full start
         // grace, because it can only begin once the old one is done.
         var stage1Entry = entry
-        var stage1BudgetMs = startGrace.budgetMs
+        var stage1BudgetMs = Self.effectiveStartGraceMs(
+            startGrace: startGrace,
+            creditElapsedSinceWrite: creditElapsedSinceWrite,
+            writtenAtNanos: freshRecord ? writeRecord?.writtenAtNanos : nil,
+            gateEntryNanos: entry.uptimeNanoseconds)
         if case .none = observed,
            Self.endBelongsToInFlightSwitch(switchInFlightAtWrite: freshRecord && writeRecord?.switchInFlight == true,
                                            startNotifiedSinceWrite: gateSnapshot.startCount > 0) {
@@ -1278,26 +1347,36 @@ final class DisplayCriteriaController {
         // notification rather than standing in for one.
         if startSignal == .none {
             var isFirstPoll = true
-            while !Self.isBudgetSpent(elapsedMs: Self.elapsedMs(since: stage1Entry), budgetMs: stage1BudgetMs) {
+            stage1: while true {
+                let switchInProgress = displayManager.isDisplayModeSwitchInProgress
+                let hasNewStart = observation.hasNewStart(since: gateSnapshot)
                 let headroomSettles = observeHeadroom(screen)
                     && Self.startPhaseHeadroomSettles(
-                        startRecorded: gateSnapshot.startedAt != nil || observation.hasNewStart(since: gateSnapshot),
-                        switchInProgress: displayManager.isDisplayModeSwitchInProgress)
-                if observation.hasNewEnd(since: gateSnapshot) || headroomSettles {
+                        startRecorded: gateSnapshot.startedAt != nil || hasNewStart,
+                        switchInProgress: switchInProgress)
+                switch Self.stage1PollVerdict(
+                    isFirstPoll: isFirstPoll,
+                    hasNewEnd: observation.hasNewEnd(since: gateSnapshot),
+                    headroomSettles: headroomSettles,
+                    startNotificationFired: hasNewStart,
+                    switchInProgress: switchInProgress,
+                    elapsedMs: Self.elapsedMs(since: stage1Entry),
+                    budgetMs: stage1BudgetMs
+                ) {
+                case .settled:
                     EngineLog.emit("[DisplayCriteria] settled during start phase (after \(Self.elapsedMs(since: entry))ms, EDR headroom \(String(format: "%.2f", screen.currentEDRHeadroom)))", category: .engine)
                     return
-                }
-                if let signal = Self.classifyStart(
-                    isFirstPoll: isFirstPoll,
-                    startNotificationFired: observation.hasNewStart(since: gateSnapshot),
-                    switchInProgress: displayManager.isDisplayModeSwitchInProgress) {
+                case .started(let signal):
                     startSignal = signal
-                    break
-                }
-                isFirstPoll = false
-                guard await Self.gateTick(milliseconds: 10, isCurrent: isCurrent) else {
-                    EngineLog.emit("[DisplayCriteria] gate abandoned in the start phase after \(Self.elapsedMs(since: entry))ms: the load it held was cancelled or superseded", category: .engine)
-                    return
+                    break stage1
+                case .pollAgain:
+                    isFirstPoll = false
+                    guard await Self.gateTick(milliseconds: 10, isCurrent: isCurrent) else {
+                        EngineLog.emit("[DisplayCriteria] gate abandoned in the start phase after \(Self.elapsedMs(since: entry))ms: the load it held was cancelled or superseded", category: .engine)
+                        return
+                    }
+                case .noSwitch:
+                    break stage1
                 }
             }
             // Time spent, not the budget: the polls carry scheduler overhead, and everything downstream is
@@ -1582,11 +1661,13 @@ final class DisplayCriteriaController {
         guard let window = resolveWindow() else {
             didApply = false
             lastApplied = nil
+            preWriteRelation = nil
             return
         }
         guard Self.writers.object(forKey: window.avDisplayManager) === self else {
             didApply = false
             lastApplied = nil
+            preWriteRelation = nil
             return
         }
         logPanelReadout("before reset", window: window)

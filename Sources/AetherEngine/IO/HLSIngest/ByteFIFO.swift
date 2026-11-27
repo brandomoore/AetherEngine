@@ -27,6 +27,12 @@ final class ByteFIFO: @unchecked Sendable {
         return parked
     }
 
+    var queuedByteCount: Int {
+        condition.lock()
+        defer { condition.unlock() }
+        return pendingCount
+    }
+
     /// AE#684: nothing queued and a caller waiting for more. A writer only parks at capacity, so with
     /// the queue empty the parked caller is the reader, and everything written so far is consumed.
     var isEmptyWithReaderParked: Bool {
@@ -101,6 +107,9 @@ final class ByteFIFO: @unchecked Sendable {
     func cancel() {
         condition.lock()
         cancelled = true
+        queue.removeAll()
+        headOffset = 0
+        pendingCount = 0
         condition.broadcast()
         condition.unlock()
     }

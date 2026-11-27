@@ -159,7 +159,9 @@ struct LiveAudioProgressTests {
             afterRead: {
                 if Thread.current.name == "AetherEngine.SoftwarePacketReadAhead.producer" {
                     producerReads.update { $0 += 1 }
-                    if producerReads.value >= 2 { sourceGate.wait() }
+                    // Hold after 7 completed 4096-byte producer reads (~75+ video frames total
+                    // with livePlayback's 6-frame probe, leaving ~64 chunks unread before EOF).
+                    if producerReads.value >= 8 { sourceGate.wait() }
                 }
             },
             afterCancel: { sourceGate.open() }

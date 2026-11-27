@@ -1337,12 +1337,25 @@ public final class HLSVideoEngine: @unchecked Sendable {
         self.sequentialOrigin = sequentialOrigin
         self.heldSourceConnection = heldSourceConnection
         self.declaredDurationSeconds = declaredDurationSeconds
-        // Caller-bounded find_stream_info budget (#68); nil keeps the .playback default. Applied only to the
-        // fallback open / live reopen here; the happy path reuses the already-budgeted preopenedDemuxer.
+        // Caller-bounded find_stream_info budget (#68); nil keeps the live or playback default.
+        // Applied to the fallback open, companion audio open, and live reopen; the happy path
+        // reuses the already-budgeted preopenedDemuxer.
         // #377: the held transport is carried too. It is chosen at open time, so a reopen that leaves
         // it out puts the session silently back on ranged requests against the one kind of origin the
         // host turned it on for, and the flag reads as having stopped working half way through.
-        self.openProfile = DemuxerOpenProfile.playback.withProbeBudget(
+        let baseOpenProfile: DemuxerOpenProfile = isLiveSession ? .livePlayback : .playback
+        self.openProfile = baseOpenProfile.withProbeBudget(
+            probesize: probesize, maxAnalyzeDuration: maxAnalyzeDuration)
+            .withSequentialOrigin(sequentialOrigin, declaredDuration: declaredDurationSeconds)
+            .withHeldSourceConnection(heldSourceConnection)
+            .skippingAttachments()
+            .withSourceOpenPolicy(sourceOpenPolicy)
+            .withUntaggedVideoColor(untaggedVideoColor)
+            .withDiagnosticContext(diagnosticContext)
+        let companionBaseProfile: DemuxerOpenProfile = companionAudioReader is HLSLiveIngestReader
+            ? .liveHLSAudioIngest
+            : baseOpenProfile
+        self.companionOpenProfile = companionBaseProfile.withProbeBudget(
             probesize: probesize, maxAnalyzeDuration: maxAnalyzeDuration)
             .withSequentialOrigin(sequentialOrigin, declaredDuration: declaredDurationSeconds)
             .withHeldSourceConnection(heldSourceConnection)
@@ -1513,7 +1526,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         }
         let side = Demuxer()
         do {
-            try side.open(reader: companion, formatHint: formatHint, isLive: true)
+            try side.open(reader: companion, formatHint: formatHint, profile: companionOpenProfile, isLive: true)
         } catch {
             throw HLSVideoEngineError.openFailed(reason: "demuxed-audio companion open failed (\(error))")
         }
@@ -1598,10 +1611,14 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Consumed in `start()`; unconsumed instances are closed by `stop()`.
     private var preopenedDemuxer: Demuxer?
 
-    /// Open profile carrying the caller-bounded probe budget (#68) for the fallback open and live reopen;
-    /// `.playback` unless the caller set `LoadOptions.probesize` / `maxAnalyzeDuration`. Read in the
-    /// `+LiveReopen` extension, so it cannot be file-private.
+    /// Open profile carrying the probe budget (#68) for the fallback open and live reopen:
+    /// `.livePlayback` for live sessions and `.playback` for VOD, unless the caller set
+    /// `LoadOptions.probesize` / `maxAnalyzeDuration`. Read in the `+LiveReopen` extension, so it
+    /// cannot be file-private.
     let openProfile: DemuxerOpenProfile
+    /// Open profile for `openCompanionAudio`: `.liveHLSAudioIngest` when backed by `HLSLiveIngestReader`
+    /// (with caller overrides preserved), matching `openProfile` otherwise.
+    let companionOpenProfile: DemuxerOpenProfile
     /// #377: opt-in held source transport, carried onto every open this session makes itself.
     let heldSourceConnection: Bool
 
@@ -2376,6 +2393,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             do {
                 audioDem = try openCompanionAudio(companion)
             } catch let error as HLSVideoEngineError {
+                companion.close()
                 guard let muxedFallback else { throw error }
                 EngineLog.emit(
                     "[HLSVideoEngine] demuxed-audio companion unusable (\(error)); keeping the audio "

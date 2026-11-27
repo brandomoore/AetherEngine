@@ -109,6 +109,21 @@ final class ByteFIFOTests: XCTestCase {
         }
         wait(for: [expectation], timeout: 300)
     }
+
+    func testCancelReleasesBufferedBytes() {
+        let fifo = ByteFIFO(capacity: 1024)
+        XCTAssertTrue(fifo.write(Data([10, 20, 30, 40])))
+        XCTAssertEqual(fifo.queuedByteCount, 4)
+
+        fifo.cancel()
+        XCTAssertEqual(fifo.queuedByteCount, 0)
+
+        var buffer = [UInt8](repeating: 0, count: 4)
+        let n = buffer.withUnsafeMutableBufferPointer {
+            fifo.read(into: $0.baseAddress!, maxLength: 4)
+        }
+        XCTAssertEqual(n, -1)
+    }
 }
 
 // Empty writes must not masquerade as the EOF that the ingest reader returns to FFmpeg.
