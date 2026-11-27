@@ -1343,6 +1343,35 @@ struct HLSLiveIngestStartupOptimizationTests {
         #expect((budget.snapshot(for: segmentURL)?.peakInflight ?? Int.max) <= 3)
     }
 
+    @Test("An off-origin companion key cannot overbook the media host after the slot wait expires")
+    func companionKeyRespectsSaturatedMediaOrigin() async throws {
+        let key = Data(repeating: 0x75, count: 16)
+        let media = try #require(GatedHLSOrigin(routes: ["/key": .init(status: 200, body: key)]))
+        defer { media.stop() }
+        let playlists = try #require(GatedHLSOrigin(routes: [:]))
+        defer { playlists.stop() }
+        let reader = HLSLiveIngestReader(playlistURL: playlists.url("/audio.m3u8"), role: .companionAudio)
+        defer { reader.close() }
+
+        // Hold the two video slots without relying on the timing of slow HTTP responses.
+        let url = media.url("/key")
+        let budget = OriginRequestBudget.shared
+        budget.setHostLimit(2, for: url)
+        defer { budget.setHostLimit(nil, for: url) }
+        let first = try #require(budget.tryAcquire(for: media.url("/v1.ts"), label: "video"))
+        defer { budget.release(first) }
+        do {
+            let second = try #require(budget.tryAcquire(for: media.url("/v2.ts"), label: "video"))
+            defer { budget.release(second) }
+            await #expect(throws: URLError(.timedOut)) { try await reader.fetchKey(url) }
+            #expect(media.hitCount(for: "/key") == 0)
+        }
+        let fetched = try await reader.fetchKey(url)
+        #expect(fetched == key)
+        #expect(media.hitCount(for: "/key") == 1)
+        #expect(budget.snapshot(for: url)?.peakInflight == 2)
+    }
+
     @Test("multi-slot capped origins partition companion concurrency and avoid speculative key overcommit")
     func cappedOriginsPartitionCompanionSlotsAndGuardKeyHeadroom() async throws {
         // 1. Slot partitioning across shared-origin main video and companion audio.

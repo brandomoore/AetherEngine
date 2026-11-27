@@ -22,7 +22,7 @@ struct LiveDemuxerProbeBudgetTests {
         let playback = DemuxerOpenProfile.playback
 
         // Live video, including HLS, keeps enough ceiling for 10 s GOPs and 6 s late PMTs.
-        #expect(live.probesize == 32 * 1024 * 1024)
+        #expect(live.probesize == 50 * 1024 * 1024)
         #expect(live.maxAnalyzeDuration == 15 * 1_000_000)
         #expect(live.fpsProbeSize == 6)
         #expect(live.allowsProbeDecoding == true)

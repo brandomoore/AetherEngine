@@ -182,16 +182,11 @@ struct DemuxerOpenProfile: Sendable {
     ///
     /// `fpsProbeSize` (6) cuts FFmpeg's default 20-frame MPEG-TS `tb_unreliable` wait to 6 frames
     /// on healthy streams while preserving frame-rate and interlaced `field_order` probing.
-    /// `probesize` (32 MiB) and `maxAnalyzeDuration` (15 s) stay wide enough to reach the first
-    /// in-band SPS/PPS + IDR keyframe across 10 s GOPs, high-bitrate broadcast/UHD streams, and
-    /// 6 s late TV PMTs (`MissingPMTLiveOpenTests`) so `videoStreamIndex` does not come back `-1`
-    /// and misroute a live video channel onto `.audio`, while still bounding dead-PID live streams
-    /// 4x tighter than VOD's 60 s ceiling.
+    /// Keep playback's byte allowance: a 36 Mb/s HEVC join can need over 32 MiB before the
+    /// next parameter sets supply the dimensions required by the segment muxer.
     static let livePlayback: DemuxerOpenProfile = {
-        var profile = playback.withProbeBudget(
-            probesize: 32 * 1024 * 1024,
-            maxAnalyzeDuration: 15 * 1_000_000
-        )
+        var profile = playback
+        profile.maxAnalyzeDuration = 15 * 1_000_000
         profile.fpsProbeSize = 6
         return profile
     }()

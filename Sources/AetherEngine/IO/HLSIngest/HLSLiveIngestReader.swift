@@ -1135,12 +1135,18 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         let ticket: OriginRequestBudget.Ticket? = await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 continuation.resume(returning: OriginRequestBudget.shared.acquire(
-                    for: url, label: label, timeout: Self.budgetSlotWaitSeconds,
+                    for: url, label: label, timeout: Self.budgetSlotWaitSeconds, allowOvercommit: false,
                     shouldAbort: { self?.isClosed ?? true }))
             }
         }
         defer { OriginRequestBudget.shared.release(ticket) }
         try Task.checkCancellation()
+        guard !isClosed else { throw CancellationError() }
+        // Playlists on different hosts can still send both readers to the same segment or key
+        // origin. Its admission timeout is a transport failure, not permission to send anyway.
+        if ticket == nil, OriginRequestBudget.originKey(for: url) != nil {
+            throw URLError(.timedOut)
+        }
         let (data, response) = try await fetch()
         if let http = response as? HTTPURLResponse {
             if let finalURL = http.url, finalURL != url {

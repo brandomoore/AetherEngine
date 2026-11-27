@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 
-- **Fix live HLS startup on long-GOP video and request-limited origins.** Interlaced video can now be identified when a segment starts between keyframes. Rotating AES keys no longer overbook a capped origin. Invalid audio rendition playlists cannot start nested readers, and a host request limit of `Int.max` no longer crashes a demuxed-audio tune.
+- **Fix live HLS startup on long-GOP video and request-limited origins.** Live video keeps the 50 MiB probe allowance so a high-bitrate HEVC channel can find its dimensions after a mid-GOP join. Interlaced video can also be identified when a segment starts between keyframes. Audio and video requests, including rotating AES keys, respect a shared origin's cap even when the playlists are on different hosts. Invalid audio rendition playlists cannot start nested readers, and a host request limit of `Int.max` no longer crashes a demuxed-audio tune.
 - **Keep upscaling running on first-generation Apple TV 4K.** The line-art and
   automatic scaler kernels no longer require nonuniform Metal threadgroups.
 - **Fix a crash sampling the active picture during software playback.** The

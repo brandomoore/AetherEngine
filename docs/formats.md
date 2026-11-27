@@ -1795,7 +1795,7 @@ The optional `AetherEngineSMB` product plays media off an SMB share (SMB 2.0.2 a
 
 A live HLS upstream can be ingested directly via `HLSLiveIngestReader` (a public forward-only `IOReader`), with no media server in the data path. A video segment need not start at a keyframe, so the ingest uses the same probe budget as raw live video before choosing the playback path. Audio rendition URIs must name media playlists, not another master playlist.
 
-- **Prefetch (#177).** Segments are fetched through a bounded prefetch pipeline: up to 4 in flight, committed to the byte stream strictly in playlist order. So the connection and TTFB (time to first byte) latency of each segment overlaps with the others, and high-bitrate channels buffer ahead of real time.
+- **Prefetch (#177).** Segments are fetched through a bounded prefetch pipeline: up to 4 in flight, committed to the byte stream strictly in playlist order. Video and companion audio share the request limit of each origin they fetch from, even when their playlists are on different hosts. So the connection and TTFB (time to first byte) latency of each segment overlaps with the others, and high-bitrate channels buffer ahead of real time.
 - **Supported:**
   - MPEG-TS segments, whole or as `EXT-X-BYTERANGE` sub-ranges of one resource (fetched with a `Range` request; an origin that answers 200 has the sub-range cut from the whole body),
   - demuxed-audio variants (`EXT-X-MEDIA` audio groups, fetched by a companion reader and merged by DTS), on the native path only. The rendition is the session's audio even when the variant's segments carry audio of their own, as RFC 8216 asks and AVPlayer does. The software path has no side-audio merge and keeps the variant's muxed audio,
